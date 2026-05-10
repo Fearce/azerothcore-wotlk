@@ -81,9 +81,6 @@ class PathGenerator
         void SetUseStraightPath(bool useStraightPath) { _useStraightPath = useStraightPath; }
         void SetPathLengthLimit(float distance) { _pointPathLimit = std::min<uint32>(uint32(distance/SMOOTH_PATH_STEP_SIZE), MAX_POINT_PATH_LENGTH); }
         void SetUseRaycast(bool useRaycast) { _useRaycast = useRaycast; }
-        void AddIncludeFlag(uint16 flag) { _filter.setIncludeFlags(_filter.getIncludeFlags() | flag); }
-        void AddExcludeFlag(uint16 flag) { _filter.setExcludeFlags(_filter.getExcludeFlags() | flag); }
-        void SetAreaCost(int area, float cost) { _filter.setAreaCost(area, cost); }
 
         // result getters
         [[nodiscard]] G3D::Vector3 const& GetStartPosition() const { return _startPosition; }

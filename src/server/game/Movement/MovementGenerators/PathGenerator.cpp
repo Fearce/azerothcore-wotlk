@@ -661,8 +661,15 @@ void PathGenerator::CreateFilter()
     }
     else // assume Player
     {
+#ifdef MOD_PLAYERBOTS
+        // With playerbots: cap at 50° (drop NAV_GROUND_STEEP) and bias
+        // water 10x so A* prefers shore routes over wading.
+        includeFlags |= (NAV_GROUND | NAV_WATER | NAV_MAGMA);
+        _filter.setAreaCost(NAV_WATER, 10.0f);
+#else
         // perfect support not possible, just stay 'safe'
         includeFlags |= (NAV_GROUND | NAV_GROUND_STEEP | NAV_WATER | NAV_MAGMA);
+#endif
     }
 
     _filter.setIncludeFlags(includeFlags);
