@@ -23,6 +23,10 @@
 #include "MMapMgr.h"
 #include "Map.h"
 #include "Metric.h"
+#ifdef MOD_PLAYERBOTS
+#include "Player.h"
+#include "WorldSession.h"
+#endif
 
  ////////////////// PathGenerator //////////////////
 PathGenerator::PathGenerator(WorldObject const* owner) :
@@ -661,14 +665,24 @@ void PathGenerator::CreateFilter()
     }
     else // assume Player
     {
-#ifdef MOD_PLAYERBOTS
-        // With playerbots: cap at 50° (drop NAV_GROUND_STEEP) and bias
-        // water 10x so A* prefers shore routes over wading.
-        includeFlags |= (NAV_GROUND | NAV_WATER | NAV_MAGMA);
-        _filter.setAreaCost(NAV_WATER, 10.0f);
-#else
         // perfect support not possible, just stay 'safe'
         includeFlags |= (NAV_GROUND | NAV_GROUND_STEEP | NAV_WATER | NAV_MAGMA);
+
+#ifdef MOD_PLAYERBOTS
+        // For playerbot sessions only: cap at 50° (exclude NAV_GROUND_STEEP)
+        // and bias water 10x so A* prefers shore routes. Real player
+        // sessions keep vanilla behavior.
+        if (Player const* p = _source->ToPlayer())
+        {
+            if (WorldSession const* sess = p->GetSession())
+            {
+                if (sess->IsBot())
+                {
+                    excludeFlags |= NAV_GROUND_STEEP;
+                    _filter.setAreaCost(NAV_WATER, 10.0f);
+                }
+            }
+        }
 #endif
     }
 
