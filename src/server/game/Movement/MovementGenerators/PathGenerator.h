@@ -83,6 +83,7 @@ class PathGenerator
         void SetUseRaycast(bool useRaycast) { _useRaycast = useRaycast; }
         void AddIncludeFlag(uint16 flag) { _filter.setIncludeFlags(_filter.getIncludeFlags() | flag); }
         void AddExcludeFlag(uint16 flag) { _filter.setExcludeFlags(_filter.getExcludeFlags() | flag); }
+        void SetAreaCost(int area, float cost) { _filter.setAreaCost(area, cost); }
 
         // result getters
         [[nodiscard]] G3D::Vector3 const& GetStartPosition() const { return _startPosition; }
