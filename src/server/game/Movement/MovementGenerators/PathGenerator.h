@@ -81,6 +81,9 @@ class PathGenerator
         void SetUseStraightPath(bool useStraightPath) { _useStraightPath = useStraightPath; }
         void SetPathLengthLimit(float distance) { _pointPathLimit = std::min<uint32>(uint32(distance/SMOOTH_PATH_STEP_SIZE), MAX_POINT_PATH_LENGTH); }
         void SetUseRaycast(bool useRaycast) { _useRaycast = useRaycast; }
+        // Adjust per-area Detour traversal cost on the active query filter.
+        // Persists across CalculatePath calls until overwritten.
+        void SetAreaCost(uint8 area, float cost) { _filter.setAreaCost(area, cost); }
 
         // result getters
         [[nodiscard]] G3D::Vector3 const& GetStartPosition() const { return _startPosition; }
