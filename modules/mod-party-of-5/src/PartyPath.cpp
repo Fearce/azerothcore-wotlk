@@ -118,12 +118,18 @@ namespace WowPsParty
             p->SetGameMaster(on);
             p->SetGMVisible(!on);
             float const rate = on ? 5.0f : 1.0f;
-            p->SetSpeed(MOVE_RUN,        rate);
-            p->SetSpeed(MOVE_RUN_BACK,   rate);
-            p->SetSpeed(MOVE_WALK,       rate);
-            p->SetSpeed(MOVE_SWIM,       rate);
-            p->SetSpeed(MOVE_SWIM_BACK,  rate);
-            p->SetSpeed(MOVE_FLIGHT,     rate);
+            // forced=true so the speed-change packet is actually sent to the
+            // controlling client (without it the player's own speed often
+            // doesn't update). Enable flight + no-gravity too, so you can
+            // genuinely fly through walls/gaps to lay the path fast.
+            p->SetSpeed(MOVE_RUN,        rate, true);
+            p->SetSpeed(MOVE_RUN_BACK,   rate, true);
+            p->SetSpeed(MOVE_WALK,       rate, true);
+            p->SetSpeed(MOVE_SWIM,       rate, true);
+            p->SetSpeed(MOVE_SWIM_BACK,  rate, true);
+            p->SetSpeed(MOVE_FLIGHT,     rate, true);
+            p->SetCanFly(on);
+            p->SetDisableGravity(on);
         }
     }
 
@@ -235,27 +241,43 @@ namespace WowPsParty
 
     void TankFollowPath(Player* bot)
     {
+        // Rate-limited diagnostic so we can see WHY the tank isn't leading.
+        // One line per bot every ~3s. Grep "WowPsParty TankPath".
+        auto tlog = [bot](char const* why)
+        {
+            static thread_local std::unordered_map<uint32, uint32> lastMs;
+            uint32 const now = getMSTime();
+            uint32& last = lastMs[bot->GetGUID().GetCounter()];
+            if (now - last < 3000) return;
+            last = now;
+            LOG_INFO("module", "[WowPsParty TankPath] {} -> {}", bot->GetName(), why);
+        };
+
         if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
         if (!bot->GetSession()) return;
-        if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) return;
-        if (bot->IsNonMeleeSpellCast(false, false, true)) return;
-        if (IsFollowerHeld(bot->GetGUID())) return;
-        if (bot->IsInCombat()) return;  // engagement system handles fighting
+        if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) { tlog("skip: possessed"); return; }
+        if (bot->IsNonMeleeSpellCast(false, false, true)) { tlog("skip: casting"); return; }
+        if (IsFollowerHeld(bot->GetGUID())) { tlog("skip: held"); return; }
+        if (bot->IsInCombat()) { tlog("skip: bot in combat"); return; }
 
         ObjectGuid const leaderGuid = GetLeaderFor(bot->GetGUID());
-        if (!leaderGuid) return;
+        if (!leaderGuid) { tlog("skip: no leader directive"); return; }
         Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
-        if (!leader || !leader->IsInWorld()) return;
-        if (leader->GetMapId() != bot->GetMapId()) return;
-        if (!leader->GetMap() || !leader->GetMap()->IsDungeon()) return;
-        if (leader->IsInCombat()) return;  // let AssistTarget take over while engaged
+        if (!leader || !leader->IsInWorld()) { tlog("skip: leader not in world"); return; }
+        if (leader->GetMapId() != bot->GetMapId()) { tlog("skip: leader other map"); return; }
+        if (!leader->GetMap() || !leader->GetMap()->IsDungeon()) { tlog("skip: leader not in dungeon"); return; }
+        if (leader->IsInCombat()) { tlog("skip: leader in combat"); return; }
 
         // Don't lead if the path doesn't exist for this dungeon.
         auto const& path = EnsurePath(bot->GetMapId());
-        if (path.size() < 2) return;
+        if (path.size() < 2) { tlog("skip: no path for this map (<2 wp)"); return; }
 
         // Leash check.
-        if (bot->GetDistance(leader) > TANK_LEASH) return;
+        if (bot->GetDistance(leader) > TANK_LEASH)
+        {
+            tlog("skip: beyond tank leash (>30y from leader)");
+            return;
+        }
 
         // Find leader's nearest waypoint (the "cursor"). Linear scan — typical
         // dungeon path is ~50-200 points, this runs once per tick per bot.
@@ -276,7 +298,7 @@ namespace WowPsParty
         // Already at the target waypoint? nothing to do.
         float const distToWp = Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
                                        wp.x, wp.y, wp.z);
-        if (distToWp <= WAYPOINT_REACHED) return;
+        if (distToWp <= WAYPOINT_REACHED) { tlog("idle: already at lookahead waypoint"); return; }
 
         // Avoid re-issuing MovePoint to the same waypoint every tick.
         uint32 const botGuidLow = bot->GetGUID().GetCounter();
@@ -294,10 +316,12 @@ namespace WowPsParty
         float const dz = std::fabs(wp.z - bot->GetPositionZ());
         if (dz > VERTICAL_STEP_TP)
         {
+            tlog("blink: vertical step too big, NearTeleport to waypoint");
             bot->NearTeleportTo(wp.x, wp.y, wp.z, wp.o);
             return;
         }
 
+        tlog("LEAD: MovePoint to lookahead waypoint");
         bot->GetMotionMaster()->Clear();
         bot->GetMotionMaster()->MovePoint(0, wp.x, wp.y, wp.z);
     }
