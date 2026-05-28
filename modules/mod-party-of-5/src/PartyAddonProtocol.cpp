@@ -887,8 +887,50 @@ static void HandleGotoDelta(Player* requester, std::string_view payload)
     requester->NearTeleportTo(targetX, targetY, targetZ,
                               requester->GetOrientation());
 
+    // Drag the rest of the party with us. Previously the catch-up
+    // teleport in PartyFollow handled this asynchronously, but it had
+    // a one-tick lag, occasionally lost bots across map boundaries,
+    // and felt janky when the user was zone-hopping. Teleport every
+    // connected party member in this same frame; ring them out by 2.5y
+    // so they don't pile on top of the requester (PartyFollow's next
+    // tick redistributes them into formation anyway).
+    uint32 const account = requester->GetSession()->GetAccountId();
+    QueryResult qP = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {}", account);
+    if (qP)
+    {
+        int formIdx = 0;
+        do
+        {
+            uint32 const g = qP->Fetch()[0].Get<uint32>();
+            if (g == requester->GetGUID().GetCounter()) continue;
+            Player* m = ObjectAccessor::FindConnectedPlayer(
+                ObjectGuid::Create<HighGuid::Player>(g));
+            if (!m) continue;
+
+            float const angle = (2.0f * float(M_PI) / 4.0f) * float(formIdx);
+            float const fx = targetX + std::cos(angle) * 2.5f;
+            float const fy = targetY + std::sin(angle) * 2.5f;
+            float fz = requester->GetMap()->GetHeight(
+                m->GetPhaseMask(), fx, fy, MAX_HEIGHT);
+            if (fz <= INVALID_HEIGHT) fz = targetZ;
+            m->UpdateAllowedPositionZ(fx, fy, fz);
+
+            if (m->GetMapId() == requester->GetMapId())
+                m->NearTeleportTo(fx, fy, fz, requester->GetOrientation());
+            else
+                m->TeleportTo(requester->GetMapId(), fx, fy, fz,
+                              requester->GetOrientation());
+
+            LOG_INFO("module",
+                "[WowPsParty] GOTO_DELTA follower {} -> ({:.1f},{:.1f},{:.1f})",
+                m->GetName(), fx, fy, fz);
+            ++formIdx;
+        } while (qP->NextRow());
+    }
+
     ChatHandler(requester->GetSession()).PSendSysMessage(
-        "|cff66ccff[WowPsParty]|r Teleported to ({:.0f}, {:.0f}). Party will follow on next tick.",
+        "|cff66ccff[WowPsParty]|r Teleported party to ({:.0f}, {:.0f}).",
         targetX, targetY);
 }
 
