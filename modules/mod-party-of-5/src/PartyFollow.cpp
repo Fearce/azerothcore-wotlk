@@ -489,6 +489,25 @@ namespace WowPsParty
             if (!follower->IsInWorld() || !leader->IsInWorld()) return true;
             if (follower == leader) return true;
 
+            // Auto-accept a pending resurrect. A bot has no client to click
+            // the "Accept" dialog, so a healer's Resurrection / Redemption
+            // sets the request data but the bot would otherwise lie dead
+            // forever (Kevin saw the paladin never stand back up). Accept on
+            // its behalf, then scrub the death-state motion the same way the
+            // .party rez command does, or MoveFollow can't drive the revived
+            // bot and the stuck-detector teleports it every few yards.
+            if (!follower->IsAlive() && follower->isResurrectRequested())
+            {
+                follower->ResurectUsingRequestData();
+                follower->GetMotionMaster()->Clear();
+                follower->GetMotionMaster()->MoveIdle();
+                follower->StopMoving();
+                LOG_INFO("module",
+                    "[WowPsParty Follow] {} auto-accepted resurrect",
+                    follower->GetName());
+                return true;
+            }
+
             // Cross-map: leader has entered a dungeon (or any other instance)
             // and the follower is still on the old map. Yank the follower
             // through with TeleportTo. Skip while the follower is mid-cast or

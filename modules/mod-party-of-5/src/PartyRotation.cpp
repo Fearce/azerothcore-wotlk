@@ -673,14 +673,23 @@ namespace WowPsParty
 
     // ----- action executor ----------------------------------------------------
 
-    // Find a spell in the bot's spellbook by case-insensitive name. Returns 0
-    // if not known.
+    // Find a spell in the bot's spellbook by case-insensitive name, returning
+    // the HIGHEST rank the bot actually knows. Returns 0 if not known.
+    //
+    // GetSpellMap() iterates in ascending spell-id order, and lower ranks have
+    // lower ids, so naively returning the first name match handed back rank 1
+    // every time — a level-20 mage was casting Rank 1 Conjure Water / Frostbolt
+    // and the healer was casting Rank 1 heals. We now keep scanning and prefer
+    // the entry with the greatest spell rank (ties → greater spell id, which is
+    // the newer version for chainless spells).
     static uint32 FindKnownSpellByName(Player* bot, std::string const& name)
     {
         std::string needle;
         needle.reserve(name.size());
         for (char c : name) needle.push_back(std::tolower(static_cast<unsigned char>(c)));
 
+        uint32 bestId   = 0;
+        uint8  bestRank = 0;
         for (auto const& kv : bot->GetSpellMap())
         {
             if (kv.second->State == PLAYERSPELL_REMOVED) continue;
@@ -691,9 +700,17 @@ namespace WowPsParty
             std::string lower;
             for (char const* p = spellName; *p; ++p)
                 lower.push_back(std::tolower(static_cast<unsigned char>(*p)));
-            if (lower == needle) return kv.first;
+            if (lower != needle) continue;
+
+            uint8 const rank = sSpellMgr->GetSpellRank(kv.first);
+            if (bestId == 0 || rank > bestRank ||
+                (rank == bestRank && kv.first > bestId))
+            {
+                bestId   = kv.first;
+                bestRank = rank;
+            }
         }
-        return 0;
+        return bestId;
     }
 
     // Lowercase a class name for case-insensitive matching in the
