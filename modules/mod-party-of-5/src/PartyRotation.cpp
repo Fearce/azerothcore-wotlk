@@ -1164,10 +1164,53 @@ namespace WowPsParty
             rules = it->second;  // copy, drop lock before doing real work
         }
 
+        // Rate-limited per-tick trace. The user has reported several
+        // "rule X isn't firing" symptoms (taunt looping, thunder clap
+        // not casting) where the actual root cause needed full visibility
+        // into the rotation loop. Log one summary block per bot every
+        // ~3 s: rule-by-rule, condition pass/fail, and what ExecAction
+        // returned. Off-by-default tuning would mean retrofitting logs
+        // every time something misbehaves, which the project rule
+        // ("Diagnostic logging in everything from the start") explicitly
+        // forbids.
+        static thread_local std::unordered_map<uint32, uint32> lastTraceMs;
+        uint32 const nowMs = getMSTime();
+        uint32& last = lastTraceMs[bot->GetGUID().GetCounter()];
+        bool const trace = (nowMs - last > 3000);
+        if (trace) last = nowMs;
+
+        if (trace)
+        {
+            Unit* victim = bot->GetVictim();
+            LOG_INFO("module",
+                "[WowPsParty Rotation] {} TICK rules={} rage={}/{} mana={}/{} target={} hp={}%",
+                bot->GetName(), uint32(rules.size()),
+                bot->GetPower(POWER_RAGE), bot->GetMaxPower(POWER_RAGE),
+                bot->GetPower(POWER_MANA), bot->GetMaxPower(POWER_MANA),
+                victim ? victim->GetGUID().GetCounter() : 0,
+                victim && victim->GetMaxHealth() > 0
+                    ? int((float(victim->GetHealth()) / float(victim->GetMaxHealth())) * 100.0f)
+                    : -1);
+        }
+
         for (RotationRule const& r : rules)
         {
-            if (!EvalCondition(r.condition, bot)) continue;
-            if (ExecAction(r.action, bot))
+            bool const condOk = EvalCondition(r.condition, bot);
+            if (!condOk)
+            {
+                if (trace)
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> NO_MATCH",
+                        r.priority, r.condition, r.action);
+                continue;
+            }
+            bool const execOk = ExecAction(r.action, bot);
+            if (trace)
+                LOG_INFO("module",
+                    "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> {}",
+                    r.priority, r.condition, r.action,
+                    execOk ? "FIRED" : "exec_failed_falling_through");
+            if (execOk)
                 return true;
         }
         return false;
