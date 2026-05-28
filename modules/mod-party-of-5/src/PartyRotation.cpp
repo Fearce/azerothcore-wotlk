@@ -838,6 +838,16 @@ namespace WowPsParty
                 bot->HasSpellCooldown(info->StartRecoveryCategory))
                 return false;
 
+            // Shapeshift / stance gate. Without this, a battle-stance
+            // warrior with a Taunt rule (requires Defensive Stance)
+            // fires CastSpell every tick, server replies with
+            // SPELL_FAILED_ONLY_SHAPESHIFT (94), and the rule loops
+            // forever instead of falling through to Thunder Clap /
+            // Heroic Strike. SpellInfo::CheckShapeshift handles the
+            // full mask (Stances + StancesNot + cancellable-form bits).
+            if (info->CheckShapeshift(uint32(bot->GetShapeshiftForm())) != SPELL_CAST_OK)
+                return false;
+
             // Power cost (mana / rage / energy / etc).
             int32 const cost = info->CalcPowerCost(bot, info->GetSchoolMask());
             if (cost > 0)
