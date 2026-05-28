@@ -517,8 +517,16 @@ namespace WowPsParty
             if (PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(follower))
                 ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
 
-            if (follower->IsInCombat()) return true;
-            if (follower->IsCharmed())  return true;
+            // Hands-off if the bot is already engaging something — combat
+            // state in AC only flips on damage exchange, but a bot that's
+            // m_attacking a mob (sword raised) needs the chase generator
+            // installed by AssistTarget to actually walk into melee. Old
+            // check only saw IsInCombat() so a warrior with a target but
+            // no aggro got MoveFollow'd back to the leader and never
+            // closed the distance.
+            if (follower->IsInCombat())   return true;
+            if (follower->GetVictim())    return true;
+            if (follower->IsCharmed())    return true;
 
             // Rotation engine has asked us to leave this bot stationary.
             // Active hold = drinking, holding-for-healer-mana, etc.

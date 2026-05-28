@@ -302,6 +302,14 @@ namespace WowPsParty
                 }
             }
         }
+        // Append the shared gold pool as a trailing record. PartyHooks
+        // mirrors every money delta across the party, so reading the
+        // requester's GetMoney() gives the pool's value. The addon's
+        // existing record-pattern needs 6 colons; "POOL:<copper>" has
+        // one, so the items loop ignores it and our pool parser picks
+        // it up separately.
+        if (!first) out << ';';
+        out << "POOL:" << requester->GetMoney();
         SendWPSP(requester, out.str());
     }
 
@@ -520,13 +528,61 @@ static void HandleEquip(Player* requester, std::string_view payload)
     if (!dest) dest = WowPsParty::ResolveControlledBody(requester);
     if (!dest) return;
 
-    // Validate dest can use the item (class/race/level/etc.)
-    InventoryResult const reason = dest->CanUseItem(srcItem->GetTemplate());
+    // Ammo doesn't slot into the regular equipment array — Player tracks
+    // the equipped ammo type via PLAYER_AMMO_ID, and arrows are consumed
+    // straight from any matching stack in the wielder's bags. The
+    // standard CanEquipItem / EquipItem path won't find a slot for it,
+    // so handle ammo separately: cross-move into dest's bags if needed,
+    // then SetAmmo(itemId).
+    if (srcItem->GetTemplate()->InventoryType == INVTYPE_AMMO)
+    {
+        uint32 const ammoItemId = srcItem->GetEntry();
+        if (srcChar != dest)
+        {
+            // Cross-character move: detach from src, re-own to dest, store.
+            srcChar->MoveItemFromInventory(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+            srcItem->SetOwnerGUID(dest->GetGUID());
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            srcItem->SaveToDB(tx);
+            CharacterDatabase.CommitTransaction(tx);
+            ItemPosCountVec destPos;
+            if (dest->CanStoreItem(NULL_BAG, NULL_SLOT, destPos, srcItem, false) == EQUIP_ERR_OK)
+            {
+                dest->MoveItemToInventory(destPos, srcItem, true);
+            }
+            else
+            {
+                // Bags full on dest — give it back to src.
+                srcItem->SetOwnerGUID(srcChar->GetGUID());
+                ItemPosCountVec backPos;
+                if (srcChar->CanStoreItem(NULL_BAG, NULL_SLOT, backPos, srcItem, false) == EQUIP_ERR_OK)
+                    srcChar->MoveItemToInventory(backPos, srcItem, true);
+                CharacterDatabaseTransaction tx2 = CharacterDatabase.BeginTransaction();
+                srcItem->SaveToDB(tx2);
+                CharacterDatabase.CommitTransaction(tx2);
+                ChatHandler(requester->GetSession()).PSendSysMessage(
+                    "|cffff5555[WowPsParty]|r {}'s bags are full — can't take ammo.",
+                    dest->GetName());
+                return;
+            }
+        }
+        dest->SetAmmo(ammoItemId);
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r Set ammo on {}.", dest->GetName());
+        WowPsParty::SendInventoryTo(requester);
+        return;
+    }
+
+    // Validate dest can use the item. The Item* overload checks armor
+    // proficiency (Cloth/Leather/Mail/Plate skill) via Item::GetSkill();
+    // the ItemTemplate* overload doesn't, so a level-20 hunter would
+    // "pass" the check on mail bracers and end up equipping them.
+    InventoryResult const reason = dest->CanUseItem(srcItem, /*not_loading=*/true);
     if (reason != EQUIP_ERR_OK)
     {
         ChatHandler(requester->GetSession()).PSendSysMessage(
-            "|cffff5555[WowPsParty]|r Can't equip on slot {}: target can't use this item.",
-            uint32(srcSlot));
+            "|cffff5555[WowPsParty]|r Can't equip on slot {}: target can't use this item (code {}).",
+            uint32(srcSlot), uint32(reason));
         return;
     }
 
@@ -598,6 +654,20 @@ static void HandleEquip(Player* requester, std::string_view payload)
         WowPsParty::SendGearTo(requester, uint32(*srcS));
     if (auto dstS = sPartyMgr.GetSlotForGuid(dest->GetGUID().GetCounter()))
         WowPsParty::SendGearTo(requester, uint32(*dstS));
+}
+
+// =============================================================================
+// Chunked-rotation builder. The full SET_ROTATION payload for a 9-rule
+// rotation exceeds the ~255-byte SendAddonMessage cap on 3.3.5a, so the
+// client now sends BEGIN_ROTATION / ROTATION_RULE × N / COMMIT_ROTATION
+// instead. This map buffers rules per (playerGuid << 8 | slot).
+// =============================================================================
+namespace {
+    std::unordered_map<uint64, std::vector<WowPsParty::RotationRule>>& PendingRotationMap()
+    {
+        static std::unordered_map<uint64, std::vector<WowPsParty::RotationRule>> m;
+        return m;
+    }
 }
 
 // SELL\t<srcPartySlot>\t<srcItemGuidLow>
@@ -1168,6 +1238,97 @@ public:
             std::ostringstream out;
             out << "PATH_INFO\t" << mapId << '\t' << n;
             SendWPSP(player, out.str());
+        }
+        // ---------- Chunked rotation save ------------------------------------
+        // WoW 3.3.5a's SendAddonMessage silently drops anything past ~255
+        // bytes. A 9-rule rotation easily exceeds 350 chars, so the whole
+        // SET_ROTATION message used to vanish without a trace. The chunked
+        // BEGIN / ROTATION_RULE / COMMIT_ROTATION sequence keeps every
+        // individual message tiny.
+        else if (command == "BEGIN_ROTATION")
+        {
+            uint32 const slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            if (slot >= WowPsParty::PARTY_SIZE) return;
+            uint64 const key = (uint64(player->GetGUID().GetCounter()) << 8) | slot;
+            PendingRotationMap()[key].clear();
+            LOG_INFO("module",
+                "[WowPsParty] BEGIN_ROTATION guid={} slot={}",
+                player->GetGUID().GetCounter(), slot);
+        }
+        else if (command == "ROTATION_RULE")
+        {
+            // payload = "<slot>\t<condition>\t<action>\t<priority>"
+            std::string s(payload);
+            std::vector<std::string> fields;
+            {
+                size_t p = 0;
+                while (p <= s.size())
+                {
+                    size_t t = s.find('\t', p);
+                    if (t == std::string::npos)
+                    {
+                        fields.push_back(s.substr(p));
+                        break;
+                    }
+                    fields.push_back(s.substr(p, t - p));
+                    p = t + 1;
+                }
+            }
+            if (fields.size() < 4) return;
+            uint32 const slot = std::strtoul(fields[0].c_str(), nullptr, 10);
+            if (slot >= WowPsParty::PARTY_SIZE) return;
+            uint64 const key = (uint64(player->GetGUID().GetCounter()) << 8) | slot;
+            WowPsParty::RotationRule r;
+            r.condition = fields[1];
+            r.action    = fields[2];
+            r.priority  = std::atoi(fields[3].c_str());
+            PendingRotationMap()[key].push_back(std::move(r));
+            LOG_INFO("module",
+                "[WowPsParty] ROTATION_RULE guid={} slot={} cond='{}' act='{}' prio={}",
+                player->GetGUID().GetCounter(), slot,
+                fields[1], fields[2], std::atoi(fields[3].c_str()));
+        }
+        else if (command == "COMMIT_ROTATION")
+        {
+            uint32 const slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            if (slot >= WowPsParty::PARTY_SIZE) return;
+            uint64 const key = (uint64(player->GetGUID().GetCounter()) << 8) | slot;
+            auto& pending = PendingRotationMap();
+            auto it = pending.find(key);
+            std::vector<WowPsParty::RotationRule> rules;
+            if (it != pending.end())
+            {
+                rules = std::move(it->second);
+                pending.erase(it);
+            }
+            // Sort by priority desc (matches ParseRotationString convention).
+            std::stable_sort(rules.begin(), rules.end(),
+                [](WowPsParty::RotationRule const& a, WowPsParty::RotationRule const& b)
+                { return a.priority > b.priority; });
+
+            uint32 const accountId = player->GetSession()->GetAccountId();
+            QueryResult q = CharacterDatabase.Query(
+                "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}",
+                accountId, slot);
+            if (!q) return;
+            uint32 const guid = q->Fetch()[0].Get<uint32>();
+
+            std::string const stored = WowPsParty::SerialiseRotationRules(rules);
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
+                "`gear_lock_json`, `priority_actions_json`) VALUES ({}, '', '', '', '', '{}') "
+                "ON DUPLICATE KEY UPDATE `priority_actions_json` = VALUES(`priority_actions_json`)",
+                guid, stored);
+            CharacterDatabase.CommitTransaction(tx);
+
+            WowPsParty::RotationCacheSet(guid, rules);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Saved {} rule(s) on slot {}.",
+                uint32(rules.size()), slot);
+            LOG_INFO("module",
+                "[WowPsParty] COMMIT_ROTATION guid={} slot={} n_rules={}",
+                player->GetGUID().GetCounter(), slot, uint32(rules.size()));
         }
         else if (command == "SET_ROTATION")
         {

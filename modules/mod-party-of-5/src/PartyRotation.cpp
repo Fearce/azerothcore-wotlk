@@ -190,7 +190,7 @@ namespace WowPsParty
         Acore::AnyUnfriendlyUnitInObjectRangeCheck check(bot, bot, radius);
         Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck>
             searcher(bot, out, check);
-        Cell::VisitAllObjects(bot, searcher, radius);
+        Cell::VisitObjects(bot, searcher, radius);
     }
 
     static uint32 CountHostilesWithin(Player* bot, float radius)
@@ -458,6 +458,20 @@ namespace WowPsParty
         if (cond == "party_has_dead")
             return FindDeadPartyMember(bot) != nullptr;
 
+        // Warrior stance detection by aura presence. Each stance is a
+        // self-applied buff that stays until you swap. Pair with
+        // `buff_self:<stance>` actions to build stance-dance rotations.
+        if (cond == "stance_is_battle")     return bot->HasAura(2457);
+        if (cond == "stance_is_defensive")  return bot->HasAura(71);
+        if (cond == "stance_is_berserker")  return bot->HasAura(2458);
+        // Same idea for druid forms — useful for feral / boomkin rules.
+        if (cond == "form_is_bear")         return bot->HasAura(5487) || bot->HasAura(9634);
+        if (cond == "form_is_cat")          return bot->HasAura(768);
+        if (cond == "form_is_moonkin")      return bot->HasAura(24858);
+        if (cond == "form_is_caster")       return bot->getClass() == CLASS_DRUID
+            && !bot->HasAura(5487) && !bot->HasAura(9634) && !bot->HasAura(768)
+            && !bot->HasAura(24858);
+
         // Boolean: is there any nearby enemy that's currently attacking an
         // ally OTHER than the bot? Used by the tank's taunt rule.
         if (cond == "enemy_loose_in_melee")
@@ -485,8 +499,51 @@ namespace WowPsParty
 
         if (name == "self_health")
             return cmp(pct(float(bot->GetHealth()), float(bot->GetMaxHealth())));
-        if (name == "self_mana" && bot->getPowerType() == POWER_MANA)
-            return cmp(pct(float(bot->GetPower(POWER_MANA)), float(bot->GetMaxPower(POWER_MANA))));
+        // Class-specific power pools — warriors don't have mana, so
+        // self_mana on a warrior is a no-op. self_rage, self_energy, etc.
+        // let you write proper rules per class. self_power is the generic
+        // "whatever power this class actually uses".
+        if (name == "self_rage")
+            return cmp(pct(float(bot->GetPower(POWER_RAGE)), float(bot->GetMaxPower(POWER_RAGE))));
+        if (name == "self_energy")
+            return cmp(pct(float(bot->GetPower(POWER_ENERGY)), float(bot->GetMaxPower(POWER_ENERGY))));
+        if (name == "self_focus")
+            return cmp(pct(float(bot->GetPower(POWER_FOCUS)), float(bot->GetMaxPower(POWER_FOCUS))));
+        if (name == "self_runic")
+            return cmp(pct(float(bot->GetPower(POWER_RUNIC_POWER)), float(bot->GetMaxPower(POWER_RUNIC_POWER))));
+        if (name == "self_power")
+        {
+            Powers const p = bot->getPowerType();
+            uint32 const mx = bot->GetMaxPower(p);
+            if (mx == 0) return false;
+            return cmp(int((float(bot->GetPower(p)) / float(mx)) * 100.0f));
+        }
+        if (name == "self_mana")
+        {
+            // Diagnostic: throttle to once per 5 s per bot so we can see
+            // why the rule isn't matching when the user expects it to.
+            static thread_local std::unordered_map<uint32, uint32> lastLog;
+            uint32 const nowMs = getMSTime();
+            uint32& last = lastLog[bot->GetGUID().GetCounter()];
+            int const manaPct = (bot->GetMaxPower(POWER_MANA) > 0)
+                ? int((float(bot->GetPower(POWER_MANA))
+                       / float(bot->GetMaxPower(POWER_MANA))) * 100.0f)
+                : -1;
+            if (nowMs - last > 5000)
+            {
+                last = nowMs;
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] {} self_mana eval: powerType={} mana={}/{} pct={} cmp_op={} threshold={}",
+                    bot->GetName(), uint32(bot->getPowerType()),
+                    bot->GetPower(POWER_MANA), bot->GetMaxPower(POWER_MANA),
+                    manaPct, op, threshold);
+            }
+            // Original behaviour: only paladins/priests/mages/etc. with a
+            // primary mana pool. Warriors/rogues should never match this.
+            if (bot->getPowerType() != POWER_MANA) return false;
+            if (manaPct < 0) return false;
+            return cmp(manaPct);
+        }
         if (name == "target_health")
         {
             Unit* tgt = bot->GetVictim();
@@ -555,6 +612,112 @@ namespace WowPsParty
         return 0;
     }
 
+    // Lowercase a class name for case-insensitive matching in the
+    // class-filter list.
+    static std::string Lower(std::string s)
+    {
+        for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    }
+
+    // Map a player class id to the lower-case keyword used in the
+    // class-filter syntax ("warrior", "paladin", ...).
+    static char const* ClassKeyword(uint8 cls)
+    {
+        switch (cls)
+        {
+            case CLASS_WARRIOR:      return "warrior";
+            case CLASS_PALADIN:      return "paladin";
+            case CLASS_HUNTER:       return "hunter";
+            case CLASS_ROGUE:        return "rogue";
+            case CLASS_PRIEST:       return "priest";
+            case CLASS_DEATH_KNIGHT: return "deathknight";
+            case CLASS_SHAMAN:       return "shaman";
+            case CLASS_MAGE:         return "mage";
+            case CLASS_WARLOCK:      return "warlock";
+            case CLASS_DRUID:        return "druid";
+            default:                 return "";
+        }
+    }
+
+    // True if `kw` appears in the comma-separated, lowercase list `csv`.
+    static bool CsvContains(std::string const& csv, std::string const& kw)
+    {
+        size_t p = 0;
+        while (p <= csv.size())
+        {
+            size_t c = csv.find(',', p);
+            std::string tok = (c == std::string::npos)
+                ? csv.substr(p) : csv.substr(p, c - p);
+            // trim leading whitespace
+            while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
+            while (!tok.empty() && tok.back()  == ' ') tok.pop_back();
+            if (tok == kw) return true;
+            if (c == std::string::npos) break;
+            p = c + 1;
+        }
+        return false;
+    }
+
+    // Find first party member matching a class-list filter and missing the
+    // named spell's aura. classCsv is comma-separated lowercase class
+    // keywords ("priest,mage,warlock,druid").
+    static Player* FindClassFilteredMissing(Player* bot,
+        std::string const& classCsv, uint32 spellId)
+    {
+        if (!bot || !spellId) return nullptr;
+        std::string const csv = Lower(classCsv);
+        Group* g = bot->GetGroup();
+        auto consider = [&](Player* m) -> Player* {
+            if (!m || !m->IsAlive() || !m->IsInWorld()) return nullptr;
+            if (m->GetMapId() != bot->GetMapId()) return nullptr;
+            char const* kw = ClassKeyword(m->getClass());
+            if (!*kw) return nullptr;
+            if (!CsvContains(csv, kw)) return nullptr;
+            if (HasAuraFromSpell(m, spellId)) return nullptr;
+            return m;
+        };
+        if (!g) return consider(bot);
+        for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
+        {
+            if (Player* hit = consider(itr->GetSource())) return hit;
+        }
+        return nullptr;
+    }
+
+    // Find first party member matching a role filter and missing the named
+    // spell's aura. roleFilter is "tank" / "healer" / "dps" / "!tank" etc.
+    static Player* FindRoleFilteredMissing(Player* bot,
+        std::string const& roleFilter, uint32 spellId)
+    {
+        if (!bot || !bot->GetSession() || !spellId) return nullptr;
+        bool negate = !roleFilter.empty() && roleFilter[0] == '!';
+        std::string wantedRole = negate ? roleFilter.substr(1) : roleFilter;
+        wantedRole = Lower(wantedRole);
+
+        uint32 const account = bot->GetSession()->GetAccountId();
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `guid`, COALESCE(`role`, 'dps') FROM `account_party` "
+            "WHERE `account` = {}", account);
+        if (!q) return nullptr;
+        do
+        {
+            uint32 const memberGuid = q->Fetch()[0].Get<uint32>();
+            std::string memberRole = q->Fetch()[1].Get<std::string>();
+            memberRole = Lower(memberRole);
+            bool const matches = (memberRole == wantedRole);
+            bool const include = negate ? !matches : matches;
+            if (!include) continue;
+            Player* m = ObjectAccessor::FindConnectedPlayer(
+                ObjectGuid::Create<HighGuid::Player>(memberGuid));
+            if (!m || !m->IsAlive() || !m->IsInWorld()) continue;
+            if (m->GetMapId() != bot->GetMapId()) continue;
+            if (HasAuraFromSpell(m, spellId)) continue;
+            return m;
+        } while (q->NextRow());
+        return nullptr;
+    }
+
     // Walk the bot's group looking for the first member missing the named
     // spell's aura. Returns nullptr if every member already has it.
     static Player* FindPartyMemberMissingAura(Player* bot, uint32 spellId)
@@ -597,7 +760,13 @@ namespace WowPsParty
             SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
             if (!info) return false;
 
-            // GCD / category cooldown.
+            // GCD: AC stores it in a per-player GlobalCooldownMgr, NOT in
+            // the regular cooldown map. StartRecoveryCategory alone misses
+            // it. Without this check the mage would happily try to cast
+            // Frostbolt during a GCD, fail with SPELL_FAILED_NOT_READY
+            // (result=67), and the rotation would fall through to Shoot.
+            if (bot->GetGlobalCooldownMgr().HasGlobalCooldown(info))
+                return false;
             if (info->StartRecoveryCategory > 0 &&
                 bot->HasSpellCooldown(info->StartRecoveryCategory))
                 return false;
@@ -643,28 +812,34 @@ namespace WowPsParty
         // per-tick re-asserter already skips while IsNonMeleeSpellCast,
         // so once the cast finishes, formation movement resumes
         // naturally on the next tick.
-        auto faceAndCast = [bot](Unit* target, uint32 spellId)
+        // Returns true if the cast was actually issued and accepted by the
+        // server. False means the spell failed validation (bad target,
+        // immune, out of LoS at cast time, etc.) — the caller treats that
+        // as "rule didn't fire" so the rotation falls through to the next
+        // lower-priority rule.
+        auto faceAndCast = [bot](Unit* target, uint32 spellId) -> bool
         {
             if (target && target != bot)
                 bot->SetFacingToObject(target);
+            int32 castMs = 0;
             if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId))
+                castMs = info->CalcCastTime();
+            if (castMs > 0)
             {
-                int32 const castMs = info->CalcCastTime();
-                if (castMs > 0)
-                {
-                    // Lock motion for the whole cast — StopMoving alone
-                    // halts the current spline but MoveChase / MoveFollow
-                    // would re-install on the very next tick (200-1000 ms),
-                    // causing the bot to stutter-step every ~200 ms.
-                    // HoldFollower makes AssistTarget + PartyFollow both
-                    // bail until the cast is fully resolved.
-                    bot->StopMoving();
-                    bot->GetMotionMaster()->Clear();
-                    WowPsParty::HoldFollower(bot->GetGUID(),
-                        uint32(castMs) + 500);
-                }
+                bot->StopMoving();
+                bot->GetMotionMaster()->Clear();
+                WowPsParty::HoldFollower(bot->GetGUID(),
+                    uint32(castMs) + 500);
             }
-            bot->CastSpell(target, spellId, false);
+            SpellCastResult const r = bot->CastSpell(target, spellId, false);
+            if (r != SPELL_CAST_OK)
+            {
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] cast {} failed on guid={} result={}",
+                    spellId, bot->GetGUID().GetCounter(), uint32(r));
+                return false;
+            }
+            return true;
         };
 
         if (verb == "cast" || verb == "cast_self")
@@ -675,8 +850,7 @@ namespace WowPsParty
             if (!target) return false;
             if (!canFireSpellOn(spellId, target)) return false;
             if (bot->IsNonMeleeSpellCast(false)) return false;
-            faceAndCast(target, spellId);
-            return true;
+            return faceAndCast(target, spellId);
         }
 
         if (verb == "buff_self")
@@ -686,8 +860,7 @@ namespace WowPsParty
             if (HasAuraFromSpell(bot, spellId)) return false;
             if (!canFireSpellOn(spellId, bot)) return false;
             if (bot->IsNonMeleeSpellCast(false)) return false;
-            faceAndCast(bot, spellId);
-            return true;
+            return faceAndCast(bot, spellId);
         }
 
         if (verb == "cast_party_lowest" || verb == "cast_party_lowest_hot")
@@ -700,8 +873,44 @@ namespace WowPsParty
                 return false;
             if (!canFireSpellOn(spellId, target)) return false;
             if (bot->IsNonMeleeSpellCast(false)) return false;
-            faceAndCast(target, spellId);
-            return true;
+            return faceAndCast(target, spellId);
+        }
+
+        // "cast_class_missing:<classes>:<spell>" — cast spell on the first
+        // party member of one of the listed classes who's missing the
+        // spell's aura. Used for class-targeted buffs (BoW on casters,
+        // BoM on melee, etc.). `arg` is "<classes>:<spell>".
+        if (verb == "cast_class_missing")
+        {
+            auto inner = arg.find(':');
+            if (inner == std::string::npos) return false;
+            std::string const classes  = arg.substr(0, inner);
+            std::string const spellNm  = arg.substr(inner + 1);
+            uint32 const spellId = FindKnownSpellByName(bot, spellNm);
+            if (!spellId) return false;
+            Player* target = FindClassFilteredMissing(bot, classes, spellId);
+            if (!target) return false;
+            if (!canFireSpellOn(spellId, target)) return false;
+            if (bot->IsNonMeleeSpellCast(false)) return false;
+            return faceAndCast(target, spellId);
+        }
+
+        // "cast_role_missing:<role>:<spell>" — same idea but filter by the
+        // role you assigned in the Party Roster (tank / healer / dps). The
+        // `!` prefix negates: "!tank" matches everyone EXCEPT tanks.
+        if (verb == "cast_role_missing")
+        {
+            auto inner = arg.find(':');
+            if (inner == std::string::npos) return false;
+            std::string const roleFilter = arg.substr(0, inner);
+            std::string const spellNm    = arg.substr(inner + 1);
+            uint32 const spellId = FindKnownSpellByName(bot, spellNm);
+            if (!spellId) return false;
+            Player* target = FindRoleFilteredMissing(bot, roleFilter, spellId);
+            if (!target) return false;
+            if (!canFireSpellOn(spellId, target)) return false;
+            if (bot->IsNonMeleeSpellCast(false)) return false;
+            return faceAndCast(target, spellId);
         }
 
         if (verb == "cast_party_missing")
@@ -712,8 +921,7 @@ namespace WowPsParty
             if (!target) return false;
             if (!canFireSpellOn(spellId, target)) return false;
             if (bot->IsNonMeleeSpellCast(false)) return false;
-            faceAndCast(target, spellId);
-            return true;
+            return faceAndCast(target, spellId);
         }
 
         // "cast_loose_enemy:<spell>" — cast the spell on the nearest hostile
@@ -729,8 +937,7 @@ namespace WowPsParty
             if (!target) return false;
             if (!canFireSpellOn(spellId, target)) return false;
             if (bot->IsNonMeleeSpellCast(false)) return false;
-            faceAndCast(target, spellId);
-            return true;
+            return faceAndCast(target, spellId);
         }
 
         if (verb == "rez_party")
@@ -742,8 +949,7 @@ namespace WowPsParty
             if (!target) return false;
             if (!canFireSpellOn(spellId, target)) return false;
             if (bot->IsNonMeleeSpellCast(false)) return false;
-            faceAndCast(target, spellId);
-            return true;
+            return faceAndCast(target, spellId);
         }
 
         // "cure_party:<spell>" — cast `spell` on the first afflicted member.
@@ -775,51 +981,80 @@ namespace WowPsParty
             if (!target) return false;
             if (!canFireSpellOn(spellId, target)) return false;
             if (bot->IsNonMeleeSpellCast(false)) return false;
-            faceAndCast(target, spellId);
-            return true;
+            return faceAndCast(target, spellId);
         }
 
         // "drink" / "eat" — sit, pull a consumable out of the SHARED
-        // inventory (any party member's bag), and apply that item's
-        // use-spell on the bot so the proper regen aura shows up.
-        // Falls back to plain sit-regen if no matching consumable is in
-        // the shared bags (so the bot still benefits from passive
-        // out-of-combat regen).
+        // inventory, apply its use-spell on the bot. Rate-limited via a
+        // per-bot timestamp so the rule firing every ~250 ms doesn't burn
+        // 20 water in 5 seconds — the aura-presence check we previously
+        // used couldn't reliably detect the drink/food aura across all
+        // ranks, leading to runaway consumption.
         if (verb == "drink" || verb == "eat")
         {
-            if (bot->IsInCombat()) return false;
+            auto bailWithLog = [&](char const* reason) {
+                static thread_local std::unordered_map<uint32, uint32> lastLog;
+                uint32 const nowMs = getMSTime();
+                uint32& last = lastLog[bot->GetGUID().GetCounter()];
+                if (nowMs - last > 5000)
+                {
+                    last = nowMs;
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation] {} verb={} bailed: {}",
+                        bot->GetName(), verb, reason);
+                }
+            };
+            if (bot->IsInCombat()) { bailWithLog("bot in combat");  return false; }
+            // PARTY-wide combat gate: a mage drinking while the warrior
+            // tanks isn't what anyone wants. Bail if ANY group member is
+            // mid-fight on the same map.
+            if (Group* g = bot->GetGroup())
+            {
+                for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
+                {
+                    Player* m = itr->GetSource();
+                    if (!m || m == bot) continue;
+                    if (m->GetMapId() != bot->GetMapId()) continue;
+                    if (m->IsInCombat())
+                    {
+                        bailWithLog("party member in combat");
+                        return false;
+                    }
+                }
+            }
             bool const wantDrink = (verb == "drink");
             bot->StopMoving();
             bot->GetMotionMaster()->Clear();
             if (bot->getStandState() != UNIT_STAND_STATE_SIT)
                 bot->SetStandState(UNIT_STAND_STATE_SIT);
-            // Only consume when the aura isn't already up; otherwise we'd
-            // burn one stack per rotation tick.
-            bool needFresh = true;
-            for (auto const& kv : bot->GetAppliedAuras())
-            {
-                Aura const* a = kv.second ? kv.second->GetBase() : nullptr;
-                if (!a) continue;
-                SpellInfo const* si = a->GetSpellInfo();
-                if (!si) continue;
-                for (uint8 e = 0; e < 3; ++e)
-                {
-                    uint32 const auraNeeded = wantDrink
-                        ? SPELL_AURA_MOD_POWER_REGEN
-                        : SPELL_AURA_MOD_REGEN;
-                    if (si->Effects[e].ApplyAuraName == auraNeeded)
-                    {
-                        needFresh = false;
-                        break;
-                    }
-                }
-                if (!needFresh) break;
-            }
-            if (needFresh)
+
+            // Drink auras in 3.3.5a last 20-30 s. 20 s between consumes
+            // gives a tiny gap of passive regen before the next stack
+            // burns, which is the natural "drink → wait → drink" cadence
+            // a real player would use anyway.
+            static std::unordered_map<uint32, uint32> lastDrinkMs;
+            static std::unordered_map<uint32, uint32> lastEatMs;
+            auto& last = wantDrink
+                ? lastDrinkMs[bot->GetGUID().GetCounter()]
+                : lastEatMs  [bot->GetGUID().GetCounter()];
+            uint32 const now = getMSTime();
+            if (now - last >= 20000)
             {
                 uint32 const spellId = ConsumeSharedConsumable(bot, wantDrink);
                 if (spellId)
+                {
                     bot->CastSpell(bot, spellId, true);  // triggered, no GCD/cost
+                    last = now;
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation] {} verb={} consumed shared item, cast spell={}",
+                        bot->GetName(), verb, spellId);
+                }
+                else
+                {
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation] {} verb={} no shared {} in party bags",
+                        bot->GetName(), verb, wantDrink ? "drink" : "food");
+                }
             }
             WowPsParty::HoldFollower(bot->GetGUID(), 1500);
             return true;
