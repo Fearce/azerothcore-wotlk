@@ -53,8 +53,10 @@
 #include "SpellMgr.h"
 #include "WorldSession.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <sstream>
+#include <vector>
 
 namespace WowPsParty
 {
@@ -774,6 +776,108 @@ static void HandleSell(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// DESTROY\t<srcPartySlot>\t<srcItemGuidLow>
+// Permanently destroys an item from a party member's bags. The addon shows a
+// confirmation popup first (Ctrl+Right-Click). Refuses equipped items and
+// non-empty bags, same guards as HandleSell.
+static void HandleDestroy(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const srcSlot = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+    if (!srcItemGuidLow) return;
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    QueryResult q = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, srcSlot);
+    if (!q) return;
+    uint32 const srcCharGuid = q->Fetch()[0].Get<uint32>();
+    Player* srcChar = ObjectAccessor::FindConnectedPlayer(
+        ObjectGuid::Create<HighGuid::Player>(srcCharGuid));
+    if (!srcChar) return;
+
+    Item* srcItem = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!srcItem) return;
+    if (srcItem->IsEquipped()) return;
+    if (srcItem->IsNotEmptyBag())
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Empty the bag before destroying it.");
+        return;
+    }
+
+    std::string const name = srcItem->GetTemplate() ? srcItem->GetTemplate()->Name1 : "item";
+    srcChar->DestroyItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+    ChatHandler(requester->GetSession()).PSendSysMessage(
+        "|cff66ccff[WowPsParty]|r Destroyed |cffffffff{}|r.", name);
+    WowPsParty::SendInventoryTo(requester);
+}
+
+// Compact + order one character's bag contents (backpack + equipped bags) the
+// way Bagnon's sort does: quality first, then item class/subclass, then entry.
+// Selection-sort via SwapItem so we never detach/re-store items (which would
+// risk bag-type mismatches or orphaning). Containers themselves aren't moved.
+static void SortBagsFor(Player* p)
+{
+    if (!p) return;
+    std::vector<uint16> slotSeq;   // every general bag position, in display order
+    std::vector<Item*>  items;     // the items currently occupying them
+
+    auto addPos = [&](uint8 bag, uint8 slot)
+    {
+        slotSeq.push_back((uint16(bag) << 8) | slot);
+        if (Item* it = p->GetItemByPos(bag, slot))
+            items.push_back(it);
+    };
+    for (uint8 s = INVENTORY_SLOT_ITEM_START; s < INVENTORY_SLOT_ITEM_END; ++s)
+        addPos(INVENTORY_SLOT_BAG_0, s);
+    for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+    {
+        Bag* bag = p->GetBagByPos(b);
+        if (!bag) continue;
+        for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+            addPos(b, uint8(j));
+    }
+
+    std::stable_sort(items.begin(), items.end(), [](Item* a, Item* b)
+    {
+        ItemTemplate const* ta = a->GetTemplate();
+        ItemTemplate const* tb = b->GetTemplate();
+        if (!ta || !tb) return ta != nullptr;
+        if (ta->Quality  != tb->Quality)  return ta->Quality  > tb->Quality;   // rarer first
+        if (ta->Class    != tb->Class)    return ta->Class    < tb->Class;
+        if (ta->SubClass != tb->SubClass) return ta->SubClass < tb->SubClass;
+        if (a->GetEntry() != b->GetEntry()) return a->GetEntry() < b->GetEntry();
+        return a->GetCount() > b->GetCount();
+    });
+
+    for (size_t i = 0; i < items.size() && i < slotSeq.size(); ++i)
+    {
+        uint16 const target = slotSeq[i];
+        Item* desired = items[i];
+        if (desired->GetPos() == target) continue;
+        p->SwapItem(desired->GetPos(), target);
+    }
+}
+
+// SORT_BAGS — sort every online party member's bags, then refresh the addon.
+static void HandleSortBags(Player* requester)
+{
+    if (!requester || !requester->GetSession()) return;
+    uint32 const account = requester->GetSession()->GetAccountId();
+    for (uint8 slot = 0; slot < WowPsParty::PARTY_SIZE; ++slot)
+    {
+        uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+        if (!guid) continue;
+        Player* p = ObjectAccessor::FindConnectedPlayer(
+            ObjectGuid::Create<HighGuid::Player>(guid));
+        if (p) SortBagsFor(p);
+    }
+    WowPsParty::SendInventoryTo(requester);
+}
+
 // SAVE_BAR\t<slot>\t<spellId1,spellId2,...> — persists the addon's local bar
 // layout for that party slot to party_loadout.action_bar_csv.
 static void HandleSaveBar(Player* requester, std::string_view payload)
@@ -1318,6 +1422,14 @@ public:
         else if (command == "SELL")
         {
             HandleSell(player, payload);
+        }
+        else if (command == "DESTROY")
+        {
+            HandleDestroy(player, payload);
+        }
+        else if (command == "SORT_BAGS")
+        {
+            HandleSortBags(player);
         }
         else if (command == "CAST")
         {
