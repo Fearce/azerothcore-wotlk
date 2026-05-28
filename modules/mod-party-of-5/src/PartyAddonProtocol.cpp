@@ -47,6 +47,8 @@
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "DBCStores.h"
+#include "DBCStructure.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 #include "SpellInfo.h"
@@ -327,6 +329,63 @@ namespace WowPsParty
         // pick them up.
         sep();
         out << "POOL:" << requester->GetMoney();
+        SendWPSP(requester, out.str());
+    }
+
+    // TALENTS\t<slot>\t<freePoints>\t<classId>\t<rec>;<rec>;...
+    //   rec = tabpage:talentId:row:col:maxRank:curRank:rank1SpellId:prereqTalentId:prereqRank
+    //   The addon renders the three trees from this; the class name table for
+    //   the tab titles lives client-side. Server enforces all spend rules in
+    //   LearnTalent, so the client gating is purely cosmetic.
+    void SendTalentsTo(Player* requester, uint32 slot)
+    {
+        if (!requester || !requester->GetSession()) return;
+        uint32 const account = requester->GetSession()->GetAccountId();
+        uint32 const guid = GuidForAccountSlot(account, slot);
+        if (!guid) return;
+        Player* p = ObjectAccessor::FindConnectedPlayer(
+            ObjectGuid::Create<HighGuid::Player>(guid));
+        if (!p) return;
+
+        uint32 const classMask = p->getClassMask();
+        std::ostringstream out;
+        out << "TALENTS\t" << slot << '\t' << p->GetFreeTalentPoints()
+            << '\t' << uint32(p->getClass()) << '\t';
+
+        bool first = true;
+        for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
+        {
+            TalentEntry const* t = sTalentStore.LookupEntry(i);
+            if (!t) continue;
+            TalentTabEntry const* tab = sTalentTabStore.LookupEntry(t->TalentTab);
+            if (!tab) continue;
+            if ((tab->ClassMask & classMask) == 0) continue;  // not this class
+            if (tab->petTalentMask) continue;                 // skip pet trees
+
+            uint32 maxRank = 0, curRank = 0, rank1 = 0;
+            for (uint8 r = 0; r < MAX_TALENT_RANK; ++r)
+            {
+                uint32 const sid = t->RankID[r];
+                if (!sid) break;
+                if (r == 0) rank1 = sid;
+                maxRank = r + 1;
+                if (p->HasSpell(sid)) curRank = r + 1;
+            }
+            if (!maxRank) continue;
+
+            // Prereq: a real dependency always has DependsOnRank >= 1. Resolve
+            // the DBC row index to the prereq's TalentID for the client.
+            uint32 prereqTalentId = 0;
+            if (t->DependsOnRank > 0)
+                if (TalentEntry const* dep = sTalentStore.LookupEntry(t->DependsOn))
+                    prereqTalentId = dep->TalentID;
+
+            if (!first) out << ';';
+            first = false;
+            out << tab->tabpage << ':' << t->TalentID << ':' << t->Row << ':'
+                << t->Col << ':' << maxRank << ':' << curRank << ':' << rank1
+                << ':' << prereqTalentId << ':' << t->DependsOnRank;
+        }
         SendWPSP(requester, out.str());
     }
 
@@ -1583,6 +1642,49 @@ public:
         else if (command == "SORT_BAGS")
         {
             HandleSortBags(player);
+        }
+        // REQ_TALENTS\t<slot>  → TALENTS\t...
+        else if (command == "REQ_TALENTS")
+        {
+            uint32 const slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            WowPsParty::SendTalentsTo(player, slot);
+        }
+        // LEARN_TALENT\t<slot>\t<talentId>\t<rank 0-based>
+        else if (command == "LEARN_TALENT")
+        {
+            std::string s(payload);
+            auto t1 = s.find('\t');
+            if (t1 == std::string::npos) return;
+            auto t2 = s.find('\t', t1 + 1);
+            if (t2 == std::string::npos) return;
+            uint32 const slot     = std::strtoul(s.substr(0, t1).c_str(), nullptr, 10);
+            uint32 const talentId = std::strtoul(s.substr(t1 + 1, t2 - t1 - 1).c_str(), nullptr, 10);
+            uint32 const rank     = std::strtoul(s.substr(t2 + 1).c_str(), nullptr, 10);
+            if (slot >= WowPsParty::PARTY_SIZE) return;
+            uint32 const account = player->GetSession()->GetAccountId();
+            uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+            if (!guid) return;
+            Player* p = ObjectAccessor::FindConnectedPlayer(
+                ObjectGuid::Create<HighGuid::Player>(guid));
+            if (!p) return;
+            p->LearnTalent(talentId, rank, false);  // false = normal spend rules
+            WowPsParty::SendTalentsTo(player, slot);
+        }
+        // RESET_TALENTS\t<slot>  — free, anywhere.
+        else if (command == "RESET_TALENTS")
+        {
+            uint32 const slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            if (slot >= WowPsParty::PARTY_SIZE) return;
+            uint32 const account = player->GetSession()->GetAccountId();
+            uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+            if (!guid) return;
+            Player* p = ObjectAccessor::FindConnectedPlayer(
+                ObjectGuid::Create<HighGuid::Player>(guid));
+            if (!p) return;
+            p->resetTalents(true);   // noResetCost = true
+            WowPsParty::SendTalentsTo(player, slot);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Reset talents for slot {} (free).", slot);
         }
         else if (command == "CAST")
         {
