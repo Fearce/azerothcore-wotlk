@@ -456,12 +456,14 @@ namespace WowPsParty
         }
         else if (mode == "loose")
         {
-            // ONLY adds already in combat with the party and not on us. No
-            // nearest-mob fallback — loose must never proactively pull idle /
-            // non-combat monsters. If there's nothing loose, desired stays
-            // null and the throttle below keeps our current victim (or we
-            // simply hold).
+            // Prefer a loose add (in combat, not on us). If there isn't one,
+            // fall back to party-defense — mobs attacking us or an ally — so
+            // the tank still engages the lone mob already on him instead of
+            // idling. pickPartyDefenseTarget is combat-only, so this never
+            // pulls an idle/non-combat monster (the bug the nearest-mob
+            // fallback used to cause).
             desired = PickLooseTarget(bot);
+            if (!desired) desired = pickPartyDefenseTarget();
         }
         else if (mode == "tank")
         {
