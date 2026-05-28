@@ -8,6 +8,7 @@
 #include "Bag.h"
 #include "Cell.h"
 #include "CellImpl.h"
+#include "Creature.h"
 #include "DatabaseEnv.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
@@ -17,7 +18,9 @@
 #include "Log.h"
 #include "MotionMaster.h"
 #include "ObjectAccessor.h"
+#include "Pet.h"
 #include "Player.h"
+#include "Spell.h"
 #include "SpellAuras.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
@@ -28,6 +31,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
+#include <deque>
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
@@ -71,6 +76,7 @@ namespace WowPsParty
             r.condition = fields[0];
             r.action    = fields[1];
             r.priority  = fields.size() >= 3 ? std::atoi(fields[2].c_str()) : 0;
+            r.flags     = fields.size() >= 4 ? fields[3] : "";
             if (r.condition.empty() || r.action.empty()) continue;
             rules.push_back(std::move(r));
         }
@@ -88,6 +94,10 @@ namespace WowPsParty
             if (!first) out << ';';
             first = false;
             out << r.condition << '|' << r.action << '|' << r.priority;
+            // Only emit the 4th field when set, so rotations that use no
+            // flags round-trip to the exact same string they had before.
+            if (!r.flags.empty())
+                out << '|' << r.flags;
         }
         return out.str();
     }
@@ -127,6 +137,86 @@ namespace WowPsParty
     {
         std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
         return g_rotationCache.find(guid) != g_rotationCache.end();
+    }
+
+    // ----- time-to-die estimator ----------------------------------------------
+    //
+    // The Kevkili rotations gate big cooldowns / DoTs / Sunder refreshes on
+    // "will this thing live another N seconds?" There's no server API for it,
+    // so we keep a short health-history per target GUID and fit a damage rate.
+    // Modelled on Kevkili's TargetTTD addon (12 s sample window, linear slope),
+    // but server-side so every bot sharing a target reuses the same samples.
+    struct TtdSample { uint32 timeMs; uint64 health; };
+    static std::unordered_map<uint64, std::deque<TtdSample>> g_ttdSamples;
+    static std::mutex g_ttdMutex;
+    static uint32 g_ttdLastSweepMs = 0;
+
+    static constexpr uint32 TTD_WINDOW_MS  = 12000; // keep ~12 s of history
+    static constexpr uint32 TTD_SAMPLE_MS  = 500;   // at most one sample / 0.5 s
+    static constexpr int    TTD_UNKNOWN    = 999;   // "effectively never dies"
+
+    // Record one health sample for `target` (throttled). Called once per tick
+    // for each bot's current victim. Resets the history if the target healed
+    // (health went up) so a heal mid-fight doesn't produce a negative slope.
+    static void TtdRecord(Unit* target)
+    {
+        if (!target || !target->IsAlive()) return;
+        uint64 const key = target->GetGUID().GetRawValue();
+        uint64 const hp  = target->GetHealth();
+        uint32 const now = getMSTime();
+
+        std::lock_guard<std::mutex> lock(g_ttdMutex);
+
+        // Periodic sweep so GUIDs of dead/despawned mobs don't accumulate.
+        if (now - g_ttdLastSweepMs > 60000)
+        {
+            g_ttdLastSweepMs = now;
+            for (auto it = g_ttdSamples.begin(); it != g_ttdSamples.end(); )
+            {
+                if (it->second.empty() ||
+                    now - it->second.back().timeMs > TTD_WINDOW_MS * 2)
+                    it = g_ttdSamples.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        auto& dq = g_ttdSamples[key];
+        if (!dq.empty())
+        {
+            if (now - dq.back().timeMs < TTD_SAMPLE_MS) return; // throttle
+            if (hp > dq.back().health) dq.clear();              // healed → reset
+        }
+        dq.push_back({ now, hp });
+        while (!dq.empty() && now - dq.front().timeMs > TTD_WINDOW_MS)
+            dq.pop_front();
+    }
+
+    // Estimate seconds until `target` dies from the recorded samples. Returns
+    // TTD_UNKNOWN when we lack data or the target isn't losing health.
+    static int TtdSeconds(Unit* target)
+    {
+        if (!target || !target->IsAlive()) return TTD_UNKNOWN;
+        uint64 const key = target->GetGUID().GetRawValue();
+
+        std::lock_guard<std::mutex> lock(g_ttdMutex);
+        auto it = g_ttdSamples.find(key);
+        if (it == g_ttdSamples.end()) return TTD_UNKNOWN;
+        auto const& dq = it->second;
+        if (dq.size() < 2) return TTD_UNKNOWN;
+
+        TtdSample const& first = dq.front();
+        TtdSample const& last  = dq.back();
+        uint32 const dtMs = last.timeMs - first.timeMs;
+        if (dtMs < 1000) return TTD_UNKNOWN;            // need ~1 s of spread
+        if (last.health >= first.health) return TTD_UNKNOWN; // not dropping
+
+        double const lostPerMs =
+            double(first.health - last.health) / double(dtMs);
+        if (lostPerMs <= 0.0) return TTD_UNKNOWN;
+        double const secs = double(last.health) / (lostPerMs * 1000.0);
+        if (secs >= double(TTD_UNKNOWN)) return TTD_UNKNOWN;
+        return int(secs);
     }
 
     // ----- party helpers ------------------------------------------------------
@@ -493,6 +583,49 @@ namespace WowPsParty
         return s ? s : 1;  // a present non-stacking aura counts as 1
     }
 
+    // Creature rank (elite tier) of a unit, or -1 if it isn't a creature
+    // (players, pets without a template, etc.). Maps to CreatureEliteType.
+    static int UnitCreatureRank(Unit* u)
+    {
+        if (!u) return -1;
+        Creature* c = u->ToCreature();
+        if (!c) return -1;
+        CreatureTemplate const* t = c->GetCreatureTemplate();
+        return t ? int(t->rank) : -1;
+    }
+
+    // Return the unit the bot is currently fighting, accounting for "no
+    // victim yet" — used by the target_* conditions.
+    static Unit* BotTarget(Player* bot) { return bot ? bot->GetVictim() : nullptr; }
+
+    // The spell `target` is currently casting (generic) or channeling, with a
+    // flag for whether a kick (silence-prevention) would interrupt it. Returns
+    // nullptr if the target isn't casting anything.
+    static SpellInfo const* CurrentCastSpell(Unit* target, bool* outChanneled,
+                                             bool* outInterruptible)
+    {
+        if (outChanneled) *outChanneled = false;
+        if (outInterruptible) *outInterruptible = false;
+        if (!target) return nullptr;
+        // Channeled first (Drain Life, Mind Flay, Hurricane …), then the
+        // generic cast bar (Frostbolt, Heal, …).
+        Spell* s = target->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
+        bool channeled = true;
+        if (!s)
+        {
+            s = target->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+            channeled = false;
+        }
+        if (!s) return nullptr;
+        SpellInfo const* info = s->GetSpellInfo();
+        if (!info) return nullptr;
+        if (outChanneled) *outChanneled = channeled;
+        if (outInterruptible)
+            *outInterruptible =
+                (info->PreventionType == SPELL_PREVENTION_TYPE_SILENCE);
+        return info;
+    }
+
     // Forward decls: EvalCondition recurses through AND-chains, and the
     // aura/cooldown conditions resolve spells by name (defined further down).
     static bool EvalSingleCondition(std::string const& cond, Player* bot);
@@ -657,6 +790,114 @@ namespace WowPsParty
         if (cond == "enemy_loose_in_range")
             return FindLooseEnemy(bot, 30.0f) != nullptr;
 
+        // --- Target classification / type --------------------------------
+        // Gate cooldowns, DoTs, CC and snares on what the target actually is,
+        // exactly like the Kevkili UnitClassification / UnitIsPlayer checks.
+        // "no target" → false for every flavour (nothing to classify).
+        if (cond == "target_is_player")
+        {
+            Unit* t = BotTarget(bot);
+            return t && t->IsPlayer();
+        }
+        if (cond == "target_is_npc")
+        {
+            Unit* t = BotTarget(bot);
+            return t && !t->IsPlayer();
+        }
+        if (cond == "target_is_boss")
+        {
+            Unit* t = BotTarget(bot);
+            if (!t) return false;
+            if (Creature* c = t->ToCreature())
+                if (c->isWorldBoss()) return true;
+            return UnitCreatureRank(t) == CREATURE_ELITE_WORLDBOSS;
+        }
+        if (cond == "target_is_elite")
+        {
+            int const r = UnitCreatureRank(BotTarget(bot));
+            return r == CREATURE_ELITE_ELITE || r == CREATURE_ELITE_RAREELITE
+                || r == CREATURE_ELITE_WORLDBOSS;
+        }
+        if (cond == "target_is_rare")
+        {
+            int const r = UnitCreatureRank(BotTarget(bot));
+            return r == CREATURE_ELITE_RARE || r == CREATURE_ELITE_RAREELITE;
+        }
+        if (cond == "target_is_normal")
+            return UnitCreatureRank(BotTarget(bot)) == CREATURE_ELITE_NORMAL;
+
+        // Creature type — drives Banish (Demon/Elemental), Turn Undead,
+        // Hibernate (Beast/Dragonkin), Polymorph (Beast/Humanoid), etc.
+        if (cond.rfind("target_type_", 0) == 0)
+        {
+            Unit* t = BotTarget(bot);
+            Creature* c = t ? t->ToCreature() : nullptr;
+            if (!c) return false;
+            uint32 const ct = c->GetCreatureType();
+            std::string const which = cond.substr(std::strlen("target_type_"));
+            if (which == "beast")     return ct == CREATURE_TYPE_BEAST;
+            if (which == "dragonkin") return ct == CREATURE_TYPE_DRAGONKIN;
+            if (which == "demon")     return ct == CREATURE_TYPE_DEMON;
+            if (which == "elemental") return ct == CREATURE_TYPE_ELEMENTAL;
+            if (which == "giant")     return ct == CREATURE_TYPE_GIANT;
+            if (which == "undead")    return ct == CREATURE_TYPE_UNDEAD;
+            if (which == "humanoid")  return ct == CREATURE_TYPE_HUMANOID;
+            return false;
+        }
+
+        // --- Target cast / interrupt -------------------------------------
+        // Pair `target_interruptible` with a `cast:<kick>` rule (Pummel,
+        // Counterspell, Kick, Earth Shock, Shield Bash) so the bot only
+        // spends the interrupt when there's actually a kickable cast.
+        if (cond == "target_casting")
+        {
+            bool ch = false, ir = false;
+            return CurrentCastSpell(BotTarget(bot), &ch, &ir) != nullptr && !ch;
+        }
+        if (cond == "target_channeling")
+        {
+            bool ch = false, ir = false;
+            return CurrentCastSpell(BotTarget(bot), &ch, &ir) != nullptr && ch;
+        }
+        if (cond == "target_interruptible")
+        {
+            bool ch = false, ir = false;
+            return CurrentCastSpell(BotTarget(bot), &ch, &ir) != nullptr && ir;
+        }
+
+        // --- Target movement ---------------------------------------------
+        // For snares (Hamstring / Wing Clip / Concussive Shot) you only want
+        // to spend the GCD when the target is actually running.
+        if (cond == "target_moving")
+        {
+            Unit* t = BotTarget(bot);
+            return t && t->isMoving();
+        }
+        if (cond == "target_not_moving")
+        {
+            Unit* t = BotTarget(bot);
+            return t && !t->isMoving();
+        }
+
+        // --- Pet status --------------------------------------------------
+        // Hunter / Warlock: keep the pet alive and summoned. `pet_health`
+        // (the <N/>N form) is handled in the numeric section below.
+        if (cond == "pet_exists")
+        {
+            Pet* p = bot->GetPet();
+            return p && p->IsAlive();
+        }
+        if (cond == "pet_missing")
+        {
+            Pet* p = bot->GetPet();
+            return !p;
+        }
+        if (cond == "pet_dead")
+        {
+            Pet* p = bot->GetPet();
+            return p && !p->IsAlive();
+        }
+
         // <name><op><N> where op is < or >
         auto opPos = cond.find_first_of("<>");
         if (opPos == std::string::npos) return false;
@@ -761,6 +1002,28 @@ namespace WowPsParty
             return cmp(int(CountHostilesWithin(bot, 8.0f)));
         if (name == "enemies_in_range")
             return cmp(int(CountHostilesWithin(bot, 30.0f)));
+
+        // Time-to-die (seconds), estimated from the target's recent health
+        // history. RAW seconds, not a percentage. No target / no data →
+        // TTD_UNKNOWN (≈never), so `target_ttd>20` fires on an unmeasured
+        // mob (assume a long fight) and `target_ttd<8` stays false — matching
+        // Kevkili's `TargetTTD(...) or 999` default.
+        if (name == "target_ttd")
+        {
+            Unit* t = bot->GetVictim();
+            if (!t) return false;
+            return cmp(TtdSeconds(t));
+        }
+        // Combo points are 0-5, compared RAW (not as a percent of anything).
+        if (name == "self_combo")
+            return cmp(int(bot->GetComboPoints()));
+        // Pet health %, for Mend Pet gating.
+        if (name == "pet_health")
+        {
+            Pet* p = bot->GetPet();
+            if (!p || !p->IsAlive()) return false;
+            return cmp(pct(float(p->GetHealth()), float(p->GetMaxHealth())));
+        }
 
         return false;
     }
@@ -933,12 +1196,29 @@ namespace WowPsParty
         return nullptr;
     }
 
-    static bool ExecAction(std::string const& act, Player* bot)
+    static bool ExecAction(std::string const& act, Player* bot,
+                           std::string const& flags)
     {
         // action format: <verb>:<arg>
         auto colon = act.find(':');
         std::string verb = act.substr(0, colon);
         std::string arg  = colon == std::string::npos ? "" : act.substr(colon + 1);
+
+        // "clip" flag: let this cast interrupt the bot's own in-progress
+        // cast/channel. Without it, a rule is skipped while the bot is
+        // mid-cast (the default — don't clip your own Frostbolt). With it,
+        // a higher-priority reactive rule (Counterspell, an emergency heal)
+        // cancels the current cast and fires. `channelClipOk` is the single
+        // gate every cast verb runs through instead of the bare
+        // IsNonMeleeSpellCast check.
+        bool const allowClip = CsvContains(Lower(flags), "clip");
+        auto channelClipOk = [bot, allowClip]() -> bool
+        {
+            if (!bot->IsNonMeleeSpellCast(false)) return true;
+            if (!allowClip) return false;
+            bot->InterruptNonMeleeSpells(false);
+            return true;
+        };
 
         // A cast is only "really fireable" when EVERYTHING checks out:
         // cooldown clear, enough mana/power, within range, line of sight,
@@ -1093,7 +1373,7 @@ namespace WowPsParty
             Unit* target = (verb == "cast_self") ? bot : bot->GetVictim();
             if (!target) return false;
             if (!canFireSpellOn(spellId, target)) return false;
-            if (bot->IsNonMeleeSpellCast(false)) return false;
+            if (!channelClipOk()) return false;
             return faceAndCast(target, spellId);
         }
 
@@ -1103,8 +1383,22 @@ namespace WowPsParty
             if (!spellId) return false;
             if (HasAuraFromSpell(bot, spellId)) return false;
             if (!canFireSpellOn(spellId, bot)) return false;
-            if (bot->IsNonMeleeSpellCast(false)) return false;
+            if (!channelClipOk()) return false;
             return faceAndCast(bot, spellId);
+        }
+
+        // "cast_pet:<spell>" — cast a spell that targets the bot's own pet
+        // (Mend Pet). Call Pet / Revive Pet are self-cast and go through the
+        // ordinary cast_self verb gated by pet_missing / pet_dead.
+        if (verb == "cast_pet")
+        {
+            uint32 const spellId = FindKnownSpellByName(bot, arg);
+            if (!spellId) return false;
+            Pet* pet = bot->GetPet();
+            if (!pet || !pet->IsAlive()) return false;
+            if (!canFireSpellOn(spellId, pet)) return false;
+            if (!channelClipOk()) return false;
+            return faceAndCast(pet, spellId);
         }
 
         if (verb == "cast_party_lowest" || verb == "cast_party_lowest_hot")
@@ -1116,7 +1410,7 @@ namespace WowPsParty
             if (verb == "cast_party_lowest_hot" && HasAuraFromSpell(target, spellId))
                 return false;
             if (!canFireSpellOn(spellId, target)) return false;
-            if (bot->IsNonMeleeSpellCast(false)) return false;
+            if (!channelClipOk()) return false;
             return faceAndCast(target, spellId);
         }
 
@@ -1135,7 +1429,7 @@ namespace WowPsParty
             Player* target = FindClassFilteredMissing(bot, classes, spellId);
             if (!target) return false;
             if (!canFireSpellOn(spellId, target)) return false;
-            if (bot->IsNonMeleeSpellCast(false)) return false;
+            if (!channelClipOk()) return false;
             return faceAndCast(target, spellId);
         }
 
@@ -1153,7 +1447,7 @@ namespace WowPsParty
             Player* target = FindRoleFilteredMissing(bot, roleFilter, spellId);
             if (!target) return false;
             if (!canFireSpellOn(spellId, target)) return false;
-            if (bot->IsNonMeleeSpellCast(false)) return false;
+            if (!channelClipOk()) return false;
             return faceAndCast(target, spellId);
         }
 
@@ -1164,7 +1458,7 @@ namespace WowPsParty
             Player* target = FindPartyMemberMissingAura(bot, spellId);
             if (!target) return false;
             if (!canFireSpellOn(spellId, target)) return false;
-            if (bot->IsNonMeleeSpellCast(false)) return false;
+            if (!channelClipOk()) return false;
             return faceAndCast(target, spellId);
         }
 
@@ -1180,7 +1474,7 @@ namespace WowPsParty
             Unit* target = FindLooseEnemy(bot, 30.0f);
             if (!target) return false;
             if (!canFireSpellOn(spellId, target)) return false;
-            if (bot->IsNonMeleeSpellCast(false)) return false;
+            if (!channelClipOk()) return false;
             return faceAndCast(target, spellId);
         }
 
@@ -1192,7 +1486,7 @@ namespace WowPsParty
             Player* target = FindDeadPartyMember(bot);
             if (!target) return false;
             if (!canFireSpellOn(spellId, target)) return false;
-            if (bot->IsNonMeleeSpellCast(false)) return false;
+            if (!channelClipOk()) return false;
             return faceAndCast(target, spellId);
         }
 
@@ -1224,7 +1518,7 @@ namespace WowPsParty
             Player* target = FindPartyMemberWithDispelType(bot, targetType);
             if (!target) return false;
             if (!canFireSpellOn(spellId, target)) return false;
-            if (bot->IsNonMeleeSpellCast(false)) return false;
+            if (!channelClipOk()) return false;
             return faceAndCast(target, spellId);
         }
 
@@ -1346,6 +1640,12 @@ namespace WowPsParty
         bool const trace = (nowMs - last > 3000);
         if (trace) last = nowMs;
 
+        // Feed the TTD estimator one sample for the current victim every tick
+        // (the recorder throttles to one sample / 0.5 s per target). Must run
+        // unconditionally — before any early return on cond mismatch — or the
+        // target_ttd condition would never accumulate history.
+        TtdRecord(bot->GetVictim());
+
         if (trace)
         {
             Unit* victim = bot->GetVictim();
@@ -1371,7 +1671,7 @@ namespace WowPsParty
                         r.priority, r.condition, r.action);
                 continue;
             }
-            bool const execOk = ExecAction(r.action, bot);
+            bool const execOk = ExecAction(r.action, bot, r.flags);
             if (trace)
                 LOG_INFO("module",
                     "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> {}",

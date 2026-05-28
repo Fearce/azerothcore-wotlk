@@ -1320,7 +1320,7 @@ public:
         }
         else if (command == "ROTATION_RULE")
         {
-            // payload = "<slot>\t<condition>\t<action>\t<priority>"
+            // payload = "<slot>\t<condition>\t<action>\t<priority>[\t<flags>]"
             std::string s(payload);
             std::vector<std::string> fields;
             {
@@ -1345,11 +1345,13 @@ public:
             r.condition = fields[1];
             r.action    = fields[2];
             r.priority  = std::atoi(fields[3].c_str());
+            r.flags     = fields.size() >= 5 ? fields[4] : "";
             PendingRotationMap()[key].push_back(std::move(r));
             LOG_INFO("module",
-                "[WowPsParty] ROTATION_RULE guid={} slot={} cond='{}' act='{}' prio={}",
+                "[WowPsParty] ROTATION_RULE guid={} slot={} cond='{}' act='{}' prio={} flags='{}'",
                 player->GetGUID().GetCounter(), slot,
-                fields[1], fields[2], std::atoi(fields[3].c_str()));
+                fields[1], fields[2], std::atoi(fields[3].c_str()),
+                fields.size() >= 5 ? fields[4] : "");
         }
         else if (command == "COMMIT_ROTATION")
         {
