@@ -838,11 +838,33 @@ namespace WowPsParty
         // silently), starving every lower-priority rule.
         auto canFireSpellOn = [bot](uint32 spellId, Unit* target) -> bool
         {
-            if (!spellId || !target) return false;
-            if (bot->HasSpellCooldown(spellId)) return false;
+            // Rate-limited rejection logger. When a rule's condition
+            // matches but the cast never fires, the per-tick trace only
+            // says "exec_failed_falling_through" — it can't see WHICH of
+            // the gates below bailed. This pins the exact reason (stance,
+            // GCD, cooldown, power, range, LoS) without spamming: at most
+            // one line per (bot,spell) every 3 s.
+            auto reject = [bot, spellId](char const* why) -> bool
+            {
+                static thread_local std::unordered_map<uint64, uint32> lastMs;
+                uint64 const key = (uint64(bot->GetGUID().GetCounter()) << 32) | spellId;
+                uint32 const now = getMSTime();
+                uint32& last = lastMs[key];
+                if (now - last > 3000)
+                {
+                    last = now;
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation]     canFire spell={} on guid={}: REJECT ({})",
+                        spellId, bot->GetGUID().GetCounter(), why);
+                }
+                return false;
+            };
+
+            if (!spellId || !target) return reject("no spell or target");
+            if (bot->HasSpellCooldown(spellId)) return reject("on cooldown");
 
             SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
-            if (!info) return false;
+            if (!info) return reject("no SpellInfo");
 
             // GCD: AC stores it in a per-player GlobalCooldownMgr, NOT in
             // the regular cooldown map. StartRecoveryCategory alone misses
@@ -850,10 +872,10 @@ namespace WowPsParty
             // Frostbolt during a GCD, fail with SPELL_FAILED_NOT_READY
             // (result=67), and the rotation would fall through to Shoot.
             if (bot->GetGlobalCooldownMgr().HasGlobalCooldown(info))
-                return false;
+                return reject("global cooldown");
             if (info->StartRecoveryCategory > 0 &&
                 bot->HasSpellCooldown(info->StartRecoveryCategory))
-                return false;
+                return reject("category cooldown");
 
             // Shapeshift / stance gate. Without this, a battle-stance
             // warrior with a Taunt rule (requires Defensive Stance)
@@ -863,14 +885,15 @@ namespace WowPsParty
             // Heroic Strike. SpellInfo::CheckShapeshift handles the
             // full mask (Stances + StancesNot + cancellable-form bits).
             if (info->CheckShapeshift(uint32(bot->GetShapeshiftForm())) != SPELL_CAST_OK)
-                return false;
+                return reject("wrong stance/form");
 
             // Power cost (mana / rage / energy / etc).
             int32 const cost = info->CalcPowerCost(bot, info->GetSchoolMask());
             if (cost > 0)
             {
                 Powers const powerType = Powers(info->PowerType);
-                if (int32(bot->GetPower(powerType)) < cost) return false;
+                if (int32(bot->GetPower(powerType)) < cost)
+                    return reject("not enough power");
             }
 
             // Self-casts don't need range / LoS checks.
@@ -878,9 +901,9 @@ namespace WowPsParty
             {
                 float const maxRange = info->GetMaxRange(info->IsPositive(), bot);
                 if (maxRange > 0 && !bot->IsWithinDistInMap(target, maxRange))
-                    return false;
+                    return reject("out of range");
                 if (!bot->IsWithinLOSInMap(target))
-                    return false;
+                    return reject("no line of sight");
             }
 
             return true;
