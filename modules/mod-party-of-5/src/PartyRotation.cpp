@@ -443,13 +443,17 @@ namespace WowPsParty
     // compares names rather than spell IDs because Kevkili-style rules
     // reference specific debuffs (Hamstring, Thunder Clap, Mortal Strike)
     // by name and we want the rule to match any rank.
-    static bool TargetHasNamedAura(Unit* target, std::string const& name)
+    // Return the first aura on `unit` whose spell name matches `name`
+    // case-insensitively, or nullptr. Callers that only need presence use
+    // TargetHasNamedAura; the timing/stack conditions need the Aura* to read
+    // GetDuration()/GetStackAmount().
+    static Aura const* FindNamedAura(Unit* unit, std::string const& name)
     {
-        if (!target || name.empty()) return false;
+        if (!unit || name.empty()) return nullptr;
         std::string needle;
         needle.reserve(name.size());
         for (char c : name) needle.push_back(char(std::tolower(static_cast<unsigned char>(c))));
-        for (auto const& kv : target->GetAppliedAuras())
+        for (auto const& kv : unit->GetAppliedAuras())
         {
             Aura const* a = kv.second ? kv.second->GetBase() : nullptr;
             if (!a) continue;
@@ -460,13 +464,39 @@ namespace WowPsParty
             std::string lower;
             for (char const* p = sname; *p; ++p)
                 lower.push_back(char(std::tolower(static_cast<unsigned char>(*p))));
-            if (lower == needle) return true;
+            if (lower == needle) return a;
         }
-        return false;
+        return nullptr;
     }
 
-    // Forward decl so EvalCondition can recurse through AND-chains.
+    static bool TargetHasNamedAura(Unit* target, std::string const& name)
+    {
+        return FindNamedAura(target, name) != nullptr;
+    }
+
+    // Remaining duration of a named aura, in milliseconds. 0 if absent.
+    // Permanent auras (maxDuration == -1) report a very large value so
+    // "remaining > N" gates treat them as never-expiring.
+    static int32 NamedAuraRemainingMs(Unit* unit, std::string const& name)
+    {
+        Aura const* a = FindNamedAura(unit, name);
+        if (!a) return 0;
+        if (a->IsPermanent()) return 0x7FFFFFFF;
+        return a->GetDuration();
+    }
+
+    static uint32 NamedAuraStacks(Unit* unit, std::string const& name)
+    {
+        Aura const* a = FindNamedAura(unit, name);
+        if (!a) return 0;
+        uint8 const s = a->GetStackAmount();
+        return s ? s : 1;  // a present non-stacking aura counts as 1
+    }
+
+    // Forward decls: EvalCondition recurses through AND-chains, and the
+    // aura/cooldown conditions resolve spells by name (defined further down).
     static bool EvalSingleCondition(std::string const& cond, Player* bot);
+    static uint32 FindKnownSpellByName(Player* bot, std::string const& name);
 
     static bool EvalCondition(std::string const& cond, Player* bot)
     {
@@ -508,6 +538,66 @@ namespace WowPsParty
             if (cname == "self_has_aura")     return TargetHasNamedAura(bot, arg);
             if (cname == "self_missing_aura") return !TargetHasNamedAura(bot, arg);
 
+            // --- Aura timing / stacks / cooldown (the min-max primitives) ---
+            // These all share an arg of the form "<spell name><op><number>",
+            // where <op> is the first '<' or '>' in the arg. Spell names have
+            // no angle brackets so the split is unambiguous. Helper unpacks
+            // (name, op, value); returns false if malformed.
+            auto unpackNameOpVal = [&arg](std::string& outName, char& outOp,
+                                          int& outVal) -> bool
+            {
+                auto p = arg.find_first_of("<>");
+                if (p == std::string::npos || p == 0) return false;
+                outName = arg.substr(0, p);
+                outOp   = arg[p];
+                outVal  = std::atoi(arg.substr(p + 1).c_str());
+                return true;
+            };
+
+            // Refresh window: "target_aura_remain:Rend<2" is TRUE when Rend
+            // has under 2s left OR is absent (remaining 0) — exactly the
+            // "reapply 2s before it drops" pattern. ">N" requires the aura
+            // present with more than N seconds left.
+            if (cname == "target_aura_remain" || cname == "self_aura_remain")
+            {
+                std::string n; char op; int sec;
+                if (!unpackNameOpVal(n, op, sec)) return false;
+                Unit* u = (cname == "self_aura_remain") ? bot : bot->GetVictim();
+                if (!u) return op == '<';   // no target → "expiring/absent" true
+                int const remSec = NamedAuraRemainingMs(u, n) / 1000;
+                return op == '<' ? (remSec < sec) : (remSec > sec);
+            }
+            if (cname == "target_aura_stacks" || cname == "self_aura_stacks")
+            {
+                std::string n; char op; int want;
+                if (!unpackNameOpVal(n, op, want)) return false;
+                Unit* u = (cname == "self_aura_stacks") ? bot : bot->GetVictim();
+                int const stacks = u ? int(NamedAuraStacks(u, n)) : 0;
+                return op == '<' ? (stacks < want) : (stacks > want);
+            }
+            // "spell_cd_remain:Mortal Strike<2" — TRUE when MS will be off
+            // cooldown within 2s (or already is). ">N" = still has more than
+            // N seconds to go. Unknown spell → treated as "not ready" (never
+            // <, never >) so a typo'd rule fails closed instead of spamming.
+            if (cname == "spell_cd_remain")
+            {
+                std::string n; char op; int sec;
+                if (!unpackNameOpVal(n, op, sec)) return false;
+                uint32 const sid = FindKnownSpellByName(bot, n);
+                if (!sid) return false;
+                int const cdSec = int(bot->GetSpellCooldownDelay(sid)) / 1000;
+                return op == '<' ? (cdSec < sec) : (cdSec > sec);
+            }
+            // "spell_ready:Overpower" — known AND off cooldown. Pair with the
+            // proc/reactive abilities (Overpower after a dodge, Revenge after
+            // a block/dodge/parry) whose usability the server tracks for us.
+            if (cname == "spell_ready")
+            {
+                uint32 const sid = FindKnownSpellByName(bot, arg);
+                if (!sid) return false;
+                return bot->GetSpellCooldownDelay(sid) == 0;
+            }
+
             // Arbitrary-radius enemy count: enemies_within:<R><op><N>
             // e.g. "enemies_within:10<2" (fewer than 2 hostiles in 10y)
             // or  "enemies_within:12>1" (more than 1 hostile in 12y).
@@ -529,6 +619,10 @@ namespace WowPsParty
         if (cond == "out_of_combat") return !bot->IsInCombat();
         if (cond == "has_target")    return bot->GetTarget() != ObjectGuid::Empty;
         if (cond == "no_target")     return bot->GetTarget() == ObjectGuid::Empty;
+        // Movement gate — pair "is_moving" with instant-only rules, or
+        // "is_not_moving" so a cast-time spell only queues when planted.
+        if (cond == "is_moving")     return bot->isMoving();
+        if (cond == "is_not_moving") return !bot->isMoving();
 
         // Party-debuff checks — boolean, no <N/>N suffix.
         if (cond == "party_has_disease")
