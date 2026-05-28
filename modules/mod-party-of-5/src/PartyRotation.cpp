@@ -290,6 +290,30 @@ namespace WowPsParty
         return uint32(targets.size());
     }
 
+    // Size of the densest cluster of hostiles that are all within `radius` of
+    // ONE of them — i.e. "how many enemies are within R of each other". This
+    // is the metric AoE placement wants (Blizzard / Flamestrike): a high value
+    // means an AoE dropped on that knot of mobs would hit them all. O(n^2) over
+    // the nearby hostile set, which is tiny.
+    static uint32 MaxEnemyCluster(Player* bot, float radius)
+    {
+        std::list<Unit*> hostiles;
+        GatherHostilesAround(bot, 45.0f, hostiles);   // candidate pool near bot
+        uint32 best = 0;
+        for (Unit* a : hostiles)
+        {
+            if (!a || !a->IsAlive() || !bot->IsValidAttackTarget(a)) continue;
+            uint32 c = 0;
+            for (Unit* b : hostiles)
+            {
+                if (!b || !b->IsAlive() || !bot->IsValidAttackTarget(b)) continue;
+                if (a->GetDistance(b) <= radius) ++c;   // counts a itself too
+            }
+            if (c > best) best = c;
+        }
+        return best;
+    }
+
     // Find an enemy within `radius` of the bot whose current victim is a
     // party member OTHER than the bot itself. Used by the tank's
     // `cast_loose_enemy:Taunt` rule to pull aggro off the healer / casters.
@@ -756,6 +780,20 @@ namespace WowPsParty
                 int const found  = int(CountHostilesWithin(bot, radius));
                 return opA == '<' ? (found < countN) : (found > countN);
             }
+            // Clustering gate for placed AoE (Blizzard / Flamestrike):
+            // "enemies_clustered:10>2" → more than 2 enemies are within 10y of
+            // EACH OTHER (the densest knot). Same R<op>N grammar as above.
+            if (cname == "enemies_clustered")
+            {
+                auto opPosA = arg.find_first_of("<>");
+                if (opPosA == std::string::npos) return false;
+                float const radius = float(std::atof(arg.substr(0, opPosA).c_str()));
+                if (radius <= 0.0f) return false;
+                char const opA = arg[opPosA];
+                int const countN = std::atoi(arg.substr(opPosA + 1).c_str());
+                int const found  = int(MaxEnemyCluster(bot, radius));
+                return opA == '<' ? (found < countN) : (found > countN);
+            }
         }
         if (cond == "in_combat")     return bot->IsInCombat();
         if (cond == "out_of_combat") return !bot->IsInCombat();
@@ -1040,6 +1078,18 @@ namespace WowPsParty
             Pet* p = bot->GetPet();
             if (!p || !p->IsAlive()) return false;
             return cmp(pct(float(p->GetHealth()), float(p->GetMaxHealth())));
+        }
+        // Distance (yards) from the bot to the controlled char it follows.
+        // Gate maintenance casts on proximity, e.g. only conjure food/water
+        // when "master_dist<15". If the leader can't be found / is off-map,
+        // report a huge distance so "<" gates fail (don't conjure blindly).
+        if (name == "master_dist")
+        {
+            ObjectGuid const lg = GetLeaderFor(bot->GetGUID());
+            Player* leader = lg ? ObjectAccessor::FindConnectedPlayer(lg) : nullptr;
+            if (!leader || !leader->IsInWorld() || leader->GetMapId() != bot->GetMapId())
+                return op == '>';   // unknown → "far": '>' true, '<' false
+            return cmp(int(bot->GetDistance(leader)));
         }
 
         return false;
