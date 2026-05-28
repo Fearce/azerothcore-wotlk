@@ -885,7 +885,23 @@ namespace WowPsParty
             // Heroic Strike. SpellInfo::CheckShapeshift handles the
             // full mask (Stances + StancesNot + cancellable-form bits).
             if (info->CheckShapeshift(uint32(bot->GetShapeshiftForm())) != SPELL_CAST_OK)
+            {
+                // Spell out the mismatch so we know which stance to dance
+                // into: current form vs the spell's required/forbidden masks.
+                static thread_local std::unordered_map<uint64, uint32> lastFormMs;
+                uint64 const fkey = (uint64(bot->GetGUID().GetCounter()) << 32) | spellId;
+                uint32 const fnow = getMSTime();
+                uint32& flast = lastFormMs[fkey];
+                if (fnow - flast > 3000)
+                {
+                    flast = fnow;
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation]     spell={} stance-block: curForm={} Stances={:#x} StancesNot={:#x}",
+                        spellId, uint32(bot->GetShapeshiftForm()),
+                        info->Stances, info->StancesNot);
+                }
                 return reject("wrong stance/form");
+            }
 
             // Power cost (mana / rage / energy / etc).
             int32 const cost = info->CalcPowerCost(bot, info->GetSchoolMask());
