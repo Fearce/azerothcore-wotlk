@@ -642,8 +642,17 @@ namespace WowPsParty
             size_t amp = cond.find('&', p);
             std::string clause = (amp == std::string::npos)
                 ? cond.substr(p) : cond.substr(p, amp - p);
-            if (!clause.empty() && !EvalSingleCondition(clause, bot))
-                return false;
+            if (!clause.empty())
+            {
+                // Leading '!' negates the clause — lets the editor express
+                // "NOT <anything>" generically (NOT elite, NOT casting, …)
+                // without a dedicated opposite condition for each one.
+                bool negate = false;
+                if (clause[0] == '!') { negate = true; clause.erase(0, 1); }
+                bool r = clause.empty() ? true : EvalSingleCondition(clause, bot);
+                if (negate) r = !r;
+                if (!r) return false;
+            }
             if (amp == std::string::npos) break;
             p = amp + 1;
         }
