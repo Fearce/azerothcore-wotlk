@@ -601,9 +601,20 @@ static void HandleEquip(Player* requester, std::string_view payload)
 
     if (srcChar == dest)
     {
-        // Same character — just move from bag to equip slot.
-        dest->RemoveItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
-        dest->EquipItem(eqDest, srcItem, true);
+        // SwapItem is the canonical equip-into-(possibly-occupied)-slot
+        // path. It atomically unequips the current occupant back into the
+        // source bag slot and equips the new item. The previous
+        // RemoveItem + EquipItem sequence VANISHED items when the dest
+        // slot was occupied (hunter replacing a bow with another bow):
+        // RemoveItem detached the new bow from its bag slot, EquipItem
+        // then refused to clobber the equipped bow, and the new item
+        // leaked — still owned by the player in DB but gone from UI.
+        uint16 const srcPos = srcItem->GetPos();
+        LOG_INFO("module",
+            "[WowPsParty Equip] same-char swap: char={} item={} ({}) srcPos={:#x} eqDest={:#x}",
+            dest->GetName(), srcItem->GetEntry(), srcItem->GetTemplate()->Name1,
+            srcPos, eqDest);
+        dest->SwapItem(srcPos, eqDest);
     }
     else
     {
@@ -630,8 +641,18 @@ static void HandleEquip(Player* requester, std::string_view payload)
             // swap=true (same reason as the same-character branch above)
             if (dest->CanEquipItem(NULL_SLOT, dest2, srcItem, true, true) == EQUIP_ERR_OK)
             {
-                dest->RemoveItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
-                dest->EquipItem(dest2, srcItem, true);
+                // Use SwapItem here too: the new item is now sitting in
+                // dest's bag, dest's old equipped item (if any) needs to
+                // travel back into that bag slot atomically. Manual
+                // RemoveItem + EquipItem had the same vanish-bug as the
+                // same-char branch.
+                uint16 const bagPos = srcItem->GetPos();
+                LOG_INFO("module",
+                    "[WowPsParty Equip] x-char swap: from={} to={} item={} ({}) bagPos={:#x} eqDest={:#x}",
+                    srcChar->GetName(), dest->GetName(),
+                    srcItem->GetEntry(), srcItem->GetTemplate()->Name1,
+                    bagPos, dest2);
+                dest->SwapItem(bagPos, dest2);
             }
         }
         else
