@@ -1693,6 +1693,28 @@ namespace WowPsParty
 
     // ----- per-tick entry point -----------------------------------------------
 
+    // True if the bot is mid drink/eat: seated with a food (MOD_REGEN) or
+    // drink (MOD_POWER_REGEN) aura active. Same aura types the shared-bag
+    // food/drink classifier uses, gated on the sit state so an unrelated
+    // power-regen passive can't trip it.
+    static bool BotIsConsuming(Player* bot)
+    {
+        if (!bot || bot->getStandState() != UNIT_STAND_STATE_SIT) return false;
+        return bot->HasAuraType(SPELL_AURA_MOD_POWER_REGEN)
+            || bot->HasAuraType(SPELL_AURA_MOD_REGEN);
+    }
+
+    // "Topped off" = full health AND (no mana pool OR full mana). Drinking
+    // targets mana; eating targets health; a mage doing both needs both full.
+    static bool BotIsTopped(Player* bot)
+    {
+        if (bot->GetHealth() < bot->GetMaxHealth()) return false;
+        if (bot->getPowerType() == POWER_MANA
+            && bot->GetPower(POWER_MANA) < bot->GetMaxPower(POWER_MANA))
+            return false;
+        return true;
+    }
+
     bool TickRotation(Player* bot)
     {
         if (!bot) return false;
@@ -1737,6 +1759,24 @@ namespace WowPsParty
                 victim && victim->GetMaxHealth() > 0
                     ? int((float(victim->GetHealth()) / float(victim->GetMaxHealth())) * 100.0f)
                     : -1);
+        }
+
+        // Commit to drinking/eating. Once a bot is mid-consume and not yet at
+        // full health/mana (and not in combat), suppress the WHOLE rotation so
+        // it keeps regenerating until topped off or the buff ends — instead of
+        // standing up to cast the instant it has enough mana for one spell.
+        // Combat breaks the regen aura anyway, so the !IsInCombat gate hands
+        // control straight back when a fight starts.
+        if (!bot->IsInCombat() && BotIsConsuming(bot) && !BotIsTopped(bot))
+        {
+            WowPsParty::HoldFollower(bot->GetGUID(), 1500);
+            if (trace)
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] {} consuming — holding until full/done "
+                    "(hp={}/{} mana={}/{})",
+                    bot->GetName(), bot->GetHealth(), bot->GetMaxHealth(),
+                    bot->GetPower(POWER_MANA), bot->GetMaxPower(POWER_MANA));
+            return true;
         }
 
         for (RotationRule const& r : rules)
