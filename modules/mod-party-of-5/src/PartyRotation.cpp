@@ -507,6 +507,23 @@ namespace WowPsParty
             }
             if (cname == "self_has_aura")     return TargetHasNamedAura(bot, arg);
             if (cname == "self_missing_aura") return !TargetHasNamedAura(bot, arg);
+
+            // Arbitrary-radius enemy count: enemies_within:<R><op><N>
+            // e.g. "enemies_within:10<2" (fewer than 2 hostiles in 10y)
+            // or  "enemies_within:12>1" (more than 1 hostile in 12y).
+            // Lets the user gate AoE spells on the actual spell radius
+            // instead of the hardcoded 8y melee / 30y range buckets.
+            if (cname == "enemies_within")
+            {
+                auto opPosA = arg.find_first_of("<>");
+                if (opPosA == std::string::npos) return false;
+                float const radius = float(std::atof(arg.substr(0, opPosA).c_str()));
+                if (radius <= 0.0f) return false;
+                char const opA = arg[opPosA];
+                int const countN = std::atoi(arg.substr(opPosA + 1).c_str());
+                int const found  = int(CountHostilesWithin(bot, radius));
+                return opA == '<' ? (found < countN) : (found > countN);
+            }
         }
         if (cond == "in_combat")     return bot->IsInCombat();
         if (cond == "out_of_combat") return !bot->IsInCombat();
