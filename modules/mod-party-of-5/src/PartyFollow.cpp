@@ -968,7 +968,14 @@ void WowPsParty_TankLeadEngagement_Trampoline(Player* bot)
 }
 
 // Tank path-follow trampoline — walks the tank along the recorded path.
+// Gated to the ASSIGNED TANK only; the other followers just MoveFollow the
+// leader. Without this gate every party bot tried to walk the path and
+// conga-lined through the dungeon.
 void WowPsParty_TankFollowPath_Trampoline(Player* bot)
 {
+    if (!bot || !bot->GetSession()) return;
+    int const tankSlot = WowPsParty::GetTankSlotForAccount(bot->GetSession()->GetAccountId());
+    if (tankSlot < 0) return;
+    if (WowPsParty::GetSlotForGuid(bot->GetGUID()) != tankSlot) return;
     WowPsParty::TankFollowPath(bot);
 }

@@ -314,6 +314,28 @@ namespace WowPsParty
         return best;
     }
 
+    // The enemy that anchors the densest cluster (most neighbours within
+    // `radius`). Cast a ground-targeted AoE at its position to catch the most
+    // mobs. nullptr if no valid hostile nearby.
+    static Unit* BestClusterAnchor(Player* bot, float radius)
+    {
+        std::list<Unit*> hostiles;
+        GatherHostilesAround(bot, 45.0f, hostiles);
+        Unit* best = nullptr;
+        uint32 bestCount = 0;
+        for (Unit* a : hostiles)
+        {
+            if (!a || !a->IsAlive() || !bot->IsValidAttackTarget(a)) continue;
+            uint32 c = 0;
+            for (Unit* b : hostiles)
+                if (b && b->IsAlive() && bot->IsValidAttackTarget(b)
+                    && a->GetDistance(b) <= radius)
+                    ++c;
+            if (c > bestCount) { bestCount = c; best = a; }
+        }
+        return best;
+    }
+
     // Find an enemy within `radius` of the bot whose current victim is a
     // party member OTHER than the bot itself. Used by the tank's
     // `cast_loose_enemy:Taunt` rule to pull aggro off the healer / casters.
@@ -1433,10 +1455,62 @@ namespace WowPsParty
             return true;
         };
 
+        // Ground-targeted AoE (Blizzard / Flamestrike / Rain of Fire / Volley):
+        // cast at a WORLD POSITION rather than a unit, so it lands on the mob
+        // cluster instead of just the current victim. Same cast-time freeze as
+        // faceAndCast.
+        auto faceAndCastAt = [bot](Unit* aimAt, uint32 spellId) -> bool
+        {
+            if (aimAt) bot->SetFacingToObject(aimAt);
+            int32 castMs = 0;
+            if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId))
+                castMs = info->CalcCastTime();
+            if (castMs > 0)
+            {
+                bot->StopMoving();
+                bot->GetMotionMaster()->Clear();
+                WowPsParty::HoldFollower(bot->GetGUID(), uint32(castMs) + 500);
+            }
+            float x, y, z;
+            aimAt->GetPosition(x, y, z);
+            SpellCastResult const r = bot->CastSpell(x, y, z, spellId, false);
+            if (r != SPELL_CAST_OK)
+            {
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] ground-cast {} failed on guid={} result={}",
+                    spellId, bot->GetGUID().GetCounter(), uint32(r));
+                return false;
+            }
+            return true;
+        };
+
         if (verb == "cast" || verb == "cast_self")
         {
             uint32 const spellId = FindKnownSpellByName(bot, arg);
             if (!spellId) return false;
+
+            // Ground-targeted AoE: aim at the densest cluster within the
+            // spell's own radius (not the victim). Detected via the spell's
+            // explicit DEST_LOCATION target flag.
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            if (verb == "cast" && info
+                && (info->GetExplicitTargetMask() & TARGET_FLAG_DEST_LOCATION))
+            {
+                float radius = 0.0f;
+                for (uint8 i = 0; i < 3; ++i)   // MAX_SPELL_EFFECTS
+                {
+                    float const er = info->Effects[i].CalcRadius(bot);
+                    if (er > radius) radius = er;
+                }
+                if (radius <= 0.0f) radius = 8.0f;
+                Unit* anchor = BestClusterAnchor(bot, radius);
+                if (!anchor) anchor = bot->GetVictim();   // no cluster → victim spot
+                if (!anchor) return false;
+                if (!canFireSpellOn(spellId, anchor)) return false;
+                if (!channelClipOk()) return false;
+                return faceAndCastAt(anchor, spellId);
+            }
+
             Unit* target = (verb == "cast_self") ? bot : bot->GetVictim();
             if (!target) return false;
             if (!canFireSpellOn(spellId, target)) return false;
