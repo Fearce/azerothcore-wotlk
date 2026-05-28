@@ -121,6 +121,12 @@ namespace WowPsParty
         PartyMgr(PartyMgr const&) = delete;
         PartyMgr& operator=(PartyMgr const&) = delete;
     };
+
+    // Teach `p` every class-trainer spell it qualifies for at its current
+    // level (CanTeachSpell enforces level/skill/prereqs). Returns the number
+    // newly learned. Used by the .party learnall command AND the on-level-up
+    // hook so the party never has to visit a trainer. Talents are untouched.
+    uint32 LearnAllClassSpells(Player* p);
 }
 
 #define sPartyMgr WowPsParty::PartyMgr::Instance()

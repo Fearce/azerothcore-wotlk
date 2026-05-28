@@ -24,6 +24,7 @@
 #include "Reputation/ReputationMgr.h"
 #include "ScriptMgr.h"
 #include "StringFormat.h"
+#include "Trainer.h"
 #include "WorldSession.h"
 
 namespace WowPsParty
@@ -40,6 +41,40 @@ namespace WowPsParty
 
     bool IsEnabled();     // from PartyBootstrap.cpp
     bool IsLogVerbose();
+
+    // Teach every class-trainer spell `p` qualifies for at its level. Shared by
+    // the .party learnall command and the on-ding hook below. CanTeachSpell
+    // enforces level/skill/prereqs and the do/while picks up follow-up ranks a
+    // freshly-learned spell unlocks.
+    uint32 LearnAllClassSpells(Player* p)
+    {
+        if (!p) return 0;
+        uint32 learned = 0;
+        std::vector<Trainer::Trainer const*> const& trainers =
+            sObjectMgr->GetClassTrainers(p->getClass());
+        bool hadNew;
+        do
+        {
+            hadNew = false;
+            for (Trainer::Trainer const* trainer : trainers)
+            {
+                if (!trainer->IsTrainerValidForPlayer(p))
+                    continue;
+                for (Trainer::Spell const& ts : trainer->GetSpells())
+                {
+                    if (!trainer->CanTeachSpell(p, &ts))
+                        continue;
+                    if (ts.IsCastable())
+                        p->CastSpell(p, ts.SpellId, true);
+                    else
+                        p->learnSpell(ts.SpellId, false);
+                    ++learned;
+                    hadNew = true;
+                }
+            }
+        } while (hadNew);
+        return learned;
+    }
 }
 
 namespace
@@ -71,8 +106,26 @@ public:
         PLAYERHOOK_ON_PLAYER_JUST_DIED,
         PLAYERHOOK_ON_MONEY_CHANGED,
         PLAYERHOOK_ON_CREATURE_KILL,
-        PLAYERHOOK_ON_STORE_NEW_ITEM
+        PLAYERHOOK_ON_STORE_NEW_ITEM,
+        PLAYERHOOK_ON_LEVEL_CHANGED
     }) { }
+
+    // Auto-learn on ding: when a party member levels up, immediately teach
+    // every class spell now available — so a 5-char party never has to trek
+    // to a trainer. Fires for the controlled char and every follower bot
+    // (they level via the mirrored XP hook).
+    void OnPlayerLevelChanged(Player* player, uint8 /*oldlevel*/) override
+    {
+        using namespace WowPsParty;
+        if (!IsEnabled() || !player || !player->GetSession()) return;
+        if (!sPartyMgr.GetSlotForGuid(player->GetGUID().GetCounter()))
+            return;  // not one of this account's party characters
+        uint32 const n = LearnAllClassSpells(player);
+        if (n)
+            LOG_INFO("module",
+                "[WowPsParty] {} reached level {} — auto-learned {} new spell(s)",
+                player->GetName(), uint32(player->GetLevel()), n);
+    }
 
     // When any party member receives an item that's required for one of
     // their OWN active quests OR any peer's active quest, mirror the

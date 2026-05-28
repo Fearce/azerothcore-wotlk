@@ -815,6 +815,119 @@ static void HandleDestroy(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// USE\t<srcPartySlot>\t<srcItemGuidLow> — use a bag consumable. The item's
+// ON_USE spell fires on the requesting (controlled) character; a consumable
+// loses one charge from its owner. Lets you right-click food/potions/quest
+// items in the shared bag like a normal bag.
+static void HandleUse(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const srcSlot = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+    if (!srcItemGuidLow) return;
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    QueryResult q = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, srcSlot);
+    if (!q) return;
+    uint32 const srcCharGuid = q->Fetch()[0].Get<uint32>();
+    Player* srcChar = ObjectAccessor::FindConnectedPlayer(
+        ObjectGuid::Create<HighGuid::Player>(srcCharGuid));
+    if (!srcChar) return;
+
+    Item* srcItem = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!srcItem) return;
+    ItemTemplate const* t = srcItem->GetTemplate();
+    if (!t) return;
+
+    uint32 useSpell = 0;
+    for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+        if (t->Spells[i].SpellTrigger == ITEM_SPELLTRIGGER_ON_USE && t->Spells[i].SpellId > 0)
+        {
+            useSpell = uint32(t->Spells[i].SpellId);
+            break;
+        }
+    if (!useSpell)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r |cffffffff{}|r isn't usable.", t->Name1);
+        return;
+    }
+
+    requester->CastSpell(requester, useSpell, true);
+    if (t->Class == ITEM_CLASS_CONSUMABLE)
+    {
+        if (srcItem->GetCount() > 1)
+        {
+            srcItem->SetCount(srcItem->GetCount() - 1);
+            srcItem->SetState(ITEM_CHANGED, srcChar);
+        }
+        else
+            srcChar->DestroyItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+    }
+    WowPsParty::SendInventoryTo(requester);
+}
+
+// SPLIT\t<srcPartySlot>\t<srcItemGuidLow>\t<count> — split `count` off a stack
+// into a free slot on the SAME character. Targets a known-empty slot so the
+// store can't merge it straight back; counts are conserved (orig -= n, new = n).
+static void HandleSplit(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    std::string s(payload);
+    // 3 tab fields
+    auto t1 = s.find('\t');
+    if (t1 == std::string::npos) return;
+    auto t2 = s.find('\t', t1 + 1);
+    if (t2 == std::string::npos) return;
+    uint32 const srcSlot        = std::strtoul(s.substr(0, t1).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(s.substr(t1 + 1, t2 - t1 - 1).c_str(), nullptr, 10);
+    uint32 const count          = std::strtoul(s.substr(t2 + 1).c_str(), nullptr, 10);
+    if (!srcItemGuidLow || !count) return;
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    QueryResult q = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, srcSlot);
+    if (!q) return;
+    uint32 const srcCharGuid = q->Fetch()[0].Get<uint32>();
+    Player* srcChar = ObjectAccessor::FindConnectedPlayer(
+        ObjectGuid::Create<HighGuid::Player>(srcCharGuid));
+    if (!srcChar) return;
+
+    Item* srcItem = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!srcItem) return;
+    if (count >= srcItem->GetCount()) return;   // nothing to split / would empty
+
+    // Find a truly empty bag slot on the same char.
+    uint8 destBag = 0, destSlot = 0;
+    bool haveSlot = false;
+    for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END && !haveSlot; ++i)
+        if (!srcChar->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+        { destBag = INVENTORY_SLOT_BAG_0; destSlot = i; haveSlot = true; }
+    for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END && !haveSlot; ++b)
+        if (Bag* bag = srcChar->GetBagByPos(b))
+            for (uint32 j = 0; j < bag->GetBagSize() && !haveSlot; ++j)
+                if (!srcChar->GetItemByPos(b, uint8(j)))
+                { destBag = b; destSlot = uint8(j); haveSlot = true; }
+    if (!haveSlot)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r No free bag slot to split into.");
+        return;
+    }
+
+    uint32 const entry = srcItem->GetEntry();
+    ItemPosCountVec dest;
+    if (srcChar->CanStoreItem(destBag, destSlot, dest, entry, count) != EQUIP_ERR_OK)
+        return;
+    srcItem->SetCount(srcItem->GetCount() - count);
+    srcItem->SetState(ITEM_CHANGED, srcChar);
+    srcChar->StoreNewItem(dest, entry, true);
+    WowPsParty::SendInventoryTo(requester);
+}
+
 // Compact + order one character's bag contents (backpack + equipped bags) the
 // way Bagnon's sort does: quality first, then item class/subclass, then entry.
 // Selection-sort via SwapItem so we never detach/re-store items (which would
@@ -840,6 +953,38 @@ static void SortBagsFor(Player* p)
         for (uint32 j = 0; j < bag->GetBagSize(); ++j)
             addPos(b, uint8(j));
     }
+
+    // Merge partial stacks of the same item first (Bagnon combines, not just
+    // orders). Pour later stacks into earlier ones up to max stack size;
+    // emptied stacks are destroyed and dropped from the list.
+    for (size_t i = 0; i < items.size(); ++i)
+    {
+        Item* a = items[i];
+        if (!a) continue;
+        uint32 const maxS = a->GetMaxStackCount();
+        if (maxS <= 1) continue;
+        for (size_t j = i + 1; j < items.size(); ++j)
+        {
+            Item* b = items[j];
+            if (!b || b->GetEntry() != a->GetEntry()) continue;
+            if (a->GetCount() >= maxS) break;
+            uint32 const space = maxS - a->GetCount();
+            uint32 const mv    = std::min(space, b->GetCount());
+            a->SetCount(a->GetCount() + mv);
+            a->SetState(ITEM_CHANGED, p);
+            if (mv >= b->GetCount())
+            {
+                p->DestroyItem(b->GetBagSlot(), b->GetSlot(), true);
+                items[j] = nullptr;
+            }
+            else
+            {
+                b->SetCount(b->GetCount() - mv);
+                b->SetState(ITEM_CHANGED, p);
+            }
+        }
+    }
+    items.erase(std::remove(items.begin(), items.end(), nullptr), items.end());
 
     std::stable_sort(items.begin(), items.end(), [](Item* a, Item* b)
     {
@@ -1426,6 +1571,14 @@ public:
         else if (command == "DESTROY")
         {
             HandleDestroy(player, payload);
+        }
+        else if (command == "USE")
+        {
+            HandleUse(player, payload);
+        }
+        else if (command == "SPLIT")
+        {
+            HandleSplit(player, payload);
         }
         else if (command == "SORT_BAGS")
         {

@@ -35,6 +35,7 @@
 #include "Pet.h"
 #include "Player.h"
 #include "ScriptMgr.h"
+#include "SpellAuraEffects.h"
 
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
@@ -699,6 +700,28 @@ namespace WowPsParty
             // even when we skip the actual MoveFollow install.
             if (PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(follower))
                 ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
+
+            // Mount matching — keep the follower's mounted state synced with the
+            // leader's so the party doesn't trail on foot during travel. Mirror
+            // the leader's actual mount spell so the model matches. Skip while
+            // in combat / casting (can't mount then anyway).
+            if (!follower->IsInCombat()
+                && !follower->IsNonMeleeSpellCast(false, false, true))
+            {
+                bool const leaderMounted = leader->IsMounted();
+                bool const botMounted    = follower->IsMounted();
+                if (leaderMounted && !botMounted)
+                {
+                    Unit::AuraEffectList const& m =
+                        leader->GetAuraEffectsByType(SPELL_AURA_MOUNTED);
+                    if (!m.empty())
+                        follower->CastSpell(follower, m.front()->GetId(), true);
+                }
+                else if (!leaderMounted && botMounted)
+                {
+                    follower->Dismount();
+                }
+            }
 
             // Hands-off if the bot is already engaging something — combat
             // state in AC only flips on damage exchange, but a bot that's

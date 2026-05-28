@@ -741,30 +741,7 @@ public:
                 continue;
             }
 
-            uint32 learned = 0;
-            std::vector<Trainer::Trainer const*> const& trainers =
-                sObjectMgr->GetClassTrainers(p->getClass());
-            bool hadNew;
-            do
-            {
-                hadNew = false;
-                for (Trainer::Trainer const* trainer : trainers)
-                {
-                    if (!trainer->IsTrainerValidForPlayer(p))
-                        continue;
-                    for (Trainer::Spell const& ts : trainer->GetSpells())
-                    {
-                        if (!trainer->CanTeachSpell(p, &ts))
-                            continue;
-                        if (ts.IsCastable())
-                            p->CastSpell(p, ts.SpellId, true);
-                        else
-                            p->learnSpell(ts.SpellId, false);
-                        ++learned;
-                        hadNew = true;
-                    }
-                }
-            } while (hadNew);
+            uint32 const learned = WowPsParty::LearnAllClassSpells(p);
 
             handler->PSendSysMessage(
                 "  |cffaaaaff[{}]|r {} ({}) — learned {} new spell(s).",

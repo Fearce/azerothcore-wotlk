@@ -1530,6 +1530,77 @@ namespace WowPsParty
             return faceAndCast(target, spellId);
         }
 
+        // "use_item:<item name>" — pop a potion / healthstone / bandage from
+        // the bot's own bags, or fire an equipped on-use trinket. Casts the
+        // item's ON_USE spell on the bot and (for bag consumables) eats one
+        // charge. Throttled per (bot,item) by the item's spell cooldown (60s
+        // floor) so a `self_health<30 | use_item:Healing Potion` rule doesn't
+        // burn the whole stack while HP is still low.
+        if (verb == "use_item")
+        {
+            std::string const needle = Lower(arg);
+            auto matchName = [&](Item* it) -> bool
+            {
+                ItemTemplate const* t = it ? it->GetTemplate() : nullptr;
+                return t && Lower(t->Name1) == needle;
+            };
+            Item* found = nullptr;
+            bool inBag = false;
+            for (uint8 s = INVENTORY_SLOT_ITEM_START; s < INVENTORY_SLOT_ITEM_END && !found; ++s)
+                if (Item* it = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, s))
+                    if (matchName(it)) { found = it; inBag = true; }
+            for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END && !found; ++b)
+                if (Bag* bag = bot->GetBagByPos(b))
+                    for (uint32 j = 0; j < bag->GetBagSize() && !found; ++j)
+                        if (Item* it = bot->GetItemByPos(b, j))
+                            if (matchName(it)) { found = it; inBag = true; }
+            if (!found)  // equipped on-use item (trinket, etc.)
+                for (uint8 e = EQUIPMENT_SLOT_START; e < EQUIPMENT_SLOT_END && !found; ++e)
+                    if (Item* it = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, e))
+                        if (matchName(it)) found = it;
+            if (!found) return false;
+
+            ItemTemplate const* t = found->GetTemplate();
+            uint32 useSpell = 0;
+            int32  cdMs     = 0;
+            for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+            {
+                if (t->Spells[i].SpellTrigger == ITEM_SPELLTRIGGER_ON_USE
+                    && t->Spells[i].SpellId > 0)
+                {
+                    useSpell = uint32(t->Spells[i].SpellId);
+                    cdMs     = t->Spells[i].SpellCooldown;
+                    break;
+                }
+            }
+            if (!useSpell) return false;
+            if (bot->HasAura(useSpell)) return false;   // buff already up
+
+            static std::unordered_map<uint64, uint32> lastUseMs;
+            uint64 const key = (uint64(bot->GetGUID().GetCounter()) << 32) | uint32(t->ItemId);
+            uint32 const now = getMSTime();
+            uint32& last = lastUseMs[key];
+            uint32 const throttle = cdMs > 0 ? uint32(cdMs) : 60000;
+            if (now - last < throttle) return false;
+
+            last = now;
+            bot->CastSpell(bot, useSpell, true);
+            if (inBag && t->Class == ITEM_CLASS_CONSUMABLE)
+            {
+                if (found->GetCount() > 1)
+                {
+                    found->SetCount(found->GetCount() - 1);
+                    found->SetState(ITEM_CHANGED, bot);
+                }
+                else
+                    bot->DestroyItem(found->GetBagSlot(), found->GetSlot(), true);
+            }
+            LOG_INFO("module",
+                "[WowPsParty Rotation] {} use_item '{}' (spell={})",
+                bot->GetName(), t->Name1, useSpell);
+            return true;
+        }
+
         // "drink" / "eat" — sit, pull a consumable out of the SHARED
         // inventory, apply its use-spell on the bot. Rate-limited via a
         // per-bot timestamp so the rule firing every ~250 ms doesn't burn
