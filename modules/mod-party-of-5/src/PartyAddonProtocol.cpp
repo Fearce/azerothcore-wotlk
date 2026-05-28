@@ -386,6 +386,9 @@ namespace WowPsParty
                 << t->Col << ':' << maxRank << ':' << curRank << ':' << rank1
                 << ':' << prereqTalentId << ':' << t->DependsOnRank;
         }
+        LOG_INFO("module",
+            "[WowPsParty Talents] send slot={} {} freePoints={} class={}",
+            slot, p->GetName(), p->GetFreeTalentPoints(), uint32(p->getClass()));
         SendWPSP(requester, out.str());
     }
 
@@ -1667,7 +1670,13 @@ public:
             Player* p = ObjectAccessor::FindConnectedPlayer(
                 ObjectGuid::Create<HighGuid::Player>(guid));
             if (!p) return;
+            uint32 const freeBefore = p->GetFreeTalentPoints();
             p->LearnTalent(talentId, rank, false);  // false = normal spend rules
+            LOG_INFO("module",
+                "[WowPsParty Talents] LEARN slot={} {} talentId={} rank={} "
+                "freeBefore={} freeAfter={}",
+                slot, p->GetName(), talentId, rank, freeBefore,
+                p->GetFreeTalentPoints());
             WowPsParty::SendTalentsTo(player, slot);
         }
         // RESET_TALENTS\t<slot>  — free, anywhere.
