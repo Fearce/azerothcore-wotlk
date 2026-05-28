@@ -775,6 +775,14 @@ namespace WowPsParty
         if (cond == "stance_is_battle")     return bot->HasAura(2457);
         if (cond == "stance_is_defensive")  return bot->HasAura(71);
         if (cond == "stance_is_berserker")  return bot->HasAura(2458);
+        // "no stance at all" — our follow bots spawn with mod-playerbots AI
+        // suppressed, so nothing puts them in a stance and every stance-locked
+        // ability silently fails the shapeshift gate. Pair a top-priority
+        // `stance_is_none | buff_self:Battle Stance` rule to self-correct,
+        // without an `always` rule fighting a deliberate Defensive/Berserker.
+        if (cond == "stance_is_none")
+            return bot->getClass() == CLASS_WARRIOR
+                && !bot->HasAura(2457) && !bot->HasAura(71) && !bot->HasAura(2458);
         // Same idea for druid forms — useful for feral / boomkin rules.
         if (cond == "form_is_bear")         return bot->HasAura(5487) || bot->HasAura(9634);
         if (cond == "form_is_cat")          return bot->HasAura(768);
