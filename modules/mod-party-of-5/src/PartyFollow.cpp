@@ -411,6 +411,17 @@ namespace WowPsParty
         if (!leader || !leader->IsInWorld()) { AssistLog(gLow, "skip: leader not in world"); return; }
         if (leader->GetMapId() != bot->GetMapId()) { AssistLog(gLow, "skip: leader on different map"); return; }
 
+        // Party leash: once the leader is >50y away, stop engaging and let the
+        // follow ticker bring us back (it walks at 50y, teleports past 100y).
+        // Yielding here stops the AI tick from re-acquiring a target between
+        // the 1Hz follow ticks.
+        if (bot->GetDistance(leader) > 50.0f)
+        {
+            if (bot->GetVictim()) bot->AttackStop();
+            AssistLog(gLow, "skip: beyond party leash (>50y) — rejoining leader");
+            return;
+        }
+
         // Target priority:
         //   1. Leader's explicit victim (you click, everyone follows).
         //   2. Whatever's currently swinging at the bot itself.
@@ -726,6 +737,44 @@ namespace WowPsParty
                 else if (!leaderMounted && botMounted)
                 {
                     follower->Dismount();
+                }
+            }
+
+            // ---- Party leash ----------------------------------------------
+            // If the controlled char has run off, the bot abandons whatever
+            // it's doing (combat, drinking, holding) and rejoins. >50y: break
+            // off and walk back. >100y: snap directly to the leader. Runs
+            // BEFORE the combat / hold / cast early-returns so it overrides
+            // them. AssistTarget + TickRotation also yield past 50y so the AI
+            // tick doesn't re-engage between these 1Hz follow ticks.
+            {
+                float const leaderDist = follower->GetDistance(leader);
+                if (leaderDist > 100.0f)
+                {
+                    if (follower->GetVictim()) follower->AttackStop();
+                    if (follower->IsInCombat()) follower->CombatStop();
+                    if (follower->getStandState() != UNIT_STAND_STATE_STAND)
+                        follower->SetStandState(UNIT_STAND_STATE_STAND);
+                    follower->GetMotionMaster()->Clear();
+                    follower->StopMoving();
+                    follower->TeleportTo(leader->GetMapId(),
+                        leader->GetPositionX(), leader->GetPositionY(),
+                        leader->GetPositionZ(), leader->GetOrientation());
+                    LOG_INFO("module",
+                        "[WowPsParty Leash] {} >100y from leader — teleport in",
+                        follower->GetName());
+                    return true;
+                }
+                if (leaderDist > 50.0f)
+                {
+                    if (follower->GetVictim()) follower->AttackStop();
+                    if (follower->IsInCombat()) follower->CombatStop();
+                    if (follower->getStandState() != UNIT_STAND_STATE_STAND)
+                        follower->SetStandState(UNIT_STAND_STATE_STAND);
+                    follower->GetMotionMaster()->Clear();
+                    follower->GetMotionMaster()->MoveFollow(leader, PET_FOLLOW_DIST,
+                        follower->GetFollowAngle());
+                    return true;
                 }
             }
 

@@ -1859,6 +1859,15 @@ namespace WowPsParty
             rules = it->second;  // copy, drop lock before doing real work
         }
 
+        // Party leash: if the controlled char has run >50y away, don't cast
+        // or drink — yield so the follow ticker rejoins the leader (it walks
+        // back at 50y, teleports past 100y). Matches AssistTarget's leash.
+        if (ObjectGuid const lg = GetLeaderFor(bot->GetGUID()))
+            if (Player* leader = ObjectAccessor::FindConnectedPlayer(lg))
+                if (leader->IsInWorld() && leader->GetMapId() == bot->GetMapId()
+                    && bot->GetDistance(leader) > 50.0f)
+                    return false;
+
         // Rate-limited per-tick trace. The user has reported several
         // "rule X isn't firing" symptoms (taunt looping, thunder clap
         // not casting) where the actual root cause needed full visibility
