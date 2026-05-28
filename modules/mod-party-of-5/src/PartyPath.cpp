@@ -47,8 +47,8 @@ namespace WowPsParty
 
         constexpr uint32 SAMPLE_INTERVAL_MS = 250;   // 4 Hz — tight corners + jumps both captured
         constexpr float  DEDUPE_MIN_DIST    = 2.0f;
-        constexpr float  TANK_LEASH         = 30.0f;
-        constexpr int    TANK_LOOK_AHEAD    = 3;
+        constexpr float  TANK_LEASH         = 35.0f;   // stop & wait past this from leader
+        constexpr float  LEAD_DISTANCE      = 25.0f;   // aim this far ahead ALONG the path
         constexpr float  WAYPOINT_REACHED   = 3.5f;
         // Vertical step size that pathfinding can't handle (jumps, drops,
         // dropdowns through holes). When the next waypoint differs by more
@@ -290,9 +290,20 @@ namespace WowPsParty
             if (d < nearestD) { nearestD = d; nearestIdx = i; }
         }
 
-        // Target = cursor + lookahead, clamped to the path's end.
-        uint32 const targetIdx = std::min(nearestIdx + TANK_LOOK_AHEAD,
-                                          uint32(path.size()) - 1);
+        // Target = walk FORWARD along the path from the leader's cursor until
+        // we're ~LEAD_DISTANCE ahead (by path length, not waypoint count — the
+        // recorded waypoints are only ~2y apart, so a fixed "+3" lookahead made
+        // the tank hug the leader). Clamped to the path end.
+        uint32 targetIdx = nearestIdx;
+        float acc = 0.0f;
+        while (targetIdx + 1 < path.size())
+        {
+            float const seg = Dist3D(path[targetIdx].x, path[targetIdx].y, path[targetIdx].z,
+                                     path[targetIdx + 1].x, path[targetIdx + 1].y, path[targetIdx + 1].z);
+            if (acc + seg > LEAD_DISTANCE) break;
+            acc += seg;
+            ++targetIdx;
+        }
         Vec3 const& wp = path[targetIdx];
 
         // Already at the target waypoint? nothing to do.
