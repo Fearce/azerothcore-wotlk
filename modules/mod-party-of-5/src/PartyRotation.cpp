@@ -438,9 +438,76 @@ namespace WowPsParty
 
     // Returns true on parse + match. Conditions of the form name<N or name>N
     // (no spaces) are parsed as comparison; otherwise treated as a flag check.
+    // True if `target` carries an aura whose Spell.dbc name matches the
+    // given string case-insensitively. Walks the applied-aura map and
+    // compares names rather than spell IDs because Kevkili-style rules
+    // reference specific debuffs (Hamstring, Thunder Clap, Mortal Strike)
+    // by name and we want the rule to match any rank.
+    static bool TargetHasNamedAura(Unit* target, std::string const& name)
+    {
+        if (!target || name.empty()) return false;
+        std::string needle;
+        needle.reserve(name.size());
+        for (char c : name) needle.push_back(char(std::tolower(static_cast<unsigned char>(c))));
+        for (auto const& kv : target->GetAppliedAuras())
+        {
+            Aura const* a = kv.second ? kv.second->GetBase() : nullptr;
+            if (!a) continue;
+            SpellInfo const* si = a->GetSpellInfo();
+            if (!si) continue;
+            char const* sname = si->SpellName[0];
+            if (!sname) continue;
+            std::string lower;
+            for (char const* p = sname; *p; ++p)
+                lower.push_back(char(std::tolower(static_cast<unsigned char>(*p))));
+            if (lower == needle) return true;
+        }
+        return false;
+    }
+
+    // Forward decl so EvalCondition can recurse through AND-chains.
+    static bool EvalSingleCondition(std::string const& cond, Player* bot);
+
     static bool EvalCondition(std::string const& cond, Player* bot)
     {
+        // AND chain: any number of conditions separated by `&` — every
+        // clause must evaluate true. Lets Kevkili-style warrior rules
+        // compose stance + rage + missing-aura gates in one rule.
+        size_t p = 0;
+        while (p <= cond.size())
+        {
+            size_t amp = cond.find('&', p);
+            std::string clause = (amp == std::string::npos)
+                ? cond.substr(p) : cond.substr(p, amp - p);
+            if (!clause.empty() && !EvalSingleCondition(clause, bot))
+                return false;
+            if (amp == std::string::npos) break;
+            p = amp + 1;
+        }
+        return true;
+    }
+
+    static bool EvalSingleCondition(std::string const& cond, Player* bot)
+    {
         if (cond == "always") return true;
+        // Conditions with a string arg: `<name>:<spell-name>`.
+        // target_has_aura:Hamstring / target_missing_aura:Mortal Strike /
+        // self_has_aura:Battle Shout / self_missing_aura:Bloodrage.
+        auto colon = cond.find(':');
+        if (colon != std::string::npos)
+        {
+            std::string const cname = cond.substr(0, colon);
+            std::string const arg   = cond.substr(colon + 1);
+            if (cname == "target_has_aura" || cname == "target_missing_aura")
+            {
+                Unit* victim = bot->GetVictim();
+                if (!victim) return cname == "target_missing_aura"; // no target = no aura
+                bool const has = TargetHasNamedAura(victim, arg);
+                return cname == "target_has_aura" ? has : !has;
+            }
+            if (cname == "self_has_aura")     return TargetHasNamedAura(bot, arg);
+            if (cname == "self_missing_aura") return !TargetHasNamedAura(bot, arg);
+        }
         if (cond == "in_combat")     return bot->IsInCombat();
         if (cond == "out_of_combat") return !bot->IsInCombat();
         if (cond == "has_target")    return bot->GetTarget() != ObjectGuid::Empty;
