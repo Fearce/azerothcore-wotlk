@@ -524,14 +524,10 @@ namespace WowPsParty
             return;
         }
 
-        if (bot->GetVictim() != desired)
+        // Install the correct chase: ranged casters hold at distance so they
+        // don't run into melee and clip their own cast bar; melee close in.
+        auto installChase = [&]()
         {
-            MarkRetarget(gLow, nowMs);
-            bool const ok = bot->Attack(desired, true);
-            // Caster classes hold at range so they don't run into melee and
-            // interrupt their own cast bars. Melee classes use the default
-            // (run-to-melee) MoveChase. Hunter is mana-using but ranged, so
-            // pick by class id, not by power type.
             uint8 const cls = bot->getClass();
             bool const isRangedCaster =
                 cls == CLASS_MAGE     || cls == CLASS_WARLOCK ||
@@ -542,16 +538,30 @@ namespace WowPsParty
             else
                 bot->GetMotionMaster()->MoveChase(desired);
             bot->SetFacingToObject(desired);
+            return isRangedCaster;
+        };
+
+        if (bot->GetVictim() != desired)
+        {
+            MarkRetarget(gLow, nowMs);
+            bool const ok = bot->Attack(desired, true);
+            bool const ranged = installChase();
             LOG_INFO("module", "[WowPsParty Assist] guid={} ENGAGE victim_guid={} attack_ok={} ranged={}",
-                     gLow, desired->GetGUID().GetCounter(), ok, isRangedCaster ? 1 : 0);
+                     gLow, desired->GetGUID().GetCounter(), ok, ranged ? 1 : 0);
         }
         else
         {
-            // Already on the right victim — but the bot may have drifted
-            // off-facing (e.g. MoveChase landed it sideways, or it was
-            // rotated by knockback). Re-face every tick so the next cast
-            // doesn't fail the "must face target" check.
-            if (!bot->HasInArc(float(M_PI), desired))
+            // Already on the right victim. If our active movement isn't a chase
+            // — e.g. the tank's path-lead MovePoint was still running when the
+            // mob aggroed — (re)install the chase so we actually walk to the mob
+            // instead of finishing the recorded route. Otherwise just keep
+            // facing it so the next cast/swing lands.
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
+            {
+                installChase();
+                AssistLog(gLow, "re-chase: stale movement (route?) replaced");
+            }
+            else if (!bot->HasInArc(float(M_PI), desired))
                 bot->SetFacingToObject(desired);
         }
     }
