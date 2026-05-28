@@ -1,0 +1,30 @@
+#
+# WowPs Party-of-5 module configuration
+#
+
+[worldserver]
+
+########################################
+# Party-of-5 module configuration
+########################################
+#
+#    WowPsParty.Enable
+#        Description: Enable the party-of-5 mod (GW1-hero / DAI-henchman style party).
+#                     When enabled, each account owns 5 characters that travel as a party;
+#                     the player controls one at a time via F1-F5 swap.
+#        Default:     1 - Enabled
+#                     0 - Disabled (module compiled in but inactive)
+#
+
+WowPsParty.Enable = 1
+
+#
+#    WowPsParty.LogVerbose
+#        Description: Emit verbose lifecycle log lines (per-player login banner, slot lookups,
+#                     swap dispatches, AI loadout reloads). Useful during development; turn off
+#                     in production to keep the log volume manageable.
+#        Default:     1 - Verbose
+#                     0 - Quiet
+#
+
+WowPsParty.LogVerbose = 1

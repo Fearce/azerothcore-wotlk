@@ -117,3 +117,7 @@ local.properties
 # ==================
 .cache
 compile_commands.json
+
+# WowPs: track our party-of-5 module that lives inside modules/.
+!/modules/mod-party-of-5/
+!/modules/mod-party-of-5/**

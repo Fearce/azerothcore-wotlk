@@ -505,6 +505,11 @@ bool Player::CanRewardQuest(Quest const* quest, uint32 reward, bool msg)
     return true;
 }
 
+// [WowPsParty PATCH] trampoline so the mod-party-of-5 module can mirror quest
+// accepts to all 5 party members. Defined in
+// modules/mod-party-of-5/src/PartyHooks.cpp.
+extern void WowPsParty_OnQuestAccepted_Trampoline(Player* who, Quest const* quest);
+
 void Player::AddQuest(Quest const* quest, Object* questGiver)
 {
     uint16 log_slot = FindQuestSlot(0);
@@ -513,6 +518,11 @@ void Player::AddQuest(Quest const* quest, Object* questGiver)
         return;
 
     uint32 quest_id = quest->GetQuestId();
+
+    // Fire the WowPsParty mirror hook so party members auto-accept the same
+    // quest. The hook short-circuits internally via a thread_local re-entrance
+    // guard.
+    WowPsParty_OnQuestAccepted_Trampoline(this, quest);
 
     // if not exist then created with set uState == NEW and rewarded=false
     QuestStatusData& questStatusData = m_QuestStatus[quest_id];

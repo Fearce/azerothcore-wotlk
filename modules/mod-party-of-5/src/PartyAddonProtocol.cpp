@@ -1,0 +1,1429 @@
+/*
+ * WowPs Party-of-5 mod — addon protocol over LANG_ADDON whispers
+ *
+ * Client side (Interface/AddOns/WowPsParty/WowPsParty.lua) sends WPSP messages
+ * to itself via SendAddonMessage("WPSP", body, "WHISPER", UnitName("player")).
+ * AC delivers those to OnPlayerBeforeSendChatMessage with lang=LANG_ADDON, so
+ * we intercept here before they hit the chat dispatcher.
+ *
+ * Server → client messages are SMSG_MESSAGECHAT with CHAT_MSG_WHISPER/LANG_ADDON
+ * carrying "WPSP\tCOMMAND\tPAYLOAD". The client's addon comm layer parses the
+ * first tab-separated token as the prefix.
+ *
+ * Wire protocol (matches the client addon):
+ *   Client → server:  REQ_ROSTER  |  PING  |  (future) LOADOUT, STRAT
+ *   Server → client:  ROSTER\t<recordsep-pipe of records>
+ *                     SWAPPED\t<oldSlot>\t<newSlot>
+ *                     PONG
+ *   Each ROSTER record is: slot\tguid\tname\tclass\tlevel\tactive(0/1)
+ *   Records are pipe-separated within the single payload string.
+ */
+
+#include "PartyMgr.h"
+#include "PartyRotation.h"
+#include "PartyFollow.h"
+#include "PartyPath.h"
+
+#include "Bag.h"
+#include "Chat.h"
+#include "CharmInfo.h"
+#include "Group.h"
+#include "GroupMgr.h"
+#include "Pet.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
+#include "StringFormat.h"
+
+#include "PlayerbotAI.h"
+#include "PlayerbotMgr.h"
+#include "AiObjectContext.h"
+#include "Value.h"
+#include "DatabaseEnv.h"
+#include "Item.h"
+#include "ItemTemplate.h"
+#include "Log.h"
+#include "Map.h"
+#include "MotionMaster.h"
+#include "ObjectAccessor.h"
+#include "ObjectMgr.h"
+#include "Player.h"
+#include "ScriptMgr.h"
+#include "SharedDefines.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
+#include "WorldSession.h"
+
+#include <cstdlib>
+#include <sstream>
+
+namespace WowPsParty
+{
+    bool IsEnabled();     // PartyBootstrap.cpp
+    bool IsLogVerbose();
+}
+
+static constexpr char const* WPSP_PREFIX = "WPSP\t";
+static constexpr std::size_t WPSP_PREFIX_LEN = 5;
+
+namespace
+{
+    static void SendWPSP(Player* target, std::string const& body)
+    {
+        if (!target || !target->GetSession())
+            return;
+        WorldPacket data;
+        std::string full;
+        full.reserve(WPSP_PREFIX_LEN + body.size());
+        full.append("WPSP\t");
+        full.append(body);
+        ChatHandler::BuildChatPacket(data, CHAT_MSG_WHISPER, LANG_ADDON,
+                                     target->GetGUID(), target->GetGUID(),
+                                     full, /*chatTag=*/0);
+        target->GetSession()->SendPacket(&data);
+    }
+
+    static std::string BuildRosterPayload(uint32 accountId)
+    {
+        auto const party = sPartyMgr.GetParty(accountId);
+        std::ostringstream out;
+        bool first = true;
+        for (auto const& m : party)
+        {
+            if (!first) out << '|';
+            first = false;
+            out << uint32(m.slot) << '\t'
+                << m.guid          << '\t'
+                << m.name          << '\t'
+                << uint32(m.classId) << '\t'
+                << uint32(m.level) << '\t'
+                << (m.online ? '1' : '0');
+        }
+        return out.str();
+    }
+}
+
+namespace WowPsParty
+{
+    void SendRosterTo(Player* player)
+    {
+        if (!player || !player->GetSession())
+            return;
+        std::string const payload = BuildRosterPayload(player->GetSession()->GetAccountId());
+        SendWPSP(player, "ROSTER\t" + payload);
+    }
+
+    void SendSwappedTo(Player* player, int oldSlot, int newSlot)
+    {
+        if (!player) return;
+        std::ostringstream out;
+        out << "SWAPPED\t" << oldSlot << '\t' << newSlot;
+        SendWPSP(player, out.str());
+    }
+
+    // Resolve the slot's character guid for the account.
+    static uint32 GuidForAccountSlot(uint32 account, uint32 slot)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}",
+            account, slot);
+        return q ? q->Fetch()[0].Get<uint32>() : 0;
+    }
+
+    static Player* ResolveControlledBody(Player* session)
+    {
+        if (!session) return nullptr;
+        if (Unit* charm = session->GetCharm())
+            if (charm->IsPlayer())
+                return charm->ToPlayer();
+        return session;  // not possessing anyone — your own body
+    }
+
+    // SPELLBOOK\t<slot>\t<spellId1,spellId2,...>
+    void SendSpellbookTo(Player* requester, uint32 slot)
+    {
+        if (!requester || !requester->GetSession()) return;
+        uint32 const account = requester->GetSession()->GetAccountId();
+        uint32 const guid = GuidForAccountSlot(account, slot);
+        if (!guid) return;
+        ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
+        Player* target = ObjectAccessor::FindConnectedPlayer(og);
+        if (!target) return;
+
+        // Dedupe by spell chain — emit only the HIGHEST-rank spell in each
+        // rank chain so the user doesn't see "Lifeblood 1/2/3/4" as four
+        // separate entries. Also drop passives, profession actives, and
+        // hidden-aura spells (those are flagged DO_NOT_DISPLAY).
+        std::unordered_map<uint32, uint32> firstToBest;  // first-in-chain → best spellId
+        for (auto const& kv : target->GetSpellMap())
+        {
+            if (kv.second->State == PLAYERSPELL_REMOVED) continue;
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(kv.first);
+            if (!info) continue;
+            if (info->IsPassive()) continue;
+            if (info->HasAttribute(SPELL_ATTR0_IS_TRADESKILL)) continue;
+            if (info->HasAttribute(SPELL_ATTR0_DO_NOT_DISPLAY)) continue;
+
+            uint32 const first = sSpellMgr->GetFirstSpellInChain(kv.first);
+            uint32 const chainKey = first ? first : kv.first;
+            auto it = firstToBest.find(chainKey);
+            if (it == firstToBest.end())
+            {
+                firstToBest[chainKey] = kv.first;
+            }
+            else
+            {
+                SpellInfo const* existing = sSpellMgr->GetSpellInfo(it->second);
+                if (existing && info->SpellLevel > existing->SpellLevel)
+                    it->second = kv.first;
+            }
+        }
+        std::ostringstream csv;
+        bool first = true;
+        for (auto const& kv : firstToBest)
+        {
+            if (!first) csv << ',';
+            first = false;
+            csv << kv.second;
+        }
+        std::ostringstream out;
+        out << "SPELLBOOK\t" << slot << '\t' << csv.str();
+        SendWPSP(requester, out.str());
+    }
+
+    // BAR\t<slot>\t<spellId1,spellId2,...,spellId12>   (0 for empty)
+    void SendActionBarTo(Player* requester, uint32 slot)
+    {
+        if (!requester || !requester->GetSession()) return;
+        uint32 const account = requester->GetSession()->GetAccountId();
+        uint32 const guid = GuidForAccountSlot(account, slot);
+        if (!guid) return;
+
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `action_bar_csv` FROM `party_loadout` WHERE `guid` = {}", guid);
+        std::string bar = q ? q->Fetch()[0].Get<std::string>() : std::string();
+        // If no row yet, emit 12 zeros so the addon shows an empty bar with the
+        // right slot count.
+        if (bar.empty())
+            bar = "0,0,0,0,0,0,0,0,0,0,0,0";
+
+        std::ostringstream out;
+        out << "BAR\t" << slot << '\t' << bar;
+        SendWPSP(requester, out.str());
+    }
+
+    // forward decls — definitions follow below
+    void SendGearTo(Player* requester, uint32 slot);
+    void SendInventoryTo(Player* requester);
+    void SendQuestProgressTo(Player* requester);
+
+    // Push spellbook + bar + gear + inventory for the new controlled body.
+    // Called from PartyMgr::SwapTo so the addon can refresh.
+    void PushControlledLoadoutTo(Player* requester, int slot)
+    {
+        if (!requester || slot < 0) return;
+        SendSpellbookTo(requester, uint32(slot));
+        SendActionBarTo(requester, uint32(slot));
+        SendGearTo(requester, uint32(slot));
+        SendInventoryTo(requester);
+    }
+
+    // GEAR\t<slot>\t<eqSlot>:<itemId>:<itemGuidLow>;...   (19 equipment slots)
+    void SendGearTo(Player* requester, uint32 slot)
+    {
+        if (!requester || !requester->GetSession()) return;
+        uint32 const account = requester->GetSession()->GetAccountId();
+        uint32 const guid = GuidForAccountSlot(account, slot);
+        if (!guid) return;
+        ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
+        Player* target = ObjectAccessor::FindConnectedPlayer(og);
+        if (!target) return;
+
+        std::ostringstream out;
+        out << "GEAR\t" << slot << '\t';
+        bool first = true;
+        for (uint8 i = EQUIPMENT_SLOT_START; i < EQUIPMENT_SLOT_END; ++i)
+        {
+            Item* item = target->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
+            if (!item) continue;
+            if (!first) out << ';';
+            first = false;
+            out << uint32(i) << ':' << item->GetEntry() << ':' << item->GetGUID().GetCounter();
+        }
+        SendWPSP(requester, out.str());
+    }
+
+    // INVENTORY\t<partySlot>:<bag>:<pos>:<itemId>:<count>:<itemGuidLow>;...
+    // Sends EVERY party member's bag contents in one message so the addon's
+    // unified inventory can render the whole party in one grid. Skips equipped
+    // items (those go via GEAR). Skips empty slots.
+    void SendInventoryTo(Player* requester)
+    {
+        if (!requester || !requester->GetSession()) return;
+        uint32 const account = requester->GetSession()->GetAccountId();
+
+        std::ostringstream out;
+        out << "INVENTORY\t";
+        bool first = true;
+
+        auto emit = [&](uint32 partySlot, uint32 bag, uint32 pos, Item* item)
+        {
+            if (!first) out << ';';
+            first = false;
+            out << partySlot << ':' << bag << ':' << pos << ':'
+                << item->GetEntry() << ':' << item->GetCount() << ':'
+                << item->GetGUID().GetCounter();
+        };
+
+        for (uint8 partySlot = 0; partySlot < PARTY_SIZE; ++partySlot)
+        {
+            uint32 const guid = GuidForAccountSlot(account, partySlot);
+            if (!guid) continue;
+            ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
+            Player* p = ObjectAccessor::FindConnectedPlayer(og);
+            if (!p) continue;
+
+            // Main backpack (16 slots): bag=255 (INVENTORY_SLOT_BAG_0), pos=23..38
+            for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            {
+                Item* item = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
+                if (item)
+                    emit(partySlot, INVENTORY_SLOT_BAG_0, i, item);
+            }
+            // Equipped bags (slots 19..22): each is a Bag with its own internal slots
+            for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            {
+                Bag* bag = p->GetBagByPos(b);
+                if (!bag) continue;
+                for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                {
+                    Item* item = p->GetItemByPos(b, j);
+                    if (item)
+                        emit(partySlot, b, j, item);
+                }
+            }
+        }
+        SendWPSP(requester, out.str());
+    }
+
+    // QUEST_PROGRESS\t<rec>|<rec>|...
+    //   record format: <partySlot>:<questId>:<questTitle>:<obj0name>=<done>/<total>,<obj1name>=<done>/<total>...
+    //   - obj names are derived from the quest objective text or the item/NPC name
+    //   - delimiter `:` inside titles is replaced with `;` to avoid clashing
+    //   - the addon (QuestProgress.lua) parses and renders per-slot sections
+    void SendQuestProgressTo(Player* requester)
+    {
+        if (!requester || !requester->GetSession()) return;
+        uint32 const account = requester->GetSession()->GetAccountId();
+
+        std::ostringstream out;
+        out << "QUEST_PROGRESS\t";
+        bool firstRec = true;
+
+        auto sanitise = [](std::string s) {
+            for (char& c : s)
+                if (c == ':' || c == '\t' || c == '|' || c == ';' || c == '=' || c == ',')
+                    c = ' ';
+            return s;
+        };
+
+        for (uint8 partySlot = 0; partySlot < PARTY_SIZE; ++partySlot)
+        {
+            uint32 const guid = GuidForAccountSlot(account, partySlot);
+            if (!guid) continue;
+            ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
+            Player* p = ObjectAccessor::FindConnectedPlayer(og);
+            if (!p) continue;
+
+            for (uint8 i = 0; i < MAX_QUEST_LOG_SIZE; ++i)
+            {
+                uint32 const questId = p->GetQuestSlotQuestId(i);
+                if (!questId) continue;
+                Quest const* qInfo = sObjectMgr->GetQuestTemplate(questId);
+                if (!qInfo) continue;
+                QuestStatus const status = p->GetQuestStatus(questId);
+                if (status != QUEST_STATUS_INCOMPLETE && status != QUEST_STATUS_COMPLETE) continue;
+
+                if (!firstRec) out << '|';
+                firstRec = false;
+
+                std::string title = sanitise(qInfo->GetTitle());
+                out << uint32(partySlot) << ':' << questId << ':' << title << ':';
+
+                bool firstObj = true;
+
+                // Item-deliver objectives
+                for (uint8 j = 0; j < QUEST_ITEM_OBJECTIVES_COUNT; ++j)
+                {
+                    uint32 const reqId    = qInfo->RequiredItemId[j];
+                    uint32 const reqCount = qInfo->RequiredItemCount[j];
+                    if (!reqId || !reqCount) continue;
+                    ItemTemplate const* it = sObjectMgr->GetItemTemplate(reqId);
+                    std::string label = it ? sanitise(it->Name1) : std::to_string(reqId);
+                    uint32 have = p->GetItemCount(reqId, true);
+                    if (have > reqCount) have = reqCount;
+                    if (!firstObj) out << ',';
+                    firstObj = false;
+                    out << label << '=' << have << '/' << reqCount;
+                }
+
+                // Kill / interact objectives
+                for (uint8 j = 0; j < QUEST_OBJECTIVES_COUNT; ++j)
+                {
+                    int32 const reqId = qInfo->RequiredNpcOrGo[j];
+                    uint32 const reqCount = qInfo->RequiredNpcOrGoCount[j];
+                    if (!reqId || !reqCount) continue;
+                    // Resolve creature/GO name. Negative ids = gameobjects.
+                    std::string label;
+                    if (reqId > 0)
+                    {
+                        if (CreatureTemplate const* ct = sObjectMgr->GetCreatureTemplate(uint32(reqId)))
+                            label = sanitise(ct->Name);
+                        else
+                            label = std::to_string(reqId);
+                    }
+                    else
+                    {
+                        if (GameObjectTemplate const* gt = sObjectMgr->GetGameObjectTemplate(uint32(-reqId)))
+                            label = sanitise(gt->name);
+                        else
+                            label = std::to_string(reqId);
+                    }
+                    // QuestStatusData lives in the player's m_QuestStatus map.
+                    // We can't grab it directly from Player without a friend
+                    // declaration, so read the slot counter via the public
+                    // wire field: GetQuestSlotCounter(slot, idx).
+                    uint16 have = p->GetReqKillOrCastCurrentCount(questId, reqId);
+                    if (have > reqCount) have = reqCount;
+                    if (!firstObj) out << ',';
+                    firstObj = false;
+                    out << label << '=' << uint32(have) << '/' << reqCount;
+                }
+            }
+        }
+
+        if (firstRec)
+        {
+            // No quests at all — send a sentinel so the addon can show
+            // "No active quests across the party."
+            out << "NONE";
+        }
+
+        SendWPSP(requester, out.str());
+    }
+}
+
+// UNEQUIP\t<partySlot>\t<eqSlotId>
+// Moves the item currently equipped at eqSlotId on the slot's character into
+// the first free inventory slot on that same character. Bag stays local to
+// the char — no cross-char transfer here (use MOVE for that).
+static void HandleUnequip(Player* requester, std::string_view payload)
+{
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const partySlot = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const eqSlot    = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+
+    if (!requester || !requester->GetSession()) return;
+    if (eqSlot >= EQUIPMENT_SLOT_END) return;
+    uint32 const account = requester->GetSession()->GetAccountId();
+
+    QueryResult q = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}",
+        account, partySlot);
+    if (!q) return;
+    uint32 const charGuid = q->Fetch()[0].Get<uint32>();
+    Player* p = ObjectAccessor::FindConnectedPlayer(
+        ObjectGuid::Create<HighGuid::Player>(charGuid));
+    if (!p) return;
+
+    Item* item = p->GetItemByPos(INVENTORY_SLOT_BAG_0, uint8(eqSlot));
+    if (!item)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Nothing equipped at slot {}.", eqSlot);
+        return;
+    }
+
+    // Find a free inventory slot to drop the item into.
+    ItemPosCountVec dest;
+    InventoryResult result = p->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false);
+    if (result != EQUIP_ERR_OK)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r No bag space to unequip ({}).", uint32(result));
+        return;
+    }
+    p->RemoveItem(INVENTORY_SLOT_BAG_0, uint8(eqSlot), true);
+    p->StoreItem(dest, item, true);
+
+    WowPsParty::SendGearTo(requester, partySlot);
+    WowPsParty::SendInventoryTo(requester);
+}
+
+// EQUIP\t<srcPartySlot>\t<srcItemGuidLow>   (always equips to the currently-
+// controlled body — destination slot is derived from the item template's class
+// & subclass so the user doesn't have to pick a slot.)
+static void HandleEquip(Player* requester, std::string_view payload)
+{
+    // Payload formats supported:
+    //   "<srcSlot>\t<srcItemGuidLow>"               -- legacy, equips on session player
+    //   "<srcSlot>\t<srcItemGuidLow>\t<destSlot>"   -- equip on a specific party slot
+    auto firstTab = payload.find('\t');
+    if (firstTab == std::string_view::npos) return;
+    uint32 const srcSlot = std::strtoul(std::string(payload.substr(0, firstTab)).c_str(), nullptr, 10);
+
+    std::string_view rest = payload.substr(firstTab + 1);
+    auto secondTab = rest.find('\t');
+    uint32 srcItemGuidLow = 0;
+    int destSlot = -1;
+    if (secondTab == std::string_view::npos)
+    {
+        srcItemGuidLow = std::strtoul(std::string(rest).c_str(), nullptr, 10);
+    }
+    else
+    {
+        srcItemGuidLow = std::strtoul(std::string(rest.substr(0, secondTab)).c_str(), nullptr, 10);
+        destSlot       = std::atoi(std::string(rest.substr(secondTab + 1)).c_str());
+    }
+    if (!srcItemGuidLow) return;
+
+    if (!requester || !requester->GetSession()) return;
+    uint32 const account = requester->GetSession()->GetAccountId();
+
+    QueryResult q = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, srcSlot);
+    if (!q) return;
+    uint32 const srcCharGuid = q->Fetch()[0].Get<uint32>();
+    ObjectGuid const srcCharObj = ObjectGuid::Create<HighGuid::Player>(srcCharGuid);
+    Player* srcChar = ObjectAccessor::FindConnectedPlayer(srcCharObj);
+    if (!srcChar) return;
+
+    Item* srcItem = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!srcItem) return;
+
+    // Resolve destination: if destSlot was specified in payload, look it
+    // up; else fall back to the session player (ResolveControlledBody now
+    // always returns the session player since swap is removed).
+    Player* dest = nullptr;
+    if (destSlot >= 0)
+    {
+        QueryResult qd = CharacterDatabase.Query(
+            "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}",
+            account, uint32(destSlot));
+        if (qd)
+        {
+            uint32 const destCharGuid = qd->Fetch()[0].Get<uint32>();
+            dest = ObjectAccessor::FindConnectedPlayer(
+                ObjectGuid::Create<HighGuid::Player>(destCharGuid));
+        }
+    }
+    if (!dest) dest = WowPsParty::ResolveControlledBody(requester);
+    if (!dest) return;
+
+    // Validate dest can use the item (class/race/level/etc.)
+    InventoryResult const reason = dest->CanUseItem(srcItem->GetTemplate());
+    if (reason != EQUIP_ERR_OK)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Can't equip on slot {}: target can't use this item.",
+            uint32(srcSlot));
+        return;
+    }
+
+    // Find a suitable equip slot. swap=true so an item already in the slot
+    // gets unequipped into a bag automatically (otherwise CanEquipItem
+    // returns NOT_EQUIPPABLE when the slot is occupied -- user had to
+    // manually unequip first, per Kevin's report).
+    uint16 eqDest;
+    InventoryResult result = dest->CanEquipItem(NULL_SLOT, eqDest, srcItem, /*swap=*/true, /*not_loading=*/true);
+    if (result != EQUIP_ERR_OK)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Equip rejected ({}). Check requirements.", uint32(result));
+        return;
+    }
+
+    if (srcChar == dest)
+    {
+        // Same character — just move from bag to equip slot.
+        dest->RemoveItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+        dest->EquipItem(eqDest, srcItem, true);
+    }
+    else
+    {
+        // Cross-character transfer that PRESERVES the Item object (and thus
+        // its enchants, gems, durability, charges, random properties, soulbind
+        // state). MoveItemFromInventory detaches the Item from srcChar without
+        // destroying it; we re-parent via SetOwnerGUID + persist via
+        // SaveInventoryAndGoldToDB; MoveItemToInventory threads it into dest's
+        // bag at the position CanStoreItem found.
+        srcChar->MoveItemFromInventory(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+        srcItem->SetOwnerGUID(dest->GetGUID());
+        // Persist the ownership change immediately so a worldserver crash
+        // doesn't leave the item half-orphaned (rows in characters_inventory
+        // would otherwise still point at srcChar).
+        CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+        srcItem->SaveToDB(tx);
+        CharacterDatabase.CommitTransaction(tx);
+
+        ItemPosCountVec destPos;
+        if (dest->CanStoreItem(NULL_BAG, NULL_SLOT, destPos, srcItem, false) == EQUIP_ERR_OK)
+        {
+            dest->MoveItemToInventory(destPos, srcItem, true);
+            uint16 dest2;
+            // swap=true (same reason as the same-character branch above)
+            if (dest->CanEquipItem(NULL_SLOT, dest2, srcItem, true, true) == EQUIP_ERR_OK)
+            {
+                dest->RemoveItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+                dest->EquipItem(dest2, srcItem, true);
+            }
+        }
+        else
+        {
+            // dest's bags are full — give it back to src so the item doesn't
+            // vanish. (Edge case; the UI should have warned earlier.)
+            srcItem->SetOwnerGUID(srcChar->GetGUID());
+            ItemPosCountVec backPos;
+            if (srcChar->CanStoreItem(NULL_BAG, NULL_SLOT, backPos, srcItem, false) == EQUIP_ERR_OK)
+                srcChar->MoveItemToInventory(backPos, srcItem, true);
+            CharacterDatabaseTransaction tx2 = CharacterDatabase.BeginTransaction();
+            srcItem->SaveToDB(tx2);
+            CharacterDatabase.CommitTransaction(tx2);
+        }
+    }
+
+    // Refresh client UI on both sides
+    WowPsParty::SendInventoryTo(requester);
+    if (auto srcS = sPartyMgr.GetSlotForGuid(srcCharGuid))
+        WowPsParty::SendGearTo(requester, uint32(*srcS));
+    if (auto dstS = sPartyMgr.GetSlotForGuid(dest->GetGUID().GetCounter()))
+        WowPsParty::SendGearTo(requester, uint32(*dstS));
+}
+
+// SELL\t<srcPartySlot>\t<srcItemGuidLow>
+//   Vendor-sells an item out of any party member's bag while the requester
+//   has a merchant frame open. The item is destroyed and the requester is
+//   credited with the standard ItemTemplate::SellPrice * count gold — the
+//   shared-gold hook (PartyHooks.cpp::OnPlayerMoneyChanged) then mirrors the
+//   gain to every other party member so the pool stays consistent.
+//
+//   We deliberately bypass the durability-refund path in HandleSellItemOpcode:
+//   it only kicks in for equipped items with lost durability, which the
+//   shared-inventory UI doesn't surface anyway (only bag items).
+static void HandleSell(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const srcSlot = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+    if (!srcItemGuidLow) return;
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    QueryResult q = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, srcSlot);
+    if (!q) return;
+    uint32 const srcCharGuid = q->Fetch()[0].Get<uint32>();
+    Player* srcChar = ObjectAccessor::FindConnectedPlayer(
+        ObjectGuid::Create<HighGuid::Player>(srcCharGuid));
+    if (!srcChar) return;
+
+    Item* srcItem = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!srcItem) return;
+
+    ItemTemplate const* tmpl = srcItem->GetTemplate();
+    if (!tmpl) return;
+
+    if (srcItem->IsNotEmptyBag())
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Empty the bag before selling.");
+        return;
+    }
+    if (srcItem->IsEquipped())
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Unequip the item before selling.");
+        return;
+    }
+    if (tmpl->SellPrice == 0)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r |cffffffff{}|r has no sell value.", tmpl->Name1);
+        return;
+    }
+
+    uint32 const count = srcItem->GetCount();
+    uint32 const money = tmpl->SellPrice * count;
+    std::string const soldName = tmpl->Name1;
+
+    srcChar->DestroyItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+    requester->ModifyMoney(int32(money));
+
+    ChatHandler(requester->GetSession()).PSendSysMessage(
+        "|cff66ccff[WowPsParty]|r Sold |cffffffff{}|r for |cffffd100{}.{}.{}|r.",
+        soldName,
+        money / 10000, (money / 100) % 100, money % 100);
+
+    WowPsParty::SendInventoryTo(requester);
+}
+
+// SAVE_BAR\t<slot>\t<spellId1,spellId2,...> — persists the addon's local bar
+// layout for that party slot to party_loadout.action_bar_csv.
+static void HandleSaveBar(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 slot = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    std::string csv(payload.substr(tab + 1));
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    QueryResult q = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, slot);
+    if (!q) return;
+    uint32 const guid = q->Fetch()[0].Get<uint32>();
+
+    CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+    tx->Append(
+        "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
+        "`gear_lock_json`, `priority_actions_json`, `action_bar_csv`) "
+        "VALUES ({}, '', '', '', '', '', '{}') "
+        "ON DUPLICATE KEY UPDATE `action_bar_csv` = VALUES(`action_bar_csv`)",
+        guid, csv);
+    CharacterDatabase.CommitTransaction(tx);
+}
+
+// MOVE\t<srcPartySlot>\t<srcItemGuidLow>\t<destPartySlot>
+//   Move an item from src char's bag into dest char's bags (free slot). Uses
+//   the same Item-preserving path as EQUIP; doesn't equip on arrival. For
+//   in-character rearrangement srcPartySlot == destPartySlot is supported.
+static void HandleMove(Player* requester, std::string_view payload)
+{
+    auto p1 = payload.find('\t');
+    if (p1 == std::string_view::npos) return;
+    auto p2 = payload.find('\t', p1 + 1);
+    if (p2 == std::string_view::npos) return;
+    uint32 const srcSlot = std::strtoul(std::string(payload.substr(0, p1)).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(p1 + 1, p2 - p1 - 1)).c_str(), nullptr, 10);
+    uint32 const dstSlot = std::strtoul(std::string(payload.substr(p2 + 1)).c_str(), nullptr, 10);
+    if (!srcItemGuidLow) return;
+    if (!requester || !requester->GetSession()) return;
+    uint32 const account = requester->GetSession()->GetAccountId();
+
+    QueryResult qs = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, srcSlot);
+    if (!qs) return;
+    QueryResult qd = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, dstSlot);
+    if (!qd) return;
+
+    Player* srcChar = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(qs->Fetch()[0].Get<uint32>()));
+    Player* dstChar = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(qd->Fetch()[0].Get<uint32>()));
+    if (!srcChar || !dstChar) return;
+
+    Item* item = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!item) return;
+
+    if (srcChar == dstChar)
+    {
+        // Same-char rearrange: find best free slot in own bags.
+        ItemPosCountVec pos;
+        if (srcChar->CanStoreItem(NULL_BAG, NULL_SLOT, pos, item, true /*swap*/) != EQUIP_ERR_OK)
+            return;
+        srcChar->RemoveItem(item->GetBagSlot(), item->GetSlot(), true);
+        srcChar->StoreItem(pos, item, true);
+    }
+    else
+    {
+        srcChar->MoveItemFromInventory(item->GetBagSlot(), item->GetSlot(), true);
+        item->SetOwnerGUID(dstChar->GetGUID());
+        CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+        item->SaveToDB(tx);
+        CharacterDatabase.CommitTransaction(tx);
+        ItemPosCountVec pos;
+        if (dstChar->CanStoreItem(NULL_BAG, NULL_SLOT, pos, item, false) == EQUIP_ERR_OK)
+            dstChar->MoveItemToInventory(pos, item, true);
+        else
+        {
+            // bounce back
+            item->SetOwnerGUID(srcChar->GetGUID());
+            ItemPosCountVec backPos;
+            if (srcChar->CanStoreItem(NULL_BAG, NULL_SLOT, backPos, item, false) == EQUIP_ERR_OK)
+                srcChar->MoveItemToInventory(backPos, item, true);
+            CharacterDatabaseTransaction tx2 = CharacterDatabase.BeginTransaction();
+            item->SaveToDB(tx2);
+            CharacterDatabase.CommitTransaction(tx2);
+        }
+    }
+
+    WowPsParty::SendInventoryTo(requester);
+}
+
+// GOTO_DELTA\t<dWorldX>\t<dWorldY>   — instant teleport. The addon
+// computes a world-space (X, Y) delta from a right-click on the world map
+// relative to the player's mapped position. We just `TeleportTo` the
+// session player there; PartyFollow's catch-up teleport drags the bots
+// onto the new map/coords within ~1 second on the next tick.
+//
+// The old "scout walks ahead, bots fight along the way" implementation
+// was great for in-zone travel through hostile territory, but Kevin
+// wants this to be a fast-travel tool for recording dungeon paths and
+// hopping between zones — so instant TP is the right answer.
+static void HandleGotoDelta(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    float const dx = std::strtof(std::string(payload.substr(0, tab)).c_str(), nullptr);
+    float const dy = std::strtof(std::string(payload.substr(tab + 1)).c_str(), nullptr);
+
+    float const targetX = requester->GetPositionX() + dx;
+    float const targetY = requester->GetPositionY() + dy;
+    float targetZ = requester->GetMap()->GetHeight(
+        requester->GetPhaseMask(), targetX, targetY, MAX_HEIGHT);
+    if (targetZ <= INVALID_HEIGHT)
+        targetZ = requester->GetPositionZ();
+    requester->UpdateAllowedPositionZ(targetX, targetY, targetZ);
+
+    LOG_INFO("module",
+        "[WowPsParty] GOTO_DELTA from guid={} TELEPORT -> ({:.1f},{:.1f},{:.1f})",
+        requester->GetGUID().GetCounter(), targetX, targetY, targetZ);
+
+    // NearTeleportTo is the "warp instantly within the same map" path. It
+    // bypasses the pre-checks in TeleportTo (combat, in-flight, recent
+    // death, taxi, transport) that were silently dropping the request.
+    requester->NearTeleportTo(targetX, targetY, targetZ,
+                              requester->GetOrientation());
+
+    ChatHandler(requester->GetSession()).PSendSysMessage(
+        "|cff66ccff[WowPsParty]|r Teleported to ({:.0f}, {:.0f}). Party will follow on next tick.",
+        targetX, targetY);
+}
+
+// PET_BAR_SET\t<slot 0-9>\t<spellId>
+// Assigns one of the controlled body's known spells to a pet-bar slot of the
+// possessed unit, then re-pushes SMSG_PET_SPELLS so Blizzard's pet bar
+// (BonusActionButton1-10) redraws with the new layout. This is the path the
+// addon takes when the user drags a spell from the custom Spellbook window
+// onto a pet-bar slot — Blizzard's native PickupSpell can't help because the
+// spell isn't in the requester's own spellbook, only the possessed body's.
+//
+// Slot constraints (from CharmInfo.h):
+//   0-2 = command buttons (attack/follow/stay) — refuse writes here
+//   3-6 = spell slots                          — accept
+//   7-9 = reaction buttons                     — refuse
+static void HandlePetBarSet(Player* requester, std::string_view payload)
+{
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos)
+    {
+        LOG_WARN("module", "[WowPsParty] PET_BAR_SET malformed payload (no tab)");
+        return;
+    }
+    int slot = std::atoi(std::string(payload.substr(0, tab)).c_str());
+    uint32 spellId = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+
+    LOG_INFO("module",
+        "[WowPsParty] PET_BAR_SET received from guid={} slot={} spell={}",
+        requester ? requester->GetGUID().GetCounter() : 0u,
+        slot, spellId);
+
+    // Possessing a Player: ALL 10 pet-bar slots (0-9) are usable for spells
+    // because the command/reaction slot semantics (attack/follow/stay /
+    // defensive/aggressive/passive) are pet-AI concepts that don't apply
+    // to a player driving another player's body. The user IS the AI.
+    // Original layout restriction (3-6 only) limited the user to 4 spells
+    // per char which is way too few.
+    if (slot < 0 || slot >= MAX_UNIT_ACTION_BAR_INDEX)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Pet-bar slot {} out of range (0-{}).",
+            slot, MAX_UNIT_ACTION_BAR_INDEX - 1);
+        LOG_INFO("module", "[WowPsParty] PET_BAR_SET refused: slot {} out of range", slot);
+        return;
+    }
+
+    Unit* charm = requester->GetCharm();
+    if (!charm)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Not possessing anyone — swap to a party member first.");
+        LOG_INFO("module", "[WowPsParty] PET_BAR_SET refused: no current charm on requester");
+        return;
+    }
+    Player* body = charm->ToPlayer();
+    if (!body)
+    {
+        LOG_WARN("module", "[WowPsParty] PET_BAR_SET refused: charm is not a Player");
+        return;
+    }
+    CharmInfo* ci = charm->GetCharmInfo();
+    if (!ci)
+    {
+        LOG_WARN("module", "[WowPsParty] PET_BAR_SET refused: charm has no CharmInfo");
+        return;
+    }
+
+    if (spellId != 0 && !body->HasActiveSpell(spellId))
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Spell {} isn't known by {}.",
+            spellId, body->GetName());
+        LOG_INFO("module",
+            "[WowPsParty] PET_BAR_SET refused: spell {} not known by body guid={}",
+            spellId, body->GetGUID().GetCounter());
+        return;
+    }
+
+    // ACT_DISABLED matches the state our patched InitPossessCreateSpells uses
+    // for spells (manual cast, no autocast).
+    ci->SetActionBar(uint8(slot), spellId, ACT_DISABLED);
+    requester->PossessSpellInitialize();
+
+    LOG_INFO("module",
+        "[WowPsParty] PET_BAR_SET applied: slot={} spell={} body={} -- "
+        "SMSG_PET_SPELLS re-sent",
+        slot, spellId, body->GetName());
+
+    ChatHandler(requester->GetSession()).PSendSysMessage(
+        "|cff66ccff[WowPsParty]|r Placed spell {} at slot {} on {}.",
+        spellId, slot, body->GetName());
+}
+
+namespace WowPsParty
+{
+    // Session-independent bootstrap. Pulls every unenrolled char on the
+    // account and inserts them into free party slots. Returns the count
+    // enrolled, and fills `messages` with human-readable lines describing
+    // each step (caller decides where to surface them — chat for player,
+    // log for SOAP/admin invocation).
+    //
+    // This is shared between the WPSP HandleBootstrapParty path (driven
+    // from an in-world session) and the .wowps_admin bootstrap command
+    // (driven from SOAP/console). Same logic, no duplication, so the
+    // test runner exercising it via SOAP exercises the same code path
+    // the addon button hits.
+    uint32 BootstrapPartyForAccount(uint32 account, std::vector<std::string>& messages)
+    {
+        QueryResult existing = CharacterDatabase.Query(
+            "SELECT `slot`, `guid` FROM `account_party` WHERE `account` = {} ORDER BY `slot`",
+            account);
+        std::vector<uint8> takenSlots;
+        if (existing)
+        {
+            do { takenSlots.push_back(existing->Fetch()[0].Get<uint8>()); }
+            while (existing->NextRow());
+        }
+        if (takenSlots.size() >= 5)
+        {
+            messages.emplace_back("Party is already full (5/5).");
+            return 0;
+        }
+
+        std::vector<uint8> freeSlots;
+        for (uint8 s = 0; s < 5; ++s)
+        {
+            bool taken = false;
+            for (uint8 t : takenSlots) if (t == s) { taken = true; break; }
+            if (!taken) freeSlots.push_back(s);
+        }
+
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT c.`guid`, c.`name` FROM `characters` c "
+            "LEFT JOIN `account_party` ap ON ap.`guid` = c.`guid` "
+            "WHERE c.`account` = {} AND ap.`guid` IS NULL "
+            "ORDER BY c.`guid` LIMIT 5", account);
+        if (!q)
+        {
+            messages.emplace_back("No unenrolled chars on this account.");
+            return 0;
+        }
+
+        uint32 enrolled = 0;
+        auto slotIt = freeSlots.begin();
+        do
+        {
+            if (slotIt == freeSlots.end()) break;
+            Field* f = q->Fetch();
+            uint32 const guid = f[0].Get<uint32>();
+            std::string const name = f[1].Get<std::string>();
+            uint8 const slot = *slotIt++;
+
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "INSERT INTO `account_party` (`account`, `slot`, `guid`, `is_active_on_login`) "
+                "VALUES ({}, {}, {}, {})",
+                account, slot, guid, (slot == 0 ? 1u : 0u));
+            tx->Append(
+                "UPDATE `characters` SET `party_slot` = {} WHERE `guid` = {}",
+                slot, guid);
+            CharacterDatabase.CommitTransaction(tx);
+
+            messages.emplace_back(Acore::StringFormat(
+                "Enrolled {} (guid={}) at slot {}.", name, guid, uint32(slot)));
+            ++enrolled;
+        } while (q->NextRow());
+
+        if (enrolled == 0)
+            messages.emplace_back("No new chars to enroll.");
+        else
+            messages.emplace_back(Acore::StringFormat(
+                "Bootstrapped {} char(s). Log out and back in to spawn the full party.", enrolled));
+
+        return enrolled;
+    }
+}
+
+static void HandleBootstrapParty(Player* requester)
+{
+    if (!requester || !requester->GetSession()) return;
+    uint32 const account = requester->GetSession()->GetAccountId();
+
+    std::vector<std::string> messages;
+    uint32 const enrolled = WowPsParty::BootstrapPartyForAccount(account, messages);
+    ChatHandler ch(requester->GetSession());
+    for (auto const& m : messages)
+        ch.PSendSysMessage("|cff66ccff[WowPsParty]|r {}", m);
+    if (enrolled > 0)
+        WowPsParty::SendRosterTo(requester);
+}
+
+// CAST\t<spellId>[\t<targetGuidLow>]
+// Casts spellId from the body the user is currently controlling (possess target,
+// or self). If targetGuidLow is omitted, uses the controlled body's victim, then
+// its selection, then casts on self for self-only spells.
+static void HandleCast(Player* requester, std::string_view payload)
+{
+    auto tab = payload.find('\t');
+    std::string spellStr(tab == std::string_view::npos ? payload : payload.substr(0, tab));
+    uint32 spellId = std::strtoul(spellStr.c_str(), nullptr, 10);
+    if (!spellId) return;
+
+    SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+    if (!info) return;
+
+    Player* caster = WowPsParty::ResolveControlledBody(requester);
+    if (!caster) return;
+
+    // The possessed body should know this spell. (We accept user input via
+    // addon protocol; defensive check.)
+    if (!caster->HasSpell(spellId))
+    {
+        if (WowPsParty::IsLogVerbose())
+            LOG_INFO("module", "[WowPsParty] CAST: guid={} doesn't know spell {}",
+                     caster->GetGUID().GetCounter(), spellId);
+        return;
+    }
+
+    Unit* target = nullptr;
+    if (tab != std::string_view::npos)
+    {
+        std::string tgtStr(payload.substr(tab + 1));
+        uint32 tgtLow = std::strtoul(tgtStr.c_str(), nullptr, 10);
+        if (tgtLow)
+            target = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(tgtLow));
+    }
+    if (!target)
+        target = caster->GetVictim();
+    if (!target)
+    {
+        ObjectGuid sel = caster->GetTarget();
+        if (sel)
+            target = ObjectAccessor::GetUnit(*caster, sel);
+    }
+    // For non-targeting spells / self-only, fall back to self.
+    if (!target)
+        target = caster;
+
+    caster->CastSpell(target, spellId, false);
+}
+
+class PartyAddonProtocolScript : public PlayerScript
+{
+public:
+    PartyAddonProtocolScript() : PlayerScript("PartyAddonProtocolScript", {
+        // PLAYERHOOK_ON_BEFORE_SEND_CHAT_MESSAGE is the hook that ACTUALLY
+        // fires OnPlayerBeforeSendChatMessage (see
+        // src/server/game/Scripting/ScriptDefines/PlayerScript.cpp:182).
+        // PLAYERHOOK_ON_CHAT is a different bit and was silently swallowing
+        // every WPSP client->server command for the entire life of the
+        // module (PET_BAR_SET, GOTO_DELTA, UNEQUIP, REQ_*, etc.). Login-
+        // time pushes still worked because those go via OnPlayerLogin.
+        PLAYERHOOK_ON_BEFORE_SEND_CHAT_MESSAGE,
+        PLAYERHOOK_ON_LOGIN
+    }) { }
+
+    void OnPlayerBeforeSendChatMessage(Player* player, uint32& type, uint32& lang, std::string& msg) override
+    {
+        if (!WowPsParty::IsEnabled() || !player) return;
+        if (lang != LANG_ADDON) return;
+        if (msg.compare(0, WPSP_PREFIX_LEN, "WPSP\t") != 0) return;
+
+        std::string_view body(msg.data() + WPSP_PREFIX_LEN, msg.size() - WPSP_PREFIX_LEN);
+        std::string_view command = body;
+        std::string_view payload;
+        if (auto tab = body.find('\t'); tab != std::string_view::npos)
+        {
+            command = body.substr(0, tab);
+            payload = body.substr(tab + 1);
+        }
+
+        // Unconditional inbound-message trace: every WPSP command, who sent
+        // it, and the payload length. Lets me see in Server.log exactly which
+        // commands reach the dispatcher versus which never arrive (i.e., the
+        // addon is broken on the send side).
+        LOG_INFO("module",
+            "[WowPsParty] WPSP RECV: from guid={} cmd='{}' payload_len={}",
+            player->GetGUID().GetCounter(),
+            std::string(command),
+            uint32(payload.size()));
+
+        if (command == "REQ_ROSTER")
+        {
+            WowPsParty::SendRosterTo(player);
+        }
+        else if (command == "REQ_SPELLBOOK")
+        {
+            uint32 slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            WowPsParty::SendSpellbookTo(player, slot);
+        }
+        else if (command == "REQ_BAR")
+        {
+            uint32 slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            WowPsParty::SendActionBarTo(player, slot);
+        }
+        else if (command == "SAVE_BAR")
+        {
+            HandleSaveBar(player, payload);
+        }
+        else if (command == "REQ_GEAR")
+        {
+            uint32 slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            WowPsParty::SendGearTo(player, slot);
+        }
+        else if (command == "REQ_INVENTORY")
+        {
+            WowPsParty::SendInventoryTo(player);
+        }
+        else if (command == "EQUIP")
+        {
+            HandleEquip(player, payload);
+        }
+        else if (command == "UNEQUIP")
+        {
+            HandleUnequip(player, payload);
+        }
+        else if (command == "MOVE")
+        {
+            HandleMove(player, payload);
+        }
+        else if (command == "SELL")
+        {
+            HandleSell(player, payload);
+        }
+        else if (command == "CAST")
+        {
+            HandleCast(player, payload);
+        }
+        else if (command == "GOTO_DELTA")
+        {
+            HandleGotoDelta(player, payload);
+        }
+        else if (command == "PET_BAR_SET")
+        {
+            HandlePetBarSet(player, payload);
+        }
+        else if (command == "BOOTSTRAP_PARTY")
+        {
+            HandleBootstrapParty(player);
+        }
+        else if (command == "REQ_QUEST_PROGRESS")
+        {
+            WowPsParty::SendQuestProgressTo(player);
+        }
+        else if (command == "RECORD_PATH_TOGGLE")
+        {
+            WowPsParty::TogglePathRecording(player);
+        }
+        else if (command == "RECORD_PATH_CLEAR")
+        {
+            if (player->GetMap() && player->GetMap()->IsDungeon())
+            {
+                uint32 const mapId = player->GetMapId();
+                WowPsParty::ClearPath(mapId);
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cff66ccff[WowPsParty]|r Cleared dungeon path for map {}.", mapId);
+            }
+            else
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cffff5555[WowPsParty]|r Stand inside a dungeon to clear its path.");
+            }
+        }
+        else if (command == "REQ_PATH_INFO")
+        {
+            uint32 const mapId = player->GetMapId();
+            uint32 const n = WowPsParty::GetPathWaypointCount(mapId);
+            std::ostringstream out;
+            out << "PATH_INFO\t" << mapId << '\t' << n;
+            SendWPSP(player, out.str());
+        }
+        else if (command == "SET_ROTATION")
+        {
+            // SET_ROTATION\t<slot>\t<dsl>
+            // Bypasses the .party setrotation chat command so the DSL's `|`
+            // delimiter doesn't collide with WoW chat colour codes (`|c`).
+            auto tab = payload.find('\t');
+            if (tab == std::string_view::npos) return;
+            uint32 const slot = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+            std::string const dsl(payload.substr(tab + 1));
+            if (slot >= WowPsParty::PARTY_SIZE) return;
+
+            uint32 const accountId = player->GetSession()->GetAccountId();
+            QueryResult q = CharacterDatabase.Query(
+                "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}",
+                accountId, slot);
+            if (!q) return;
+            uint32 const guid = q->Fetch()[0].Get<uint32>();
+
+            auto rules = WowPsParty::ParseRotationString(dsl);
+            std::string const stored = WowPsParty::SerialiseRotationRules(rules);
+
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
+                "`gear_lock_json`, `priority_actions_json`) VALUES ({}, '', '', '', '', '{}') "
+                "ON DUPLICATE KEY UPDATE `priority_actions_json` = VALUES(`priority_actions_json`)",
+                guid, stored);
+            CharacterDatabase.CommitTransaction(tx);
+
+            WowPsParty::RotationCacheSet(guid, rules);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Saved {} rule(s) on slot {}.",
+                uint32(rules.size()), slot);
+        }
+        else if (command == "MGMT_LIST")
+        {
+            // Reply with one record per character on the account:
+            //   <guid>:<name>:<race>:<class>:<level>:<slot|-1>:<role>;...
+            uint32 const accountId = player->GetSession()->GetAccountId();
+            QueryResult q = CharacterDatabase.Query(
+                "SELECT c.guid, c.name, c.race, c.class, c.level, "
+                "       COALESCE(ap.slot, 255) AS slot, "
+                "       COALESCE(ap.role, 'dps') AS role "
+                "FROM `characters` c "
+                "LEFT JOIN `account_party` ap ON ap.guid = c.guid AND ap.account = c.account "
+                "WHERE c.account = {} AND (c.deleteInfos_Account IS NULL OR c.deleteInfos_Account = 0) "
+                "ORDER BY COALESCE(ap.slot, 255), c.name",
+                accountId);
+
+            std::ostringstream out;
+            out << "MGMT_LIST\t";
+            bool first = true;
+            if (q)
+            {
+                do
+                {
+                    Field* f = q->Fetch();
+                    uint32 const g = f[0].Get<uint32>();
+                    std::string nm = f[1].Get<std::string>();
+                    uint32 const race = f[2].Get<uint8>();
+                    uint32 const cls  = f[3].Get<uint8>();
+                    uint32 const lvl  = f[4].Get<uint8>();
+                    uint8 const slot  = f[5].Get<uint8>();
+                    std::string role  = f[6].Get<std::string>();
+                    int const slotOut = (slot == 255) ? -1 : int(slot);
+
+                    if (!first) out << ';';
+                    first = false;
+                    out << g << ':' << nm << ':' << race << ':' << cls << ':'
+                        << lvl << ':' << slotOut << ':' << role;
+                } while (q->NextRow());
+            }
+            SendWPSP(player, out.str());
+        }
+        else if (command == "MGMT_ROLE")
+        {
+            // MGMT_ROLE\t<slot>\t<role>   role ∈ {tank, healer, dps}
+            auto tab = payload.find('\t');
+            if (tab == std::string_view::npos) return;
+            uint32 const slot = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+            std::string role(payload.substr(tab + 1));
+            if (role != "tank" && role != "healer" && role != "dps") return;
+            if (slot >= WowPsParty::PARTY_SIZE) return;
+
+            uint32 const accountId = player->GetSession()->GetAccountId();
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "UPDATE `account_party` SET `role` = '{}' WHERE `account` = {} AND `slot` = {}",
+                role, accountId, slot);
+            CharacterDatabase.CommitTransaction(tx);
+
+            // Re-install follow directives so the new role takes effect this tick.
+            WowPsParty::ClearFollowersForAccount(accountId);
+            WowPsParty::SetActiveFollowers(accountId, player->GetGUID());
+
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Slot {} role set to |cffffffff{}|r.", slot, role);
+        }
+        else if (command == "MGMT_KICK")
+        {
+            // MGMT_KICK\t<slot>
+            uint32 const slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            if (slot >= WowPsParty::PARTY_SIZE) return;
+            uint32 const accountId = player->GetSession()->GetAccountId();
+
+            QueryResult q = CharacterDatabase.Query(
+                "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}",
+                accountId, slot);
+            if (!q)
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cffff5555[WowPsParty]|r Slot {} is already empty.", slot);
+                return;
+            }
+            uint32 const kickedGuid = q->Fetch()[0].Get<uint32>();
+            if (kickedGuid == player->GetGUID().GetCounter())
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cffff5555[WowPsParty]|r You can't kick the character you're playing — "
+                    "log in as a different one first.");
+                return;
+            }
+
+            // If the kicked char is currently spawned as a bot, log it out.
+            Player* botPlayer = ObjectAccessor::FindConnectedPlayer(
+                ObjectGuid::Create<HighGuid::Player>(kickedGuid));
+            if (botPlayer && sPlayerbotsMgr.GetPlayerbotAI(botPlayer))
+            {
+                if (PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(player))
+                    mgr->LogoutPlayerBot(botPlayer->GetGUID());
+            }
+
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append("DELETE FROM `account_party` WHERE `account` = {} AND `slot` = {}",
+                       accountId, slot);
+            tx->Append("UPDATE `characters` SET `party_slot` = NULL WHERE `guid` = {}", kickedGuid);
+            CharacterDatabase.CommitTransaction(tx);
+
+            WowPsParty::ClearFollowersForAccount(accountId);
+            WowPsParty::SetActiveFollowers(accountId, player->GetGUID());
+
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Kicked slot {} from the party.", slot);
+        }
+        else if (command == "MGMT_INVITE")
+        {
+            // MGMT_INVITE\t<guid>
+            uint32 const targetGuid = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            if (!targetGuid) return;
+            uint32 const accountId = player->GetSession()->GetAccountId();
+
+            // Resolve the name for the enroll API.
+            QueryResult q = CharacterDatabase.Query(
+                "SELECT `name`, `account` FROM `characters` WHERE `guid` = {}", targetGuid);
+            if (!q)
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cffff5555[WowPsParty]|r Character not found.");
+                return;
+            }
+            std::string const name = q->Fetch()[0].Get<std::string>();
+            uint32 const charAccount = q->Fetch()[1].Get<uint32>();
+            if (charAccount != accountId)
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cffff5555[WowPsParty]|r That character isn't on your account.");
+                return;
+            }
+
+            auto result = sPartyMgr.Enroll(player, targetGuid, name);
+            switch (result)
+            {
+                case WowPsParty::EnrollResult::Ok:
+                {
+                    // Immediate spawn if we have room and the active player
+                    // is online.
+                    if (PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(player))
+                    {
+                        mgr->AddPlayerBot(
+                            ObjectGuid::Create<HighGuid::Player>(targetGuid), accountId);
+                    }
+                    WowPsParty::ClearFollowersForAccount(accountId);
+                    WowPsParty::SetActiveFollowers(accountId, player->GetGUID());
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cff66ccff[WowPsParty]|r Invited |cffffffff{}|r to the party.", name);
+                    break;
+                }
+                case WowPsParty::EnrollResult::AlreadyEnrolled:
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cffff5555[WowPsParty]|r |cffffffff{}|r is already in the party.", name);
+                    break;
+                case WowPsParty::EnrollResult::PartyFull:
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cffff5555[WowPsParty]|r Party is full (5/5). Kick someone first.");
+                    break;
+                default:
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cffff5555[WowPsParty]|r Couldn't invite |cffffffff{}|r.", name);
+                    break;
+            }
+        }
+        else if (command == "CLEAR_ROTATION")
+        {
+            uint32 const slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            if (slot >= WowPsParty::PARTY_SIZE) return;
+            uint32 const accountId = player->GetSession()->GetAccountId();
+            QueryResult q = CharacterDatabase.Query(
+                "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}",
+                accountId, slot);
+            if (!q) return;
+            uint32 const guid = q->Fetch()[0].Get<uint32>();
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "UPDATE `party_loadout` SET `priority_actions_json` = '' WHERE `guid` = {}", guid);
+            CharacterDatabase.CommitTransaction(tx);
+            WowPsParty::RotationCacheClear(guid);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Cleared rotation for slot {}.", slot);
+        }
+        else if (command == "PING")
+        {
+            WorldPacket data;
+            ChatHandler::BuildChatPacket(data, CHAT_MSG_WHISPER, LANG_ADDON,
+                                         player->GetGUID(), player->GetGUID(),
+                                         std::string("WPSP\tPONG"), /*chatTag=*/0);
+            player->GetSession()->SendPacket(&data);
+        }
+        else
+        {
+            if (WowPsParty::IsLogVerbose())
+                LOG_INFO("module", "[WowPsParty] unhandled WPSP command='{}' from guid={}",
+                         std::string(command), player->GetGUID().GetCounter());
+        }
+
+        // Swallow the message — don't broadcast / echo as chat.
+        msg.clear();
+        type = CHAT_MSG_SYSTEM;  // safe no-op type
+    }
+
+    void OnPlayerLogin(Player* player) override
+    {
+        if (!WowPsParty::IsEnabled() || !player) return;
+        // Defer the initial ROSTER push so the client's addon has a chance to
+        // register its CHAT_MSG_ADDON handler. The addon's PLAYER_ENTERING_WORLD
+        // also requests REQ_ROSTER ~3s after login as a belt-and-braces.
+        ObjectGuid const guid = player->GetGUID();
+        player->m_Events.AddEventAtOffset([guid]()
+        {
+            if (Player* alive = ObjectAccessor::FindConnectedPlayer(guid))
+                WowPsParty::SendRosterTo(alive);
+        }, std::chrono::seconds(4));
+    }
+};
+
+void AddPartyAddonProtocolScripts()
+{
+    new PartyAddonProtocolScript();
+}

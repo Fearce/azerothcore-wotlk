@@ -92,7 +92,38 @@ void CharmInfo::InitPossessCreateSpells()
         }
     }
     else
+    {
         InitEmptyActionBar();
+
+        // [WowPsParty PATCH] Populate ALL 10 pet bar slots (0..9) with the
+        // possessed Player's spells. The default WoW layout reserves 0-2 for
+        // pet-AI commands and 7-9 for reactions, but for player-on-player
+        // possess those are meaningless — the controller IS the AI. So we
+        // use every slot for a spell. PartyAddonProtocol's HandlePetBarSet
+        // now accepts 0-9 too.
+        if (Player* p = _unit->ToPlayer())
+        {
+            uint32 slot = 0;
+            for (auto const& kv : p->GetSpellMap())
+            {
+                if (slot >= MAX_UNIT_ACTION_BAR_INDEX)  // 10
+                    break;
+                if (kv.second->State == PLAYERSPELL_REMOVED)
+                    continue;
+                SpellInfo const* info = sSpellMgr->GetSpellInfo(kv.first);
+                if (!info)
+                    continue;
+                if (info->IsPassive())
+                    continue;
+                if (info->HasAttribute(SPELL_ATTR0_IS_TRADESKILL))
+                    continue;
+                if (info->HasAttribute(SPELL_ATTR0_DO_NOT_DISPLAY))
+                    continue;
+                if (AddSpellToActionBar(info, ACT_DISABLED, slot))
+                    ++slot;
+            }
+        }
+    }
 }
 
 void CharmInfo::InitCharmCreateSpells()

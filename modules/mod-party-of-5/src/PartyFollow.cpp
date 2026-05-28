@@ -1,0 +1,754 @@
+/*
+ * WowPs Party-of-5 — Dedicated follow system implementation
+ *
+ * See PartyFollow.h for rationale.
+ *
+ * Implementation notes:
+ *   - Registry is a flat vector<Directive>. We expect ~5 entries per
+ *     account, total max maybe 50 in a real session. Linear scan is fine.
+ *   - Tick accumulator pattern: we don't need an exact 1Hz; "approximately
+ *     once per second" is the contract. WorldHook::OnUpdate fires every
+ *     world tick (~50ms-ish in AC); we accumulate diff and fire when over
+ *     threshold.
+ *   - MoveFollow is idempotent when the bot is already following the same
+ *     target with same dist/angle. AC's MoveSplineInit caches the spline
+ *     state and won't generate redundant packets unless the destination
+ *     actually changed. So re-asserting every second is cheap.
+ *   - Skip conditions per follower:
+ *       * not in world  -> skip (transient logout/teleport)
+ *       * different map  -> skip (cross-map MoveFollow is broken)
+ *       * in combat      -> skip (combat AI runs MoveChase; don't fight it)
+ *       * has charm      -> skip (mid-possess controller; charm is fragile)
+ *       * is charmed     -> skip (controlled-by-someone; can't drive)
+ *       * leader missing -> skip the entry; don't auto-clear (leader may
+ *                          just be momentarily offline mid-loading-screen)
+ */
+#include "PartyFollow.h"
+#include "PartyMgr.h"
+#include "PartyPath.h"
+
+#include "Log.h"
+#include "MotionMaster.h"
+#include "ObjectAccessor.h"
+#include "Pet.h"
+#include "Player.h"
+#include "ScriptMgr.h"
+
+#include "PlayerbotAI.h"
+#include "PlayerbotMgr.h"
+#include "RandomPlayerbotMgr.h"
+
+#include "WorldSession.h"
+#include "WorldSessionMgr.h"
+#include "WorldPacket.h"
+#include "Opcodes.h"
+
+#include <atomic>
+#include <functional>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace WowPsParty
+{
+    namespace
+    {
+        struct Directive
+        {
+            uint32      account;       // for SetActiveFollowers clearing
+            ObjectGuid  followerGuid;
+            ObjectGuid  leaderGuid;
+            uint8       slot   = 0;    // 0..4 within the owning account's party
+            std::string role   = "dps"; // tank / healer / dps
+        };
+
+        // Which slot in the directive list belongs to the "leading tank" for
+        // dungeon formations. Computed in SetActiveFollowers; -1 means none
+        // (no tank enrolled, or active player IS the tank).
+        struct AccountFormation
+        {
+            int tankSlot = -1;  // slot whose member is the dungeon-front tank
+        };
+        static std::unordered_map<uint32, AccountFormation> g_formations;
+
+        // followerGuidLow -> absolute getMSTime() at which the hold expires.
+        // Used by AssistTarget / PartyFollow to skip motion changes while a
+        // bot is intentionally stationary (drinking, holding for healer, etc).
+        static std::unordered_map<uint32, uint32> g_holdUntilMs;
+
+        struct PendingRelogin
+        {
+            uint32     account;
+            ObjectGuid targetGuid;
+        };
+
+        static std::mutex                g_mutex;
+        static std::vector<Directive>    g_directives;
+        static std::vector<PendingRelogin> g_pendingRelogins;
+        static std::atomic<bool>         g_tickerInstalled{false};
+        static constexpr uint32          TICK_INTERVAL_MS = 1000;
+
+        // Per-account quick erase by account id.
+        void EraseByAccount_NoLock(uint32 account)
+        {
+            g_directives.erase(
+                std::remove_if(g_directives.begin(), g_directives.end(),
+                    [account](Directive const& d) { return d.account == account; }),
+                g_directives.end());
+        }
+    } // namespace
+
+    void SetActiveFollowers(uint32 account, ObjectGuid leaderGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        EraseByAccount_NoLock(account);
+        g_formations.erase(account);
+
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `guid`, `slot`, COALESCE(`role`, 'dps') FROM `account_party` "
+            "WHERE `account` = {}", account);
+        if (!q) return;
+        uint32 added = 0;
+        int firstTankSlot = -1;
+        do
+        {
+            Field* f = q->Fetch();
+            uint32 const memberGuidLow = f[0].Get<uint32>();
+            uint8 const  memberSlot    = f[1].Get<uint8>();
+            std::string  memberRole    = f[2].Get<std::string>();
+            ObjectGuid const memberGuid = ObjectGuid::Create<HighGuid::Player>(memberGuidLow);
+            if (memberGuid == leaderGuid) continue;
+
+            Directive d;
+            d.account = account;
+            d.followerGuid = memberGuid;
+            d.leaderGuid = leaderGuid;
+            d.slot = memberSlot;
+            d.role = std::move(memberRole);
+            if (d.role == "tank" && firstTankSlot < 0)
+                firstTankSlot = int(memberSlot);
+            g_directives.push_back(std::move(d));
+            ++added;
+
+            // Disable mod-playerbots' own follow strategy on this bot so it
+            // doesn't fight our ticker. Their FollowAction reads stale
+            // GroupLeaderValue cache and was pulling bots back to the
+            // original session player every AI tick -- visible as bots
+            // oscillating between old leader and new leader. Combat strategies
+            // (MoveChase etc.) are unaffected.
+            Player* p = ObjectAccessor::FindConnectedPlayer(memberGuid);
+            if (p)
+            {
+                if (PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(p))
+                {
+                    ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
+                }
+            }
+        } while (q->NextRow());
+
+        g_formations[account].tankSlot = firstTankSlot;
+
+        LOG_INFO("module",
+            "[WowPsParty Follow] SetActiveFollowers account={} leader_guid={} "
+            "followers_installed={} dungeon_tank_slot={}",
+            account, leaderGuid.GetCounter(), added, firstTankSlot);
+    }
+
+    bool BotHasActiveFollowDirective(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (auto const& d : g_directives)
+            if (d.followerGuid == guid) return true;
+        return false;
+    }
+
+    void HoldFollower(ObjectGuid followerGuid, uint32 durationMs)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_holdUntilMs[followerGuid.GetCounter()] = getMSTime() + durationMs;
+    }
+
+    bool IsFollowerHeld(ObjectGuid followerGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_holdUntilMs.find(followerGuid.GetCounter());
+        if (it == g_holdUntilMs.end()) return false;
+        if (getMSTime() >= it->second)
+        {
+            g_holdUntilMs.erase(it);
+            return false;
+        }
+        return true;
+    }
+
+    ObjectGuid GetLeaderFor(ObjectGuid followerGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (auto const& d : g_directives)
+            if (d.followerGuid == followerGuid) return d.leaderGuid;
+        return ObjectGuid::Empty;
+    }
+
+    // Throttled log helper — at most one line per bot per 4 seconds, per
+    // unique reason. Otherwise diagnostic logging here floods the file.
+    static void AssistLog(uint32 guidLow, char const* reason)
+    {
+        static thread_local std::unordered_map<uint64, uint32> lastMs;
+        uint64 key = (uint64(guidLow) << 32) ^ std::hash<std::string>{}(reason);
+        uint32 nowMs = getMSTime();
+        uint32& last = lastMs[key];
+        if (nowMs - last < 4000) return;
+        last = nowMs;
+        LOG_INFO("module", "[WowPsParty Assist] guid={} {}", guidLow, reason);
+    }
+
+    // Reads the assigned tank slot for an account from the formation cache.
+    // -1 if none. Caller must NOT hold g_mutex.
+    static int GetTankSlotForAccount(uint32 account)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_formations.find(account);
+        if (it == g_formations.end()) return -1;
+        return it->second.tankSlot;
+    }
+
+    // Reads a bot's party slot from the directive registry.
+    // -1 if the bot isn't tracked.
+    static int GetSlotForGuid(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (auto const& d : g_directives)
+            if (d.followerGuid == guid) return int(d.slot);
+        return -1;
+    }
+
+    void TankLeadEngagement(Player* bot)
+    {
+        if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
+        if (!bot->GetSession()) return;
+        if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) return;
+        if (bot->IsNonMeleeSpellCast(false, false, true)) return;
+        if (IsFollowerHeld(bot->GetGUID())) return;
+
+        // Is this the assigned tank?
+        uint32 const account = bot->GetSession()->GetAccountId();
+        int const tankSlot = GetTankSlotForAccount(account);
+        if (tankSlot < 0) return;
+        int const mySlot = GetSlotForGuid(bot->GetGUID());
+        if (mySlot != tankSlot) return;
+
+        ObjectGuid const leaderGuid = GetLeaderFor(bot->GetGUID());
+        if (!leaderGuid) return;
+        Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
+        if (!leader || !leader->IsInWorld()) return;
+        if (leader->GetMapId() != bot->GetMapId()) return;
+        if (!leader->GetMap() || !leader->GetMap()->IsDungeon()) return;
+
+        // 30-yard leash. If we've drifted out of leash, let PartyFollow's
+        // MoveFollow yank us back instead of chasing a far mob.
+        if (bot->GetDistance(leader) > 30.0f) return;
+
+        // Don't steal initiative from the user. If the leader's mid-fight
+        // (or even just targeting something), AssistTarget already syncs
+        // the tank's victim — we don't need to pick our own.
+        if (leader->GetVictim()) return;
+
+        // Already attacking something alive? leave it alone.
+        if (Unit* v = bot->GetVictim())
+            if (v->IsAlive()) return;
+
+        // Find the nearest hostile to the leader within 40y of them.
+        // SelectNearbyTarget(exclude, dist) returns the nearest unit that
+        // `this` considers a valid attack target — perfect for "what's
+        // about to fight us".
+        Unit* nearest = leader->SelectNearbyTarget(nullptr, 40.0f);
+        if (!nearest || !nearest->IsAlive()) return;
+        if (!bot->IsValidAttackTarget(nearest)) return;
+
+        bool const ok = bot->Attack(nearest, true);
+        bot->GetMotionMaster()->MoveChase(nearest);
+        bot->SetFacingToObject(nearest);
+        LOG_INFO("module", "[WowPsParty TankLead] guid={} PULL mob_guid={} entry={} ok={}",
+                 bot->GetGUID().GetCounter(), nearest->GetGUID().GetCounter(),
+                 nearest->GetEntry(), ok);
+    }
+
+    void AssistTarget(Player* bot)
+    {
+        if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
+        uint32 const gLow = bot->GetGUID().GetCounter();
+
+        // User-controlled body: never touch its target/motion.
+        if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) { AssistLog(gLow, "skip: possessed"); return; }
+        // Don't interrupt a cast in progress.
+        if (bot->IsNonMeleeSpellCast(false, false, true)) { AssistLog(gLow, "skip: casting"); return; }
+        // Rotation engine has parked this bot (drinking, etc).
+        if (IsFollowerHeld(bot->GetGUID())) { AssistLog(gLow, "skip: held by rotation"); return; }
+
+        ObjectGuid const leaderGuid = GetLeaderFor(bot->GetGUID());
+        if (!leaderGuid)
+        {
+            AssistLog(gLow, "skip: no leader directive (not a managed bot)");
+            return;
+        }
+
+        Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
+        if (!leader || !leader->IsInWorld()) { AssistLog(gLow, "skip: leader not in world"); return; }
+        if (leader->GetMapId() != bot->GetMapId()) { AssistLog(gLow, "skip: leader on different map"); return; }
+
+        // Target priority:
+        //   1. Leader's explicit victim (you click, everyone follows).
+        //   2. Whatever's currently swinging at the bot itself.
+        //   3. Whatever's swinging at any party member on the same map.
+        // Without #3 we got the "mage solos a mob while the whole party
+        // stands around" bug: only the leader's target made anything fire.
+        auto pickPartyDefenseTarget = [&]() -> Unit*
+        {
+            // self-defense
+            for (Unit* a : bot->getAttackers())
+                if (a && a->IsAlive() && bot->IsValidAttackTarget(a))
+                    return a;
+            // party-defense — walk the bot's group and pick any attacker
+            // hitting a member we share a map with.
+            if (Group* g = bot->GetGroup())
+            {
+                for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
+                {
+                    Player* m = itr->GetSource();
+                    if (!m || !m->IsInWorld() || m == bot) continue;
+                    if (m->GetMapId() != bot->GetMapId()) continue;
+                    for (Unit* a : m->getAttackers())
+                        if (a && a->IsAlive() && bot->IsValidAttackTarget(a))
+                            return a;
+                }
+            }
+            return nullptr;
+        };
+
+        Unit* leaderTarget = leader->GetVictim();
+        bool const leaderTargetValid = leaderTarget && leaderTarget->IsAlive()
+                                       && bot->IsValidAttackTarget(leaderTarget);
+        Unit* desired = leaderTargetValid ? leaderTarget : pickPartyDefenseTarget();
+
+        if (!desired)
+        {
+            // Nothing to fight anywhere — drop combat so PartyFollow can
+            // resume movement.
+            if (bot->GetVictim())
+            {
+                AssistLog(gLow, "no-targets: AttackStop");
+                bot->AttackStop();
+            }
+            return;
+        }
+
+        if (bot->GetVictim() != desired)
+        {
+            bool const ok = bot->Attack(desired, true);
+            // Caster classes hold at range so they don't run into melee and
+            // interrupt their own cast bars. Melee classes use the default
+            // (run-to-melee) MoveChase. Hunter is mana-using but ranged, so
+            // pick by class id, not by power type.
+            uint8 const cls = bot->getClass();
+            bool const isRangedCaster =
+                cls == CLASS_MAGE     || cls == CLASS_WARLOCK ||
+                cls == CLASS_PRIEST   || cls == CLASS_HUNTER  ||
+                cls == CLASS_SHAMAN   || cls == CLASS_DRUID;
+            if (isRangedCaster)
+                bot->GetMotionMaster()->MoveChase(desired, ChaseRange(15.0f, 25.0f));
+            else
+                bot->GetMotionMaster()->MoveChase(desired);
+            bot->SetFacingToObject(desired);
+            LOG_INFO("module", "[WowPsParty Assist] guid={} ENGAGE victim_guid={} attack_ok={} ranged={}",
+                     gLow, desired->GetGUID().GetCounter(), ok, isRangedCaster ? 1 : 0);
+        }
+        else
+        {
+            // Already on the right victim — but the bot may have drifted
+            // off-facing (e.g. MoveChase landed it sideways, or it was
+            // rotated by knockback). Re-face every tick so the next cast
+            // doesn't fail the "must face target" check.
+            if (!bot->HasInArc(float(M_PI), desired))
+                bot->SetFacingToObject(desired);
+        }
+    }
+
+    void QueueQuietRelogin(uint32 sessionAccount, ObjectGuid targetGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_pendingRelogins.push_back({sessionAccount, targetGuid});
+        LOG_INFO("module",
+            "[WowPsParty Follow] QueueQuietRelogin account={} target_guid={}",
+            sessionAccount, targetGuid.GetCounter());
+    }
+
+    namespace
+    {
+        // Quiet logout + login chain. Mirrors WorldSession::LogoutPlayer
+        // (Server/WorldSession.cpp:641) but SKIPS SendPacket(LogoutComplete)
+        // -- that's the packet that puts the client in char-select state
+        // and breaks the chain. Without it, client stays in world view; we
+        // then push HandlePlayerLoginOpcode which sends LOGIN_VERIFY_WORLD
+        // + initial state packets, client transitions via loading screen
+        // to the new char's world view.
+        void DoQuietRelogin(uint32 account, ObjectGuid targetGuid)
+        {
+            WorldSession* session = sWorldSessionMgr->FindSession(account);
+            if (!session)
+            {
+                LOG_WARN("module",
+                    "[WowPsParty QuietRelogin] no session for account={}", account);
+                return;
+            }
+            Player* current = session->GetPlayer();
+            if (!current)
+            {
+                LOG_WARN("module",
+                    "[WowPsParty QuietRelogin] session for account={} has no current player",
+                    account);
+                return;
+            }
+            if (current->GetGUID() == targetGuid)
+            {
+                LOG_INFO("module",
+                    "[WowPsParty QuietRelogin] already on target guid={}, no-op",
+                    targetGuid.GetCounter());
+                return;
+            }
+
+            // First, if the target is currently in world as a bot, log it
+            // out so the upcoming HandlePlayerLoginOpcode can load it fresh.
+            if (Player* targetBot = ObjectAccessor::FindConnectedPlayer(targetGuid))
+            {
+                if (sPlayerbotsMgr.GetPlayerbotAI(targetBot))
+                {
+                    LOG_INFO("module",
+                        "[WowPsParty QuietRelogin] logging out target bot guid={}",
+                        targetGuid.GetCounter());
+                    sRandomPlayerbotMgr.LogoutPlayerBot(targetGuid);
+                }
+            }
+
+            LOG_INFO("module",
+                "[WowPsParty QuietRelogin] quiet-logging current guid={} name={}",
+                current->GetGUID().GetCounter(), current->GetName());
+
+            // Mimic LogoutPlayer's body, sans the SMSG_LOGOUT_COMPLETE.
+            // Save state first.
+            current->SaveToDB(false, true);
+
+            // Cleanup before removal
+            current->CleanupChannels();
+            if (Group* g = current->GetGroup())
+                g->SendUpdate();
+
+            // Remove from map
+            current->CleanupsBeforeDelete();
+            if (Map* m = current->FindMap())
+            {
+                m->RemovePlayerFromMap(current, true);
+                m->AfterPlayerUnlinkFromMap();
+            }
+
+            // Detach session from current player. Note: SetPlayer(nullptr)
+            // deletes the previous pointer if SaveToDB succeeded.
+            session->SetPlayer(nullptr);
+
+            LOG_INFO("module",
+                "[WowPsParty QuietRelogin] triggering login for target guid={}",
+                targetGuid.GetCounter());
+
+            // Build CMSG_PLAYER_LOGIN packet and dispatch via the normal
+            // handler. The handler reads ObjectGuid via operator>>, loads
+            // the player from DB, sends LOGIN_VERIFY_WORLD + initial state
+            // to the client. Client should transition via loading screen.
+            WorldPacket pkt(CMSG_PLAYER_LOGIN, 8);
+            pkt << uint64(targetGuid.GetRawValue());
+            session->HandlePlayerLoginOpcode(pkt);
+        }
+    } // namespace
+
+    void ClearFollowersForAccount(uint32 account)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        EraseByAccount_NoLock(account);
+        LOG_INFO("module", "[WowPsParty Follow] Cleared directives for account={}", account);
+    }
+
+    namespace
+    {
+        // Apply a single directive: install MoveFollow if safe.
+        // Returns true if the directive should be kept, false to mark
+        // for removal (leader gone, etc.).
+        bool ApplyDirective(Directive const& d)
+        {
+            Player* follower = ObjectAccessor::FindConnectedPlayer(d.followerGuid);
+            Player* leader   = ObjectAccessor::FindConnectedPlayer(d.leaderGuid);
+            if (!follower || !leader) return true;
+            if (!follower->IsInWorld() || !leader->IsInWorld()) return true;
+            if (follower == leader) return true;
+
+            // Cross-map: leader has entered a dungeon (or any other instance)
+            // and the follower is still on the old map. Yank the follower
+            // through with TeleportTo. Skip while the follower is mid-cast or
+            // currently being teleported themselves; we'll retry next tick.
+            if (follower->GetMapId() != leader->GetMapId())
+            {
+                if (follower->IsBeingTeleported()) return true;
+                if (follower->IsNonMeleeSpellCast(false, false, true)) return true;
+                follower->TeleportTo(
+                    leader->GetMapId(),
+                    leader->GetPositionX(), leader->GetPositionY(),
+                    leader->GetPositionZ(), leader->GetOrientation());
+                LOG_INFO("module",
+                    "[WowPsParty Follow] cross-map teleport: {} -> map={} (chasing {})",
+                    follower->GetName(), leader->GetMapId(), leader->GetName());
+                return true;
+            }
+
+            // Persistently disable mod-playerbots' follow strategy on each
+            // tick. UpdateAIGroupMaster (called from PlayerbotAI::UpdateAI
+            // during combat) re-enables "+follow" via FindNewMaster, so a
+            // one-shot disable from SetActiveFollowers gets undone after
+            // any fight. Re-disabling on every tick is idempotent if already
+            // off. Done BEFORE the combat/cast early-returns so it persists
+            // even when we skip the actual MoveFollow install.
+            if (PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(follower))
+                ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
+
+            if (follower->IsInCombat()) return true;
+            if (follower->IsCharmed())  return true;
+
+            // Rotation engine has asked us to leave this bot stationary.
+            // Active hold = drinking, holding-for-healer-mana, etc.
+            if (IsFollowerHeld(d.followerGuid)) return true;
+            // DON'T skip if follower->GetCharm() -- the session player
+            // (Kevtank) IS the controller during a swap, has a charm, but
+            // we WANT his body to walk toward the new controlled body.
+            // Earlier "MotionMaster destabilises charm" theory turned out
+            // to be the mod-playerbots AI interaction, not MoveFollow per
+            // se. Now that PartyMgr.cpp doesn't poke the AI on swap, this
+            // is safe.
+
+            // Skip if mid-cast. Re-asserting MoveFollow interrupts spells
+            // (UNIT_STATE_CASTING gets cleared by movegen change). Wait
+            // until cast finishes, then re-assert on the next tick.
+            if (follower->IsNonMeleeSpellCast(false, false, true))
+                return true;
+
+            // (We used to skip re-asserting when the follower was within
+            // PET_FOLLOW_DIST + 1.5y of the leader to save packets. That
+            // broke role-aware positioning: a tank starting stacked on the
+            // leader needs to be REPOSITIONED 12y ahead, even when dist is
+            // small. We always re-assert now; MoveSpline caches the spline
+            // state so identical re-asserts produce no extra packets.)
+            float const dist = follower->GetDistance(leader);
+
+            // Catch-up teleport: MoveFollow can't reliably path through
+            // doorways, building interiors, or across complex terrain. We
+            // use two conditions:
+            //   (a) distance > 50y → always teleport.
+            //   (b) bot has been at the *same* distance > 8y for 3+
+            //       consecutive ticks → it's stuck; teleport.
+            // Tracker is keyed by follower guid.
+            uint32 const guidLow = d.followerGuid.GetCounter();
+            static thread_local std::unordered_map<uint32, std::pair<float, uint32>> stuckTracker;
+            auto& tracked = stuckTracker[guidLow];
+            bool const sameAsLast = std::fabs(tracked.first - dist) < 0.5f;
+            if (sameAsLast)
+                tracked.second++;
+            else
+            {
+                tracked.first  = dist;
+                tracked.second = 0;
+            }
+            bool const farAway     = dist > 50.0f;
+            bool const stuckClose  = dist > 8.0f && tracked.second >= 3;
+            if (farAway || stuckClose)
+            {
+                if (follower->IsBeingTeleported())  return true;
+                if (follower->IsNonMeleeSpellCast(false, false, true)) return true;
+                follower->TeleportTo(
+                    leader->GetMapId(),
+                    leader->GetPositionX(), leader->GetPositionY(),
+                    leader->GetPositionZ(), leader->GetOrientation());
+                LOG_INFO("module",
+                    "[WowPsParty Follow] catch-up teleport: {} dist={:.1f} stuck_ticks={}",
+                    follower->GetName(), dist, tracked.second);
+                tracked = {0.0f, 0};
+                return true;
+            }
+
+            // CHARMER skipped entirely. Earlier attempts (MoveFollow, then
+            // NearTeleportTo) both triggered AC paths that cleared
+            // UNIT_FLAG_POSSESSED on the controlled body, breaking possess
+            // and letting the AI take over (confirmed in user testing
+            // 2026-05-28). Tank/vacated body stays put during possess --
+            // user manually walks back or swaps to tank to retrieve him.
+            // Trade UX nicety for charm stability; charm stability is the
+            // critical requirement.
+            if (follower->GetCharm()) return true;
+
+            // Spread followers around the leader so they don't stack on a
+            // single point. Layout depends on context:
+            //
+            //   Open-world: all followers fan out BEHIND the leader, on
+            //     four fixed bearings — slot 1 rear-right, slot 2 rear-
+            //     left, slot 3 directly behind, slot 4 right flank.
+            //   Dungeon + a designated tank: the tank takes a lead
+            //     position 12y AHEAD of the leader (angle PI). The other
+            //     followers still fan out behind. MoveFollow's leash keeps
+            //     the tank from running off — they only re-position once
+            //     the leader walks, so if the user pauses the tank pauses.
+            static constexpr float SLOT_ANGLES[5] = {
+                0.0f,                // unused; slot 0 is the leader
+                float(M_PI) / 4.0f,
+                3.0f * float(M_PI) / 4.0f,
+                0.0f,
+                float(M_PI) / 2.0f,
+            };
+
+            bool const inDungeon = leader->GetMap() && leader->GetMap()->IsDungeon();
+            int tankSlot = -1;
+            {
+                auto it = g_formations.find(d.account);
+                if (it != g_formations.end()) tankSlot = it->second.tankSlot;
+            }
+            bool const isLeadTank = inDungeon && tankSlot >= 0 && int(d.slot) == tankSlot;
+
+            float angle = follower->GetFollowAngle();
+            float followDist = PET_FOLLOW_DIST;
+            if (isLeadTank)
+            {
+                // If the dungeon has a recorded path, the path-follow
+                // ticker drives the tank's motion. Skip MoveFollow so the
+                // two systems don't fight each other on every tick.
+                if (WowPsParty::GetPathWaypointCount(leader->GetMapId()) >= 2)
+                    return true;
+                angle = float(M_PI);   // directly in front of the leader
+                followDist = 12.0f;    // walk a body-length ahead
+            }
+            else if (d.slot < 5)
+            {
+                angle = SLOT_ANGLES[d.slot];
+            }
+
+            // If the bot was sitting (post-drink), stand up before moving
+            // so the spline doesn't fight the seated stand-state.
+            if (follower->getStandState() != UNIT_STAND_STATE_STAND)
+                follower->SetStandState(UNIT_STAND_STATE_STAND);
+
+            follower->GetMotionMaster()->Clear();
+            follower->GetMotionMaster()->MoveFollow(
+                leader, followDist, angle);
+
+            static thread_local std::unordered_map<uint32, uint32> lastLogMs;
+            uint32 nowMs = getMSTime();
+            uint32& last = lastLogMs[d.followerGuid.GetCounter()];
+            if (nowMs - last > 10000)
+            {
+                last = nowMs;
+                LOG_INFO("module",
+                    "[WowPsParty Follow] tick: {} -> MoveFollow {} dist={:.1f}",
+                    follower->GetName(), leader->GetName(), dist);
+            }
+            return true;
+        }
+
+    } // anonymous namespace
+
+    // WorldScript OnUpdate hook -- ticks ~every 1s, applies all directives.
+    // File-scope class (not in anon ns) so AddPartyFollowScripts can `new` it.
+    class PartyFollowWorldScript : public WorldScript
+    {
+    public:
+        PartyFollowWorldScript() : WorldScript("PartyFollowWorldScript", {
+            WORLDHOOK_ON_UPDATE
+        }) { }
+
+        void OnUpdate(uint32 diff) override
+        {
+            // Always tick path-recording even if no directives exist —
+            // recording happens before the user has assigned tanks/healers.
+            WowPsParty::TickPathRecording(diff);
+
+            // First: drain any pending relogins. These need to run on a
+            // world-thread tick, not from inside the chat-command call
+            // stack. They process at most one per tick to avoid swamping
+            // the server with concurrent loads.
+            {
+                PendingRelogin pending{};
+                bool havePending = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    if (!g_pendingRelogins.empty())
+                    {
+                        pending = g_pendingRelogins.front();
+                        g_pendingRelogins.erase(g_pendingRelogins.begin());
+                        havePending = true;
+                    }
+                }
+                if (havePending)
+                    DoQuietRelogin(pending.account, pending.targetGuid);
+            }
+
+            _accum += diff;
+            if (_accum < TICK_INTERVAL_MS) return;
+            _accum = 0;
+
+            std::vector<Directive> snapshot;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                snapshot = g_directives;
+            }
+
+            for (auto const& d : snapshot)
+                (void)ApplyDirective(d);
+        }
+
+    private:
+        uint32 _accum = 0;
+    };
+
+    void InstallFollowTicker()
+    {
+        // No-op now: registration moved to AddPartyFollowScripts() called from
+        // the module loader at server startup (proper AC script-init point).
+        // Kept as a stable public no-op so callers don't need to be removed.
+    }
+}
+
+// Module-loader entry point; called from party_of_5_loader.cpp at startup.
+void AddPartyFollowScripts()
+{
+    new WowPsParty::PartyFollowWorldScript();
+    LOG_INFO("module", "[WowPsParty Follow] ticker registered (interval=1000ms)");
+}
+
+// Trampoline for the patched mod-playerbots UpdateAI. Lets us avoid an
+// include cycle between the two modules.
+bool WowPsParty_BotHasActiveFollowDirective_Trampoline(ObjectGuid guid)
+{
+    return WowPsParty::BotHasActiveFollowDirective(guid);
+}
+
+// Trampoline for the patched mod-playerbots UpdateAI to run our minimal
+// combat assist instead of the default strategy engine.
+void WowPsParty_AssistTarget_Trampoline(Player* bot)
+{
+    WowPsParty::AssistTarget(bot);
+}
+
+// Tank-lead trampoline — same dispatch point, called immediately after
+// AssistTarget so dungeon-tank pulls fire when the leader is idle.
+void WowPsParty_TankLeadEngagement_Trampoline(Player* bot)
+{
+    WowPsParty::TankLeadEngagement(bot);
+}
+
+// Tank path-follow trampoline — walks the tank along the recorded path.
+void WowPsParty_TankFollowPath_Trampoline(Player* bot)
+{
+    WowPsParty::TankFollowPath(bot);
+}
