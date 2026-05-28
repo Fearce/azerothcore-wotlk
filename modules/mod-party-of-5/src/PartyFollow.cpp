@@ -256,12 +256,37 @@ namespace WowPsParty
         TargetModeCacheSet(guidLow, mode);
     }
 
+    // ---- retarget throttle --------------------------------------------------
+    // Timestamp (getMSTime) of each bot's last target SWITCH. Used to stop the
+    // "spinbot" when several mobs flank the tank and the nearest-loose pick
+    // would flip every tick: once a bot has a live valid victim, it won't
+    // switch to a different one for RETARGET_COOLDOWN_MS — but a dead/gone
+    // victim always retargets immediately.
+    static constexpr uint32 RETARGET_COOLDOWN_MS = 3000;
+    static std::unordered_map<uint32, uint32> g_lastRetargetMs;  // guidLow -> ms
+    static std::mutex g_retargetMutex;
+
+    static bool RetargetReady(uint32 guidLow, uint32 nowMs)
+    {
+        std::lock_guard<std::mutex> lock(g_retargetMutex);
+        auto it = g_lastRetargetMs.find(guidLow);
+        return it == g_lastRetargetMs.end()
+            || (nowMs - it->second) >= RETARGET_COOLDOWN_MS;
+    }
+
+    static void MarkRetarget(uint32 guidLow, uint32 nowMs)
+    {
+        std::lock_guard<std::mutex> lock(g_retargetMutex);
+        g_lastRetargetMs[guidLow] = nowMs;
+    }
+
     // Nearest hostile (within `range`) whose current victim is NOT `bot` —
     // i.e. an add that's loose on the casters/healer. Returns nullptr if every
     // nearby hostile is already on the bot (or there are none). Built from the
     // party's attacker lists so it needs no grid search.
     static Unit* PickLooseTarget(Player* bot)
     {
+        constexpr float LOOSE_MAX_RANGE = 30.0f;   // don't chase across the room
         Unit* best = nullptr;
         float bestDist = 1e9f;
         auto consider = [&](Unit* a)
@@ -270,6 +295,7 @@ namespace WowPsParty
             if (a->GetVictim() == bot) return;          // already on us
             if (!bot->IsValidAttackTarget(a)) return;
             float const d = bot->GetDistance(a);
+            if (d > LOOSE_MAX_RANGE) return;            // out of grab range
             if (d < bestDist) { bestDist = d; best = a; }
         };
         for (Unit* a : bot->getAttackers())             // mobs on me but not targeting me (taunted off, etc.)
@@ -448,6 +474,26 @@ namespace WowPsParty
         if (desired && (!desired->IsAlive() || !bot->IsValidAttackTarget(desired)))
             desired = nullptr;
 
+        // Retarget throttle. If we're already on a live, valid victim, don't
+        // abandon it for a DIFFERENT one more than once per cooldown — that's
+        // the spinbot fix when several mobs flank the tank. A dead/gone victim
+        // (currentValid == false) drops straight through and retargets now.
+        uint32 const nowMs = getMSTime();
+        Unit* const current = bot->GetVictim();
+        bool const currentValid = current && current->IsAlive()
+                                  && bot->IsValidAttackTarget(current);
+        if (currentValid)
+        {
+            if (!desired)
+            {
+                desired = current;   // nothing new worth switching to — stay put
+            }
+            else if (desired != current && !RetargetReady(gLow, nowMs))
+            {
+                desired = current;   // too soon to switch — keep current victim
+            }
+        }
+
         if (!desired)
         {
             // Nothing to fight anywhere — drop combat so PartyFollow can
@@ -462,6 +508,7 @@ namespace WowPsParty
 
         if (bot->GetVictim() != desired)
         {
+            MarkRetarget(gLow, nowMs);
             bool const ok = bot->Attack(desired, true);
             // Caster classes hold at range so they don't run into melee and
             // interrupt their own cast bars. Melee classes use the default
