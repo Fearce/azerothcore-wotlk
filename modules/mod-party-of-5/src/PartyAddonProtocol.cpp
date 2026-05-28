@@ -264,11 +264,14 @@ namespace WowPsParty
         std::ostringstream out;
         out << "INVENTORY\t";
         bool first = true;
+        uint32 totalSlots = 0;   // party-wide bag capacity (for empty-cell count)
+
+        // Separator helper for non-item trailing records (BAG/CAP/POOL).
+        auto sep = [&]() { if (!first) out << ';'; first = false; };
 
         auto emit = [&](uint32 partySlot, uint32 bag, uint32 pos, Item* item)
         {
-            if (!first) out << ';';
-            first = false;
+            sep();
             out << partySlot << ':' << bag << ':' << pos << ':'
                 << item->GetEntry() << ':' << item->GetCount() << ':'
                 << item->GetGUID().GetCounter();
@@ -283,17 +286,26 @@ namespace WowPsParty
             if (!p) continue;
 
             // Main backpack (16 slots): bag=255 (INVENTORY_SLOT_BAG_0), pos=23..38
+            totalSlots += INVENTORY_SLOT_ITEM_END - INVENTORY_SLOT_ITEM_START;
             for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
             {
                 Item* item = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
                 if (item)
                     emit(partySlot, INVENTORY_SLOT_BAG_0, i, item);
             }
-            // Equipped bags (slots 19..22): each is a Bag with its own internal slots
+            // The 4 equippable bag slots (19..22). Emit one BAG record per
+            // slot — including empties (bagItemId 0) — so the addon can show
+            // them in the bag strip and let the user equip a found bag. Then
+            // emit the items inside any equipped bag.
             for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
             {
+                uint32 const bagIdx = b - INVENTORY_SLOT_BAG_START;  // 0..3
                 Bag* bag = p->GetBagByPos(b);
+                sep();
+                out << "BAG:" << uint32(partySlot) << ':' << bagIdx << ':'
+                    << (bag ? bag->GetEntry() : 0);
                 if (!bag) continue;
+                totalSlots += bag->GetBagSize();
                 for (uint32 j = 0; j < bag->GetBagSize(); ++j)
                 {
                     Item* item = p->GetItemByPos(b, j);
@@ -302,13 +314,16 @@ namespace WowPsParty
                 }
             }
         }
-        // Append the shared gold pool as a trailing record. PartyHooks
-        // mirrors every money delta across the party, so reading the
-        // requester's GetMoney() gives the pool's value. The addon's
-        // existing record-pattern needs 6 colons; "POOL:<copper>" has
-        // one, so the items loop ignores it and our pool parser picks
-        // it up separately.
-        if (!first) out << ';';
+        // Total party bag capacity, so the addon can render empty cells up to
+        // the real free space rather than a fixed minimum.
+        sep();
+        out << "CAP:" << totalSlots;
+        // Shared gold pool. PartyHooks mirrors every money delta across the
+        // party, so the requester's GetMoney() is the pool value. "POOL:" /
+        // "CAP:" / "BAG:" all carry fewer than the 6 colons the item parser
+        // needs, so the items loop ignores them and the dedicated parsers
+        // pick them up.
+        sep();
         out << "POOL:" << requester->GetMoney();
         SendWPSP(requester, out.str());
     }
