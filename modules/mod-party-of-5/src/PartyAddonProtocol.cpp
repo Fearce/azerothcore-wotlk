@@ -1254,6 +1254,55 @@ public:
         {
             WowPsParty::SendInventoryTo(player);
         }
+        // REQ_TARGETMODE\t<slot>  →  TARGETMODE\t<slot>\t<mode>
+        else if (command == "REQ_TARGETMODE")
+        {
+            uint32 const slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            uint32 const account = player->GetSession()->GetAccountId();
+            uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+            std::string mode = "master";
+            if (guid)
+            {
+                QueryResult q = CharacterDatabase.Query(
+                    "SELECT `strategies_csv` FROM `party_loadout` WHERE `guid` = {}", guid);
+                if (q)
+                {
+                    std::string s = q->Fetch()[0].Get<std::string>();
+                    if (!s.empty()) mode = s;
+                }
+            }
+            std::ostringstream out;
+            out << "TARGETMODE\t" << slot << '\t' << mode;
+            SendWPSP(player, out.str());
+        }
+        // SET_TARGETMODE\t<slot>\t<mode>
+        else if (command == "SET_TARGETMODE")
+        {
+            std::string s(payload);
+            auto tab = s.find('\t');
+            if (tab == std::string::npos) return;
+            uint32 const slot = std::strtoul(s.substr(0, tab).c_str(), nullptr, 10);
+            std::string mode = s.substr(tab + 1);
+            if (slot >= WowPsParty::PARTY_SIZE) return;
+            // Whitelist — only known modes reach the DB (also blocks any
+            // injection via the stored-into-SQL string).
+            if (mode != "master" && mode != "tank" && mode != "nearest"
+                && mode != "loose")
+                return;
+            uint32 const account = player->GetSession()->GetAccountId();
+            uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+            if (!guid) return;
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
+                "`gear_lock_json`, `priority_actions_json`) VALUES ({}, '{}', '', '', '', '') "
+                "ON DUPLICATE KEY UPDATE `strategies_csv` = VALUES(`strategies_csv`)",
+                guid, mode);
+            CharacterDatabase.CommitTransaction(tx);
+            WowPsParty::TargetModeCacheSet(guid, mode);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Target mode for slot {} set to '{}'.", slot, mode);
+        }
         else if (command == "EQUIP")
         {
             HandleEquip(player, payload);

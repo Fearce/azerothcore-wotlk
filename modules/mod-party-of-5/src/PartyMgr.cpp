@@ -40,6 +40,7 @@ namespace WowPsParty
     void SendRosterTo(Player* player);
     void SendSwappedTo(Player* player, int oldSlot, int newSlot);
     void RotationCacheRefreshFromDB(uint32 guid);
+    void TargetModeRefreshFromDB(uint32 guidLow);
     void PushControlledLoadoutTo(Player* requester, int slot);
 }
 
@@ -244,6 +245,7 @@ namespace WowPsParty
             {
                 uint32 const guid = row.second;
                 RotationCacheRefreshFromDB(guid);
+                TargetModeRefreshFromDB(guid);
                 if (guid == activeGuid) continue;
                 if (spawned >= 4) break;
                 ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);

@@ -24,6 +24,8 @@
 
 #include "ObjectGuid.h"
 
+#include <string>
+
 class Player;
 
 namespace WowPsParty
@@ -67,6 +69,16 @@ namespace WowPsParty
     // chase active so an empty rotation still produces useful idle
     // behaviour (= the unit auto-attacks the same thing you do).
     void AssistTarget(Player* bot);
+
+    // Per-member target-selection mode. Stored in party_loadout.strategies_csv,
+    // cached in memory, consumed by AssistTarget to decide which enemy the bot
+    // attacks. Modes: "master" (default — whatever the controlled char targets,
+    // with party-defense fallback), "tank" (focus-fire the party tank's target),
+    // "nearest" (closest hostile), "loose" (nearest enemy that ISN'T attacking
+    // this bot — for a tank picking up adds off the casters/healer).
+    void TargetModeCacheSet(uint32 guidLow, std::string const& mode);
+    void TargetModeRefreshFromDB(uint32 guidLow);
+    std::string GetTargetMode(uint32 guidLow);
 
     // Tell the follow ticker to LEAVE this bot alone for the next
     // `durationMs` milliseconds — used by the rotation engine's

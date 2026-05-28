@@ -27,6 +27,8 @@
 #include "PartyMgr.h"
 #include "PartyPath.h"
 
+#include "DatabaseEnv.h"
+#include "Group.h"
 #include "Log.h"
 #include "MotionMaster.h"
 #include "ObjectAccessor.h"
@@ -223,6 +225,90 @@ namespace WowPsParty
         return -1;
     }
 
+    // ---- per-member target-selection mode ----------------------------------
+    // Cached so AssistTarget (runs every tick) never hits the DB. Separate
+    // mutex from g_mutex to avoid lock-ordering tangles with the directive
+    // registry that AssistTarget also reads.
+    static std::unordered_map<uint32, std::string> g_targetMode;  // guidLow -> mode
+    static std::mutex g_targetModeMutex;
+
+    void TargetModeCacheSet(uint32 guidLow, std::string const& mode)
+    {
+        std::lock_guard<std::mutex> lock(g_targetModeMutex);
+        if (mode.empty() || mode == "master")
+            g_targetMode.erase(guidLow);   // default needs no entry
+        else
+            g_targetMode[guidLow] = mode;
+    }
+
+    std::string GetTargetMode(uint32 guidLow)
+    {
+        std::lock_guard<std::mutex> lock(g_targetModeMutex);
+        auto it = g_targetMode.find(guidLow);
+        return it == g_targetMode.end() ? std::string("master") : it->second;
+    }
+
+    void TargetModeRefreshFromDB(uint32 guidLow)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `strategies_csv` FROM `party_loadout` WHERE `guid` = {}", guidLow);
+        std::string mode = q ? q->Fetch()[0].Get<std::string>() : std::string();
+        TargetModeCacheSet(guidLow, mode);
+    }
+
+    // Nearest hostile (within `range`) whose current victim is NOT `bot` —
+    // i.e. an add that's loose on the casters/healer. Returns nullptr if every
+    // nearby hostile is already on the bot (or there are none). Built from the
+    // party's attacker lists so it needs no grid search.
+    static Unit* PickLooseTarget(Player* bot)
+    {
+        Unit* best = nullptr;
+        float bestDist = 1e9f;
+        auto consider = [&](Unit* a)
+        {
+            if (!a || !a->IsAlive()) return;
+            if (a->GetVictim() == bot) return;          // already on us
+            if (!bot->IsValidAttackTarget(a)) return;
+            float const d = bot->GetDistance(a);
+            if (d < bestDist) { bestDist = d; best = a; }
+        };
+        for (Unit* a : bot->getAttackers())             // mobs on me but not targeting me (taunted off, etc.)
+            consider(a);
+        if (Group* g = bot->GetGroup())
+        {
+            for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
+            {
+                Player* m = itr->GetSource();
+                if (!m || !m->IsInWorld() || m == bot) continue;
+                if (m->GetMapId() != bot->GetMapId()) continue;
+                for (Unit* a : m->getAttackers())
+                    consider(a);
+            }
+        }
+        return best;
+    }
+
+    // The party tank's current victim, for focus-fire ("tank" mode). The tank
+    // may be a follower bot (found via the directive registry) or the
+    // controlled char itself (then the leader's victim is the tank's victim).
+    static Unit* TankVictim(Player* bot, Player* leader)
+    {
+        int const tankSlot = GetTankSlotForAccount(bot->GetSession()->GetAccountId());
+        if (tankSlot < 0) return leader ? leader->GetVictim() : nullptr;
+        if (Group* g = bot->GetGroup())
+        {
+            for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
+            {
+                Player* m = itr->GetSource();
+                if (!m) continue;
+                if (GetSlotForGuid(m->GetGUID()) == tankSlot)
+                    return m->GetVictim();          // bot tank
+            }
+        }
+        // Tank isn't a follower bot → it's the controlled char (the leader).
+        return leader ? leader->GetVictim() : nullptr;
+    }
+
     void TankLeadEngagement(Player* bot)
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
@@ -329,7 +415,38 @@ namespace WowPsParty
         Unit* leaderTarget = leader->GetVictim();
         bool const leaderTargetValid = leaderTarget && leaderTarget->IsAlive()
                                        && bot->IsValidAttackTarget(leaderTarget);
-        Unit* desired = leaderTargetValid ? leaderTarget : pickPartyDefenseTarget();
+
+        // Per-member target mode decides who we engage. "master" (default)
+        // keeps the original behaviour; the others let the user tell the tank
+        // to grab loose adds while everyone else focus-fires the tank's kill.
+        std::string const mode = GetTargetMode(gLow);
+        Unit* desired = nullptr;
+        if (mode == "nearest")
+        {
+            desired = bot->SelectNearbyTarget(nullptr, 40.0f);
+            if (!desired) desired = pickPartyDefenseTarget();
+        }
+        else if (mode == "loose")
+        {
+            desired = PickLooseTarget(bot);
+            if (!desired) desired = bot->SelectNearbyTarget(nullptr, 40.0f);
+            if (!desired) desired = pickPartyDefenseTarget();
+        }
+        else if (mode == "tank")
+        {
+            Unit* tv = TankVictim(bot, leader);
+            if (tv && tv->IsAlive() && bot->IsValidAttackTarget(tv))
+                desired = tv;
+            else
+                desired = pickPartyDefenseTarget();
+        }
+        else // "master" / default
+        {
+            desired = leaderTargetValid ? leaderTarget : pickPartyDefenseTarget();
+        }
+        // Final safety: never hand back a dead/invalid target.
+        if (desired && (!desired->IsAlive() || !bot->IsValidAttackTarget(desired)))
+            desired = nullptr;
 
         if (!desired)
         {
