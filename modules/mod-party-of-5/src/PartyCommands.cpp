@@ -27,8 +27,10 @@
 #include "Group.h"
 #include "GroupMgr.h"
 #include "ObjectAccessor.h"
+#include "ObjectMgr.h"
 #include "Player.h"
 #include "RBAC.h"
+#include "Trainer.h"
 #include "WorldSession.h"
 
 #include <algorithm>
@@ -87,6 +89,7 @@ public:
             { "goto",         HandleGotoCommand,         SEC_PLAYER, Console::Yes },
             { "stop",         HandleStopCommand,         SEC_PLAYER, Console::Yes },
             { "repair",       HandleRepairCommand,       SEC_PLAYER, Console::Yes },
+            { "learnall",     HandleLearnAllCommand,     SEC_PLAYER, Console::Yes },
             { "sellgrays",    HandleSellGraysCommand,    SEC_PLAYER, Console::Yes },
             { "hearth",       HandleHearthCommand,       SEC_PLAYER, Console::Yes },
             { "status",       HandleStatusCommand,       SEC_PLAYER, Console::Yes },
@@ -350,6 +353,7 @@ public:
         handler->PSendSysMessage(".party swap <0-4>      |cff888888- take control of slot|r");
         handler->PSendSysMessage(".party unswap          |cff888888- return to your body|r");
         handler->PSendSysMessage(".party rez [slot]      |cff888888- revive dead member(s)|r");
+        handler->PSendSysMessage(".party learnall        |cff888888- train all class spells for level|r");
         handler->PSendSysMessage(".party preset <slot> <class>  |cff888888- apply default rotation|r");
         handler->PSendSysMessage(".party setrotation <slot> <dsl>");
         handler->PSendSysMessage(".party getrotation [slot]");
@@ -703,6 +707,74 @@ public:
         body->GetMotionMaster()->Clear();
         body->StopMoving();
         handler->PSendSysMessage("|cff66ccff[WowPsParty]|r Stopped.");
+        return true;
+    }
+
+    // .party learnall — teach every online party member all class spells they
+    // qualify for at their current level, the same set a class trainer would
+    // offer. Mirrors AC's `.learn all_myclass` trainer loop: CanTeachSpell
+    // enforces level + skill + prerequisite-chain, and the do/while repeats so
+    // a spell that unlocks a follow-up rank gets the follow-up too. Talents are
+    // intentionally NOT touched (that's a spec choice, not "train everything").
+    static bool HandleLearnAllCommand(ChatHandler* handler, Optional<std::string> /*unused*/)
+    {
+        WorldSession* session = handler->GetSession();
+        if (!session) return false;
+        uint32 const acct = session->GetAccountId();
+        auto const party = sPartyMgr.GetParty(acct);
+        if (party.empty())
+        {
+            handler->PSendSysMessage("|cffffcc55[WowPsParty]|r You don't have a party.");
+            return true;
+        }
+
+        uint8 reached = 0;
+        for (auto const& m : party)
+        {
+            Player* p = ObjectAccessor::FindConnectedPlayer(
+                ObjectGuid::Create<HighGuid::Player>(m.guid));
+            if (!p || !p->IsInWorld())
+            {
+                handler->PSendSysMessage(
+                    "  |cffaaaaff[{}]|r {} |cff888888(offline — skipped)|r",
+                    uint32(m.slot), m.name);
+                continue;
+            }
+
+            uint32 learned = 0;
+            std::vector<Trainer::Trainer const*> const& trainers =
+                sObjectMgr->GetClassTrainers(p->getClass());
+            bool hadNew;
+            do
+            {
+                hadNew = false;
+                for (Trainer::Trainer const* trainer : trainers)
+                {
+                    if (!trainer->IsTrainerValidForPlayer(p))
+                        continue;
+                    for (Trainer::Spell const& ts : trainer->GetSpells())
+                    {
+                        if (!trainer->CanTeachSpell(p, &ts))
+                            continue;
+                        if (ts.IsCastable())
+                            p->CastSpell(p, ts.SpellId, true);
+                        else
+                            p->learnSpell(ts.SpellId, false);
+                        ++learned;
+                        hadNew = true;
+                    }
+                }
+            } while (hadNew);
+
+            handler->PSendSysMessage(
+                "  |cffaaaaff[{}]|r {} ({}) — learned {} new spell(s).",
+                uint32(m.slot), p->GetName(), ClassName(p->getClass()), learned);
+            ++reached;
+        }
+        handler->PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r Trained class spells for {} online member(s). "
+            "Open the spellbook (P) or re-open the rotation editor to see the new ranks.",
+            uint32(reached));
         return true;
     }
 
