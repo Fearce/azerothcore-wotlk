@@ -293,6 +293,7 @@ namespace WowPsParty
         auto consider = [&](Unit* a)
         {
             if (!a || !a->IsAlive()) return;
+            if (!a->IsInCombat()) return;               // never pull idle mobs
             if (a->GetVictim() == bot) return;          // already on us
             if (!bot->IsValidAttackTarget(a)) return;
             float const d = bot->GetDistance(a);
@@ -455,9 +456,12 @@ namespace WowPsParty
         }
         else if (mode == "loose")
         {
+            // ONLY adds already in combat with the party and not on us. No
+            // nearest-mob fallback — loose must never proactively pull idle /
+            // non-combat monsters. If there's nothing loose, desired stays
+            // null and the throttle below keeps our current victim (or we
+            // simply hold).
             desired = PickLooseTarget(bot);
-            if (!desired) desired = bot->SelectNearbyTarget(nullptr, 40.0f);
-            if (!desired) desired = pickPartyDefenseTarget();
         }
         else if (mode == "tank")
         {
