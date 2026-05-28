@@ -369,7 +369,11 @@ namespace WowPsParty
                 if (!sid) break;
                 if (r == 0) rank1 = sid;
                 maxRank = r + 1;
-                if (p->HasSpell(sid)) curRank = r + 1;
+                // Most talents are PASSIVE — LearnTalent stores them in the
+                // talent map (addTalent), NOT the spell book, so HasSpell()
+                // misses them. HasTalent() is the authoritative rank source
+                // (it's what LearnTalent itself checks).
+                if (p->HasTalent(sid, p->GetActiveSpec())) curRank = r + 1;
             }
             if (!maxRank) continue;
 
