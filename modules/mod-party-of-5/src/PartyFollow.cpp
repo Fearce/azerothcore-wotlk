@@ -229,6 +229,22 @@ namespace WowPsParty
         return n;
     }
 
+    // Stable 0-based ordinal of `follower` among all of `leaderGuid`'s
+    // companions (sorted by guid). Drives formation spread — distinct per
+    // companion regardless of account_party slot, so HENCHMEN (which have no
+    // slot) fan out too instead of all stacking on the default angle.
+    int FormationIndexFor(ObjectGuid follower, ObjectGuid leaderGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        std::vector<uint32> guids;
+        for (auto const& d : g_directives)
+            if (d.leaderGuid == leaderGuid) guids.push_back(d.followerGuid.GetCounter());
+        std::sort(guids.begin(), guids.end());
+        for (size_t i = 0; i < guids.size(); ++i)
+            if (guids[i] == follower.GetCounter()) return int(i);
+        return 0;
+    }
+
     bool BotHasActiveFollowDirective(ObjectGuid guid)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -686,10 +702,14 @@ namespace WowPsParty
                 cls == CLASS_MAGE     || cls == CLASS_WARLOCK ||
                 cls == CLASS_PRIEST   || cls == CLASS_HUNTER  ||
                 cls == CLASS_SHAMAN   || cls == CLASS_DRUID;
+            // Distinct bearing per companion so melee SURROUND the mob and
+            // ranged fan out, instead of every bot stacking on one point.
+            int const fi = FormationIndexFor(bot->GetGUID(), GetLeaderFor(bot->GetGUID()));
+            float const chaseAngle = float(fi) * (2.0f * float(M_PI) / 5.0f);
             if (isRangedCaster)
-                bot->GetMotionMaster()->MoveChase(desired, ChaseRange(15.0f, 25.0f));
+                bot->GetMotionMaster()->MoveChase(desired, ChaseRange(15.0f, 25.0f), ChaseAngle(chaseAngle));
             else
-                bot->GetMotionMaster()->MoveChase(desired);
+                bot->GetMotionMaster()->MoveChase(desired, {}, ChaseAngle(chaseAngle));
             bot->SetFacingToObject(desired);
             return isRangedCaster;
         };
@@ -971,12 +991,17 @@ namespace WowPsParty
             //     followers still fan out behind. MoveFollow's leash keeps
             //     the tank from running off — they only re-position once
             //     the leader walks, so if the user pauses the tank pauses.
-            static constexpr float SLOT_ANGLES[5] = {
-                0.0f,                // unused; slot 0 is the leader
-                float(M_PI) / 4.0f,
-                3.0f * float(M_PI) / 4.0f,
-                0.0f,
-                float(M_PI) / 2.0f,
+            // Distinct rear-arc bearings so companions fan out instead of
+            // stacking. Indexed by FORMATION ORDINAL (not account slot), so
+            // henchmen — which have no slot — also spread. Extra companions
+            // beyond the table wrap to an outer ring.
+            static constexpr float FORM_ANGLES[6] = {
+                float(M_PI),            // directly behind
+                float(M_PI) * 0.72f,    // behind-left
+                float(M_PI) * 1.28f,    // behind-right
+                float(M_PI) * 0.5f,     // left flank
+                float(M_PI) * 1.5f,     // right flank
+                float(M_PI) * 0.9f,     // back-left inner
             };
 
             bool const inDungeon = leader->GetMap() && leader->GetMap()->IsDungeon();
@@ -999,9 +1024,11 @@ namespace WowPsParty
                 angle = float(M_PI);   // directly in front of the leader
                 followDist = 12.0f;    // walk a body-length ahead
             }
-            else if (d.slot < 5)
+            else
             {
-                angle = SLOT_ANGLES[d.slot];
+                int const fi = FormationIndexFor(d.followerGuid, d.leaderGuid);
+                angle = FORM_ANGLES[fi % 6];
+                followDist = PET_FOLLOW_DIST + float(fi / 6) * 2.5f;
             }
 
             // If the bot was sitting (post-drink), stand up before moving

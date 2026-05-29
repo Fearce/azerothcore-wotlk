@@ -49,6 +49,7 @@ namespace WowPsParty
     bool   IsHenchman(ObjectGuid guid);
     uint32 CountHenchmenFor(ObjectGuid leaderGuid);
     uint32 CountFollowersFor(ObjectGuid leaderGuid);   // alts + henchmen
+    int    FormationIndexFor(ObjectGuid follower, ObjectGuid leaderGuid);
 
     // Wires up the per-tick re-asserter. Called once from
     // PartyBootstrapWorldScript::OnStartup. Idempotent; subsequent
