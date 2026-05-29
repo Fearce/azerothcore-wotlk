@@ -1551,18 +1551,19 @@ public:
             std::string mode = "master";
             if (guid)
             {
+                // The in-memory cache is what AssistTarget actually reads, so it
+                // is authoritative for the dropdown. The DB only overrides it
+                // when the user explicitly saved a mode — a row can also exist
+                // with an EMPTY strategies_csv (created by a rotation-only
+                // commit), so an empty value must NOT mask the cache (that was
+                // the "tank henchman shows master" display drift).
+                mode = WowPsParty::GetTargetMode(guid);
                 QueryResult q = CharacterDatabase.Query(
                     "SELECT `strategies_csv` FROM `party_loadout` WHERE `guid` = {}", guid);
                 if (q)
                 {
                     std::string s = q->Fetch()[0].Get<std::string>();
                     if (!s.empty()) mode = s;
-                }
-                else
-                {
-                    // No DB row yet (e.g. a henchman whose tank "loose" lives
-                    // only in the in-memory cache) — reflect the live cache.
-                    mode = WowPsParty::GetTargetMode(guid);
                 }
             }
             std::ostringstream out;
@@ -1818,6 +1819,10 @@ public:
 
             std::string const stored = WowPsParty::SerialiseRotationRules(rules);
             CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            // The empty strings for the other columns are INSERT-path
+            // placeholders only — the ON DUPLICATE KEY UPDATE touches just
+            // priority_actions_json, so an existing row's mode/lead are kept.
+            // Don't "simplify" this into a plain INSERT: that would clobber them.
             tx->Append(
                 "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
                 "`gear_lock_json`, `priority_actions_json`) VALUES ({}, '', '', '', '', '{}') "
