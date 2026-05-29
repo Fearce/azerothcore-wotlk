@@ -50,6 +50,7 @@ namespace WowPsParty
     uint32 CountHenchmenFor(ObjectGuid leaderGuid);
     uint32 CountFollowersFor(ObjectGuid leaderGuid);   // alts + henchmen
     int    FormationIndexFor(ObjectGuid follower, ObjectGuid leaderGuid);
+    bool   IsLeadTank(ObjectGuid botGuid);   // role-based; works for henchmen
 
     // Wires up the per-tick re-asserter. Called once from
     // PartyBootstrapWorldScript::OnStartup. Idempotent; subsequent

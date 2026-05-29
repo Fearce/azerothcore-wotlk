@@ -229,6 +229,27 @@ namespace WowPsParty
         return n;
     }
 
+    // True if `botGuid` is the account's designated dungeon lead tank, decided
+    // by DIRECTIVE ROLE (the lowest-guid follower with role "tank"), so a hired
+    // HENCHMAN tank can lead the route too — the old slot-based check excluded
+    // henchmen (they have no account_party slot).
+    bool IsLeadTank(ObjectGuid botGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        uint32 account = 0;
+        bool found = false;
+        for (auto const& d : g_directives)
+            if (d.followerGuid == botGuid) { account = d.account; found = true; break; }
+        if (!found) return false;
+        ObjectGuid lead;
+        for (auto const& d : g_directives)
+            if (d.account == account && d.role == "tank")
+                if (lead.IsEmpty() ||
+                    d.followerGuid.GetCounter() < lead.GetCounter())
+                    lead = d.followerGuid;
+        return !lead.IsEmpty() && lead == botGuid;
+    }
+
     // Stable 0-based ordinal of `follower` among all of `leaderGuid`'s
     // companions (sorted by guid). Drives formation spread — distinct per
     // companion regardless of account_party slot, so HENCHMEN (which have no
@@ -513,12 +534,8 @@ namespace WowPsParty
         if (bot->IsNonMeleeSpellCast(false, false, true)) return;
         if (IsFollowerHeld(bot->GetGUID())) return;
 
-        // Is this the assigned tank?
-        uint32 const account = bot->GetSession()->GetAccountId();
-        int const tankSlot = GetTankSlotForAccount(account);
-        if (tankSlot < 0) return;
-        int const mySlot = GetSlotForGuid(bot->GetGUID());
-        if (mySlot != tankSlot) return;
+        // Is this the lead tank? Role-based so a hired henchman tank counts.
+        if (!IsLeadTank(bot->GetGUID())) return;
         if (!GetLeadInDungeon(bot->GetGUID().GetCounter())) return;  // leading disabled
 
         ObjectGuid const leaderGuid = GetLeaderFor(bot->GetGUID());
@@ -603,19 +620,20 @@ namespace WowPsParty
             for (Unit* a : bot->getAttackers())
                 if (a && a->IsAlive() && bot->IsValidAttackTarget(a))
                     return a;
-            // party-defense — walk the bot's group and pick any attacker
-            // hitting a member we share a map with.
-            if (Group* g = bot->GetGroup())
+            // party-defense via our directive roster (leader + all bots +
+            // henchmen), NOT the WoW group — the group can form incompletely,
+            // which left bots ignoring a member under attack. This is what makes
+            // heroes and henchmen actually defend EACH OTHER.
+            std::vector<ObjectGuid> party;
+            GetPartyGuidsFor(bot->GetGUID(), party);
+            for (ObjectGuid const& gg : party)
             {
-                for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
-                {
-                    Player* m = itr->GetSource();
-                    if (!m || !m->IsInWorld() || m == bot) continue;
-                    if (m->GetMapId() != bot->GetMapId()) continue;
-                    for (Unit* a : m->getAttackers())
-                        if (a && a->IsAlive() && bot->IsValidAttackTarget(a))
-                            return a;
-                }
+                Player* m = ObjectAccessor::FindConnectedPlayer(gg);
+                if (!m || !m->IsInWorld() || m == bot) continue;
+                if (m->GetMapId() != bot->GetMapId()) continue;
+                for (Unit* a : m->getAttackers())
+                    if (a && a->IsAlive() && bot->IsValidAttackTarget(a))
+                        return a;
             }
             return nullptr;
         };
@@ -1005,12 +1023,7 @@ namespace WowPsParty
             };
 
             bool const inDungeon = leader->GetMap() && leader->GetMap()->IsDungeon();
-            int tankSlot = -1;
-            {
-                auto it = g_formations.find(d.account);
-                if (it != g_formations.end()) tankSlot = it->second.tankSlot;
-            }
-            bool const isLeadTank = inDungeon && tankSlot >= 0 && int(d.slot) == tankSlot;
+            bool const isLeadTank = inDungeon && IsLeadTank(d.followerGuid);
 
             float angle = follower->GetFollowAngle();
             float followDist = PET_FOLLOW_DIST;
@@ -1138,9 +1151,8 @@ void WowPsParty_TankLeadEngagement_Trampoline(Player* bot)
 void WowPsParty_TankFollowPath_Trampoline(Player* bot)
 {
     if (!bot || !bot->GetSession()) return;
-    int const tankSlot = WowPsParty::GetTankSlotForAccount(bot->GetSession()->GetAccountId());
-    if (tankSlot < 0) return;
-    if (WowPsParty::GetSlotForGuid(bot->GetGUID()) != tankSlot) return;
+    // Lead tank = lowest-guid follower with role "tank" (alt OR henchman).
+    if (!WowPsParty::IsLeadTank(bot->GetGUID())) return;
     if (!WowPsParty::GetLeadInDungeon(bot->GetGUID().GetCounter())) return;  // user disabled leading
     WowPsParty::TankFollowPath(bot);
 }
