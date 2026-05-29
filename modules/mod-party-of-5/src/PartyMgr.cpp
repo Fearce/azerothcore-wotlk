@@ -4,6 +4,7 @@
 
 #include "PartyMgr.h"
 #include "PartyFollow.h"
+#include "PartyRotation.h"
 
 #include "Chat.h"
 #include "CharacterCache.h"
@@ -170,6 +171,27 @@ namespace WowPsParty
         return uint32(level) * 250u;
     }
 
+    // Canonical per-class starter rotation (spell NAMES, so the engine picks
+    // the highest known rank at any level). Shared by `.party preset` and
+    // henchman hire. Keep in sync — this is the single source.
+    std::string DefaultRotationForClass(uint8 cls)
+    {
+        switch (cls)
+        {
+            case 1:  return "self_health<40|cast_self:Battle Shout|80;has_target|cast:Heroic Strike|50;has_target|cast:Rend|30";
+            case 2:  return "self_health<35|cast_self:Holy Light|90;always|cast_self:Devotion Aura|70;has_target|cast:Judgement of Light|40";
+            case 3:  return "has_target|cast:Serpent Sting|60;has_target|cast:Arcane Shot|40;has_target|cast:Auto Shot|20";
+            case 4:  return "out_of_combat|cast_self:Stealth|95;has_target|cast:Sinister Strike|50";
+            case 5:  return "party_lowest_health<55|cast_party_lowest:Lesser Heal|95;has_target|cast:Smite|30;always|buff_self:Power Word: Fortitude|70";
+            case 6:  return "self_health<35|cast_self:Death Strike|90;has_target|cast:Plague Strike|60;has_target|cast:Blood Strike|40";
+            case 7:  return "party_lowest_health<40|cast_party_lowest:Healing Wave|90;has_target|cast:Lightning Bolt|50;always|buff_self:Lightning Shield|70";
+            case 8:  return "self_health<35|cast_self:Frost Nova|95;has_target|cast:Frostbolt|50;has_target|cast:Fireball|40";
+            case 9:  return "has_target|cast:Corruption|60;has_target|cast:Shadow Bolt|40;self_health<30|cast:Drain Life|95";
+            case 11: return "party_lowest_health<40|cast_party_lowest:Rejuvenation|90;has_target|cast:Wrath|50;has_target|cast:Moonfire|30";
+            default: return "";
+        }
+    }
+
     // Query offline random-pool chars of the given classes near `level`.
     static void QueryHenchCandidates(std::string const& acctCsv,
         std::string const& classCsv, uint8 lo, uint8 hi, uint8 level,
@@ -249,7 +271,7 @@ namespace WowPsParty
         // Validate candidate is an offline random-pool char.
         std::string const acctCsv = RndbotAccountCsv();
         QueryResult q = CharacterDatabase.Query(
-            "SELECT `level`,`online`,`account` FROM `characters` WHERE `guid` = {}",
+            "SELECT `level`,`online`,`account`,`class` FROM `characters` WHERE `guid` = {}",
             candidateGuid);
         if (!q)
         {
@@ -260,6 +282,7 @@ namespace WowPsParty
         Field* f = q->Fetch();
         uint8 const level   = f[0].Get<uint8>();
         bool  const online  = f[1].Get<uint8>() != 0;
+        uint8 const cls     = f[3].Get<uint8>();
         if (online)
         {
             outMsg = "That henchman is busy — pick another (Refresh the list).";
@@ -306,6 +329,14 @@ namespace WowPsParty
         // permission check (WowPsParty_IsHenchman_Trampoline) lets the cross-
         // account random-pool char in.
         WowPsParty::AddHenchmanDirective(account, henchGuid, requester->GetGUID(), useRole);
+
+        // Load a class-default rotation so the henchman runs OUR combat AI
+        // (AssistTarget positioning, LoS approach, no melee-stacking) with
+        // sensible spells — the same engine the heroes use. Without a cached
+        // rotation it would just auto-attack.
+        WowPsParty::RotationCacheSet(candidateGuid,
+            WowPsParty::ParseRotationString(DefaultRotationForClass(cls)));
+
         mgr->AddPlayerBot(henchGuid, account);
 
         // The spawn is async (login query holder). After a short delay: if the
@@ -368,6 +399,7 @@ namespace WowPsParty
         ObjectGuid const g = ObjectGuid::Create<HighGuid::Player>(henchGuid);
         if (!WowPsParty::IsHenchman(g)) return;   // only dismiss henchmen
         WowPsParty::RemoveFollower(g);
+        WowPsParty::RotationCacheClear(henchGuid);
         if (Player* hen = ObjectAccessor::FindConnectedPlayer(g))
             if (hen->GetGroup()) hen->RemoveFromGroup();
         // Log the bot out via the master's mgr regardless of whether it's
@@ -390,6 +422,7 @@ namespace WowPsParty
         if (!WowPsParty::IsHenchman(henchGuid)) return;
         ObjectGuid const leaderGuid = WowPsParty::GetLeaderFor(henchGuid);
         WowPsParty::RemoveFollower(henchGuid);
+        WowPsParty::RotationCacheClear(henchGuid.GetCounter());
         LOG_INFO("module",
             "[WowPsParty Henchmen] henchman left party — dismissing hench_guid={}",
             henchGuid.GetCounter());

@@ -728,6 +728,27 @@ namespace WowPsParty
 
     namespace
     {
+        // Auto-vote GREED on every pending group-loot roll for this bot. We
+        // hard-return out of mod-playerbots' UpdateAI, suppressing its default
+        // loot-roll action, so without this our party bots (heroes AND hired
+        // henchmen) never respond to a roll and the player has to click greed
+        // for each. Kevin's rule: all party bots greed on everything when the
+        // party is on group loot (which it is whenever a henchman is present).
+        static void AutoGreedRolls(Player* bot)
+        {
+            if (!bot) return;
+            Group* g = bot->GetGroup();
+            if (!g) return;
+            for (Roll* roll : g->GetRolls())
+            {
+                if (!roll) continue;
+                auto it = roll->playerVote.find(bot->GetGUID());
+                if (it == roll->playerVote.end() || it->second != NOT_EMITED_YET)
+                    continue;
+                g->CountRollVote(bot->GetGUID(), roll->itemGUID, GREED);
+            }
+        }
+
         // Apply a single directive: install MoveFollow if safe.
         // Returns true if the directive should be kept, false to mark
         // for removal (leader gone, etc.).
@@ -738,6 +759,9 @@ namespace WowPsParty
             if (!follower || !leader) return true;
             if (!follower->IsInWorld() || !leader->IsInWorld()) return true;
             if (follower == leader) return true;
+
+            // Greed any pending loot rolls before the combat/death returns.
+            AutoGreedRolls(follower);
 
             // Auto-accept a pending resurrect. A bot has no client to click
             // the "Accept" dialog, so a healer's Resurrection / Redemption

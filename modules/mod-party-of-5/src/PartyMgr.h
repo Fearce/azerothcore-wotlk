@@ -96,6 +96,12 @@ namespace WowPsParty
     // Copper cost to hire a henchman of the given level.
     uint32 HenchmanHireCost(uint8 level);
 
+    // Canonical starter rotation DSL for a class id (1=Warr…11=Druid). Shared
+    // by the `.party preset` command and henchman hire so henchmen run our
+    // rotation engine + combat AI (positioning, LoS approach) with sensible
+    // class spells, instead of the default playerbot AI. Empty for unknown.
+    std::string DefaultRotationForClass(uint8 cls);
+
     // Hire `candidateGuid` for `requester`. Validates gold + party space,
     // deducts the fee, spawns the bot and registers the follow directive.
     bool HireHenchman(Player* requester, uint32 candidateGuid, std::string const& role,

@@ -294,24 +294,18 @@ public:
         std::transform(cls.begin(), cls.end(), cls.begin(),
                        [](unsigned char c){ return std::tolower(c); });
 
-        // Each preset is a ;-separated DSL (same format as setrotation). Most
-        // tuned for level 15 because that's the test party — adjust spell
-        // names if you're running higher levels with different spell ranks.
-        static const std::unordered_map<std::string, std::string> presets = {
-            { "warrior",     "self_health<40|cast_self:Battle Shout|80;has_target|cast:Heroic Strike|50;has_target|cast:Rend|30" },
-            { "paladin",     "self_health<35|cast_self:Holy Light|90;always|cast_self:Devotion Aura|70;has_target|cast:Judgement of Light|40" },
-            { "hunter",      "self_health<30|cast_self:Healing Potion|95;has_target|cast:Serpent Sting|60;has_target|cast:Arcane Shot|40" },
-            { "rogue",       "out_of_combat|cast_self:Stealth|95;has_target|cast:Sinister Strike|50" },
-            { "priest",      "self_health<55|cast_self:Lesser Heal|95;has_target|cast:Smite|30;always|cast_self:Power Word: Fortitude|70" },
-            { "deathknight", "self_health<35|cast_self:Death Strike|90;has_target|cast:Plague Strike|60;has_target|cast:Blood Strike|40" },
-            { "shaman",      "self_health<40|cast_self:Healing Wave|90;has_target|cast:Lightning Bolt|50;always|cast_self:Lightning Shield|70" },
-            { "mage",        "self_health<35|cast_self:Frost Nova|95;has_target|cast:Frostbolt|50;has_target|cast:Fireball|40" },
-            { "warlock",     "self_health<30|cast_self:Drain Life|95;has_target|cast:Corruption|60;has_target|cast:Shadow Bolt|40" },
-            { "druid",       "self_health<40|cast_self:Rejuvenation|90;has_target|cast:Wrath|50;has_target|cast:Moonfire|30" },
+        // Map the class name to its id, then pull the canonical starter
+        // rotation from WowPsParty::DefaultRotationForClass (shared with
+        // henchman hire so there's one source of truth).
+        static const std::unordered_map<std::string, uint8> classIds = {
+            { "warrior", 1 }, { "paladin", 2 }, { "hunter", 3 }, { "rogue", 4 },
+            { "priest", 5 }, { "deathknight", 6 }, { "shaman", 7 }, { "mage", 8 },
+            { "warlock", 9 }, { "druid", 11 },
         };
-
-        auto it = presets.find(cls);
-        if (it == presets.end())
+        auto idIt = classIds.find(cls);
+        std::string const dsl = (idIt != classIds.end())
+            ? WowPsParty::DefaultRotationForClass(idIt->second) : std::string();
+        if (dsl.empty())
         {
             handler->PSendSysMessage(
                 "|cffff5555[WowPsParty]|r Unknown class '{}'. Available: warrior, paladin, hunter, "
@@ -329,7 +323,7 @@ public:
             return false;
         }
 
-        auto rules = WowPsParty::ParseRotationString(it->second);
+        auto rules = WowPsParty::ParseRotationString(dsl);
         std::string const stored = WowPsParty::SerialiseRotationRules(rules);
 
         CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
