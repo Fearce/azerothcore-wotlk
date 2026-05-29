@@ -31,6 +31,7 @@
 #include "Group.h"
 #include "Log.h"
 #include "MotionMaster.h"
+#include "StringFormat.h"
 #include "ObjectAccessor.h"
 #include "Pet.h"
 #include "Player.h"
@@ -389,6 +390,20 @@ namespace WowPsParty
         LOG_INFO("module", "[WowPsParty Assist] guid={} {}", guidLow, reason);
     }
 
+    // Throttled per (bot, reason) diagnostic for the gathering path. Only fires
+    // for bots that actually have a gather profession (the skill gate runs
+    // first), so it won't spam for ordinary followers.
+    static void GatherLog(uint32 guidLow, std::string const& reason)
+    {
+        static thread_local std::unordered_map<uint64, uint32> lastMs;
+        uint64 key = (uint64(guidLow) << 32) ^ std::hash<std::string>{}(reason);
+        uint32 nowMs = getMSTime();
+        uint32& last = lastMs[key];
+        if (nowMs - last < 4000) return;
+        last = nowMs;
+        LOG_INFO("module", "[WowPsParty Gather] guid={} {}", guidLow, reason);
+    }
+
     // Reads the assigned tank slot for an account from the formation cache.
     // -1 if none. Caller must NOT hold g_mutex.
     static int GetTankSlotForAccount(uint32 account)
@@ -638,7 +653,11 @@ namespace WowPsParty
             if (skillId == SKILL_MINING || skillId == SKILL_HERBALISM)
             {
                 skillIdOut = skillId;
-                reqOut     = std::max<uint32>(2u, lock->Skill[i]);
+                // The node's actual required skill — NOT floored to 2. A fresh
+                // miner (skill 1) must be able to mine a Copper Vein (req 1);
+                // flooring to 2 rejected every low-level node. Matches the
+                // engine's Spell::CanOpenLock check (skillValue >= lock->Skill).
+                reqOut     = lock->Skill[i];
                 return true;
             }
         }
@@ -722,21 +741,22 @@ namespace WowPsParty
         bool const canHerb = bot->HasSkill(SKILL_HERBALISM);
         if (!canMine && !canHerb) return;
 
+        uint32 const gLow = bot->GetGUID().GetCounter();
+        uint32 const now  = getMSTime();
+
         // Nowhere to put the mats — don't harvest (AutoStoreLoot silently drops
         // items that don't fit, which would deplete the node for nothing) and
         // don't even approach. Resumes once a bag slot frees up.
-        if (bot->GetFreeInventorySpace() == 0) return;
+        if (bot->GetFreeInventorySpace() == 0) { GatherLog(gLow, "skip: bags full"); return; }
 
         ObjectGuid const leaderGuid = GetLeaderFor(bot->GetGUID());
-        if (!leaderGuid) return;
+        if (!leaderGuid) { GatherLog(gLow, "skip: no leader directive"); return; }
         Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
-        if (!leader || !leader->IsInWorld()) return;
-        if (leader->GetMapId() != bot->GetMapId()) return;
+        if (!leader || !leader->IsInWorld()) { GatherLog(gLow, "skip: leader not in world"); return; }
+        if (leader->GetMapId() != bot->GetMapId()) { GatherLog(gLow, "skip: leader other map"); return; }
         // Don't wander off to gather while still catching up to the party.
-        if (bot->GetDistance(leader) > GATHER_LEADER_LEASH) return;
-
-        uint32 const gLow = bot->GetGUID().GetCounter();
-        uint32 const now  = getMSTime();
+        if (bot->GetDistance(leader) > GATHER_LEADER_LEASH)
+        { GatherLog(gLow, "skip: lagging leader (>40y)"); return; }
 
         // Read this bot's committed node + avoid entry.
         ObjectGuid committed, avoid;
