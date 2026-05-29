@@ -76,6 +76,36 @@ namespace WowPsParty
     void AccountSettingsRefreshFromDB(uint32 account);
     void EnsureSettingsTable();   // CREATE TABLE IF NOT EXISTS — call on startup
 
+    // ----- Henchmen --------------------------------------------------------
+    // GW1-style hireable bot companions, drawn from the random-bot pool. They
+    // use default mod-playerbots combat AI but our follow / leash / tank-lead.
+    // Temporary: released on dismiss or logout.
+    struct HenchmanCandidate
+    {
+        uint32      guid  = 0;
+        std::string name;
+        uint8       cls   = 0;
+        uint8       level = 0;
+        std::string role;       // tank / healer / dps
+    };
+
+    // Up to 10 candidates (2 tank / 2 healer / 6 dps) from offline random-pool
+    // chars near the requester's level (±2, or 80 if the player is 80).
+    std::vector<HenchmanCandidate> BuildHenchmanCandidates(Player* requester);
+
+    // Copper cost to hire a henchman of the given level.
+    uint32 HenchmanHireCost(uint8 level);
+
+    // Hire `candidateGuid` for `requester`. Validates gold + party space,
+    // deducts the fee, spawns the bot and registers the follow directive.
+    bool HireHenchman(Player* requester, uint32 candidateGuid, std::string const& role,
+                      std::string& outMsg);
+
+    // Release one henchman (or all of the account's). Logs the bot out so it
+    // returns to the random pool.
+    void DismissHenchman(Player* requester, uint32 henchGuid);
+    void DismissAllHenchmen(Player* requester);
+
     class PartyMgr
     {
     public:

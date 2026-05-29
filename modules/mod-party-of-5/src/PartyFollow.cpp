@@ -65,6 +65,7 @@ namespace WowPsParty
             ObjectGuid  leaderGuid;
             uint8       slot   = 0;    // 0..4 within the owning account's party
             std::string role   = "dps"; // tank / healer / dps
+            bool        henchman = false; // hired bot (default combat AI), not an enrolled alt
         };
 
         // Which slot in the directive list belongs to the "leading tank" for
@@ -150,6 +151,59 @@ namespace WowPsParty
             "[WowPsParty Follow] SetActiveFollowers account={} leader_guid={} "
             "followers_installed={} dungeon_tank_slot={}",
             account, leaderGuid.GetCounter(), added, firstTankSlot);
+    }
+
+    // Append a single follow directive for a hired henchman, WITHOUT clearing
+    // the account's other directives (SetActiveFollowers rebuilds the whole
+    // set, which would wipe henchmen). The henchman gets our follow ticker,
+    // leash and tank-lead, but the UpdateAI gate lets default mod-playerbots
+    // AI run its combat rotation (see WowPsParty_IsHenchman_Trampoline).
+    void AddHenchmanDirective(uint32 account, ObjectGuid henchGuid,
+                              ObjectGuid leaderGuid, std::string const& role)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (auto const& d : g_directives)
+            if (d.followerGuid == henchGuid) return;   // already tracked
+        Directive d;
+        d.account      = account;
+        d.followerGuid = henchGuid;
+        d.leaderGuid   = leaderGuid;
+        d.slot         = 255;          // not an account_party slot
+        d.role         = role.empty() ? "dps" : role;
+        d.henchman     = true;
+        g_directives.push_back(std::move(d));
+        LOG_INFO("module",
+            "[WowPsParty Follow] AddHenchmanDirective account={} hench_guid={} "
+            "leader_guid={} role={}", account, henchGuid.GetCounter(),
+            leaderGuid.GetCounter(), role);
+    }
+
+    // Drop a single follower's directive (henchman dismiss / logout).
+    void RemoveFollower(ObjectGuid followerGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_directives.erase(
+            std::remove_if(g_directives.begin(), g_directives.end(),
+                [&](Directive const& d){ return d.followerGuid == followerGuid; }),
+            g_directives.end());
+    }
+
+    bool IsHenchman(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (auto const& d : g_directives)
+            if (d.followerGuid == guid) return d.henchman;
+        return false;
+    }
+
+    // Number of hired henchmen currently following the given leader.
+    uint32 CountHenchmenFor(ObjectGuid leaderGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        uint32 n = 0;
+        for (auto const& d : g_directives)
+            if (d.henchman && d.leaderGuid == leaderGuid) ++n;
+        return n;
     }
 
     bool BotHasActiveFollowDirective(ObjectGuid guid)
@@ -980,6 +1034,13 @@ void AddPartyFollowScripts()
 bool WowPsParty_BotHasActiveFollowDirective_Trampoline(ObjectGuid guid)
 {
     return WowPsParty::BotHasActiveFollowDirective(guid);
+}
+
+// Trampoline: is this bot a hired henchman? The patched UpdateAI uses this to
+// keep our follow/tank-lead but let DEFAULT mod-playerbots AI run combat.
+bool WowPsParty_IsHenchman_Trampoline(ObjectGuid guid)
+{
+    return WowPsParty::IsHenchman(guid);
 }
 
 // Trampoline for the patched mod-playerbots UpdateAI to run our minimal

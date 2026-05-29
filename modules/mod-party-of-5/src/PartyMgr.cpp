@@ -34,6 +34,7 @@
 #include "WorldPacket.h"
 #include "Opcodes.h"
 
+#include <algorithm>
 #include <mutex>
 #include <unordered_map>
 
@@ -121,6 +122,236 @@ namespace WowPsParty
         else if (key == "shared_inventory")   s.sharedInventory   = value;
         else if (key == "shared_gear")        s.sharedGear        = value;
         else if (key == "shared_progression") s.sharedProgression = value;
+    }
+
+    // ----- Henchmen ----------------------------------------------------------
+
+    // Cached CSV of random-bot account ids ("rndbot*"), read once from the
+    // auth DB. Used to scope the henchman candidate pool to random-pool chars.
+    static std::string RndbotAccountCsv()
+    {
+        static std::string cached;
+        static bool loaded = false;
+        if (loaded) return cached;
+        loaded = true;
+        QueryResult q = LoginDatabase.Query(
+            "SELECT `id` FROM `account` WHERE `username` LIKE 'rndbot%'");
+        std::ostringstream csv;
+        bool first = true;
+        if (q) do {
+            if (!first) csv << ',';
+            first = false;
+            csv << q->Fetch()[0].Get<uint32>();
+        } while (q->NextRow());
+        cached = csv.str();
+        LOG_INFO("module", "[WowPsParty Henchmen] random-bot account pool size: {}",
+                 first ? 0u : 1u);  // non-empty marker
+        return cached;
+    }
+
+    // class id -> default henchman role.
+    static char const* ClassDefaultRole(uint8 cls)
+    {
+        switch (cls)
+        {
+            case 1:  return "tank";    // Warrior
+            case 2:  return "tank";    // Paladin (prot-ish)
+            case 6:  return "tank";    // Death Knight
+            case 5:  return "healer";  // Priest
+            case 7:  return "healer";  // Shaman
+            case 11: return "healer";  // Druid
+            default: return "dps";     // Hunter/Rogue/Mage/Warlock
+        }
+    }
+
+    uint32 HenchmanHireCost(uint8 level)
+    {
+        // ~2.5 silver per level — "a little money" (L18 ≈ 45s, L80 = 2g).
+        return uint32(level) * 250u;
+    }
+
+    // Query offline random-pool chars of the given classes near `level`.
+    static void QueryHenchCandidates(std::string const& acctCsv,
+        std::string const& classCsv, uint8 lo, uint8 hi, uint8 level,
+        uint32 limit, std::vector<HenchmanCandidate>& out)
+    {
+        if (acctCsv.empty()) return;
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `guid`,`name`,`class`,`level` FROM `characters` "
+            "WHERE `account` IN ({}) AND `online` = 0 AND `class` IN ({}) "
+            "AND `level` BETWEEN {} AND {} "
+            "ORDER BY ABS(CAST(`level` AS SIGNED) - {}) ASC, RAND() LIMIT {}",
+            acctCsv, classCsv, uint32(lo), uint32(hi), uint32(level), limit);
+        if (!q) return;
+        do {
+            Field* f = q->Fetch();
+            HenchmanCandidate c;
+            c.guid  = f[0].Get<uint32>();
+            c.name  = f[1].Get<std::string>();
+            c.cls   = f[2].Get<uint8>();
+            c.level = f[3].Get<uint8>();
+            c.role  = ClassDefaultRole(c.cls);
+            out.push_back(std::move(c));
+        } while (q->NextRow());
+    }
+
+    std::vector<HenchmanCandidate> BuildHenchmanCandidates(Player* requester)
+    {
+        std::vector<HenchmanCandidate> out;
+        if (!requester) return out;
+        std::string const acctCsv = RndbotAccountCsv();
+        if (acctCsv.empty()) return out;
+
+        uint8 const L  = requester->GetLevel();
+        uint8 const lo = (L >= 80) ? 80 : uint8(std::max(1, int(L) - 2));
+        uint8 const hi = (L >= 80) ? 80 : uint8(std::min(80, int(L) + 2));
+
+        // 2 tanks (Warr/Pala/DK/Druid), 2 healers (Priest/Pala/Shaman/Druid),
+        // 6 dps (any class). Exact-band first; the ORDER BY closeness keeps
+        // them near the player's level.
+        QueryHenchCandidates(acctCsv, "1,2,6,11", lo, hi, L, 2, out);
+        QueryHenchCandidates(acctCsv, "2,5,7,11", lo, hi, L, 2, out);
+        QueryHenchCandidates(acctCsv, "1,2,3,4,5,6,7,8,9,11", lo, hi, L, 6, out);
+
+        // Force the role label per the slot it was drawn for (the same char
+        // could appear via two class sets; dedupe by guid keeping first role).
+        std::vector<HenchmanCandidate> deduped;
+        for (auto& c : out)
+        {
+            bool seen = false;
+            for (auto const& d : deduped) if (d.guid == c.guid) { seen = true; break; }
+            if (!seen) deduped.push_back(c);
+        }
+        return deduped;
+    }
+
+    // Set the group's loot rule based on whether any henchman is present:
+    // henchman in party → GROUP_LOOT (rolls), else FREE_FOR_ALL (premade).
+    static void UpdateGroupLootForHenchmen(Player* leader)
+    {
+        if (!leader) return;
+        Group* g = leader->GetGroup();
+        if (!g) return;
+        bool const hasHench = WowPsParty::CountHenchmenFor(leader->GetGUID()) > 0;
+        g->SetLootMethod(hasHench ? GROUP_LOOT : FREE_FOR_ALL);
+        g->SendUpdate();
+        LOG_INFO("module", "[WowPsParty Henchmen] loot method -> {} (henchmen present={})",
+                 hasHench ? "GROUP_LOOT" : "FREE_FOR_ALL", hasHench);
+    }
+
+    bool HireHenchman(Player* requester, uint32 candidateGuid,
+                      std::string const& role, std::string& outMsg)
+    {
+        if (!requester || !requester->GetSession())
+        { outMsg = "No session."; return false; }
+        uint32 const account = requester->GetSession()->GetAccountId();
+
+        // Validate candidate is an offline random-pool char.
+        std::string const acctCsv = RndbotAccountCsv();
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `level`,`online`,`account` FROM `characters` WHERE `guid` = {}",
+            candidateGuid);
+        if (!q) { outMsg = "Henchman not found."; return false; }
+        Field* f = q->Fetch();
+        uint8 const level   = f[0].Get<uint8>();
+        bool  const online  = f[1].Get<uint8>() != 0;
+        if (online) { outMsg = "That henchman is busy — pick another."; return false; }
+
+        // Party-space cap: WoW group holds 5 (leader + 4 companions). Count
+        // current companions = existing followers (alts + henchmen).
+        if (Group* grp = requester->GetGroup())
+            if (grp->GetMembersCount() >= 5)
+            { outMsg = "Your party is full (5)."; return false; }
+
+        // Gold check + deduct.
+        uint32 const cost = HenchmanHireCost(level);
+        if (requester->GetMoney() < cost)
+        { outMsg = "Not enough gold to hire."; return false; }
+        requester->ModifyMoney(-int32(cost));
+
+        ObjectGuid const henchGuid = ObjectGuid::Create<HighGuid::Player>(candidateGuid);
+        std::string const useRole = role.empty() ? "dps" : role;
+
+        // Register as a henchman BEFORE spawning so the patched AddPlayerBot
+        // permission check (WowPsParty_IsHenchman_Trampoline) lets the cross-
+        // account random-pool char in.
+        WowPsParty::AddHenchmanDirective(account, henchGuid, requester->GetGUID(), useRole);
+
+        PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+        if (!mgr)
+        {
+            WowPsParty::RemoveFollower(henchGuid);
+            requester->ModifyMoney(int32(cost));   // refund
+            outMsg = "Bot manager not ready — try again in a moment.";
+            return false;
+        }
+        mgr->AddPlayerBot(henchGuid, account);
+
+        // The spawn is async (login query holder). Add to the group + set loot
+        // once the bot is in world. Capture by guid; retry a few times.
+        ObjectGuid const leaderGuid = requester->GetGUID();
+        requester->m_Events.AddEventAtOffset([leaderGuid, henchGuid]()
+        {
+            Player* lead = ObjectAccessor::FindConnectedPlayer(leaderGuid);
+            Player* hen  = ObjectAccessor::FindConnectedPlayer(henchGuid);
+            if (!lead || !hen) return;
+            Group* g = lead->GetGroup();
+            if (!g)
+            {
+                g = new Group();
+                if (!g->Create(lead)) { delete g; return; }
+                sGroupMgr->AddGroup(g);
+            }
+            if (!g->IsMember(henchGuid))
+            {
+                if (hen->GetGroup()) hen->RemoveFromGroup();
+                g->AddMember(hen);
+            }
+            UpdateGroupLootForHenchmen(lead);
+            // Loot/gather like the rest of the party.
+            if (PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(hen))
+            {
+                ai->ChangeStrategy("+loot",   BOT_STATE_NON_COMBAT);
+                ai->ChangeStrategy("+gather", BOT_STATE_NON_COMBAT);
+            }
+        }, std::chrono::seconds(3));
+
+        LOG_INFO("module",
+            "[WowPsParty Henchmen] HIRE account={} hench_guid={} role={} level={} cost={}",
+            account, candidateGuid, useRole, uint32(level), cost);
+        outMsg = "Hired!";
+        return true;
+    }
+
+    void DismissHenchman(Player* requester, uint32 henchGuid)
+    {
+        if (!requester || !requester->GetSession()) return;
+        ObjectGuid const g = ObjectGuid::Create<HighGuid::Player>(henchGuid);
+        if (!WowPsParty::IsHenchman(g)) return;   // only dismiss henchmen
+        WowPsParty::RemoveFollower(g);
+        if (Player* hen = ObjectAccessor::FindConnectedPlayer(g))
+        {
+            if (hen->GetGroup()) hen->RemoveFromGroup();
+            if (PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester))
+                mgr->LogoutPlayerBot(g);
+        }
+        UpdateGroupLootForHenchmen(requester);
+        LOG_INFO("module", "[WowPsParty Henchmen] DISMISS hench_guid={}", henchGuid);
+    }
+
+    void DismissAllHenchmen(Player* requester)
+    {
+        if (!requester) return;
+        // Collect this leader's henchmen, then dismiss each.
+        std::vector<ObjectGuid> hench;
+        {
+            std::vector<ObjectGuid> guids;
+            WowPsParty::GetPartyGuidsFor(requester->GetGUID(), guids);
+            for (ObjectGuid const& gg : guids)
+                if (WowPsParty::IsHenchman(gg)) hench.push_back(gg);
+        }
+        for (ObjectGuid const& gg : hench)
+            DismissHenchman(requester, gg.GetCounter());
     }
 
     static uint32 FetchAccountForGuid(uint32 guid)

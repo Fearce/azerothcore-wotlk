@@ -119,6 +119,10 @@ public:
         // Drop any in-progress path recording so the char doesn't persist
         // ghost mode (fly + 5x speed) and relog stuck in the air.
         WowPsParty::CancelPathRecording(player);
+
+        // Henchmen are temporary — release them (log the random-pool bots out
+        // + drop their follow directives) when the leader logs out.
+        WowPsParty::DismissAllHenchmen(player);
     }
 
     void OnPlayerLogin(Player* player) override

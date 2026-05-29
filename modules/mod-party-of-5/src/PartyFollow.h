@@ -40,6 +40,15 @@ namespace WowPsParty
     // Optional: clear directives for an account (e.g., on logout).
     void ClearFollowersForAccount(uint32 account);
 
+    // Henchmen: hired bot companions drawn from the random-bot pool. They get
+    // our follow ticker / leash / tank-lead but DEFAULT mod-playerbots combat
+    // AI. Tracked as a follow directive flagged henchman=true.
+    void   AddHenchmanDirective(uint32 account, ObjectGuid henchGuid,
+                                ObjectGuid leaderGuid, std::string const& role);
+    void   RemoveFollower(ObjectGuid followerGuid);   // dismiss / logout
+    bool   IsHenchman(ObjectGuid guid);
+    uint32 CountHenchmenFor(ObjectGuid leaderGuid);
+
     // Wires up the per-tick re-asserter. Called once from
     // PartyBootstrapWorldScript::OnStartup. Idempotent; subsequent
     // calls are no-ops.

@@ -131,6 +131,26 @@ namespace WowPsParty
         SendWPSP(player, out.str());
     }
 
+    // HENCHMEN\t<rec>;<rec>;...   rec = guid:name:cls:level:role:cost
+    // The hireable random-pool candidates near the player's level.
+    void SendHenchmenTo(Player* player)
+    {
+        if (!player) return;
+        auto const cands = BuildHenchmanCandidates(player);
+        std::ostringstream out;
+        out << "HENCHMEN\t";
+        bool first = true;
+        for (auto const& c : cands)
+        {
+            if (!first) out << ';';
+            first = false;
+            out << c.guid << ':' << c.name << ':' << uint32(c.cls) << ':'
+                << uint32(c.level) << ':' << c.role << ':'
+                << HenchmanHireCost(c.level);
+        }
+        SendWPSP(player, out.str());
+    }
+
     // Resolve the slot's character guid for the account.
     static uint32 GuidForAccountSlot(uint32 account, uint32 slot)
     {
@@ -1389,6 +1409,35 @@ public:
             LOG_INFO("module",
                 "[WowPsParty] SET_SETTING account={} {}={}", account, key, val ? 1 : 0);
             WowPsParty::SendSettingsTo(player);   // echo back the full set
+        }
+        else if (command == "REQ_HENCHMEN")
+        {
+            WowPsParty::SendHenchmenTo(player);
+        }
+        else if (command == "HIRE_HENCHMAN")
+        {
+            // HIRE_HENCHMAN\t<guid>\t<role>
+            std::string s(payload);
+            auto t = s.find('\t');
+            uint32 const guid = std::strtoul(
+                (t == std::string::npos ? s : s.substr(0, t)).c_str(), nullptr, 10);
+            std::string const role = (t == std::string::npos) ? "dps" : s.substr(t + 1);
+            std::string msg;
+            bool const ok = WowPsParty::HireHenchman(player, guid, role, msg);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r %s", msg.c_str());
+            if (ok) WowPsParty::SendHenchmenTo(player);  // refresh (the hired one is now busy)
+        }
+        else if (command == "DISMISS_HENCHMAN")
+        {
+            uint32 const guid = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            WowPsParty::DismissHenchman(player, guid);
+            WowPsParty::SendHenchmenTo(player);
+        }
+        else if (command == "DISMISS_ALL_HENCHMEN")
+        {
+            WowPsParty::DismissAllHenchmen(player);
+            WowPsParty::SendHenchmenTo(player);
         }
         else if (command == "REQ_SPELLBOOK")
         {
