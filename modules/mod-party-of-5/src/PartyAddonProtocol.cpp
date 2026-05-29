@@ -1503,6 +1503,33 @@ public:
             uint32 slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
             WowPsParty::SendGearTo(player, slot);
         }
+        // REQ_GENROT\t<token>  →  GENROT\t<token>\t<dsl>
+        // "Generate rotation" button: hand back the class-default rotation for
+        // the member so the editor can populate an empty rotation the user can
+        // then tweak + Save & Apply. Reuses DefaultRotationForClass (the same
+        // default the bot already runs on hire). Converts the '|' field sep to
+        // '~' for the editor's import parser (which avoids '|', a WoW escape).
+        else if (command == "REQ_GENROT")
+        {
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            if (!guid) return;
+            uint8 cls = 0;
+            if (Player* p = ObjectAccessor::FindConnectedPlayer(
+                    ObjectGuid::Create<HighGuid::Player>(guid)))
+                cls = p->getClass();
+            else
+            {
+                QueryResult q = CharacterDatabase.Query(
+                    "SELECT `class` FROM `characters` WHERE `guid` = {}", guid);
+                if (q) cls = q->Fetch()[0].Get<uint8>();
+            }
+            std::string dsl = WowPsParty::DefaultRotationForClass(cls);
+            std::replace(dsl.begin(), dsl.end(), '|', '~');
+            std::ostringstream out;
+            out << "GENROT\t" << token << '\t' << dsl;
+            SendWPSP(player, out.str());
+        }
         else if (command == "REQ_INVENTORY")
         {
             WowPsParty::SendInventoryTo(player);
