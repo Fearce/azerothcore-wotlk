@@ -131,22 +131,22 @@ namespace WowPsParty
     static std::string RndbotAccountCsv()
     {
         static std::string cached;
-        static bool loaded = false;
-        if (loaded) return cached;
-        loaded = true;
+        if (!cached.empty()) return cached;   // only cache a non-empty result
         QueryResult q = LoginDatabase.Query(
             "SELECT `id` FROM `account` WHERE `username` LIKE 'rndbot%'");
         std::ostringstream csv;
+        uint32 n = 0;
         bool first = true;
         if (q) do {
             if (!first) csv << ',';
             first = false;
             csv << q->Fetch()[0].Get<uint32>();
+            ++n;
         } while (q->NextRow());
         cached = csv.str();
-        LOG_INFO("module", "[WowPsParty Henchmen] random-bot account pool size: {}",
-                 first ? 0u : 1u);  // non-empty marker
-        return cached;
+        LOG_INFO("module",
+            "[WowPsParty Henchmen] random-bot account pool: {} accounts", n);
+        return cached;   // empty stays uncached → retried next call
     }
 
     // class id -> default henchman role.
@@ -257,16 +257,21 @@ namespace WowPsParty
         bool  const online  = f[1].Get<uint8>() != 0;
         if (online) { outMsg = "That henchman is busy — pick another."; return false; }
 
-        // Party-space cap: WoW group holds 5 (leader + 4 companions). Count
-        // current companions = existing followers (alts + henchmen).
-        if (Group* grp = requester->GetGroup())
-            if (grp->GetMembersCount() >= 5)
-            { outMsg = "Your party is full (5)."; return false; }
+        // Party-space cap: leader + 4 companions max. Count current followers
+        // (alts + henchmen) from the directive registry — works even before
+        // the WoW group object exists (solo + first henchman).
+        if (WowPsParty::CountFollowersFor(requester->GetGUID()) >= 4)
+        { outMsg = "Your party is full (4 companions)."; return false; }
 
-        // Gold check + deduct.
+        // Gold check + deduct (after all synchronous validation).
         uint32 const cost = HenchmanHireCost(level);
         if (requester->GetMoney() < cost)
         { outMsg = "Not enough gold to hire."; return false; }
+
+        PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+        if (!mgr)
+        { outMsg = "Bot manager not ready — try again in a moment."; return false; }
+
         requester->ModifyMoney(-int32(cost));
 
         ObjectGuid const henchGuid = ObjectGuid::Create<HighGuid::Player>(candidateGuid);
@@ -276,25 +281,34 @@ namespace WowPsParty
         // permission check (WowPsParty_IsHenchman_Trampoline) lets the cross-
         // account random-pool char in.
         WowPsParty::AddHenchmanDirective(account, henchGuid, requester->GetGUID(), useRole);
-
-        PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
-        if (!mgr)
-        {
-            WowPsParty::RemoveFollower(henchGuid);
-            requester->ModifyMoney(int32(cost));   // refund
-            outMsg = "Bot manager not ready — try again in a moment.";
-            return false;
-        }
         mgr->AddPlayerBot(henchGuid, account);
 
-        // The spawn is async (login query holder). Add to the group + set loot
-        // once the bot is in world. Capture by guid; retry a few times.
+        // The spawn is async (login query holder). After a short delay: if the
+        // bot arrived, group it + set loot; if it never arrived, undo the hire
+        // (drop the directive, refund the gold) so we never leak a directive or
+        // charge the player for a no-show.
         ObjectGuid const leaderGuid = requester->GetGUID();
-        requester->m_Events.AddEventAtOffset([leaderGuid, henchGuid]()
+        requester->m_Events.AddEventAtOffset([leaderGuid, henchGuid, cost]()
         {
             Player* lead = ObjectAccessor::FindConnectedPlayer(leaderGuid);
             Player* hen  = ObjectAccessor::FindConnectedPlayer(henchGuid);
-            if (!lead || !hen) return;
+            if (!hen || !hen->IsInWorld())
+            {
+                WowPsParty::RemoveFollower(henchGuid);
+                if (lead)
+                {
+                    lead->ModifyMoney(int32(cost));   // refund the no-show
+                    UpdateGroupLootForHenchmen(lead);
+                    if (lead->GetSession())
+                        ChatHandler(lead->GetSession()).PSendSysMessage(
+                            "|cffff5555[WowPsParty]|r Henchman didn't arrive — refunded.");
+                }
+                LOG_WARN("module",
+                    "[WowPsParty Henchmen] spawn no-show hench_guid={} — refunded {}",
+                    henchGuid.GetCounter(), cost);
+                return;
+            }
+            if (!lead) return;
             Group* g = lead->GetGroup();
             if (!g)
             {
@@ -314,7 +328,7 @@ namespace WowPsParty
                 ai->ChangeStrategy("+loot",   BOT_STATE_NON_COMBAT);
                 ai->ChangeStrategy("+gather", BOT_STATE_NON_COMBAT);
             }
-        }, std::chrono::seconds(3));
+        }, std::chrono::seconds(4));
 
         LOG_INFO("module",
             "[WowPsParty Henchmen] HIRE account={} hench_guid={} role={} level={} cost={}",
@@ -330,11 +344,12 @@ namespace WowPsParty
         if (!WowPsParty::IsHenchman(g)) return;   // only dismiss henchmen
         WowPsParty::RemoveFollower(g);
         if (Player* hen = ObjectAccessor::FindConnectedPlayer(g))
-        {
             if (hen->GetGroup()) hen->RemoveFromGroup();
-            if (PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester))
-                mgr->LogoutPlayerBot(g);
-        }
+        // Log the bot out via the master's mgr regardless of whether it's
+        // currently found in world — it may still be mid-spawn; not doing so
+        // would orphan a default-AI companion with no directive until restart.
+        if (PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester))
+            mgr->LogoutPlayerBot(g);
         UpdateGroupLootForHenchmen(requester);
         LOG_INFO("module", "[WowPsParty Henchmen] DISMISS hench_guid={}", henchGuid);
     }

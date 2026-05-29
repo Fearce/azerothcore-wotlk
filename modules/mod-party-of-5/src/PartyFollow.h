@@ -48,6 +48,7 @@ namespace WowPsParty
     void   RemoveFollower(ObjectGuid followerGuid);   // dismiss / logout
     bool   IsHenchman(ObjectGuid guid);
     uint32 CountHenchmenFor(ObjectGuid leaderGuid);
+    uint32 CountFollowersFor(ObjectGuid leaderGuid);   // alts + henchmen
 
     // Wires up the per-tick re-asserter. Called once from
     // PartyBootstrapWorldScript::OnStartup. Idempotent; subsequent

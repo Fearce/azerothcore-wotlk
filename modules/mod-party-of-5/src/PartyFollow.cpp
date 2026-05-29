@@ -100,7 +100,19 @@ namespace WowPsParty
     void SetActiveFollowers(uint32 account, ObjectGuid leaderGuid)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        EraseByAccount_NoLock(account);
+        // Erase only enrolled-alt directives — KEEP hired henchmen. They live
+        // outside account_party, so a full wipe would drop them from our
+        // management (UpdateAI stops treating them as party bots → they revert
+        // to default-AI "glued to master" without follow/leash). Kicking or
+        // re-enrolling an alt re-runs this, so henchmen must survive it.
+        g_directives.erase(
+            std::remove_if(g_directives.begin(), g_directives.end(),
+                [account](Directive const& d)
+                { return d.account == account && !d.henchman; }),
+            g_directives.end());
+        // Re-point surviving henchmen at the current leader.
+        for (auto& d : g_directives)
+            if (d.account == account && d.henchman) d.leaderGuid = leaderGuid;
         g_formations.erase(account);
 
         QueryResult q = CharacterDatabase.Query(
@@ -203,6 +215,17 @@ namespace WowPsParty
         uint32 n = 0;
         for (auto const& d : g_directives)
             if (d.henchman && d.leaderGuid == leaderGuid) ++n;
+        return n;
+    }
+
+    // Total companions (enrolled alts + henchmen) following the given leader.
+    // Used for the party-space cap before the WoW group exists.
+    uint32 CountFollowersFor(ObjectGuid leaderGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        uint32 n = 0;
+        for (auto const& d : g_directives)
+            if (d.leaderGuid == leaderGuid) ++n;
         return n;
     }
 

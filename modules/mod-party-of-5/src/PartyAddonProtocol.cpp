@@ -1879,11 +1879,15 @@ public:
                 return;
             }
 
-            // If the kicked char is currently spawned as a bot, log it out.
+            // If the kicked char is currently spawned as a bot, remove it from
+            // the group (else it lingers as an offline party member the user
+            // has to uninvite by hand) and log it out.
             Player* botPlayer = ObjectAccessor::FindConnectedPlayer(
                 ObjectGuid::Create<HighGuid::Player>(kickedGuid));
             if (botPlayer && sPlayerbotsMgr.GetPlayerbotAI(botPlayer))
             {
+                if (botPlayer->GetGroup())
+                    botPlayer->RemoveFromGroup();
                 if (PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(player))
                     mgr->LogoutPlayerBot(botPlayer->GetGUID());
             }
@@ -1894,7 +1898,9 @@ public:
             tx->Append("UPDATE `characters` SET `party_slot` = NULL WHERE `guid` = {}", kickedGuid);
             CharacterDatabase.CommitTransaction(tx);
 
-            WowPsParty::ClearFollowersForAccount(accountId);
+            // Rebuild alt directives (kicked alt is gone from account_party so
+            // it won't return). SetActiveFollowers preserves henchmen; do NOT
+            // ClearFollowersForAccount first — that wipes henchmen too.
             WowPsParty::SetActiveFollowers(accountId, player->GetGUID());
 
             ChatHandler(player->GetSession()).PSendSysMessage(
