@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 // Forward declarations of helpers defined in PartyAddonProtocol.cpp / PartyRotation.cpp
 namespace WowPsParty
@@ -718,6 +719,37 @@ namespace WowPsParty
             if (!leader || !leader->GetSession()) return;
             uint32 const account = leader->GetSession()->GetAccountId();
 
+            auto const rows = FetchPartyRows(account);
+            std::unordered_set<uint32> enrolled;
+            for (auto const& row : rows) enrolled.insert(row.second);
+
+            // Purge leftover henchmen BEFORE (re)building the group. Henchmen are
+            // temporary (gone on dismiss/logout), but the WoW group is saved to
+            // DB, so on the next login it still lists last session's henchmen as
+            // offline members — the player would have to kick them by hand. Their
+            // directives were already cleared on logout, so we can't use
+            // IsHenchman here; instead remove any group member that isn't the
+            // leader and isn't one of this account's enrolled alts. (This party
+            // group only ever holds the player + their alts + henchmen, so
+            // "not enrolled" == henchman.) Done first because RemoveMember can
+            // DISBAND the group when it drops below 2 — we re-acquire it after.
+            if (Group* existing = leader->GetGroup())
+            {
+                std::vector<ObjectGuid> toRemove;
+                for (auto const& slot : existing->GetMemberSlots())
+                    if (slot.guid != leader->GetGUID() &&
+                        !enrolled.count(slot.guid.GetCounter()))
+                        toRemove.push_back(slot.guid);
+                for (ObjectGuid const& g : toRemove)
+                {
+                    existing->RemoveMember(g);  // may delete the group object
+                    LOG_INFO("module",
+                        "[WowPsParty] login purge: removed stale henchman guid={} "
+                        "from party group", g.GetCounter());
+                }
+            }
+
+            // Re-acquire the group — the purge above may have disbanded it.
             Group* group = leader->GetGroup();
             if (!group)
             {
@@ -732,7 +764,6 @@ namespace WowPsParty
             group->SetLootMethod(FREE_FOR_ALL);
 
             // Walk the party and invite every member that isn't already in.
-            auto const rows = FetchPartyRows(account);
             for (auto const& row : rows)
             {
                 ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(row.second);
