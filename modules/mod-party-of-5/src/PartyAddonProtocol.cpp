@@ -1988,7 +1988,10 @@ public:
                         mgr->AddPlayerBot(
                             ObjectGuid::Create<HighGuid::Player>(targetGuid), accountId);
                     }
-                    WowPsParty::ClearFollowersForAccount(accountId);
+                    // Rebuild alt directives for the new enrollee. SetActiveFollowers
+                    // already erases+rebuilds the !henchman directives while KEEPING
+                    // henchmen — do NOT ClearFollowersForAccount first, that wiped
+                    // the player's henchmen (they reverted to default AI and left).
                     WowPsParty::SetActiveFollowers(accountId, player->GetGUID());
                     ChatHandler(player->GetSession()).PSendSysMessage(
                         "|cff66ccff[WowPsParty]|r Invited |cffffffff{}|r to the party.", name);
