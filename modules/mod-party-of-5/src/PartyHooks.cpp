@@ -46,6 +46,14 @@ namespace WowPsParty
     bool IsEnabled();     // from PartyBootstrap.cpp
     bool IsLogVerbose();
 
+    // Shared-progression toggle (XP / gold / loot / quest mirroring). Off =
+    // each char keeps its own — normal solo play. Defaults ON.
+    static bool ProgressionShared(Player* p)
+    {
+        if (!p || !p->GetSession()) return false;
+        return GetAccountSettings(p->GetSession()->GetAccountId()).sharedProgression;
+    }
+
     // Teach every class-trainer spell `p` qualifies for at its level. Shared by
     // the .party learnall command and the on-ding hook below. CanTeachSpell
     // enforces level/skill/prereqs and the do/while picks up follow-up ranks a
@@ -199,6 +207,7 @@ public:
         using namespace WowPsParty;
         if (!IsEnabled() || g_propagatingLoot) return;
         if (!player || !player->GetSession() || !item) return;
+        if (!ProgressionShared(player)) return;   // solo: keep own loot
 
         ItemTemplate const* tmpl = item->GetTemplate();
         if (!tmpl) return;
@@ -255,6 +264,7 @@ public:
     {
         if (!WowPsParty::IsEnabled() || !killer || !killed) return;
         if (!killer->GetSession()) return;
+        if (!WowPsParty::ProgressionShared(killer)) return;  // solo: normal loot
 
         // Only auto-loot if the killer is in a WowPsParty party (avoid
         // stealing loot from non-party players who happen to be on a
@@ -347,6 +357,7 @@ public:
             return;
         if (!WowPsParty::IsEnabled() || !player || !player->GetSession() || amount == 0)
             return;
+        if (!WowPsParty::ProgressionShared(player)) return;  // solo: own gold
 
         std::vector<Player*> const peers =
             LoadedPartyPeers(player->GetSession()->GetAccountId(), player);
@@ -371,6 +382,7 @@ public:
             return;
         if (!WowPsParty::IsEnabled() || !player || !player->GetSession() || amount == 0)
             return;
+        if (!WowPsParty::ProgressionShared(player)) return;  // solo: own XP
 
         std::vector<Player*> const peers =
             LoadedPartyPeers(player->GetSession()->GetAccountId(), player);
@@ -397,6 +409,7 @@ public:
             return;
         if (!WowPsParty::IsEnabled() || !player || !player->GetSession() || amount == 0.0f || factionID <= 0)
             return;
+        if (!WowPsParty::ProgressionShared(player)) return;  // solo: own reputation
 
         FactionEntry const* faction = sFactionStore.LookupEntry(uint32(factionID));
         if (!faction)
@@ -432,6 +445,7 @@ void WowPsParty_OnQuestAccepted_Trampoline(Player* who, Quest const* quest)
 {
     if (WowPsParty::g_propagatingQuest) return;
     if (!WowPsParty::IsEnabled() || !who || !who->GetSession() || !quest) return;
+    if (!WowPsParty::ProgressionShared(who)) return;   // solo: don't mirror quests
 
     std::vector<Player*> const peers =
         LoadedPartyPeers(who->GetSession()->GetAccountId(), who);

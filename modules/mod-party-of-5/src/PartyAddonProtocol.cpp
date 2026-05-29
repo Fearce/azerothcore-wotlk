@@ -116,6 +116,21 @@ namespace WowPsParty
         SendWPSP(player, "ROSTER\t" + payload);
     }
 
+    // SETTINGS\t<spawn>\t<inv>\t<gear>\t<prog>  (each 0/1) — the account's
+    // solo/Po5 feature toggles, so the client panel reflects them and the
+    // client-side UI hijacks (B/C) honour them.
+    void SendSettingsTo(Player* player)
+    {
+        if (!player || !player->GetSession()) return;
+        PartySettings const s = GetAccountSettings(player->GetSession()->GetAccountId());
+        std::ostringstream out;
+        out << "SETTINGS\t" << (s.spawnCompanions ? 1 : 0)
+            << '\t' << (s.sharedInventory ? 1 : 0)
+            << '\t' << (s.sharedGear ? 1 : 0)
+            << '\t' << (s.sharedProgression ? 1 : 0);
+        SendWPSP(player, out.str());
+    }
+
     // Resolve the slot's character guid for the account.
     static uint32 GuidForAccountSlot(uint32 account, uint32 slot)
     {
@@ -1356,6 +1371,24 @@ public:
         if (command == "REQ_ROSTER")
         {
             WowPsParty::SendRosterTo(player);
+        }
+        else if (command == "REQ_SETTINGS")
+        {
+            WowPsParty::SendSettingsTo(player);
+        }
+        else if (command == "SET_SETTING")
+        {
+            // SET_SETTING\t<key>\t<0|1>
+            std::string s(payload);
+            auto t = s.find('\t');
+            if (t == std::string::npos) return;
+            std::string const key = s.substr(0, t);
+            bool const val = std::strtoul(s.substr(t + 1).c_str(), nullptr, 10) != 0;
+            uint32 const account = player->GetSession()->GetAccountId();
+            WowPsParty::SetAccountSetting(account, key, val);
+            LOG_INFO("module",
+                "[WowPsParty] SET_SETTING account={} {}={}", account, key, val ? 1 : 0);
+            WowPsParty::SendSettingsTo(player);   // echo back the full set
         }
         else if (command == "REQ_SPELLBOOK")
         {

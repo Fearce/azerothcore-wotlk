@@ -39,3 +39,16 @@ SET @ddl := IF(@col_exists = 0,
 PREPARE stmt FROM @ddl;
 EXECUTE stmt;
 DEALLOCATE PREPARE stmt;
+
+-- Per-account solo/Party-of-5 feature toggles. All default ON (full Po5);
+-- unchecking lets the same install run normal solo play. Mirrors the runtime
+-- EnsureSettingsTable() CREATE so existing DBs get it without a migration.
+CREATE TABLE IF NOT EXISTS `party_account_settings` (
+    `account`            INT UNSIGNED NOT NULL,
+    `spawn_companions`   TINYINT      NOT NULL DEFAULT 1,
+    `shared_inventory`   TINYINT      NOT NULL DEFAULT 1,
+    `shared_gear`        TINYINT      NOT NULL DEFAULT 1,
+    `shared_progression` TINYINT      NOT NULL DEFAULT 1,
+    PRIMARY KEY (`account`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+  COMMENT='WowPsParty: per-account solo/Po5 feature toggles';

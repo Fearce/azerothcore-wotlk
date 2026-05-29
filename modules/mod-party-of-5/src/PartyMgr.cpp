@@ -34,6 +34,9 @@
 #include "WorldPacket.h"
 #include "Opcodes.h"
 
+#include <mutex>
+#include <unordered_map>
+
 // Forward declarations of helpers defined in PartyAddonProtocol.cpp / PartyRotation.cpp
 namespace WowPsParty
 {
@@ -50,6 +53,74 @@ namespace WowPsParty
     {
         static PartyMgr instance;
         return instance;
+    }
+
+    // ----- per-account feature toggles ---------------------------------------
+    static std::unordered_map<uint32, PartySettings> g_accountSettings;
+    static std::mutex                                g_settingsMutex;
+
+    void EnsureSettingsTable()
+    {
+        CharacterDatabase.DirectExecute(
+            "CREATE TABLE IF NOT EXISTS `party_account_settings` ("
+            "`account` INT UNSIGNED NOT NULL PRIMARY KEY, "
+            "`spawn_companions` TINYINT NOT NULL DEFAULT 1, "
+            "`shared_inventory` TINYINT NOT NULL DEFAULT 1, "
+            "`shared_gear` TINYINT NOT NULL DEFAULT 1, "
+            "`shared_progression` TINYINT NOT NULL DEFAULT 1)");
+    }
+
+    void AccountSettingsRefreshFromDB(uint32 account)
+    {
+        PartySettings s;  // all-ON default
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `spawn_companions`,`shared_inventory`,`shared_gear`,"
+            "`shared_progression` FROM `party_account_settings` WHERE `account` = {}",
+            account);
+        if (q)
+        {
+            Field* f = q->Fetch();
+            s.spawnCompanions   = f[0].Get<uint8>() != 0;
+            s.sharedInventory   = f[1].Get<uint8>() != 0;
+            s.sharedGear        = f[2].Get<uint8>() != 0;
+            s.sharedProgression = f[3].Get<uint8>() != 0;
+        }
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        g_accountSettings[account] = s;
+    }
+
+    PartySettings GetAccountSettings(uint32 account)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_settingsMutex);
+            auto it = g_accountSettings.find(account);
+            if (it != g_accountSettings.end()) return it->second;
+        }
+        AccountSettingsRefreshFromDB(account);
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        return g_accountSettings[account];
+    }
+
+    void SetAccountSetting(uint32 account, std::string const& key, bool value)
+    {
+        static const std::unordered_map<std::string, int> cols = {
+            {"spawn_companions", 0}, {"shared_inventory", 1},
+            {"shared_gear", 2}, {"shared_progression", 3} };
+        if (cols.find(key) == cols.end()) return;
+        uint8 const v = value ? 1 : 0;
+        // Upsert the single column; unspecified columns keep their table
+        // default (1) on insert, which matches "all ON by default".
+        CharacterDatabase.Execute(
+            "INSERT INTO `party_account_settings` (`account`, `{}`) VALUES ({}, {}) "
+            "ON DUPLICATE KEY UPDATE `{}` = {}",
+            key, account, uint32(v), key, uint32(v));
+        // Refresh the cached struct field.
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        PartySettings& s = g_accountSettings[account];
+        if      (key == "spawn_companions")   s.spawnCompanions   = value;
+        else if (key == "shared_inventory")   s.sharedInventory   = value;
+        else if (key == "shared_gear")        s.sharedGear        = value;
+        else if (key == "shared_progression") s.sharedProgression = value;
     }
 
     static uint32 FetchAccountForGuid(uint32 guid)
@@ -212,6 +283,18 @@ namespace WowPsParty
 
         uint32 const account = active->GetSession()->GetAccountId();
         uint32 const activeGuid = active->GetGUID().GetCounter();
+
+        // Load this account's feature toggles up front (cached). Solo mode
+        // (companions off) keeps the enrolled roster + rotations/talents on
+        // disk — we just don't spawn the bots or form the party group.
+        AccountSettingsRefreshFromDB(account);
+        if (!GetAccountSettings(account).spawnCompanions)
+        {
+            LOG_INFO("module",
+                "[WowPsParty] OnActiveLogin: account={} companions OFF (solo) — "
+                "not spawning party.", account);
+            return;
+        }
 
         auto const rows = FetchPartyRows(account);
         if (rows.empty())

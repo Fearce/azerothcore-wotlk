@@ -83,6 +83,10 @@ public:
         // mod-playerbots' AI cache that was getting stuck on the original
         // session player. See PartyFollow.h for the rationale.
         WowPsParty::InstallFollowTicker();
+
+        // Per-account feature toggles (solo / Po5). Create the table on the
+        // live DB if a migration hasn't run yet.
+        WowPsParty::EnsureSettingsTable();
     }
 };
 

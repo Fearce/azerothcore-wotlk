@@ -57,6 +57,25 @@ namespace WowPsParty
     // can drive it without a live player session.
     uint32 BootstrapPartyForAccount(uint32 account, std::vector<std::string>& messages);
 
+    // Per-account feature toggles. The same install can run full Party-of-5
+    // (all ON, the default) or normal solo play (companions off, normal bags,
+    // no shared progression). Persisted in `party_account_settings`.
+    struct PartySettings
+    {
+        bool spawnCompanions   = true;  // spawn the 4 enrolled alts as bots
+        bool sharedInventory   = true;  // CLIENT: B opens the merged party grid
+        bool sharedGear        = true;  // CLIENT: C opens the party gear panel
+        bool sharedProgression = true;  // SERVER: mirror XP / gold / loot / quests
+    };
+
+    // Cached read; all-ON default for an account with no row yet.
+    PartySettings GetAccountSettings(uint32 account);
+    // Persist one toggle. key ∈ {spawn_companions, shared_inventory,
+    // shared_gear, shared_progression}. Updates the DB and the cache.
+    void SetAccountSetting(uint32 account, std::string const& key, bool value);
+    void AccountSettingsRefreshFromDB(uint32 account);
+    void EnsureSettingsTable();   // CREATE TABLE IF NOT EXISTS — call on startup
+
     class PartyMgr
     {
     public:
