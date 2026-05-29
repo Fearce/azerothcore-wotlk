@@ -1618,6 +1618,47 @@ public:
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Target mode for slot {} set to '{}'.", slot, mode);
         }
+        // REQ_LEADDUNGEON\t<slot>  →  LEADDUNGEON\t<slot>\t<0|1>
+        else if (command == "REQ_LEADDUNGEON")
+        {
+            uint32 const slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            uint32 const account = player->GetSession()->GetAccountId();
+            uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+            bool on = true;
+            if (guid)
+            {
+                QueryResult q = CharacterDatabase.Query(
+                    "SELECT `glyphs_csv` FROM `party_loadout` WHERE `guid` = {}", guid);
+                if (q && q->Fetch()[0].Get<std::string>() == "0") on = false;
+            }
+            std::ostringstream out;
+            out << "LEADDUNGEON\t" << slot << '\t' << (on ? 1 : 0);
+            SendWPSP(player, out.str());
+        }
+        // SET_LEADDUNGEON\t<slot>\t<0|1>
+        else if (command == "SET_LEADDUNGEON")
+        {
+            std::string s(payload);
+            auto tab = s.find('\t');
+            if (tab == std::string::npos) return;
+            uint32 const slot = std::strtoul(s.substr(0, tab).c_str(), nullptr, 10);
+            bool const on = (s.substr(tab + 1) != "0");
+            if (slot >= WowPsParty::PARTY_SIZE) return;
+            uint32 const account = player->GetSession()->GetAccountId();
+            uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+            if (!guid) return;
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
+                "`gear_lock_json`, `priority_actions_json`) VALUES ({}, '', '', '{}', '', '') "
+                "ON DUPLICATE KEY UPDATE `glyphs_csv` = VALUES(`glyphs_csv`)",
+                guid, on ? "1" : "0");
+            CharacterDatabase.CommitTransaction(tx);
+            WowPsParty::LeadDungeonCacheSet(guid, on);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Slot {} lead-in-dungeons: {}.",
+                slot, on ? "ON" : "OFF");
+        }
         else if (command == "EQUIP")
         {
             HandleEquip(player, payload);

@@ -257,6 +257,34 @@ namespace WowPsParty
         TargetModeCacheSet(guidLow, mode);
     }
 
+    // ---- "lead in dungeons" toggle (tank) ----------------------------------
+    // Whether this member is allowed to lead the recorded dungeon path + pull.
+    // Stored in party_loadout.glyphs_csv ("0" = off). Default ON so existing
+    // tanks keep leading; only an explicit "0" disables it.
+    static std::unordered_map<uint32, bool> g_leadDungeon;  // guidLow -> false only when off
+    static std::mutex g_leadMutex;
+
+    void LeadDungeonCacheSet(uint32 guidLow, bool on)
+    {
+        std::lock_guard<std::mutex> lock(g_leadMutex);
+        if (on) g_leadDungeon.erase(guidLow);   // default ON needs no entry
+        else    g_leadDungeon[guidLow] = false;
+    }
+
+    bool GetLeadInDungeon(uint32 guidLow)
+    {
+        std::lock_guard<std::mutex> lock(g_leadMutex);
+        return g_leadDungeon.find(guidLow) == g_leadDungeon.end();  // absent = ON
+    }
+
+    void LeadDungeonRefreshFromDB(uint32 guidLow)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `glyphs_csv` FROM `party_loadout` WHERE `guid` = {}", guidLow);
+        std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+        LeadDungeonCacheSet(guidLow, v != "0");
+    }
+
     // ---- retarget throttle --------------------------------------------------
     // Timestamp (getMSTime) of each bot's last target SWITCH. Used to stop the
     // "spinbot" when several mobs flank the tank and the nearest-loose pick
@@ -351,6 +379,7 @@ namespace WowPsParty
         if (tankSlot < 0) return;
         int const mySlot = GetSlotForGuid(bot->GetGUID());
         if (mySlot != tankSlot) return;
+        if (!GetLeadInDungeon(bot->GetGUID().GetCounter())) return;  // leading disabled
 
         ObjectGuid const leaderGuid = GetLeaderFor(bot->GetGUID());
         if (!leaderGuid) return;
@@ -1036,5 +1065,6 @@ void WowPsParty_TankFollowPath_Trampoline(Player* bot)
     int const tankSlot = WowPsParty::GetTankSlotForAccount(bot->GetSession()->GetAccountId());
     if (tankSlot < 0) return;
     if (WowPsParty::GetSlotForGuid(bot->GetGUID()) != tankSlot) return;
+    if (!WowPsParty::GetLeadInDungeon(bot->GetGUID().GetCounter())) return;  // user disabled leading
     WowPsParty::TankFollowPath(bot);
 }

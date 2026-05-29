@@ -80,6 +80,11 @@ namespace WowPsParty
     void TargetModeRefreshFromDB(uint32 guidLow);
     std::string GetTargetMode(uint32 guidLow);
 
+    // Per-tank "lead the recorded dungeon path + pull" toggle (default ON).
+    void LeadDungeonCacheSet(uint32 guidLow, bool on);
+    void LeadDungeonRefreshFromDB(uint32 guidLow);
+    bool GetLeadInDungeon(uint32 guidLow);
+
     // Tell the follow ticker to LEAVE this bot alone for the next
     // `durationMs` milliseconds — used by the rotation engine's
     // `drink` / `hold_position` actions so a bot that's just been told

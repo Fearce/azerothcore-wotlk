@@ -51,9 +51,10 @@ namespace WowPsParty
         constexpr float  LEAD_DISTANCE      = 25.0f;   // aim this far ahead ALONG the path
         constexpr float  WAYPOINT_REACHED   = 3.5f;
         // Vertical step size that pathfinding can't handle (jumps, drops,
-        // dropdowns through holes). When the next waypoint differs by more
-        // than this in Z, the tank skips walking and just teleports.
-        constexpr float  VERTICAL_STEP_TP   = 4.0f;
+        // dropdowns through holes). Checked over the IMMEDIATE next stride
+        // (~2y), so only a true cliff trips it — descending ramps (Deadmines)
+        // have small per-stride Z change and are walked, not teleported.
+        constexpr float  VERTICAL_STEP_TP   = 6.0f;
 
         static float Dist3D(float ax, float ay, float az, float bx, float by, float bz)
         {
@@ -324,11 +325,24 @@ namespace WowPsParty
         // in Stockades, the giant fall in LBRS …) Teleport instead of
         // trying to path. User-facing this looks like the tank "blinks"
         // through the obstacle, which Kevin signed off on.
-        float const dz = std::fabs(wp.z - bot->GetPositionZ());
-        if (dz > VERTICAL_STEP_TP)
+        // Teleport ONLY across a genuine cliff/hole — a big Z change over the
+        // tank's IMMEDIATE next stride (recorded waypoints are ~2y apart).
+        // Comparing Z to the far lookahead made smooth descents teleport every
+        // tick. Find the tank's own cursor, then look at its very next step.
+        uint32 tankNearest = 0;
+        float  tankNearD   = std::numeric_limits<float>::max();
+        for (uint32 i = 0; i < path.size(); ++i)
         {
-            tlog("blink: vertical step too big, NearTeleport to waypoint");
-            bot->NearTeleportTo(wp.x, wp.y, wp.z, wp.o);
+            float const d = Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                                   path[i].x, path[i].y, path[i].z);
+            if (d < tankNearD) { tankNearD = d; tankNearest = i; }
+        }
+        uint32 const stepIdx = std::min(tankNearest + 1, uint32(path.size()) - 1);
+        float const dzStep = std::fabs(path[stepIdx].z - bot->GetPositionZ());
+        if (dzStep > VERTICAL_STEP_TP)
+        {
+            tlog("blink: cliff on next stride, NearTeleport across");
+            bot->NearTeleportTo(path[stepIdx].x, path[stepIdx].y, path[stepIdx].z, path[stepIdx].o);
             return;
         }
 

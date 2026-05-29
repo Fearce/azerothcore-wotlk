@@ -1619,6 +1619,35 @@ namespace WowPsParty
             return faceAndCast(target, spellId);
         }
 
+        // "pull:<spell>" — initiate a RANGED pull. Picks the nearest hostile
+        // within 30y that ISN'T in combat yet and casts <spell> at it (Throw,
+        // Shoot, Hunter's Mark, etc.) WITHOUT closing to melee. Pair with an
+        // `out_of_combat` condition so it pulls one mob, then the rotation /
+        // engagement system takes over once that mob aggros. Lets a warrior
+        // tank pull with Throw instead of charging the whole room.
+        if (verb == "pull")
+        {
+            if (bot->IsInCombat()) return false;
+            uint32 const spellId = FindKnownSpellByName(bot, arg);
+            if (!spellId) return false;
+            std::list<Unit*> hostiles;
+            GatherHostilesAround(bot, 30.0f, hostiles);
+            Unit* best = nullptr;
+            float bestD = 1e9f;
+            for (Unit* u : hostiles)
+            {
+                if (!u || !u->IsAlive() || u->IsInCombat()) continue;  // only un-engaged
+                if (!bot->IsValidAttackTarget(u)) continue;
+                float const d = bot->GetDistance(u);
+                if (d < bestD) { bestD = d; best = u; }
+            }
+            if (!best) return false;
+            if (!canFireSpellOn(spellId, best)) return false;
+            if (!channelClipOk()) return false;
+            bot->SetTarget(best->GetGUID());   // so combat/AssistTarget picks it up
+            return faceAndCast(best, spellId); // ranged: faceAndCast doesn't run in
+        }
+
         if (verb == "rez_party")
         {
             if (bot->IsInCombat()) return false;
@@ -1795,6 +1824,10 @@ namespace WowPsParty
                 {
                     bot->CastSpell(bot, spellId, true);  // triggered, no GCD/cost
                     last = now;
+                    // Announce it so the player knows the bot is regenerating.
+                    bot->Say(wantDrink ? "Drinking to recover mana."
+                                       : "Sitting down to eat.",
+                             LANG_UNIVERSAL);
                     LOG_INFO("module",
                         "[WowPsParty Rotation] {} verb={} consumed shared item, cast spell={}",
                         bot->GetName(), verb, spellId);
