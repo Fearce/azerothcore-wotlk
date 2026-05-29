@@ -363,8 +363,14 @@ namespace WowPsParty
         std::lock_guard<std::mutex> lock(g_mutex);
         uint32 account = 0;
         bool found = false;
+        // Match whether `member` is a FOLLOWER or the LEADER. The leader is
+        // never stored as a followerGuid, so a leader-only match is essential —
+        // without it, GetPartyGuidsFor(leader) returned empty, which silently
+        // broke DismissAllHenchmen(leader) (left stale henchman directives that
+        // inflated the party-full count) and party enumeration for the leader.
         for (auto const& d : g_directives)
-            if (d.followerGuid == member) { account = d.account; found = true; break; }
+            if (d.followerGuid == member || d.leaderGuid == member)
+            { account = d.account; found = true; break; }
         if (!found) return;
         ObjectGuid leader;
         for (auto const& d : g_directives)
