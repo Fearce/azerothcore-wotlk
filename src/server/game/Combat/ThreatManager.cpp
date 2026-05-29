@@ -705,6 +705,21 @@ void ThreatManager::ProcessAIUpdates()
             if (threatEntry->pctMod != 1.0f) // flat/AP modifiers handled in Spell::HandleThreatSpells
                 threat *= threatEntry->pctMod;
 
+        // WowPsParty: the Voidwalker's Torment generates 20% more threat than
+        // standard, so the pet is a slightly better off-tank. Boosting only the
+        // damage-derived threat here (not adding a spell_threat row) keeps the
+        // spell's flat initial threat (threat += SpellLevel) intact — this is a
+        // pure bonus with no regression. Torment ranks 1-6.
+        switch (spell->Id)
+        {
+            case 3716: case 7809: case 7810:
+            case 7811: case 11774: case 11775:
+                threat *= 1.2f;
+                break;
+            default:
+                break;
+        }
+
         if (Player* modOwner = victim->GetSpellModOwner())
             modOwner->ApplySpellMod(spell->Id, SPELLMOD_THREAT, threat);
     }
