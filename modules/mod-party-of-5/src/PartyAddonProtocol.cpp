@@ -116,14 +116,6 @@ namespace WowPsParty
         SendWPSP(player, "ROSTER\t" + payload);
     }
 
-    void SendSwappedTo(Player* player, int oldSlot, int newSlot)
-    {
-        if (!player) return;
-        std::ostringstream out;
-        out << "SWAPPED\t" << oldSlot << '\t' << newSlot;
-        SendWPSP(player, out.str());
-    }
-
     // Resolve the slot's character guid for the account.
     static uint32 GuidForAccountSlot(uint32 account, uint32 slot)
     {
@@ -194,39 +186,17 @@ namespace WowPsParty
         SendWPSP(requester, out.str());
     }
 
-    // BAR\t<slot>\t<spellId1,spellId2,...,spellId12>   (0 for empty)
-    void SendActionBarTo(Player* requester, uint32 slot)
-    {
-        if (!requester || !requester->GetSession()) return;
-        uint32 const account = requester->GetSession()->GetAccountId();
-        uint32 const guid = GuidForAccountSlot(account, slot);
-        if (!guid) return;
-
-        QueryResult q = CharacterDatabase.Query(
-            "SELECT `action_bar_csv` FROM `party_loadout` WHERE `guid` = {}", guid);
-        std::string bar = q ? q->Fetch()[0].Get<std::string>() : std::string();
-        // If no row yet, emit 12 zeros so the addon shows an empty bar with the
-        // right slot count.
-        if (bar.empty())
-            bar = "0,0,0,0,0,0,0,0,0,0,0,0";
-
-        std::ostringstream out;
-        out << "BAR\t" << slot << '\t' << bar;
-        SendWPSP(requester, out.str());
-    }
-
     // forward decls — definitions follow below
     void SendGearTo(Player* requester, uint32 slot);
     void SendInventoryTo(Player* requester);
     void SendQuestProgressTo(Player* requester);
 
-    // Push spellbook + bar + gear + inventory for the new controlled body.
-    // Called from PartyMgr::SwapTo so the addon can refresh.
+    // Push spellbook + gear + inventory for the active body on login. The
+    // spellbook feeds the rotation editor's spell picker.
     void PushControlledLoadoutTo(Player* requester, int slot)
     {
         if (!requester || slot < 0) return;
         SendSpellbookTo(requester, uint32(slot));
-        SendActionBarTo(requester, uint32(slot));
         SendGearTo(requester, uint32(slot));
         SendInventoryTo(requester);
     }
@@ -1096,32 +1066,6 @@ static void HandleSortBags(Player* requester)
     WowPsParty::SendInventoryTo(requester);
 }
 
-// SAVE_BAR\t<slot>\t<spellId1,spellId2,...> — persists the addon's local bar
-// layout for that party slot to party_loadout.action_bar_csv.
-static void HandleSaveBar(Player* requester, std::string_view payload)
-{
-    if (!requester || !requester->GetSession()) return;
-    auto tab = payload.find('\t');
-    if (tab == std::string_view::npos) return;
-    uint32 slot = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
-    std::string csv(payload.substr(tab + 1));
-
-    uint32 const account = requester->GetSession()->GetAccountId();
-    QueryResult q = CharacterDatabase.Query(
-        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, slot);
-    if (!q) return;
-    uint32 const guid = q->Fetch()[0].Get<uint32>();
-
-    CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
-    tx->Append(
-        "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
-        "`gear_lock_json`, `priority_actions_json`, `action_bar_csv`) "
-        "VALUES ({}, '', '', '', '', '', '{}') "
-        "ON DUPLICATE KEY UPDATE `action_bar_csv` = VALUES(`action_bar_csv`)",
-        guid, csv);
-    CharacterDatabase.CommitTransaction(tx);
-}
-
 // MOVE\t<srcPartySlot>\t<srcItemGuidLow>\t<destPartySlot>
 //   Move an item from src char's bag into dest char's bags (free slot). Uses
 //   the same Item-preserving path as EQUIP; doesn't equip on arrival. For
@@ -1271,96 +1215,6 @@ static void HandleGotoDelta(Player* requester, std::string_view payload)
         targetX, targetY);
 }
 
-// PET_BAR_SET\t<slot 0-9>\t<spellId>
-// Assigns one of the controlled body's known spells to a pet-bar slot of the
-// possessed unit, then re-pushes SMSG_PET_SPELLS so Blizzard's pet bar
-// (BonusActionButton1-10) redraws with the new layout. This is the path the
-// addon takes when the user drags a spell from the custom Spellbook window
-// onto a pet-bar slot — Blizzard's native PickupSpell can't help because the
-// spell isn't in the requester's own spellbook, only the possessed body's.
-//
-// Slot constraints (from CharmInfo.h):
-//   0-2 = command buttons (attack/follow/stay) — refuse writes here
-//   3-6 = spell slots                          — accept
-//   7-9 = reaction buttons                     — refuse
-static void HandlePetBarSet(Player* requester, std::string_view payload)
-{
-    auto tab = payload.find('\t');
-    if (tab == std::string_view::npos)
-    {
-        LOG_WARN("module", "[WowPsParty] PET_BAR_SET malformed payload (no tab)");
-        return;
-    }
-    int slot = std::atoi(std::string(payload.substr(0, tab)).c_str());
-    uint32 spellId = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
-
-    LOG_INFO("module",
-        "[WowPsParty] PET_BAR_SET received from guid={} slot={} spell={}",
-        requester ? requester->GetGUID().GetCounter() : 0u,
-        slot, spellId);
-
-    // Possessing a Player: ALL 10 pet-bar slots (0-9) are usable for spells
-    // because the command/reaction slot semantics (attack/follow/stay /
-    // defensive/aggressive/passive) are pet-AI concepts that don't apply
-    // to a player driving another player's body. The user IS the AI.
-    // Original layout restriction (3-6 only) limited the user to 4 spells
-    // per char which is way too few.
-    if (slot < 0 || slot >= MAX_UNIT_ACTION_BAR_INDEX)
-    {
-        ChatHandler(requester->GetSession()).PSendSysMessage(
-            "|cffff5555[WowPsParty]|r Pet-bar slot {} out of range (0-{}).",
-            slot, MAX_UNIT_ACTION_BAR_INDEX - 1);
-        LOG_INFO("module", "[WowPsParty] PET_BAR_SET refused: slot {} out of range", slot);
-        return;
-    }
-
-    Unit* charm = requester->GetCharm();
-    if (!charm)
-    {
-        ChatHandler(requester->GetSession()).PSendSysMessage(
-            "|cffff5555[WowPsParty]|r Not possessing anyone — swap to a party member first.");
-        LOG_INFO("module", "[WowPsParty] PET_BAR_SET refused: no current charm on requester");
-        return;
-    }
-    Player* body = charm->ToPlayer();
-    if (!body)
-    {
-        LOG_WARN("module", "[WowPsParty] PET_BAR_SET refused: charm is not a Player");
-        return;
-    }
-    CharmInfo* ci = charm->GetCharmInfo();
-    if (!ci)
-    {
-        LOG_WARN("module", "[WowPsParty] PET_BAR_SET refused: charm has no CharmInfo");
-        return;
-    }
-
-    if (spellId != 0 && !body->HasActiveSpell(spellId))
-    {
-        ChatHandler(requester->GetSession()).PSendSysMessage(
-            "|cffff5555[WowPsParty]|r Spell {} isn't known by {}.",
-            spellId, body->GetName());
-        LOG_INFO("module",
-            "[WowPsParty] PET_BAR_SET refused: spell {} not known by body guid={}",
-            spellId, body->GetGUID().GetCounter());
-        return;
-    }
-
-    // ACT_DISABLED matches the state our patched InitPossessCreateSpells uses
-    // for spells (manual cast, no autocast).
-    ci->SetActionBar(uint8(slot), spellId, ACT_DISABLED);
-    requester->PossessSpellInitialize();
-
-    LOG_INFO("module",
-        "[WowPsParty] PET_BAR_SET applied: slot={} spell={} body={} -- "
-        "SMSG_PET_SPELLS re-sent",
-        slot, spellId, body->GetName());
-
-    ChatHandler(requester->GetSession()).PSendSysMessage(
-        "|cff66ccff[WowPsParty]|r Placed spell {} at slot {} on {}.",
-        spellId, slot, body->GetName());
-}
-
 namespace WowPsParty
 {
     // Session-independent bootstrap. Pulls every unenrolled char on the
@@ -1459,56 +1313,6 @@ static void HandleBootstrapParty(Player* requester)
         WowPsParty::SendRosterTo(requester);
 }
 
-// CAST\t<spellId>[\t<targetGuidLow>]
-// Casts spellId from the body the user is currently controlling (possess target,
-// or self). If targetGuidLow is omitted, uses the controlled body's victim, then
-// its selection, then casts on self for self-only spells.
-static void HandleCast(Player* requester, std::string_view payload)
-{
-    auto tab = payload.find('\t');
-    std::string spellStr(tab == std::string_view::npos ? payload : payload.substr(0, tab));
-    uint32 spellId = std::strtoul(spellStr.c_str(), nullptr, 10);
-    if (!spellId) return;
-
-    SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
-    if (!info) return;
-
-    Player* caster = WowPsParty::ResolveControlledBody(requester);
-    if (!caster) return;
-
-    // The possessed body should know this spell. (We accept user input via
-    // addon protocol; defensive check.)
-    if (!caster->HasSpell(spellId))
-    {
-        if (WowPsParty::IsLogVerbose())
-            LOG_INFO("module", "[WowPsParty] CAST: guid={} doesn't know spell {}",
-                     caster->GetGUID().GetCounter(), spellId);
-        return;
-    }
-
-    Unit* target = nullptr;
-    if (tab != std::string_view::npos)
-    {
-        std::string tgtStr(payload.substr(tab + 1));
-        uint32 tgtLow = std::strtoul(tgtStr.c_str(), nullptr, 10);
-        if (tgtLow)
-            target = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(tgtLow));
-    }
-    if (!target)
-        target = caster->GetVictim();
-    if (!target)
-    {
-        ObjectGuid sel = caster->GetTarget();
-        if (sel)
-            target = ObjectAccessor::GetUnit(*caster, sel);
-    }
-    // For non-targeting spells / self-only, fall back to self.
-    if (!target)
-        target = caster;
-
-    caster->CastSpell(target, spellId, false);
-}
-
 class PartyAddonProtocolScript : public PlayerScript
 {
 public:
@@ -1557,15 +1361,6 @@ public:
         {
             uint32 slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
             WowPsParty::SendSpellbookTo(player, slot);
-        }
-        else if (command == "REQ_BAR")
-        {
-            uint32 slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
-            WowPsParty::SendActionBarTo(player, slot);
-        }
-        else if (command == "SAVE_BAR")
-        {
-            HandleSaveBar(player, payload);
         }
         else if (command == "REQ_GEAR")
         {
@@ -1747,17 +1542,9 @@ public:
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Reset talents for slot {} (free).", slot);
         }
-        else if (command == "CAST")
-        {
-            HandleCast(player, payload);
-        }
         else if (command == "GOTO_DELTA")
         {
             HandleGotoDelta(player, payload);
-        }
-        else if (command == "PET_BAR_SET")
-        {
-            HandlePetBarSet(player, payload);
         }
         else if (command == "BOOTSTRAP_PARTY")
         {

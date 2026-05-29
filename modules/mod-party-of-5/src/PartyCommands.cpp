@@ -78,8 +78,6 @@ public:
             { "list",   HandleListCommand,   SEC_PLAYER, Console::Yes },
             { "leave",  HandleLeaveCommand,  SEC_PLAYER, Console::Yes },
             { "slot",   HandleSlotCommand,   SEC_PLAYER, Console::Yes },
-            { "swap",   HandleSwapCommand,   SEC_PLAYER, Console::Yes },
-            { "unswap", HandleUnswapCommand, SEC_PLAYER, Console::Yes },
             { "rez",          HandleRezCommand,          SEC_PLAYER, Console::Yes },
             { "setrotation",  HandleSetRotationCommand,  SEC_PLAYER, Console::Yes },
             { "getrotation",  HandleGetRotationCommand,  SEC_PLAYER, Console::Yes },
@@ -248,91 +246,6 @@ public:
         return true;
     }
 
-    // .party swap <0-4> — seamlessly take control of the party member at the slot
-    static bool HandleSwapCommand(ChatHandler* handler, Optional<uint32> slotArg)
-    {
-        Player* requestor = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
-        if (!requestor)
-            return false;
-
-        if (!slotArg)
-        {
-            handler->PSendSysMessage(
-                "|cffff5555[WowPsParty]|r Usage: |cffffff00.party swap <0-4>|r");
-            handler->SetSentErrorMessage(true);
-            return false;
-        }
-
-        uint32 const slot = *slotArg;
-        if (slot >= WowPsParty::PARTY_SIZE)
-        {
-            handler->PSendSysMessage(
-                "|cffff5555[WowPsParty]|r Slot must be 0-4 (got {}).", slot);
-            handler->SetSentErrorMessage(true);
-            return false;
-        }
-
-        // RELOGIN APPROACHES FAILED. Tried both full LogoutPlayer +
-        // HandlePlayerLoginOpcode (client went to char-select, DC'd) and
-        // quiet logout that skipped SMSG_LOGOUT_COMPLETE (still DC'd).
-        // WoW 3.3.5a client doesn't accept SMSG_LOGIN_VERIFY_WORLD mid-
-        // session regardless. Back to POSSESS-based swap; the trade-off
-        // is tank stands still during possess but at least swap WORKS.
-        WowPsParty::SwapResult const r = sPartyMgr.SwapTo(requestor, static_cast<uint8>(slot));
-        switch (r)
-        {
-            case WowPsParty::SwapResult::Ok:
-                handler->PSendSysMessage(
-                    "|cff66ccff[WowPsParty]|r Controlling slot {}. "
-                    "Your previous body becomes a follower bot.", slot);
-                handler->PSendSysMessage(
-                    "|cffffcc55[WowPsParty]|r WARNING: until the addon ships in Phase 3, the "
-                    "action bar shows a pet-style bar and your original spellbook is unsafe to "
-                    "use (casting your old spells may disconnect you). Type |cffffff00.party "
-                    "unswap|r to return to your real body if things break.");
-                return true;
-
-            case WowPsParty::SwapResult::InvalidSlot:
-                handler->PSendSysMessage(
-                    "|cffff5555[WowPsParty]|r Slot {} is empty. "
-                    "Use |cffffff00.party list|r to see your roster.", slot);
-                handler->SetSentErrorMessage(true);
-                return false;
-
-            case WowPsParty::SwapResult::TargetNotInWorld:
-                handler->PSendSysMessage(
-                    "|cffff5555[WowPsParty]|r The character in slot {} isn't currently in the world. "
-                    "Try again in a few seconds — they may still be spawning.", slot);
-                handler->SetSentErrorMessage(true);
-                return false;
-
-            case WowPsParty::SwapResult::TargetIsDead:
-                handler->PSendSysMessage(
-                    "|cffff5555[WowPsParty]|r Slot {} is dead. Rez them first.", slot);
-                handler->SetSentErrorMessage(true);
-                return false;
-
-            case WowPsParty::SwapResult::AlreadyControllingTarget:
-                handler->PSendSysMessage(
-                    "|cffffcc55[WowPsParty]|r You're already controlling slot {}.", slot);
-                return true;
-
-            case WowPsParty::SwapResult::InBattleground:
-                handler->PSendSysMessage(
-                    "|cffff5555[WowPsParty]|r Swaps are disabled in battlegrounds and arenas.");
-                handler->SetSentErrorMessage(true);
-                return false;
-
-            case WowPsParty::SwapResult::VehicleSetupFailed:
-                handler->PSendSysMessage(
-                    "|cffff5555[WowPsParty]|r Swap failed at the server (charm/possess error). "
-                    "Check the worldserver log; this is the spike path mentioned in the architecture.");
-                handler->SetSentErrorMessage(true);
-                return false;
-        }
-        return false;
-    }
-
     // Resolve a slot 0-4 to that party member's guid. Returns 0 if invalid or empty.
     static uint32 GuidForSlot(uint32 accountId, uint32 slot)
     {
@@ -350,15 +263,13 @@ public:
         handler->PSendSysMessage(".party list            |cff888888- show roster|r");
         handler->PSendSysMessage(".party leave           |cff888888- remove this char|r");
         handler->PSendSysMessage(".party slot <0-4>      |cff888888- mark active-on-login|r");
-        handler->PSendSysMessage(".party swap <0-4>      |cff888888- take control of slot|r");
-        handler->PSendSysMessage(".party unswap          |cff888888- return to your body|r");
         handler->PSendSysMessage(".party rez [slot]      |cff888888- revive dead member(s)|r");
         handler->PSendSysMessage(".party learnall        |cff888888- train all class spells for level|r");
         handler->PSendSysMessage(".party preset <slot> <class>  |cff888888- apply default rotation|r");
         handler->PSendSysMessage(".party setrotation <slot> <dsl>");
         handler->PSendSysMessage(".party getrotation [slot]");
         handler->PSendSysMessage(".party clearrotation <slot>");
-        handler->PSendSysMessage("|cff66ccffAddon UI:|r F1-F5 swap, /wowps all, /wowps editor");
+        handler->PSendSysMessage("|cff66ccffAddon UI:|r /wowps all, /wowps editor");
         return true;
     }
 
@@ -585,7 +496,9 @@ public:
     {
         Player* who = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
         if (!who) return false;
-        sPartyMgr.Unswap(who);
+        // Defensive: drop any lingering charm so the user is in their own body.
+        if (Unit* charm = who->GetCharm())
+            charm->RemoveCharmedBy(who);
 
         uint32 const acct = who->GetSession()->GetAccountId();
         auto const party = sPartyMgr.GetParty(acct);
@@ -921,26 +834,6 @@ public:
         else
         {
             handler->PSendSysMessage("|cff66ccff[WowPsParty]|r Revived {} party member(s).", uint32(rezzed));
-        }
-        return true;
-    }
-
-    // .party unswap — drop any active possess and return to your real body.
-    static bool HandleUnswapCommand(ChatHandler* handler, Optional<std::string> /*unused*/)
-    {
-        Player* requestor = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
-        if (!requestor)
-            return false;
-
-        if (sPartyMgr.Unswap(requestor))
-        {
-            handler->PSendSysMessage(
-                "|cff66ccff[WowPsParty]|r Released. You're back in your own body.");
-        }
-        else
-        {
-            handler->PSendSysMessage(
-                "|cffffcc55[WowPsParty]|r Nothing to release — you weren't possessing anyone.");
         }
         return true;
     }

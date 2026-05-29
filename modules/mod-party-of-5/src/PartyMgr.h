@@ -49,17 +49,6 @@ namespace WowPsParty
         DatabaseError,
     };
 
-    enum class SwapResult
-    {
-        Ok,
-        InvalidSlot,            // slot out of range or empty
-        TargetNotInWorld,       // the bot for the target slot isn't currently loaded
-        TargetIsDead,
-        AlreadyControllingTarget,
-        InBattleground,         // swaps disabled while in PvP queue / battleground / arena
-        VehicleSetupFailed,     // the CreateVehicleKit/EnterVehicle dance failed at the server
-    };
-
     // Session-independent bootstrap (defined in PartyAddonProtocol.cpp).
     // Enrolls every char on the account that isn't already enrolled, into
     // free party slots (up to 5 total). Returns number enrolled. `messages`
@@ -94,27 +83,6 @@ namespace WowPsParty
         // mod-playerbots to spawn the other members as bots in the active player's
         // session. Called from PartyBootstrap's PlayerScript::OnPlayerLogin hook.
         void OnActiveLogin(Player* active);
-
-        // Swap the player's active control to the party member at the given slot.
-        // Uses CHARM_TYPE_POSSESS (same primitive Mind Control uses): camera,
-        // mover, and client control all follow the target unit automatically.
-        // Currently-held charms are dropped first so successive swaps work.
-        SwapResult SwapTo(Player* requestor, uint8 targetSlot);
-
-        // Drop the current possess and return control to the session's own
-        // character. Recovery path when a swap leaves the player in a bad state
-        // (e.g., they accidentally cast a spell from the original spellbook —
-        // see the action-bar UX wrinkle that the Phase 3 addon is meant to fix).
-        // Returns true if a charm was released, false if nothing to release.
-        bool Unswap(Player* requestor);
-
-        // True character-switch via logout/login chain. Avoids all the
-        // CHARM_TYPE_POSSESS limitations (charmer-can't-move, possess
-        // breaking on charmer motion, etc.) by actually re-binding the
-        // session to a different Player object. ~2-3s loading screen per
-        // swap is the cost; gain is rock-solid control transfer + the
-        // new "main char" actually moves because it IS the session player.
-        SwapResult SwapToViaRelogin(Player* requestor, uint8 targetSlot);
 
     private:
         PartyMgr() = default;

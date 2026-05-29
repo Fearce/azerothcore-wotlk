@@ -236,20 +236,47 @@ namespace WowPsParty
     // Walks the bot's group and returns the lowest-HP alive party member
     // (including the bot itself). Returns nullptr if the bot isn't in a group
     // or no member is alive in range.
+    // Authoritative party roster for target-selection. Enumerates from our
+    // own follow directives (leader + all bots) rather than bot->GetGroup(),
+    // which can form incompletely from bot-spawn timing and leave a bot blind
+    // to the leader's health. Only in-world, same-map members are returned;
+    // pass includeDead=true for resurrection targeting. Falls back to the WoW
+    // group, then to the bot alone, if directives aren't populated yet.
+    static void GatherPartyPlayers(Player* bot, std::vector<Player*>& out,
+                                   bool includeDead)
+    {
+        if (!bot) return;
+        auto consider = [&](Player* m) {
+            if (!m || !m->IsInWorld()) return;
+            if (m->GetMapId() != bot->GetMapId()) return;
+            if (!includeDead && !m->IsAlive()) return;
+            if (std::find(out.begin(), out.end(), m) == out.end())
+                out.push_back(m);
+        };
+
+        std::vector<ObjectGuid> guids;
+        WowPsParty::GetPartyGuidsFor(bot->GetGUID(), guids);
+        for (ObjectGuid const& g : guids)
+            consider(ObjectAccessor::FindConnectedPlayer(g));
+
+        if (out.empty())
+        {
+            if (Group* grp = bot->GetGroup())
+                for (GroupReference* itr = grp->GetFirstMember(); itr; itr = itr->next())
+                    consider(itr->GetSource());
+            else
+                consider(bot);
+        }
+    }
+
     static Player* GetLowestHpPartyMember(Player* bot)
     {
-        if (!bot) return nullptr;
-        Group* g = bot->GetGroup();
-        if (!g)
-            return bot->IsAlive() ? bot : nullptr;
-
+        std::vector<Player*> party;
+        GatherPartyPlayers(bot, party, /*includeDead=*/false);
         Player* best = nullptr;
         float bestPct = 200.0f;
-        for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
+        for (Player* m : party)
         {
-            Player* m = itr->GetSource();
-            if (!m || !m->IsAlive() || !m->IsInWorld()) continue;
-            if (m->GetMapId() != bot->GetMapId()) continue;
             float const maxHp = float(m->GetMaxHealth());
             if (maxHp <= 0) continue;
             float const pct = (float(m->GetHealth()) / maxHp) * 100.0f;
@@ -356,7 +383,13 @@ namespace WowPsParty
         if (!bot) return nullptr;
         std::list<Unit*> targets;
         GatherHostilesAround(bot, radius, targets);
-        Group* g = bot->GetGroup();
+
+        // Party membership from our own directives (leader + bots), NOT the
+        // WoW group — the group can form incompletely and the tank would then
+        // ignore a mob beating on the leader.
+        std::vector<ObjectGuid> partyGuids;
+        WowPsParty::GetPartyGuidsFor(bot->GetGUID(), partyGuids);
+
         for (Unit* enemy : targets)
         {
             if (!enemy || !enemy->IsAlive()) continue;
@@ -364,15 +397,9 @@ namespace WowPsParty
             if (!victim) continue;
             if (victim == bot) continue;          // already on us
             if (!victim->IsPlayer()) continue;     // only care about party
-            if (g)
-            {
-                if (!g->IsMember(victim->GetGUID())) continue;
-            }
-            else
-            {
-                // No group → only "ally" is self; we already excluded bot
-                continue;
-            }
+            if (std::find(partyGuids.begin(), partyGuids.end(),
+                          victim->GetGUID()) == partyGuids.end())
+                continue;                          // victim isn't a party member
             if (!bot->IsValidAttackTarget(enemy)) continue;
             return enemy;
         }
@@ -524,14 +551,11 @@ namespace WowPsParty
     static Player* FindDeadPartyMember(Player* bot)
     {
         if (!bot) return nullptr;
-        Group* g = bot->GetGroup();
-        if (!g) return nullptr;
-        for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
+        std::vector<Player*> party;
+        GatherPartyPlayers(bot, party, /*includeDead=*/true);
+        for (Player* m : party)
         {
-            Player* m = itr->GetSource();
-            if (!m || !m->IsInWorld() || m == bot) continue;
-            if (m->GetMapId() != bot->GetMapId()) continue;
-            if (m->IsAlive()) continue;
+            if (m == bot || m->IsAlive()) continue;
             return m;
         }
         return nullptr;
@@ -543,19 +567,10 @@ namespace WowPsParty
     static Player* FindPartyMemberWithDispelType(Player* bot, DispelType type)
     {
         if (!bot) return nullptr;
-        Group* g = bot->GetGroup();
-        auto check = [type, bot](Player* m) -> bool {
-            if (!m || !m->IsAlive() || !m->IsInWorld()) return false;
-            if (m->GetMapId() != bot->GetMapId()) return false;
-            return HasDebuffOfType(m, type);
-        };
-        if (!g)
-            return check(bot) ? bot : nullptr;
-        for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
-        {
-            Player* m = itr->GetSource();
-            if (check(m)) return m;
-        }
+        std::vector<Player*> party;
+        GatherPartyPlayers(bot, party, /*includeDead=*/false);
+        for (Player* m : party)
+            if (HasDebuffOfType(m, type)) return m;
         return nullptr;
     }
 
@@ -1226,20 +1241,15 @@ namespace WowPsParty
     {
         if (!bot || !spellId) return nullptr;
         std::string const csv = Lower(classCsv);
-        Group* g = bot->GetGroup();
-        auto consider = [&](Player* m) -> Player* {
-            if (!m || !m->IsAlive() || !m->IsInWorld()) return nullptr;
-            if (m->GetMapId() != bot->GetMapId()) return nullptr;
-            char const* kw = ClassKeyword(m->getClass());
-            if (!*kw) return nullptr;
-            if (!CsvContains(csv, kw)) return nullptr;
-            if (HasAuraFromSpell(m, spellId)) return nullptr;
-            return m;
-        };
-        if (!g) return consider(bot);
-        for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
+        std::vector<Player*> party;
+        GatherPartyPlayers(bot, party, /*includeDead=*/false);
+        for (Player* m : party)
         {
-            if (Player* hit = consider(itr->GetSource())) return hit;
+            char const* kw = ClassKeyword(m->getClass());
+            if (!*kw) continue;
+            if (!CsvContains(csv, kw)) continue;
+            if (HasAuraFromSpell(m, spellId)) continue;
+            return m;
         }
         return nullptr;
     }
@@ -1282,18 +1292,10 @@ namespace WowPsParty
     static Player* FindPartyMemberMissingAura(Player* bot, uint32 spellId)
     {
         if (!bot || !spellId) return nullptr;
-        Group* g = bot->GetGroup();
-        if (!g)
-            return (bot->IsAlive() && !HasAuraFromSpell(bot, spellId)) ? bot : nullptr;
-
-        for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
-        {
-            Player* m = itr->GetSource();
-            if (!m || !m->IsAlive() || !m->IsInWorld()) continue;
-            if (m->GetMapId() != bot->GetMapId()) continue;
-            if (HasAuraFromSpell(m, spellId)) continue;
-            return m;
-        }
+        std::vector<Player*> party;
+        GatherPartyPlayers(bot, party, /*includeDead=*/false);
+        for (Player* m : party)
+            if (!HasAuraFromSpell(m, spellId)) return m;
         return nullptr;
     }
 
@@ -1872,15 +1874,14 @@ namespace WowPsParty
             };
             if (bot->IsInCombat()) { bailWithLog("bot in combat");  return false; }
             // PARTY-wide combat gate: a mage drinking while the warrior
-            // tanks isn't what anyone wants. Bail if ANY group member is
-            // mid-fight on the same map.
-            if (Group* g = bot->GetGroup())
+            // tanks isn't what anyone wants. Bail if ANY party member is
+            // mid-fight on the same map. Enumerated from our directives.
             {
-                for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
+                std::vector<Player*> party;
+                GatherPartyPlayers(bot, party, /*includeDead=*/true);
+                for (Player* m : party)
                 {
-                    Player* m = itr->GetSource();
-                    if (!m || m == bot) continue;
-                    if (m->GetMapId() != bot->GetMapId()) continue;
+                    if (m == bot) continue;
                     if (m->IsInCombat())
                     {
                         bailWithLog("party member in combat");

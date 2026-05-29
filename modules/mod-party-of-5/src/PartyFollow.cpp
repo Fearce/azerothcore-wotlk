@@ -51,6 +51,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <algorithm>
 #include <vector>
 
 namespace WowPsParty
@@ -80,15 +81,8 @@ namespace WowPsParty
         // bot is intentionally stationary (drinking, holding for healer, etc).
         static std::unordered_map<uint32, uint32> g_holdUntilMs;
 
-        struct PendingRelogin
-        {
-            uint32     account;
-            ObjectGuid targetGuid;
-        };
-
         static std::mutex                g_mutex;
         static std::vector<Directive>    g_directives;
-        static std::vector<PendingRelogin> g_pendingRelogins;
         static std::atomic<bool>         g_tickerInstalled{false};
         static constexpr uint32          TICK_INTERVAL_MS = 1000;
 
@@ -191,6 +185,31 @@ namespace WowPsParty
         for (auto const& d : g_directives)
             if (d.followerGuid == followerGuid) return d.leaderGuid;
         return ObjectGuid::Empty;
+    }
+
+    // Enumerate the whole party (leader + all follower bots) that `member`
+    // belongs to, straight from our in-memory follow directives. This is the
+    // authoritative party roster — independent of the WoW Group, which can
+    // form incompletely from bot-spawn timing races and leave a healer bot
+    // ungrouped (and therefore blind to the leader's health). `member` itself
+    // is included. Returns nothing if the member has no directive.
+    void GetPartyGuidsFor(ObjectGuid member, std::vector<ObjectGuid>& out)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        uint32 account = 0;
+        bool found = false;
+        for (auto const& d : g_directives)
+            if (d.followerGuid == member) { account = d.account; found = true; break; }
+        if (!found) return;
+        ObjectGuid leader;
+        for (auto const& d : g_directives)
+            if (d.account == account)
+            {
+                out.push_back(d.followerGuid);
+                leader = d.leaderGuid;   // same for every row in the account
+            }
+        if (leader && std::find(out.begin(), out.end(), leader) == out.end())
+            out.push_back(leader);
     }
 
     // Throttled log helper — at most one line per bot per 4 seconds, per
@@ -595,101 +614,6 @@ namespace WowPsParty
         }
     }
 
-    void QueueQuietRelogin(uint32 sessionAccount, ObjectGuid targetGuid)
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_pendingRelogins.push_back({sessionAccount, targetGuid});
-        LOG_INFO("module",
-            "[WowPsParty Follow] QueueQuietRelogin account={} target_guid={}",
-            sessionAccount, targetGuid.GetCounter());
-    }
-
-    namespace
-    {
-        // Quiet logout + login chain. Mirrors WorldSession::LogoutPlayer
-        // (Server/WorldSession.cpp:641) but SKIPS SendPacket(LogoutComplete)
-        // -- that's the packet that puts the client in char-select state
-        // and breaks the chain. Without it, client stays in world view; we
-        // then push HandlePlayerLoginOpcode which sends LOGIN_VERIFY_WORLD
-        // + initial state packets, client transitions via loading screen
-        // to the new char's world view.
-        void DoQuietRelogin(uint32 account, ObjectGuid targetGuid)
-        {
-            WorldSession* session = sWorldSessionMgr->FindSession(account);
-            if (!session)
-            {
-                LOG_WARN("module",
-                    "[WowPsParty QuietRelogin] no session for account={}", account);
-                return;
-            }
-            Player* current = session->GetPlayer();
-            if (!current)
-            {
-                LOG_WARN("module",
-                    "[WowPsParty QuietRelogin] session for account={} has no current player",
-                    account);
-                return;
-            }
-            if (current->GetGUID() == targetGuid)
-            {
-                LOG_INFO("module",
-                    "[WowPsParty QuietRelogin] already on target guid={}, no-op",
-                    targetGuid.GetCounter());
-                return;
-            }
-
-            // First, if the target is currently in world as a bot, log it
-            // out so the upcoming HandlePlayerLoginOpcode can load it fresh.
-            if (Player* targetBot = ObjectAccessor::FindConnectedPlayer(targetGuid))
-            {
-                if (sPlayerbotsMgr.GetPlayerbotAI(targetBot))
-                {
-                    LOG_INFO("module",
-                        "[WowPsParty QuietRelogin] logging out target bot guid={}",
-                        targetGuid.GetCounter());
-                    sRandomPlayerbotMgr.LogoutPlayerBot(targetGuid);
-                }
-            }
-
-            LOG_INFO("module",
-                "[WowPsParty QuietRelogin] quiet-logging current guid={} name={}",
-                current->GetGUID().GetCounter(), current->GetName());
-
-            // Mimic LogoutPlayer's body, sans the SMSG_LOGOUT_COMPLETE.
-            // Save state first.
-            current->SaveToDB(false, true);
-
-            // Cleanup before removal
-            current->CleanupChannels();
-            if (Group* g = current->GetGroup())
-                g->SendUpdate();
-
-            // Remove from map
-            current->CleanupsBeforeDelete();
-            if (Map* m = current->FindMap())
-            {
-                m->RemovePlayerFromMap(current, true);
-                m->AfterPlayerUnlinkFromMap();
-            }
-
-            // Detach session from current player. Note: SetPlayer(nullptr)
-            // deletes the previous pointer if SaveToDB succeeded.
-            session->SetPlayer(nullptr);
-
-            LOG_INFO("module",
-                "[WowPsParty QuietRelogin] triggering login for target guid={}",
-                targetGuid.GetCounter());
-
-            // Build CMSG_PLAYER_LOGIN packet and dispatch via the normal
-            // handler. The handler reads ObjectGuid via operator>>, loads
-            // the player from DB, sends LOGIN_VERIFY_WORLD + initial state
-            // to the client. Client should transition via loading screen.
-            WorldPacket pkt(CMSG_PLAYER_LOGIN, 8);
-            pkt << uint64(targetGuid.GetRawValue());
-            session->HandlePlayerLoginOpcode(pkt);
-        }
-    } // namespace
-
     void ClearFollowersForAccount(uint32 account)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -980,26 +904,6 @@ namespace WowPsParty
             // Always tick path-recording even if no directives exist —
             // recording happens before the user has assigned tanks/healers.
             WowPsParty::TickPathRecording(diff);
-
-            // First: drain any pending relogins. These need to run on a
-            // world-thread tick, not from inside the chat-command call
-            // stack. They process at most one per tick to avoid swamping
-            // the server with concurrent loads.
-            {
-                PendingRelogin pending{};
-                bool havePending = false;
-                {
-                    std::lock_guard<std::mutex> lock(g_mutex);
-                    if (!g_pendingRelogins.empty())
-                    {
-                        pending = g_pendingRelogins.front();
-                        g_pendingRelogins.erase(g_pendingRelogins.begin());
-                        havePending = true;
-                    }
-                }
-                if (havePending)
-                    DoQuietRelogin(pending.account, pending.targetGuid);
-            }
 
             _accum += diff;
             if (_accum < TICK_INTERVAL_MS) return;

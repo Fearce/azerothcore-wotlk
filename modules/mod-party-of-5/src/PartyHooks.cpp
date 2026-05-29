@@ -1,10 +1,10 @@
 /*
  * WowPs Party-of-5 mod — Track-4 PlayerScript hooks
  *
- * Mirrors XP and reputation gains across all 5 party members and triggers
- * auto-swap when the currently-controlled body dies. Each hook uses a
+ * Mirrors XP, reputation, money, loot and quest accepts across all 5 party
+ * members, and auto-learns class spells on level-up. Each hook uses a
  * thread_local guard to avoid the obvious infinite recursion (each mirrored
- * XP/rep grant would re-enter the hook and re-mirror forever).
+ * grant would re-enter the hook and re-mirror forever).
  */
 
 #include "PartyMgr.h"
@@ -39,7 +39,6 @@ namespace WowPsParty
     // PlayerScript hooks on the world thread.
     static thread_local bool g_propagatingXP    = false;
     static thread_local bool g_propagatingRep   = false;
-    static thread_local bool g_autoSwapping     = false;
     static thread_local bool g_propagatingMoney = false;
     static thread_local bool g_propagatingQuest = false;
     static thread_local bool g_propagatingLoot  = false;
@@ -108,7 +107,6 @@ public:
     PartyHooksPlayerScript() : PlayerScript("PartyHooksPlayerScript", {
         PLAYERHOOK_ON_GIVE_EXP,
         PLAYERHOOK_ON_GIVE_REPUTATION,
-        PLAYERHOOK_ON_PLAYER_JUST_DIED,
         PLAYERHOOK_ON_MONEY_CHANGED,
         PLAYERHOOK_ON_CREATURE_KILL,
         PLAYERHOOK_ON_STORE_NEW_ITEM,
@@ -421,20 +419,6 @@ public:
         WowPsParty::g_propagatingRep = false;
     }
 
-    // Auto-swap on death: if the body the user is currently driving dies,
-    // jump control to the next alive party member. Without this the user is
-    // stuck staring at their corpse waiting to release. Also: if the dead
-    // player is one of the bots (not the body the user is currently driving),
-    // schedule a battlefield-rez 6s after death so wipes are recoverable
-    // without trekking to a spirit healer. (Standard GW1 hero behaviour:
-    // your party isn't permanently down just because one member died.)
-    void OnPlayerJustDied(Player* /*deceased*/) override
-    {
-        // Auto-rez removed. Death is handled by the priest's rotation —
-        // they can run a `Resurrect dead member` rule out of combat. If
-        // the whole party wipes, everyone respawns at the spirit healer
-        // via the normal release-corpse flow.
-    }
 };
 
 void AddPartyHooksScripts()

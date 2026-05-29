@@ -25,6 +25,7 @@
 #include "ObjectGuid.h"
 
 #include <string>
+#include <vector>
 
 class Player;
 
@@ -44,17 +45,18 @@ namespace WowPsParty
     // calls are no-ops.
     void InstallFollowTicker();
 
-    // Queue a "quiet relogin" swap to be processed on the next world tick.
-    // Avoids deleting the in-flight session player from inside its own
-    // packet handler. The actual quiet logout + login chain runs in the
-    // PartyFollow WorldScript::OnUpdate hook.
-    void QueueQuietRelogin(uint32 sessionAccount, ObjectGuid targetGuid);
-
     // Returns true if the given bot has an active follow directive
     // (i.e., is a non-leader party member). Used by the patched
     // PlayerbotAI::UpdateAI to pause the AI tick while out-of-combat
     // so mod-playerbots' other actions don't fight our follow ticker.
     bool BotHasActiveFollowDirective(ObjectGuid guid);
+
+    // Fill `out` with the whole party (leader + all follower bots) that the
+    // given member belongs to, from our in-memory follow directives. Use this
+    // instead of bot->GetGroup() for party-target logic — the WoW Group can
+    // form incompletely and leave bots blind to the leader. `member` is
+    // included; empty if the member isn't a tracked follower.
+    void GetPartyGuidsFor(ObjectGuid member, std::vector<ObjectGuid>& out);
 
     // Returns the leader guid that this follower is bound to, or an
     // empty ObjectGuid if no directive exists. Used by AssistTarget to
