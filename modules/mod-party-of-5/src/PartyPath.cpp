@@ -188,6 +188,26 @@ namespace WowPsParty
         return g_recording.find(playerGuid.GetCounter()) != g_recording.end();
     }
 
+    // Logging out mid-recording would otherwise persist ghost mode (fly +
+    // no-gravity + 5x speed) onto the character — they'd relog stuck in the
+    // air with broken movement. Drop the recording (without saving the
+    // partial buffer) and reset movement state on the way out.
+    void CancelPathRecording(Player* player)
+    {
+        if (!player) return;
+        uint32 const guidLow = player->GetGUID().GetCounter();
+        {
+            std::lock_guard<std::mutex> lock(g_recMutex);
+            auto it = g_recording.find(guidLow);
+            if (it == g_recording.end()) return;
+            g_recording.erase(it);
+        }
+        ApplyGhostMode(player, false);
+        LOG_INFO("module",
+            "[WowPsParty Path] recording cancelled on logout for guid={} "
+            "(ghost mode cleared)", guidLow);
+    }
+
     void TickPathRecording(uint32 diffMs)
     {
         std::vector<uint32> toSample;

@@ -151,6 +151,11 @@ namespace WowPsParty
     static std::mutex g_ttdMutex;
     static uint32 g_ttdLastSweepMs = 0;
 
+    // Guards the per-bot consumable/use-item throttle timestamp maps below.
+    // Map updates can run on multiple threads, so these shared statics need
+    // the same lock discipline as g_ttdSamples / g_rotationCache.
+    static std::mutex g_useThrottleMutex;
+
     static constexpr uint32 TTD_WINDOW_MS  = 12000; // keep ~12 s of history
     static constexpr uint32 TTD_SAMPLE_MS  = 500;   // at most one sample / 0.5 s
     static constexpr int    TTD_UNKNOWN    = 999;   // "effectively never dies"
@@ -1741,11 +1746,13 @@ namespace WowPsParty
             static std::unordered_map<uint64, uint32> lastUseMs;
             uint64 const key = (uint64(bot->GetGUID().GetCounter()) << 32) | uint32(t->ItemId);
             uint32 const now = getMSTime();
-            uint32& last = lastUseMs[key];
             uint32 const throttle = cdMs > 0 ? uint32(cdMs) : 60000;
-            if (now - last < throttle) return false;
-
-            last = now;
+            {
+                std::lock_guard<std::mutex> lock(g_useThrottleMutex);
+                uint32& last = lastUseMs[key];
+                if (now - last < throttle) return false;
+                last = now;
+            }
             bot->CastSpell(bot, useSpell, true);
             if (inBag && t->Class == ITEM_CLASS_CONSUMABLE)
             {
@@ -1813,17 +1820,24 @@ namespace WowPsParty
             // a real player would use anyway.
             static std::unordered_map<uint32, uint32> lastDrinkMs;
             static std::unordered_map<uint32, uint32> lastEatMs;
-            auto& last = wantDrink
-                ? lastDrinkMs[bot->GetGUID().GetCounter()]
-                : lastEatMs  [bot->GetGUID().GetCounter()];
+            uint32 const consumeKey = bot->GetGUID().GetCounter();
             uint32 const now = getMSTime();
+            uint32 last;
+            {
+                std::lock_guard<std::mutex> lock(g_useThrottleMutex);
+                last = wantDrink ? lastDrinkMs[consumeKey] : lastEatMs[consumeKey];
+            }
             if (now - last >= 20000)
             {
                 uint32 const spellId = ConsumeSharedConsumable(bot, wantDrink);
                 if (spellId)
                 {
                     bot->CastSpell(bot, spellId, true);  // triggered, no GCD/cost
-                    last = now;
+                    {
+                        std::lock_guard<std::mutex> lock(g_useThrottleMutex);
+                        (wantDrink ? lastDrinkMs[consumeKey]
+                                   : lastEatMs[consumeKey]) = now;
+                    }
                     // Announce it so the player knows the bot is regenerating.
                     bot->Say(wantDrink ? "Drinking to recover mana."
                                        : "Sitting down to eat.",

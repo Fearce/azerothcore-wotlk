@@ -988,9 +988,16 @@ static void HandleSplit(Player* requester, std::string_view payload)
     ItemPosCountVec dest;
     if (srcChar->CanStoreItem(destBag, destSlot, dest, entry, count) != EQUIP_ERR_OK)
         return;
-    srcItem->SetCount(srcItem->GetCount() - count);
+    uint32 const beforeCount = srcItem->GetCount();
+    srcItem->SetCount(beforeCount - count);
     srcItem->SetState(ITEM_CHANGED, srcChar);
-    srcChar->StoreNewItem(dest, entry, true);
+    // If the store fails despite CanStoreItem succeeding, roll the source
+    // count back so we don't silently destroy `count` items.
+    if (!srcChar->StoreNewItem(dest, entry, true))
+    {
+        srcItem->SetCount(beforeCount);
+        srcItem->SetState(ITEM_CHANGED, srcChar);
+    }
     WowPsParty::SendInventoryTo(requester);
 }
 

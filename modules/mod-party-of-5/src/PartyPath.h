@@ -44,6 +44,11 @@ namespace WowPsParty
     // Returns true if the given player is currently recording a path.
     bool IsRecordingPath(ObjectGuid playerGuid);
 
+    // Abort an in-progress recording without persisting it, resetting the
+    // player's movement state (ghost mode off). Call on logout so a player
+    // who logs out mid-record doesn't relog stuck flying.
+    void CancelPathRecording(Player* player);
+
     // Sample-tick hook called from PartyFollow's 1Hz ticker for every
     // recording player. Handles GM-mode reapplication, speed, and the
     // position-sample buffer.

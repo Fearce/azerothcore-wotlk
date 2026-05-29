@@ -7,6 +7,8 @@
  *     condition|action|priority[|flags];...
  *
  * Conditions can be AND-chained with '&' (every clause must hold).
+ * Any single clause may be prefixed with '!' to negate it (generic NOT),
+ * e.g. "!target_is_boss" or "!self_has_aura:Bloodlust".
  *
  * Supported conditions (selection — see PartyRotation.cpp for the full set):
  *     always
@@ -28,6 +30,10 @@
  *     target_aura_stacks:<spell><op>N  self_aura_stacks
  *     spell_ready:<spell>  spell_cd_remain:<spell><op>N
  *     enemies_within:<R><op>N  enemies_in_melee  enemies_in_range
+ *     enemies_clustered:<R><op>N  most enemies within R yd of each other
+ *                                 (gate for Blizzard/Flamestrike-style AoE)
+ *     master_dist<N | master_dist>N      yards from the party leader
+ *     stance_is_none                     warrior in no stance (apply one)
  *     pet_exists | pet_missing | pet_dead | pet_health<N|>N
  *     party_lowest_health<N|>N  healer_mana  tank_health
  *     party_has_{disease,poison,magic,curse,dead}
@@ -42,6 +48,10 @@
  *     cast_party_missing:<spell>   buff first member missing the spell's aura
  *     cast_class_missing / cast_role_missing / cure_party / rez_party /
  *     cast_loose_enemy / drink / eat / hold_position
+ *     use_item:<item name>         use a consumable/trinket from shared bags
+ *     pull:<spell name>            ranged opener (Throw/Shoot) for the tank
+ *  Ground-targeted AoE spells (Blizzard, Flamestrike, Rain of Fire) used via
+ *  cast:<spell> auto-aim at the densest enemy cluster, not the current target.
  *
  * Optional 4th field `flags` (comma-separated). Recognised:
  *     clip   — allow this cast to interrupt the bot's own cast/channel.

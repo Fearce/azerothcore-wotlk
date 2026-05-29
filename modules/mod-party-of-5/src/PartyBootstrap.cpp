@@ -15,6 +15,7 @@
 
 #include "PartyMgr.h"
 #include "PartyFollow.h"
+#include "PartyPath.h"
 
 #include "Chat.h"
 #include "Config.h"
@@ -110,6 +111,10 @@ public:
                      player->GetGUID().GetCounter(), charm->GetGUID().GetCounter());
             charm->RemoveCharmedBy(player);
         }
+
+        // Drop any in-progress path recording so the char doesn't persist
+        // ghost mode (fly + 5x speed) and relog stuck in the air.
+        WowPsParty::CancelPathRecording(player);
     }
 
     void OnPlayerLogin(Player* player) override
