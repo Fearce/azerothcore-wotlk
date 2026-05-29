@@ -105,6 +105,8 @@ namespace WowPsParty
     // returns to the random pool.
     void DismissHenchman(Player* requester, uint32 henchGuid);
     void DismissAllHenchmen(Player* requester);
+    // Dismiss by guid (group-removal hook → uninvite = despawn).
+    void DismissHenchmanByGuid(ObjectGuid henchGuid);
 
     class PartyMgr
     {

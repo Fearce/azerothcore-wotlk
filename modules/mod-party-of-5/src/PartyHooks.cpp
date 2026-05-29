@@ -24,6 +24,7 @@
 #include "Reputation/ReputationMgr.h"
 #include "PartyFollow.h"
 #include "ScriptMgr.h"
+#include "GroupScript.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "StringFormat.h"
@@ -434,9 +435,30 @@ public:
 
 };
 
+// When a henchman leaves the party by ANY means (the addon Dismiss button,
+// or the stock WoW group UI "Remove from group"), make it stop following and
+// despawn — Kevin's "pretend he just hearthstoned" behaviour. Enrolled alts
+// and the leader are ignored (IsHenchman gate).
+class PartyHenchmanGroupScript : public GroupScript
+{
+public:
+    PartyHenchmanGroupScript() : GroupScript("PartyHenchmanGroupScript", {
+        GROUPHOOK_ON_REMOVE_MEMBER
+    }) { }
+
+    void OnRemoveMember(Group* /*group*/, ObjectGuid guid, RemoveMethod /*method*/,
+                        ObjectGuid /*kicker*/, char const* /*reason*/) override
+    {
+        if (!WowPsParty::IsEnabled()) return;
+        if (WowPsParty::IsHenchman(guid))
+            WowPsParty::DismissHenchmanByGuid(guid);
+    }
+};
+
 void AddPartyHooksScripts()
 {
     new PartyHooksPlayerScript();
+    new PartyHenchmanGroupScript();
 }
 
 // Trampoline called from the [WowPsParty PATCH] in PlayerQuest.cpp::AddQuest.

@@ -1425,7 +1425,7 @@ public:
             std::string msg;
             bool const ok = WowPsParty::HireHenchman(player, guid, role, msg);
             ChatHandler(player->GetSession()).PSendSysMessage(
-                "|cff66ccff[WowPsParty]|r %s", msg.c_str());
+                "|cff66ccff[WowPsParty]|r {}", msg);
             if (ok) WowPsParty::SendHenchmenTo(player);  // refresh (the hired one is now busy)
         }
         else if (command == "DISMISS_HENCHMAN")

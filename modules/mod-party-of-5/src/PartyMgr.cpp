@@ -251,26 +251,51 @@ namespace WowPsParty
         QueryResult q = CharacterDatabase.Query(
             "SELECT `level`,`online`,`account` FROM `characters` WHERE `guid` = {}",
             candidateGuid);
-        if (!q) { outMsg = "Henchman not found."; return false; }
+        if (!q)
+        {
+            outMsg = "Henchman not found.";
+            LOG_INFO("module", "[WowPsParty Henchmen] hire REFUSED guid={}: not in DB", candidateGuid);
+            return false;
+        }
         Field* f = q->Fetch();
         uint8 const level   = f[0].Get<uint8>();
         bool  const online  = f[1].Get<uint8>() != 0;
-        if (online) { outMsg = "That henchman is busy — pick another."; return false; }
+        if (online)
+        {
+            outMsg = "That henchman is busy — pick another (Refresh the list).";
+            LOG_INFO("module", "[WowPsParty Henchmen] hire REFUSED guid={}: already online", candidateGuid);
+            return false;
+        }
 
         // Party-space cap: leader + 4 companions max. Count current followers
         // (alts + henchmen) from the directive registry — works even before
         // the WoW group object exists (solo + first henchman).
-        if (WowPsParty::CountFollowersFor(requester->GetGUID()) >= 4)
-        { outMsg = "Your party is full (4 companions)."; return false; }
+        uint32 const followers = WowPsParty::CountFollowersFor(requester->GetGUID());
+        if (followers >= 4)
+        {
+            outMsg = "Your party is full (4 companions).";
+            LOG_INFO("module", "[WowPsParty Henchmen] hire REFUSED guid={}: party full (followers={})",
+                     candidateGuid, followers);
+            return false;
+        }
 
         // Gold check + deduct (after all synchronous validation).
         uint32 const cost = HenchmanHireCost(level);
         if (requester->GetMoney() < cost)
-        { outMsg = "Not enough gold to hire."; return false; }
+        {
+            outMsg = "Not enough gold to hire.";
+            LOG_INFO("module", "[WowPsParty Henchmen] hire REFUSED guid={}: gold {} < cost {}",
+                     candidateGuid, requester->GetMoney(), cost);
+            return false;
+        }
 
         PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
         if (!mgr)
-        { outMsg = "Bot manager not ready — try again in a moment."; return false; }
+        {
+            outMsg = "Bot manager not ready — try again in a moment.";
+            LOG_INFO("module", "[WowPsParty Henchmen] hire REFUSED guid={}: no PlayerbotMgr", candidateGuid);
+            return false;
+        }
 
         requester->ModifyMoney(-int32(cost));
 
@@ -304,8 +329,8 @@ namespace WowPsParty
                             "|cffff5555[WowPsParty]|r Henchman didn't arrive — refunded.");
                 }
                 LOG_WARN("module",
-                    "[WowPsParty Henchmen] spawn no-show hench_guid={} — refunded {}",
-                    henchGuid.GetCounter(), cost);
+                    "[WowPsParty Henchmen] spawn no-show hench_guid={} — refunded {} "
+                    "(bot not in world after delay)", henchGuid.GetCounter(), cost);
                 return;
             }
             if (!lead) return;
@@ -328,7 +353,7 @@ namespace WowPsParty
                 ai->ChangeStrategy("+loot",   BOT_STATE_NON_COMBAT);
                 ai->ChangeStrategy("+gather", BOT_STATE_NON_COMBAT);
             }
-        }, std::chrono::seconds(4));
+        }, std::chrono::seconds(8));
 
         LOG_INFO("module",
             "[WowPsParty Henchmen] HIRE account={} hench_guid={} role={} level={} cost={}",
@@ -352,6 +377,32 @@ namespace WowPsParty
             mgr->LogoutPlayerBot(g);
         UpdateGroupLootForHenchmen(requester);
         LOG_INFO("module", "[WowPsParty Henchmen] DISMISS hench_guid={}", henchGuid);
+    }
+
+    // Dismiss a henchman identified only by guid — used by the group-removal
+    // hook so that uninviting a henchman from the party (by ANY means, incl.
+    // the stock WoW group UI) makes it stop following and despawn ("instant
+    // hearth"). Drops the directive immediately (stops our follow ticker) and
+    // defers the logout one tick — we may be called mid-group-removal, and
+    // LogoutPlayerBot would otherwise re-enter group teardown for this member.
+    void DismissHenchmanByGuid(ObjectGuid henchGuid)
+    {
+        if (!WowPsParty::IsHenchman(henchGuid)) return;
+        ObjectGuid const leaderGuid = WowPsParty::GetLeaderFor(henchGuid);
+        WowPsParty::RemoveFollower(henchGuid);
+        LOG_INFO("module",
+            "[WowPsParty Henchmen] henchman left party — dismissing hench_guid={}",
+            henchGuid.GetCounter());
+        Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
+        if (!leader) return;
+        leader->m_Events.AddEventAtOffset([leaderGuid, henchGuid]()
+        {
+            Player* l = ObjectAccessor::FindConnectedPlayer(leaderGuid);
+            if (!l) return;
+            if (PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(l))
+                mgr->LogoutPlayerBot(henchGuid);
+            UpdateGroupLootForHenchmen(l);
+        }, std::chrono::milliseconds(200));
     }
 
     void DismissAllHenchmen(Player* requester)
