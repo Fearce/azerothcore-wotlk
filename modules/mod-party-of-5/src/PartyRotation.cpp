@@ -846,6 +846,20 @@ namespace WowPsParty
         }
         if (cond == "in_combat")     return bot->IsInCombat();
         if (cond == "out_of_combat") return !bot->IsInCombat();
+        // Party-wide combat state: true if ANY party member (leader + bots)
+        // is fighting. Use these for pull / hold-position / between-pull rules
+        // so the tank doesn't "pre-pull" or stand idle while the rest of the
+        // party is already mid-fight but the tank personally hasn't taken
+        // aggro yet (the per-bot out_of_combat is true for it then).
+        if (cond == "party_in_combat" || cond == "party_out_of_combat")
+        {
+            std::vector<Player*> party;
+            GatherPartyPlayers(bot, party, /*includeDead=*/true);
+            bool any = false;
+            for (Player* m : party)
+                if (m->IsInCombat()) { any = true; break; }
+            return cond == "party_in_combat" ? any : !any;
+        }
         if (cond == "has_target")    return bot->GetTarget() != ObjectGuid::Empty;
         if (cond == "no_target")     return bot->GetTarget() == ObjectGuid::Empty;
         // Movement gate — pair "is_moving" with instant-only rules, or
