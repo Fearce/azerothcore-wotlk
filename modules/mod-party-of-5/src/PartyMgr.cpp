@@ -337,6 +337,14 @@ namespace WowPsParty
         WowPsParty::RotationCacheSet(candidateGuid,
             WowPsParty::ParseRotationString(DefaultRotationForClass(cls)));
 
+        // Tank henchmen default to "loose" target mode: grab the nearest
+        // hostile that ISN'T already on the tank, so they peel adds off the
+        // casters/healer instead of tunneling whatever the leader hits. Set
+        // unconditionally (tank -> loose, otherwise -> master) so a recycled
+        // rndbot GUID never inherits a stale mode from a prior hire.
+        WowPsParty::TargetModeCacheSet(candidateGuid,
+                                       useRole == "tank" ? "loose" : "master");
+
         mgr->AddPlayerBot(henchGuid, account);
 
         // The spawn is async (login query holder). After a short delay: if the
@@ -400,6 +408,7 @@ namespace WowPsParty
         if (!WowPsParty::IsHenchman(g)) return;   // only dismiss henchmen
         WowPsParty::RemoveFollower(g);
         WowPsParty::RotationCacheClear(henchGuid);
+        WowPsParty::TargetModeCacheSet(henchGuid, "master");   // drop tank "loose"
         if (Player* hen = ObjectAccessor::FindConnectedPlayer(g))
             if (hen->GetGroup()) hen->RemoveFromGroup();
         // Log the bot out via the master's mgr regardless of whether it's
@@ -423,6 +432,7 @@ namespace WowPsParty
         ObjectGuid const leaderGuid = WowPsParty::GetLeaderFor(henchGuid);
         WowPsParty::RemoveFollower(henchGuid);
         WowPsParty::RotationCacheClear(henchGuid.GetCounter());
+        WowPsParty::TargetModeCacheSet(henchGuid.GetCounter(), "master");
         LOG_INFO("module",
             "[WowPsParty Henchmen] henchman left party — dismissing hench_guid={}",
             henchGuid.GetCounter());
