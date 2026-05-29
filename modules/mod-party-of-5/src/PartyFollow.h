@@ -51,6 +51,13 @@ namespace WowPsParty
     // so mod-playerbots' other actions don't fight our follow ticker.
     bool BotHasActiveFollowDirective(ObjectGuid guid);
 
+    // Mark a tank as actively leading the dungeon path for the next
+    // durationMs. While this is set, the follow ticker leaves the tank to
+    // TankFollowPath — no MoveFollow re-assert and, crucially, no "stuck"
+    // catch-up teleport (which otherwise snaps a leading-but-idle tank onto a
+    // stopped leader). Called every tick from TankFollowPath while leading.
+    void MarkTankLeading(ObjectGuid tankGuid, uint32 durationMs);
+
     // Fill `out` with the whole party (leader + all follower bots) that the
     // given member belongs to, from our in-memory follow directives. Use this
     // instead of bot->GetGroup() for party-target logic — the WoW Group can

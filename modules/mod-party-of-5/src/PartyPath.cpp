@@ -300,6 +300,14 @@ namespace WowPsParty
             return;
         }
 
+        // Past the skip gates, we're committed to leading this tick. Tell the
+        // follow ticker to keep its hands off (no MoveFollow re-assert, no
+        // stuck catch-up teleport) — otherwise, when the leader stops and the
+        // tank idles at its lookahead, the ticker reads the constant distance
+        // as "stuck" and teleports the tank onto the leader. Refreshed every
+        // tick; expires shortly after we stop leading (combat / beyond leash).
+        WowPsParty::MarkTankLeading(bot->GetGUID(), 2500);
+
         // Find leader's nearest waypoint (the "cursor"). Linear scan — typical
         // dungeon path is ~50-200 points, this runs once per tick per bot.
         uint32 nearestIdx = 0;

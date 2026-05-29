@@ -179,6 +179,34 @@ namespace WowPsParty
         return true;
     }
 
+    // followerGuidLow -> ms until which the bot is actively leading the
+    // dungeon path. Distinct from HoldFollower (which TankFollowPath also
+    // honours, so it can't hold itself): this signal is read ONLY by the
+    // follow ticker so it leaves the leading tank entirely to TankFollowPath.
+    // Without it, the ticker's "constant distance for 3 ticks = stuck"
+    // catch-up teleport fires when the leader stops and the tank idles at its
+    // lookahead — snapping the tank onto the leader.
+    static std::unordered_map<uint32, uint32> g_tankLeadUntilMs;
+
+    void MarkTankLeading(ObjectGuid tankGuid, uint32 durationMs)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_tankLeadUntilMs[tankGuid.GetCounter()] = getMSTime() + durationMs;
+    }
+
+    static bool IsTankLeading(ObjectGuid tankGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_tankLeadUntilMs.find(tankGuid.GetCounter());
+        if (it == g_tankLeadUntilMs.end()) return false;
+        if (getMSTime() >= it->second)
+        {
+            g_tankLeadUntilMs.erase(it);
+            return false;
+        }
+        return true;
+    }
+
     ObjectGuid GetLeaderFor(ObjectGuid followerGuid)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -755,6 +783,15 @@ namespace WowPsParty
             // Rotation engine has asked us to leave this bot stationary.
             // Active hold = drinking, holding-for-healer-mana, etc.
             if (IsFollowerHeld(d.followerGuid)) return true;
+
+            // Tank is actively leading the dungeon route — hands off entirely.
+            // TankFollowPath owns its movement; if we re-assert MoveFollow or
+            // run the "stuck = constant distance" catch-up teleport here, a
+            // tank idling at its lookahead (because the leader stopped) gets
+            // yanked onto the leader after ~3 ticks. The >100y hard leash
+            // above still rescues a genuinely-lost tank.
+            if (IsTankLeading(d.followerGuid)) return true;
+
             // DON'T skip if follower->GetCharm() -- the session player
             // (Kevtank) IS the controller during a swap, has a charm, but
             // we WANT his body to walk toward the new controlled body.
