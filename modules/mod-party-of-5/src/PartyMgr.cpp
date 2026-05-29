@@ -193,18 +193,20 @@ namespace WowPsParty
         }
     }
 
-    // Query offline random-pool chars of the given classes near `level`.
+    // Query offline random-pool chars of the given classes near `level`, of the
+    // given races (so henchmen match the player's faction).
     static void QueryHenchCandidates(std::string const& acctCsv,
-        std::string const& classCsv, uint8 lo, uint8 hi, uint8 level,
+        std::string const& classCsv, std::string const& raceCsv,
+        uint8 lo, uint8 hi, uint8 level,
         uint32 limit, std::vector<HenchmanCandidate>& out)
     {
-        if (acctCsv.empty()) return;
+        if (acctCsv.empty() || raceCsv.empty()) return;
         QueryResult q = CharacterDatabase.Query(
             "SELECT `guid`,`name`,`class`,`level` FROM `characters` "
             "WHERE `account` IN ({}) AND `online` = 0 AND `class` IN ({}) "
-            "AND `level` BETWEEN {} AND {} "
+            "AND `race` IN ({}) AND `level` BETWEEN {} AND {} "
             "ORDER BY ABS(CAST(`level` AS SIGNED) - {}) ASC, RAND() LIMIT {}",
-            acctCsv, classCsv, uint32(lo), uint32(hi), uint32(level), limit);
+            acctCsv, classCsv, raceCsv, uint32(lo), uint32(hi), uint32(level), limit);
         if (!q) return;
         do {
             Field* f = q->Fetch();
@@ -229,12 +231,18 @@ namespace WowPsParty
         uint8 const lo = (L >= 80) ? 80 : uint8(std::max(1, int(L) - 2));
         uint8 const hi = (L >= 80) ? 80 : uint8(std::min(80, int(L) + 2));
 
-        // 2 tanks (Warr/Pala/DK/Druid), 2 healers (Priest/Pala/Shaman/Druid),
-        // 6 dps (any class). Exact-band first; the ORDER BY closeness keeps
-        // them near the player's level.
-        QueryHenchCandidates(acctCsv, "1,2,6,11", lo, hi, L, 2, out);
-        QueryHenchCandidates(acctCsv, "2,5,7,11", lo, hi, L, 2, out);
-        QueryHenchCandidates(acctCsv, "1,2,3,4,5,6,7,8,9,11", lo, hi, L, 6, out);
+        // Same-faction only — a Horde henchman can't group with / heal an
+        // Alliance player. Race ids by team.
+        std::string const raceCsv = (requester->GetTeamId() == TEAM_ALLIANCE)
+            ? "1,3,4,7,11"   // Human, Dwarf, Night Elf, Gnome, Draenei
+            : "2,5,6,8,10";  // Orc, Undead, Tauren, Troll, Blood Elf
+
+        // ~20 candidates: 4 tanks (Warr/Pala/DK/Druid), 4 healers
+        // (Priest/Pala/Shaman/Druid), 12 dps (any class). Exact-band first; the
+        // ORDER BY closeness keeps them near the player's level.
+        QueryHenchCandidates(acctCsv, "1,2,6,11", raceCsv, lo, hi, L, 4, out);
+        QueryHenchCandidates(acctCsv, "2,5,7,11", raceCsv, lo, hi, L, 4, out);
+        QueryHenchCandidates(acctCsv, "1,2,3,4,5,6,7,8,9,11", raceCsv, lo, hi, L, 12, out);
 
         // Force the role label per the slot it was drawn for (the same char
         // could appear via two class sets; dedupe by guid keeping first role).
