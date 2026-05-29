@@ -36,6 +36,7 @@
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
+#include <utility>
 
 namespace WowPsParty
 {
@@ -155,6 +156,12 @@ namespace WowPsParty
     // Map updates can run on multiple threads, so these shared statics need
     // the same lock discipline as g_ttdSamples / g_rotationCache.
     static std::mutex g_useThrottleMutex;
+
+    // Per-bot "approaching a cast target" state: guid -> (targetGuidLow,
+    // lastMoveChaseMs). Throttles MoveChase re-issue so the LoS/range
+    // approach doesn't recompute the navmesh path every UpdateAI tick.
+    // Guarded by g_useThrottleMutex.
+    static std::unordered_map<uint32, std::pair<uint32, uint32>> g_approachState;
 
     static constexpr uint32 TTD_WINDOW_MS  = 12000; // keep ~12 s of history
     static constexpr uint32 TTD_SAMPLE_MS  = 500;   // at most one sample / 0.5 s
@@ -1321,8 +1328,17 @@ namespace WowPsParty
         // an `always | cast: Holy Light` on a low-mana paladin would
         // halt the loop every tick (rule "fired" but actual cast failed
         // silently), starving every lower-priority rule.
-        auto canFireSpellOn = [bot](uint32 spellId, Unit* target) -> bool
+        // Why the last canFireSpellOn() rejected, so the caller can decide
+        // whether to reposition. POSITION = the cast would succeed if only
+        // the bot were closer / had line of sight (walk toward the target);
+        // HARD = cooldown / power / stance / GCD (no point moving, fall
+        // through to a lower-priority rule).
+        enum class CastBlock { None, Hard, Position };
+        CastBlock castBlock = CastBlock::None;
+
+        auto canFireSpellOn = [bot, &castBlock](uint32 spellId, Unit* target) -> bool
         {
+            castBlock = CastBlock::Hard;
             // Rate-limited rejection logger. When a rule's condition
             // matches but the cast never fires, the per-tick trace only
             // says "exec_failed_falling_through" — it can't see WHICH of
@@ -1402,11 +1418,18 @@ namespace WowPsParty
             {
                 float const maxRange = info->GetMaxRange(info->IsPositive(), bot);
                 if (maxRange > 0 && !bot->IsWithinDistInMap(target, maxRange))
+                {
+                    castBlock = CastBlock::Position;
                     return reject("out of range");
+                }
                 if (!bot->IsWithinLOSInMap(target))
+                {
+                    castBlock = CastBlock::Position;
                     return reject("no line of sight");
+                }
             }
 
+            castBlock = CastBlock::None;
             return true;
         };
 
@@ -1489,6 +1512,79 @@ namespace WowPsParty
             return true;
         };
 
+        // Walk toward a cast target the bot can't yet reach. MoveChase routes
+        // around corners via the navmesh, so a healer whose target is behind a
+        // wall rounds the corner until line of sight clears instead of standing
+        // still spamming a blocked cast. Throttled so we don't recompute the
+        // path every UpdateAI tick (that stutters the bot in place). Returns
+        // true — committing to the approach counts as the rule "firing", which
+        // also stops the rotation from dropping to a worse lower-priority rule.
+        auto repositionToCast = [bot](Unit* target, uint32 spellId) -> bool
+        {
+            if (!target || target == bot) return false;
+
+            // Suppress the follow/assist ticker for the approach window.
+            WowPsParty::HoldFollower(bot->GetGUID(), 1200);
+
+            uint32 const gLow = bot->GetGUID().GetCounter();
+            uint32 const tLow = target->GetGUID().GetCounter();
+            uint32 const now  = getMSTime();
+            bool reissue = true;
+            {
+                std::lock_guard<std::mutex> lock(g_useThrottleMutex);
+                auto& e = g_approachState[gLow];   // (targetGuidLow, lastMoveMs)
+                bool const chasing = bot->GetMotionMaster()
+                    ->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE;
+                if (e.first == tLow && (now - e.second) < 700 && chasing)
+                    reissue = false;
+                else { e.first = tLow; e.second = now; }
+            }
+
+            if (reissue)
+            {
+                // No LoS → close right in (small follow distance) so the bot
+                // keeps moving until it rounds the corner. LoS but out of
+                // range → settle just inside max range.
+                float chaseDist = 2.0f;
+                if (bot->IsWithinLOSInMap(target))
+                {
+                    float maxRange = 0.0f;
+                    if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
+                        maxRange = si->GetMaxRange(si->IsPositive(), bot);
+                    chaseDist = (maxRange > 6.0f) ? (maxRange - 3.0f) : 3.0f;
+                }
+                bot->GetMotionMaster()->MoveChase(target, chaseDist);
+            }
+
+            static thread_local std::unordered_map<uint64, uint32> lastLog;
+            uint64 const lkey = (uint64(gLow) << 32) | spellId;
+            uint32& llast = lastLog[lkey];
+            if (now - llast > 3000)
+            {
+                llast = now;
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] {} approaching target guid={} for spell={} "
+                    "(dist={:.1f} los={})",
+                    bot->GetName(), tLow, spellId, bot->GetDistance(target),
+                    bot->IsWithinLOSInMap(target) ? 1 : 0);
+            }
+            return true;
+        };
+
+        // Validate + cast a directed spell; if the ONLY blocker is range or
+        // line of sight, walk toward the target instead of bailing.
+        auto castOrApproach = [&](Unit* target, uint32 spellId) -> bool
+        {
+            if (canFireSpellOn(spellId, target))
+            {
+                if (!channelClipOk()) return false;
+                return faceAndCast(target, spellId);
+            }
+            if (castBlock == CastBlock::Position)
+                return repositionToCast(target, spellId);
+            return false;
+        };
+
         if (verb == "cast" || verb == "cast_self")
         {
             uint32 const spellId = FindKnownSpellByName(bot, arg);
@@ -1518,9 +1614,7 @@ namespace WowPsParty
 
             Unit* target = (verb == "cast_self") ? bot : bot->GetVictim();
             if (!target) return false;
-            if (!canFireSpellOn(spellId, target)) return false;
-            if (!channelClipOk()) return false;
-            return faceAndCast(target, spellId);
+            return castOrApproach(target, spellId);
         }
 
         if (verb == "buff_self")
@@ -1555,9 +1649,7 @@ namespace WowPsParty
             if (!target) return false;
             if (verb == "cast_party_lowest_hot" && HasAuraFromSpell(target, spellId))
                 return false;
-            if (!canFireSpellOn(spellId, target)) return false;
-            if (!channelClipOk()) return false;
-            return faceAndCast(target, spellId);
+            return castOrApproach(target, spellId);
         }
 
         // "cast_class_missing:<classes>:<spell>" — cast spell on the first
@@ -1574,9 +1666,7 @@ namespace WowPsParty
             if (!spellId) return false;
             Player* target = FindClassFilteredMissing(bot, classes, spellId);
             if (!target) return false;
-            if (!canFireSpellOn(spellId, target)) return false;
-            if (!channelClipOk()) return false;
-            return faceAndCast(target, spellId);
+            return castOrApproach(target, spellId);
         }
 
         // "cast_role_missing:<role>:<spell>" — same idea but filter by the
@@ -1592,9 +1682,7 @@ namespace WowPsParty
             if (!spellId) return false;
             Player* target = FindRoleFilteredMissing(bot, roleFilter, spellId);
             if (!target) return false;
-            if (!canFireSpellOn(spellId, target)) return false;
-            if (!channelClipOk()) return false;
-            return faceAndCast(target, spellId);
+            return castOrApproach(target, spellId);
         }
 
         if (verb == "cast_party_missing")
@@ -1603,9 +1691,7 @@ namespace WowPsParty
             if (!spellId) return false;
             Player* target = FindPartyMemberMissingAura(bot, spellId);
             if (!target) return false;
-            if (!canFireSpellOn(spellId, target)) return false;
-            if (!channelClipOk()) return false;
-            return faceAndCast(target, spellId);
+            return castOrApproach(target, spellId);
         }
 
         // "cast_loose_enemy:<spell>" — cast the spell on the nearest hostile
@@ -1619,9 +1705,7 @@ namespace WowPsParty
             if (!spellId) return false;
             Unit* target = FindLooseEnemy(bot, 30.0f);
             if (!target) return false;
-            if (!canFireSpellOn(spellId, target)) return false;
-            if (!channelClipOk()) return false;
-            return faceAndCast(target, spellId);
+            return castOrApproach(target, spellId);
         }
 
         // "pull:<spell>" — initiate a RANGED pull. Picks the nearest hostile
@@ -1660,9 +1744,7 @@ namespace WowPsParty
             if (!spellId) return false;
             Player* target = FindDeadPartyMember(bot);
             if (!target) return false;
-            if (!canFireSpellOn(spellId, target)) return false;
-            if (!channelClipOk()) return false;
-            return faceAndCast(target, spellId);
+            return castOrApproach(target, spellId);
         }
 
         // "cure_party:<spell>" — cast `spell` on the first afflicted member.
@@ -1692,9 +1774,7 @@ namespace WowPsParty
             if (targetType == DISPEL_NONE) return false;
             Player* target = FindPartyMemberWithDispelType(bot, targetType);
             if (!target) return false;
-            if (!canFireSpellOn(spellId, target)) return false;
-            if (!channelClipOk()) return false;
-            return faceAndCast(target, spellId);
+            return castOrApproach(target, spellId);
         }
 
         // "use_item:<item name>" — pop a potion / healthstone / bandage from
@@ -1970,6 +2050,18 @@ namespace WowPsParty
 
         for (RotationRule const& r : rules)
         {
+            // A rule disabled in the editor (checkbox off) carries the
+            // "disabled" flag — keep it in the list so the user doesn't lose
+            // it, but never fire it.
+            if (CsvContains(Lower(r.flags), "disabled"))
+            {
+                if (trace)
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> DISABLED",
+                        r.priority, r.condition, r.action);
+                continue;
+            }
+
             bool const condOk = EvalCondition(r.condition, bot);
             if (!condOk)
             {
