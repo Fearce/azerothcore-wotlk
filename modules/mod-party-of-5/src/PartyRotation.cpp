@@ -250,6 +250,12 @@ namespace WowPsParty
             if (!m || !m->IsInWorld()) return;
             if (m->GetMapId() != bot->GetMapId()) return;
             if (!includeDead && !m->IsAlive()) return;
+            // Skip members the bot can't cast beneficial spells on. The core
+            // blocks cross-faction friendly casts (e.g. an Alliance druid can't
+            // Rejuv a Horde henchman), so including such a member would let the
+            // lowest-HP picker lock onto an unhealable target and heal nobody.
+            // The bot itself is always eligible.
+            if (m != bot && !bot->IsFriendlyTo(m)) return;
             if (std::find(out.begin(), out.end(), m) == out.end())
                 out.push_back(m);
         };
