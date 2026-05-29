@@ -22,10 +22,15 @@
 #include "Player.h"
 #include "QuestDef.h"
 #include "Reputation/ReputationMgr.h"
+#include "PartyFollow.h"
 #include "ScriptMgr.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
 #include "StringFormat.h"
 #include "Trainer.h"
 #include "WorldSession.h"
+
+#include <unordered_set>
 
 namespace WowPsParty
 {
@@ -120,11 +125,66 @@ public:
         if (!IsEnabled() || !player || !player->GetSession()) return;
         if (!sPartyMgr.GetSlotForGuid(player->GetGUID().GetCounter()))
             return;  // not one of this account's party characters
+
+        // Snapshot the spell-chains already known so we can report only the
+        // genuinely NEW abilities (not higher ranks of spells already in use —
+        // those don't need a rotation change since rules auto-pick top rank).
+        std::unordered_set<uint32> knownChains;
+        for (auto const& kv : player->GetSpellMap())
+        {
+            if (kv.second->State == PLAYERSPELL_REMOVED) continue;
+            uint32 const root = sSpellMgr->GetFirstSpellInChain(kv.first);
+            knownChains.insert(root ? root : kv.first);
+        }
+
         uint32 const n = LearnAllClassSpells(player);
-        if (n)
-            LOG_INFO("module",
-                "[WowPsParty] {} reached level {} — auto-learned {} new spell(s)",
-                player->GetName(), uint32(player->GetLevel()), n);
+        if (!n) return;
+
+        // Collect names of the new abilities (new chain-roots, active + shown).
+        std::vector<std::string> newNames;
+        std::unordered_set<uint32> seen;
+        for (auto const& kv : player->GetSpellMap())
+        {
+            if (kv.second->State == PLAYERSPELL_REMOVED) continue;
+            uint32 const root = sSpellMgr->GetFirstSpellInChain(kv.first);
+            uint32 const key  = root ? root : kv.first;
+            if (knownChains.count(key)) continue;       // already had it
+            if (!seen.insert(key).second) continue;     // dedupe ranks
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(kv.first);
+            if (!si) continue;
+            if (si->IsPassive()) continue;              // not rotation-relevant
+            if (si->HasAttribute(SPELL_ATTR0_IS_TRADESKILL)) continue;
+            if (si->HasAttribute(SPELL_ATTR0_DO_NOT_DISPLAY)) continue;
+            char const* nm = si->SpellName[0];
+            if (nm && *nm) newNames.push_back(nm);
+        }
+
+        LOG_INFO("module",
+            "[WowPsParty] {} reached level {} — auto-learned {} spell(s), {} new",
+            player->GetName(), uint32(player->GetLevel()), n, uint32(newNames.size()));
+        if (newNames.empty()) return;
+
+        std::string list;
+        uint32 shown = 0;
+        for (auto const& nm : newNames)
+        {
+            if (shown >= 6) { list += ", …"; break; }
+            if (!list.empty()) list += ", ";
+            list += nm;
+            ++shown;
+        }
+
+        // Send the reminder to the char the player is actually watching: the
+        // leader for a follower bot, or the leveling char itself if controlled.
+        Player* recipient = player;
+        if (ObjectGuid const lg = GetLeaderFor(player->GetGUID()))
+            if (Player* leader = ObjectAccessor::FindConnectedPlayer(lg))
+                recipient = leader;
+        if (recipient->GetSession())
+            ChatHandler(recipient->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r {} (L{}) learned: |cffffff00{}|r — open the "
+                "rotation editor (Y) to slot them in.",
+                player->GetName(), uint32(player->GetLevel()), list);
     }
 
     // When any party member receives an item that's required for one of
