@@ -151,47 +151,6 @@ namespace WowPsParty
         SendWPSP(player, out.str());
     }
 
-    // PARTYHENCH\t<rec>;<rec>;...   rec = guidLow:name:classId
-    // The henchmen currently in the player's party, so the rotation editor can
-    // offer a per-henchman tab/selector. Distinct from HENCHMEN (the hireable
-    // candidate list): this is who's actually in the group right now.
-    void SendPartyHenchTo(Player* player)
-    {
-        if (!player) return;
-        std::vector<ObjectGuid> party;
-        WowPsParty::GetPartyGuidsFor(player->GetGUID(), party);
-        std::ostringstream out;
-        out << "PARTYHENCH\t";
-        bool first = true;
-        for (ObjectGuid const& g : party)
-        {
-            if (!WowPsParty::IsHenchman(g)) continue;
-            std::string name;
-            uint32 cls = 0;
-            if (Player* hp = ObjectAccessor::FindConnectedPlayer(g))
-            {
-                name = hp->GetName();
-                cls  = hp->getClass();
-            }
-            else
-            {
-                QueryResult q = CharacterDatabase.Query(
-                    "SELECT `name`,`class` FROM `characters` WHERE `guid` = {}",
-                    g.GetCounter());
-                if (q)
-                {
-                    Field* f = q->Fetch();
-                    name = f[0].Get<std::string>();
-                    cls  = f[1].Get<uint8>();
-                }
-            }
-            if (name.empty()) continue;
-            if (!first) out << ';';
-            first = false;
-            out << g.GetCounter() << ':' << name << ':' << cls;
-        }
-        SendWPSP(player, out.str());
-    }
 
     // Resolve the slot's character guid for the account.
     static uint32 GuidForAccountSlot(uint32 account, uint32 slot)
@@ -427,19 +386,19 @@ namespace WowPsParty
     //   The addon renders the three trees from this; the class name table for
     //   the tab titles lives client-side. Server enforces all spend rules in
     //   LearnTalent, so the client gating is purely cosmetic.
-    void SendTalentsTo(Player* requester, uint32 slot)
+    // `echo` is the address token the client sent (slot number for an alt, or
+    // "h<guid>" for a henchman) so the reply routes to the right talent tab.
+    static void SendTalentsForGuid(Player* requester, uint32 guid,
+                                   std::string const& echo)
     {
-        if (!requester || !requester->GetSession()) return;
-        uint32 const account = requester->GetSession()->GetAccountId();
-        uint32 const guid = GuidForAccountSlot(account, slot);
-        if (!guid) return;
+        if (!requester || !requester->GetSession() || !guid) return;
         Player* p = ObjectAccessor::FindConnectedPlayer(
             ObjectGuid::Create<HighGuid::Player>(guid));
         if (!p) return;
 
         uint32 const classMask = p->getClassMask();
         std::ostringstream out;
-        out << "TALENTS\t" << slot << '\t' << p->GetFreeTalentPoints()
+        out << "TALENTS\t" << echo << '\t' << p->GetFreeTalentPoints()
             << '\t' << uint32(p->getClass()) << '\t';
 
         bool first = true;
@@ -481,9 +440,18 @@ namespace WowPsParty
                 << ':' << prereqTalentId << ':' << t->DependsOnRank;
         }
         LOG_INFO("module",
-            "[WowPsParty Talents] send slot={} {} freePoints={} class={}",
-            slot, p->GetName(), p->GetFreeTalentPoints(), uint32(p->getClass()));
+            "[WowPsParty Talents] send token={} {} freePoints={} class={}",
+            echo, p->GetName(), p->GetFreeTalentPoints(), uint32(p->getClass()));
         SendWPSP(requester, out.str());
+    }
+
+    // Slot-addressed talents (alts). Echoes the slot number.
+    void SendTalentsTo(Player* requester, uint32 slot)
+    {
+        if (!requester || !requester->GetSession()) return;
+        uint32 const guid = GuidForAccountSlot(
+            requester->GetSession()->GetAccountId(), slot);
+        SendTalentsForGuid(requester, guid, std::to_string(slot));
     }
 
     // QUEST_PROGRESS\t<rec>|<rec>|...
@@ -1499,10 +1467,6 @@ public:
         {
             WowPsParty::SendHenchmenTo(player);
         }
-        else if (command == "REQ_PARTYHENCH")
-        {
-            WowPsParty::SendPartyHenchTo(player);
-        }
         else if (command == "HIRE_HENCHMAN")
         {
             // HIRE_HENCHMAN\t<guid>\t<role>
@@ -1662,13 +1626,15 @@ public:
         {
             HandleSortBags(player);
         }
-        // REQ_TALENTS\t<slot>  → TALENTS\t...
+        // REQ_TALENTS\t<token>  → TALENTS\t...  (alt slot OR henchman "h<guid>")
         else if (command == "REQ_TALENTS")
         {
-            uint32 const slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
-            WowPsParty::SendTalentsTo(player, slot);
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            WowPsParty::SendTalentsForGuid(player, guid, token);
         }
-        // LEARN_TALENT\t<slot>\t<talentId>\t<rank 0-based>
+        // LEARN_TALENT\t<token>\t<talentId>\t<rank 0-based>. Henchmen are fixed:
+        // their talents are read-only, so a henchman token is rejected.
         else if (command == "LEARN_TALENT")
         {
             std::string s(payload);
@@ -1676,40 +1642,38 @@ public:
             if (t1 == std::string::npos) return;
             auto t2 = s.find('\t', t1 + 1);
             if (t2 == std::string::npos) return;
-            uint32 const slot     = std::strtoul(s.substr(0, t1).c_str(), nullptr, 10);
+            std::string const token = s.substr(0, t1);
             uint32 const talentId = std::strtoul(s.substr(t1 + 1, t2 - t1 - 1).c_str(), nullptr, 10);
             uint32 const rank     = std::strtoul(s.substr(t2 + 1).c_str(), nullptr, 10);
-            if (slot >= WowPsParty::PARTY_SIZE) return;
-            uint32 const account = player->GetSession()->GetAccountId();
-            uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
             if (!guid) return;
-            Player* p = ObjectAccessor::FindConnectedPlayer(
-                ObjectGuid::Create<HighGuid::Player>(guid));
+            ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
+            if (WowPsParty::IsHenchman(og)) return;   // henchman talents are fixed
+            Player* p = ObjectAccessor::FindConnectedPlayer(og);
             if (!p) return;
             uint32 const freeBefore = p->GetFreeTalentPoints();
             p->LearnTalent(talentId, rank, false);  // false = normal spend rules
             LOG_INFO("module",
-                "[WowPsParty Talents] LEARN slot={} {} talentId={} rank={} "
+                "[WowPsParty Talents] LEARN token={} {} talentId={} rank={} "
                 "freeBefore={} freeAfter={}",
-                slot, p->GetName(), talentId, rank, freeBefore,
+                token, p->GetName(), talentId, rank, freeBefore,
                 p->GetFreeTalentPoints());
-            WowPsParty::SendTalentsTo(player, slot);
+            WowPsParty::SendTalentsForGuid(player, guid, token);
         }
-        // RESET_TALENTS\t<slot>  — free, anywhere.
+        // RESET_TALENTS\t<token>  — free, anywhere. Henchmen are read-only.
         else if (command == "RESET_TALENTS")
         {
-            uint32 const slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
-            if (slot >= WowPsParty::PARTY_SIZE) return;
-            uint32 const account = player->GetSession()->GetAccountId();
-            uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
             if (!guid) return;
-            Player* p = ObjectAccessor::FindConnectedPlayer(
-                ObjectGuid::Create<HighGuid::Player>(guid));
+            ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
+            if (WowPsParty::IsHenchman(og)) return;   // henchman talents are fixed
+            Player* p = ObjectAccessor::FindConnectedPlayer(og);
             if (!p) return;
             p->resetTalents(true);   // noResetCost = true
-            WowPsParty::SendTalentsTo(player, slot);
+            WowPsParty::SendTalentsForGuid(player, guid, token);
             ChatHandler(player->GetSession()).PSendSysMessage(
-                "|cff66ccff[WowPsParty]|r Reset talents for slot {} (free).", slot);
+                "|cff66ccff[WowPsParty]|r Reset talents (free).");
         }
         else if (command == "GOTO_DELTA")
         {

@@ -379,6 +379,14 @@ public:
     // Mirror kill/quest XP to every party member so the 5 level together.
     void OnPlayerGiveXP(Player* player, uint32& amount, Unit* victim, uint8 xpSource) override
     {
+        // Henchmen are fixed at their hire level — they never level up, so they
+        // never gain XP (from group kills or anything else). Zero it out before
+        // anything else, including the propagation guard.
+        if (player && WowPsParty::IsHenchman(player->GetGUID()))
+        {
+            amount = 0;
+            return;
+        }
         if (WowPsParty::g_propagatingXP)
             return;
         if (!WowPsParty::IsEnabled() || !player || !player->GetSession() || amount == 0)
