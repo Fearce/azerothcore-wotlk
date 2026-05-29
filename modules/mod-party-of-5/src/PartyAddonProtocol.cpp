@@ -1983,16 +1983,21 @@ public:
                 {
                     // Immediate spawn if we have room and the active player
                     // is online.
+                    // Install the follow directive BEFORE spawning the bot.
+                    // The directive is what gates the bot out of mod-playerbots'
+                    // default AI in PlayerbotAI::UpdateAI. If we spawn first, the
+                    // bot can run a tick of default AI before the directive lands
+                    // — that's how a freshly-invited warrior alt cast Shield Block
+                    // (a default tank-strategy ability) that isn't in its rotation.
+                    // SetActiveFollowers erases+rebuilds the !henchman directives
+                    // while KEEPING henchmen (do NOT ClearFollowersForAccount —
+                    // that wiped the player's henchmen).
+                    WowPsParty::SetActiveFollowers(accountId, player->GetGUID());
                     if (PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(player))
                     {
                         mgr->AddPlayerBot(
                             ObjectGuid::Create<HighGuid::Player>(targetGuid), accountId);
                     }
-                    // Rebuild alt directives for the new enrollee. SetActiveFollowers
-                    // already erases+rebuilds the !henchman directives while KEEPING
-                    // henchmen — do NOT ClearFollowersForAccount first, that wiped
-                    // the player's henchmen (they reverted to default AI and left).
-                    WowPsParty::SetActiveFollowers(accountId, player->GetGUID());
                     ChatHandler(player->GetSession()).PSendSysMessage(
                         "|cff66ccff[WowPsParty]|r Invited |cffffffff{}|r to the party.", name);
                     break;
