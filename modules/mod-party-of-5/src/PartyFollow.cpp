@@ -37,6 +37,15 @@
 #include "ScriptMgr.h"
 #include "SpellAuraEffects.h"
 
+// Gathering (mining / herbalism) for follower bots.
+#include "Cell.h"
+#include "CellImpl.h"
+#include "DBCStores.h"
+#include "GameObject.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
+#include "LootMgr.h"
+
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 #include "RandomPlayerbotMgr.h"
@@ -58,6 +67,19 @@ namespace WowPsParty
 {
     namespace
     {
+        // Predicate for the grid searcher: any spawned GameObject within range.
+        // The mining/herb skill-lock filtering happens in the caller; this just
+        // collects nearby spawned GOs.
+        struct NearbySpawnedGOCheck
+        {
+            NearbySpawnedGOCheck(WorldObject const* src, float range)
+                : _src(src), _range(range) {}
+            bool operator()(GameObject* go) const
+            { return go && go->isSpawned() && _src->IsWithinDist(go, _range, false); }
+            WorldObject const* _src;
+            float _range;
+        };
+
         struct Directive
         {
             uint32      account;       // for SetActiveFollowers clearing
@@ -572,6 +594,209 @@ namespace WowPsParty
         LOG_INFO("module", "[WowPsParty TankLead] guid={} PULL mob_guid={} entry={} ok={}",
                  bot->GetGUID().GetCounter(), nearest->GetGUID().GetCounter(),
                  nearest->GetEntry(), ok);
+    }
+
+    // ===== Gathering (mining / herbalism) ==================================
+    //
+    // A follower bot that the player trained in Mining or Herbalism will, while
+    // OUT OF COMBAT and travelling with the party, peel off to harvest a nearby
+    // node (within 30y) that's within its skill, then resume following. Only the
+    // player's own alts gather — henchmen are temporary combat companions and
+    // are skipped. There's no toggle: training the profession IS the opt-in.
+
+    static constexpr float GATHER_SCAN_RANGE = 30.0f;  // node search radius
+    static constexpr float GATHER_REACH      = 5.0f;   // interaction distance
+    static constexpr float GATHER_LEADER_LEASH = 40.0f; // don't gather if lagging
+    static constexpr uint32 GATHER_APPROACH_TIMEOUT_MS = 6000; // give up if stuck
+    static constexpr uint32 GATHER_AVOID_MS = 30000;   // ignore an unreachable node
+
+    // Per-bot gather state. Committing to one node stops the bot oscillating
+    // between two equidistant nodes; the avoid slot remembers a node we gave up
+    // reaching (wedged on geometry) so we don't immediately re-pick it and spin.
+    struct GatherState
+    {
+        ObjectGuid node;            // node we're walking toward
+        uint32     commitMs   = 0;  // when we committed (stuck timeout)
+        ObjectGuid avoid;           // a node we abandoned as unreachable
+        uint32     avoidUntil = 0;
+    };
+    static std::unordered_map<uint32, GatherState> g_gather;  // botLow -> state
+    static std::mutex g_gatherMutex;
+
+    // If `go` is a mining/herb node, return its profession skill + required
+    // skill value. False for anything else (treasure chests, lockpick doors,
+    // quest objects — their lock isn't a mining/herb skill lock).
+    static bool NodeGatherSkill(GameObject* go, uint32& skillIdOut, uint32& reqOut)
+    {
+        if (!go) return false;
+        LockEntry const* lock = sLockStore.LookupEntry(go->GetGOInfo()->GetLockId());
+        if (!lock) return false;
+        for (uint8 i = 0; i < 8; ++i)
+        {
+            if (lock->Type[i] != LOCK_KEY_SKILL) continue;
+            uint32 const skillId = SkillByLockType(LockType(lock->Index[i]));
+            if (skillId == SKILL_MINING || skillId == SKILL_HERBALISM)
+            {
+                skillIdOut = skillId;
+                reqOut     = std::max<uint32>(2u, lock->Skill[i]);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // True if `bot` can gather `go` right now: spawned, ready (not mid-harvest),
+    // a mining/herb node, bot has the profession AND enough skill, and hasn't
+    // already harvested this spawn.
+    static bool IsGatherableBy(Player* bot, GameObject* go)
+    {
+        if (!go || !go->isSpawned()) return false;
+        if (go->getLootState() != GO_READY) return false;
+        uint32 skillId = 0, req = 0;
+        if (!NodeGatherSkill(go, skillId, req)) return false;
+        if (!bot->HasSkill(skillId)) return false;
+        if (uint32(bot->GetSkillValue(skillId)) < req) return false;
+        if (go->IsInSkillupList(bot->GetGUID())) return false;
+        return true;
+    }
+
+    static GameObject* FindNearestGatherNode(Player* bot, float range, ObjectGuid avoid)
+    {
+        std::list<GameObject*> gos;
+        NearbySpawnedGOCheck check(bot, range);
+        Acore::GameObjectListSearcher<NearbySpawnedGOCheck> searcher(bot, gos, check);
+        Cell::VisitObjects(bot, searcher, range);
+
+        GameObject* best = nullptr;
+        float bestDist = range + 1.0f;
+        for (GameObject* go : gos)
+        {
+            if (avoid && go->GetGUID() == avoid) continue;  // unreachable, skip
+            if (!IsGatherableBy(bot, go)) continue;
+            float const d = bot->GetDistance(go);
+            if (d < bestDist) { bestDist = d; best = go; }
+        }
+        return best;
+    }
+
+    // Harvest the node directly into the bot's bags. Mirrors the essence of
+    // Spell::EffectOpenLock (skill-up guarded by the per-GO skillup list, then
+    // loot) but without a loot window — our party bots hard-return from
+    // UpdateAI, so mod-playerbots' default loot AI never runs for them.
+    static void GatherNode(Player* bot, GameObject* go)
+    {
+        uint32 skillId = 0, req = 0;
+        if (!NodeGatherSkill(go, skillId, req)) return;
+
+        bot->SetFacingToObject(go);
+
+        if (!go->IsInSkillupList(bot->GetGUID()))
+        {
+            go->AddToSkillupList(bot->GetGUID());
+            if (uint32 pure = bot->GetPureSkillValue(skillId))
+                bot->UpdateGatherSkill(skillId, pure, req);
+        }
+
+        if (uint32 const lootId = go->GetGOInfo()->GetLootId())
+            bot->AutoStoreLoot(lootId, LootTemplates_Gameobject, true);
+
+        // Deplete it so it despawns + respawns like a real harvested vein.
+        go->SetLootState(GO_JUST_DEACTIVATED);
+
+        LOG_INFO("module",
+            "[WowPsParty Gather] {} harvested go entry={} skill={} req={}",
+            bot->GetName(), go->GetEntry(), skillId, req);
+    }
+
+    void TickGathering(Player* bot)
+    {
+        if (!bot || !bot->IsAlive() || !bot->IsInWorld() || !bot->GetSession()) return;
+        if (bot->IsInCombat()) return;                     // only when idle
+        if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) return; // the controlled body
+        if (bot->IsNonMeleeSpellCast(false, false, true)) return;
+        if (IsHenchman(bot->GetGUID())) return;            // only the player's alts
+        if (IsTankLeading(bot->GetGUID())) return;         // busy leading a dungeon
+
+        // Fast skill gate — most bots have neither profession, exit immediately.
+        bool const canMine = bot->HasSkill(SKILL_MINING);
+        bool const canHerb = bot->HasSkill(SKILL_HERBALISM);
+        if (!canMine && !canHerb) return;
+
+        // Nowhere to put the mats — don't harvest (AutoStoreLoot silently drops
+        // items that don't fit, which would deplete the node for nothing) and
+        // don't even approach. Resumes once a bag slot frees up.
+        if (bot->GetFreeInventorySpace() == 0) return;
+
+        ObjectGuid const leaderGuid = GetLeaderFor(bot->GetGUID());
+        if (!leaderGuid) return;
+        Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
+        if (!leader || !leader->IsInWorld()) return;
+        if (leader->GetMapId() != bot->GetMapId()) return;
+        // Don't wander off to gather while still catching up to the party.
+        if (bot->GetDistance(leader) > GATHER_LEADER_LEASH) return;
+
+        uint32 const gLow = bot->GetGUID().GetCounter();
+        uint32 const now  = getMSTime();
+
+        // Read this bot's committed node + avoid entry.
+        ObjectGuid committed, avoid;
+        uint32 commitMs = 0, avoidUntil = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_gatherMutex);
+            auto& st  = g_gather[gLow];
+            committed = st.node;
+            commitMs  = st.commitMs;
+            avoid     = st.avoid;
+            avoidUntil = st.avoidUntil;
+        }
+
+        GameObject* node = committed
+            ? ObjectAccessor::GetGameObject(*bot, committed) : nullptr;
+
+        if (!IsGatherableBy(bot, node))
+        {
+            // Lost/invalid committed node — pick the nearest valid one, skipping
+            // any node we recently gave up reaching.
+            node = FindNearestGatherNode(bot, GATHER_SCAN_RANGE,
+                                         (now < avoidUntil) ? avoid : ObjectGuid::Empty);
+            std::lock_guard<std::mutex> lock(g_gatherMutex);
+            auto& st = g_gather[gLow];
+            st.node     = node ? node->GetGUID() : ObjectGuid::Empty;
+            st.commitMs = node ? now : 0;
+        }
+        else if (commitMs && (now - commitMs) > GATHER_APPROACH_TIMEOUT_MS &&
+                 !bot->IsWithinDistInMap(node, GATHER_REACH))
+        {
+            // Committed but can't reach it (wedged on geometry). Abandon it and
+            // avoid re-picking it for a while; next tick re-scans for another.
+            std::lock_guard<std::mutex> lock(g_gatherMutex);
+            auto& st = g_gather[gLow];
+            st.avoid      = node->GetGUID();
+            st.avoidUntil = now + GATHER_AVOID_MS;
+            st.node       = ObjectGuid::Empty;
+            st.commitMs   = 0;
+            return;
+        }
+        if (!node) return;
+
+        if (bot->IsWithinDistInMap(node, GATHER_REACH))
+        {
+            GatherNode(bot, node);
+            std::lock_guard<std::mutex> lock(g_gatherMutex);
+            auto& st = g_gather[gLow];
+            st.node = ObjectGuid::Empty;
+            st.commitMs = 0;
+        }
+        else
+        {
+            // Walk to the node and keep the 1Hz follow re-asserter off us so it
+            // doesn't yank us back to the leader mid-approach. MovePoint paths
+            // around geometry (generatePath defaults true).
+            HoldFollower(bot->GetGUID(), 2500);
+            bot->SetFacingToObject(node);
+            bot->GetMotionMaster()->MovePoint(0xA17,
+                node->GetPositionX(), node->GetPositionY(), node->GetPositionZ());
+        }
     }
 
     void AssistTarget(Player* bot)
@@ -1155,4 +1380,10 @@ void WowPsParty_TankFollowPath_Trampoline(Player* bot)
     if (!WowPsParty::IsLeadTank(bot->GetGUID())) return;
     if (!WowPsParty::GetLeadInDungeon(bot->GetGUID().GetCounter())) return;  // user disabled leading
     WowPsParty::TankFollowPath(bot);
+}
+
+// Gathering trampoline — out-of-combat mining/herbalism for the player's alts.
+void WowPsParty_TickGathering_Trampoline(Player* bot)
+{
+    WowPsParty::TickGathering(bot);
 }

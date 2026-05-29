@@ -117,6 +117,13 @@ namespace WowPsParty
     void HoldFollower(ObjectGuid followerGuid, uint32 durationMs);
     bool IsFollowerHeld(ObjectGuid followerGuid);
 
+    // Out-of-combat gathering. If `bot` is one of the player's alts (not a
+    // henchman) and was trained in Mining or Herbalism, harvest a nearby node
+    // (within 30y, within the bot's skill) while travelling with the party,
+    // then resume following. Training the profession is the only opt-in — no
+    // toggle. Called every AI tick; fast-exits for bots without a gather skill.
+    void TickGathering(Player* bot);
+
     // Dungeon tank-lead engagement. If `bot` is the assigned tank for
     // its account, the leader is in a dungeon and not already engaging
     // a target, and there's a hostile creature within 40 yards of the
