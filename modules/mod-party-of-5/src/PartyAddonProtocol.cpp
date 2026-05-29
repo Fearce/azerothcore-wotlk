@@ -151,6 +151,48 @@ namespace WowPsParty
         SendWPSP(player, out.str());
     }
 
+    // PARTYHENCH\t<rec>;<rec>;...   rec = guidLow:name:classId
+    // The henchmen currently in the player's party, so the rotation editor can
+    // offer a per-henchman tab/selector. Distinct from HENCHMEN (the hireable
+    // candidate list): this is who's actually in the group right now.
+    void SendPartyHenchTo(Player* player)
+    {
+        if (!player) return;
+        std::vector<ObjectGuid> party;
+        WowPsParty::GetPartyGuidsFor(player->GetGUID(), party);
+        std::ostringstream out;
+        out << "PARTYHENCH\t";
+        bool first = true;
+        for (ObjectGuid const& g : party)
+        {
+            if (!WowPsParty::IsHenchman(g)) continue;
+            std::string name;
+            uint32 cls = 0;
+            if (Player* hp = ObjectAccessor::FindConnectedPlayer(g))
+            {
+                name = hp->GetName();
+                cls  = hp->getClass();
+            }
+            else
+            {
+                QueryResult q = CharacterDatabase.Query(
+                    "SELECT `name`,`class` FROM `characters` WHERE `guid` = {}",
+                    g.GetCounter());
+                if (q)
+                {
+                    Field* f = q->Fetch();
+                    name = f[0].Get<std::string>();
+                    cls  = f[1].Get<uint8>();
+                }
+            }
+            if (name.empty()) continue;
+            if (!first) out << ';';
+            first = false;
+            out << g.GetCounter() << ':' << name << ':' << cls;
+        }
+        SendWPSP(player, out.str());
+    }
+
     // Resolve the slot's character guid for the account.
     static uint32 GuidForAccountSlot(uint32 account, uint32 slot)
     {
@@ -158,6 +200,40 @@ namespace WowPsParty
             "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}",
             account, slot);
         return q ? q->Fetch()[0].Get<uint32>() : 0;
+    }
+
+    // Resolve a rotation-editor address token to a character guid.
+    //   "h<guidLow>"  -> a henchman (validated: must be a henchman currently
+    //                    led by this player, so one account can't poke another's
+    //                    bot loadout by guessing guids).
+    //   "<n>"         -> account_party slot n (the heroes), as before.
+    // Returns 0 when the token doesn't resolve to something this player may edit.
+    static uint32 ResolveLoadoutToken(Player* player, std::string const& token)
+    {
+        if (!player || !player->GetSession() || token.empty()) return 0;
+        if (token[0] == 'h' || token[0] == 'H')
+        {
+            uint32 const g = std::strtoul(token.c_str() + 1, nullptr, 10);
+            if (!g) return 0;
+            ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(g);
+            if (WowPsParty::IsHenchman(og) &&
+                WowPsParty::GetLeaderFor(og) == player->GetGUID())
+                return g;
+            return 0;
+        }
+        uint32 const slot = std::strtoul(token.c_str(), nullptr, 10);
+        if (slot >= WowPsParty::PARTY_SIZE) return 0;
+        return GuidForAccountSlot(player->GetSession()->GetAccountId(), slot);
+    }
+
+    // Pull the first tab-separated field (the address token) off a payload,
+    // leaving `rest` pointing at whatever follows the tab (empty if none).
+    static std::string SplitToken(std::string const& payload, std::string& rest)
+    {
+        auto t = payload.find('\t');
+        if (t == std::string::npos) { rest.clear(); return payload; }
+        rest = payload.substr(t + 1);
+        return payload.substr(0, t);
     }
 
     static Player* ResolveControlledBody(Player* session)
@@ -169,13 +245,13 @@ namespace WowPsParty
         return session;  // not possessing anyone — your own body
     }
 
-    // SPELLBOOK\t<slot>\t<spellId1,spellId2,...>
-    void SendSpellbookTo(Player* requester, uint32 slot)
+    // SPELLBOOK\t<echo>\t<spellId1,spellId2,...>
+    // `echo` is the address token the client sent (a slot number for heroes, or
+    // "h<guid>" for henchmen) so the client routes the reply to the right tab.
+    static void SendSpellbookForGuid(Player* requester, uint32 guid,
+                                     std::string const& echo)
     {
-        if (!requester || !requester->GetSession()) return;
-        uint32 const account = requester->GetSession()->GetAccountId();
-        uint32 const guid = GuidForAccountSlot(account, slot);
-        if (!guid) return;
+        if (!requester || !requester->GetSession() || !guid) return;
         ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
         Player* target = ObjectAccessor::FindConnectedPlayer(og);
         if (!target) return;
@@ -217,8 +293,17 @@ namespace WowPsParty
             csv << kv.second;
         }
         std::ostringstream out;
-        out << "SPELLBOOK\t" << slot << '\t' << csv.str();
+        out << "SPELLBOOK\t" << echo << '\t' << csv.str();
         SendWPSP(requester, out.str());
+    }
+
+    // Slot-addressed spellbook (heroes). Echoes the slot number.
+    void SendSpellbookTo(Player* requester, uint32 slot)
+    {
+        if (!requester || !requester->GetSession()) return;
+        uint32 const guid = GuidForAccountSlot(
+            requester->GetSession()->GetAccountId(), slot);
+        SendSpellbookForGuid(requester, guid, std::to_string(slot));
     }
 
     // forward decls — definitions follow below
@@ -1414,6 +1499,10 @@ public:
         {
             WowPsParty::SendHenchmenTo(player);
         }
+        else if (command == "REQ_PARTYHENCH")
+        {
+            WowPsParty::SendPartyHenchTo(player);
+        }
         else if (command == "HIRE_HENCHMAN")
         {
             // HIRE_HENCHMAN\t<guid>\t<role>
@@ -1441,8 +1530,9 @@ public:
         }
         else if (command == "REQ_SPELLBOOK")
         {
-            uint32 slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
-            WowPsParty::SendSpellbookTo(player, slot);
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            WowPsParty::SendSpellbookForGuid(player, guid, token);
         }
         else if (command == "REQ_GEAR")
         {
@@ -1453,12 +1543,11 @@ public:
         {
             WowPsParty::SendInventoryTo(player);
         }
-        // REQ_TARGETMODE\t<slot>  →  TARGETMODE\t<slot>\t<mode>
+        // REQ_TARGETMODE\t<token>  →  TARGETMODE\t<token>\t<mode>
         else if (command == "REQ_TARGETMODE")
         {
-            uint32 const slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
-            uint32 const account = player->GetSession()->GetAccountId();
-            uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
             std::string mode = "master";
             if (guid)
             {
@@ -1469,27 +1558,29 @@ public:
                     std::string s = q->Fetch()[0].Get<std::string>();
                     if (!s.empty()) mode = s;
                 }
+                else
+                {
+                    // No DB row yet (e.g. a henchman whose tank "loose" lives
+                    // only in the in-memory cache) — reflect the live cache.
+                    mode = WowPsParty::GetTargetMode(guid);
+                }
             }
             std::ostringstream out;
-            out << "TARGETMODE\t" << slot << '\t' << mode;
+            out << "TARGETMODE\t" << token << '\t' << mode;
             SendWPSP(player, out.str());
         }
-        // SET_TARGETMODE\t<slot>\t<mode>
+        // SET_TARGETMODE\t<token>\t<mode>
         else if (command == "SET_TARGETMODE")
         {
-            std::string s(payload);
-            auto tab = s.find('\t');
-            if (tab == std::string::npos) return;
-            uint32 const slot = std::strtoul(s.substr(0, tab).c_str(), nullptr, 10);
-            std::string mode = s.substr(tab + 1);
-            if (slot >= WowPsParty::PARTY_SIZE) return;
+            std::string rest;
+            std::string const token = WowPsParty::SplitToken(std::string(payload), rest);
+            std::string mode = rest;
             // Whitelist — only known modes reach the DB (also blocks any
             // injection via the stored-into-SQL string).
             if (mode != "master" && mode != "tank" && mode != "nearest"
                 && mode != "loose")
                 return;
-            uint32 const account = player->GetSession()->GetAccountId();
-            uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
             if (!guid) return;
             CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
             tx->Append(
@@ -1500,36 +1591,32 @@ public:
             CharacterDatabase.CommitTransaction(tx);
             WowPsParty::TargetModeCacheSet(guid, mode);
             ChatHandler(player->GetSession()).PSendSysMessage(
-                "|cff66ccff[WowPsParty]|r Target mode for slot {} set to '{}'.", slot, mode);
+                "|cff66ccff[WowPsParty]|r Target mode set to '{}'.", mode);
         }
-        // REQ_LEADDUNGEON\t<slot>  →  LEADDUNGEON\t<slot>\t<0|1>
+        // REQ_LEADDUNGEON\t<token>  →  LEADDUNGEON\t<token>\t<0|1>
         else if (command == "REQ_LEADDUNGEON")
         {
-            uint32 const slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
-            uint32 const account = player->GetSession()->GetAccountId();
-            uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
             bool on = true;
             if (guid)
             {
                 QueryResult q = CharacterDatabase.Query(
                     "SELECT `glyphs_csv` FROM `party_loadout` WHERE `guid` = {}", guid);
                 if (q && q->Fetch()[0].Get<std::string>() == "0") on = false;
+                else if (!q) on = WowPsParty::GetLeadInDungeon(guid);
             }
             std::ostringstream out;
-            out << "LEADDUNGEON\t" << slot << '\t' << (on ? 1 : 0);
+            out << "LEADDUNGEON\t" << token << '\t' << (on ? 1 : 0);
             SendWPSP(player, out.str());
         }
-        // SET_LEADDUNGEON\t<slot>\t<0|1>
+        // SET_LEADDUNGEON\t<token>\t<0|1>
         else if (command == "SET_LEADDUNGEON")
         {
-            std::string s(payload);
-            auto tab = s.find('\t');
-            if (tab == std::string::npos) return;
-            uint32 const slot = std::strtoul(s.substr(0, tab).c_str(), nullptr, 10);
-            bool const on = (s.substr(tab + 1) != "0");
-            if (slot >= WowPsParty::PARTY_SIZE) return;
-            uint32 const account = player->GetSession()->GetAccountId();
-            uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+            std::string rest;
+            std::string const token = WowPsParty::SplitToken(std::string(payload), rest);
+            bool const on = (rest != "0");
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
             if (!guid) return;
             CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
             tx->Append(
@@ -1540,8 +1627,7 @@ public:
             CharacterDatabase.CommitTransaction(tx);
             WowPsParty::LeadDungeonCacheSet(guid, on);
             ChatHandler(player->GetSession()).PSendSysMessage(
-                "|cff66ccff[WowPsParty]|r Slot {} lead-in-dungeons: {}.",
-                slot, on ? "ON" : "OFF");
+                "|cff66ccff[WowPsParty]|r Lead-in-dungeons: {}.", on ? "ON" : "OFF");
         }
         else if (command == "EQUIP")
         {
@@ -1671,17 +1757,17 @@ public:
         // individual message tiny.
         else if (command == "BEGIN_ROTATION")
         {
-            uint32 const slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
-            if (slot >= WowPsParty::PARTY_SIZE) return;
-            uint64 const key = (uint64(player->GetGUID().GetCounter()) << 8) | slot;
-            PendingRotationMap()[key].clear();
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            if (!guid) return;
+            PendingRotationMap()[guid].clear();
             LOG_INFO("module",
-                "[WowPsParty] BEGIN_ROTATION guid={} slot={}",
-                player->GetGUID().GetCounter(), slot);
+                "[WowPsParty] BEGIN_ROTATION editor={} target_guid={}",
+                player->GetGUID().GetCounter(), guid);
         }
         else if (command == "ROTATION_RULE")
         {
-            // payload = "<slot>\t<condition>\t<action>\t<priority>[\t<flags>]"
+            // payload = "<token>\t<condition>\t<action>\t<priority>[\t<flags>]"
             std::string s(payload);
             std::vector<std::string> fields;
             {
@@ -1699,28 +1785,26 @@ public:
                 }
             }
             if (fields.size() < 4) return;
-            uint32 const slot = std::strtoul(fields[0].c_str(), nullptr, 10);
-            if (slot >= WowPsParty::PARTY_SIZE) return;
-            uint64 const key = (uint64(player->GetGUID().GetCounter()) << 8) | slot;
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, fields[0]);
+            if (!guid) return;
             WowPsParty::RotationRule r;
             r.condition = fields[1];
             r.action    = fields[2];
             r.priority  = std::atoi(fields[3].c_str());
             r.flags     = fields.size() >= 5 ? fields[4] : "";
-            PendingRotationMap()[key].push_back(std::move(r));
+            PendingRotationMap()[guid].push_back(std::move(r));
             LOG_INFO("module",
-                "[WowPsParty] ROTATION_RULE guid={} slot={} cond='{}' act='{}' prio={} flags='{}'",
-                player->GetGUID().GetCounter(), slot,
-                fields[1], fields[2], std::atoi(fields[3].c_str()),
+                "[WowPsParty] ROTATION_RULE target_guid={} cond='{}' act='{}' prio={} flags='{}'",
+                guid, fields[1], fields[2], std::atoi(fields[3].c_str()),
                 fields.size() >= 5 ? fields[4] : "");
         }
         else if (command == "COMMIT_ROTATION")
         {
-            uint32 const slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
-            if (slot >= WowPsParty::PARTY_SIZE) return;
-            uint64 const key = (uint64(player->GetGUID().GetCounter()) << 8) | slot;
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            if (!guid) return;
             auto& pending = PendingRotationMap();
-            auto it = pending.find(key);
+            auto it = pending.find(guid);
             std::vector<WowPsParty::RotationRule> rules;
             if (it != pending.end())
             {
@@ -1731,13 +1815,6 @@ public:
             std::stable_sort(rules.begin(), rules.end(),
                 [](WowPsParty::RotationRule const& a, WowPsParty::RotationRule const& b)
                 { return a.priority > b.priority; });
-
-            uint32 const accountId = player->GetSession()->GetAccountId();
-            QueryResult q = CharacterDatabase.Query(
-                "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}",
-                accountId, slot);
-            if (!q) return;
-            uint32 const guid = q->Fetch()[0].Get<uint32>();
 
             std::string const stored = WowPsParty::SerialiseRotationRules(rules);
             CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
@@ -1750,11 +1827,10 @@ public:
 
             WowPsParty::RotationCacheSet(guid, rules);
             ChatHandler(player->GetSession()).PSendSysMessage(
-                "|cff66ccff[WowPsParty]|r Saved {} rule(s) on slot {}.",
-                uint32(rules.size()), slot);
+                "|cff66ccff[WowPsParty]|r Saved {} rule(s).", uint32(rules.size()));
             LOG_INFO("module",
-                "[WowPsParty] COMMIT_ROTATION guid={} slot={} n_rules={}",
-                player->GetGUID().GetCounter(), slot, uint32(rules.size()));
+                "[WowPsParty] COMMIT_ROTATION target_guid={} n_rules={}",
+                guid, uint32(rules.size()));
         }
         else if (command == "SET_ROTATION")
         {
@@ -1965,21 +2041,16 @@ public:
         }
         else if (command == "CLEAR_ROTATION")
         {
-            uint32 const slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
-            if (slot >= WowPsParty::PARTY_SIZE) return;
-            uint32 const accountId = player->GetSession()->GetAccountId();
-            QueryResult q = CharacterDatabase.Query(
-                "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}",
-                accountId, slot);
-            if (!q) return;
-            uint32 const guid = q->Fetch()[0].Get<uint32>();
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            if (!guid) return;
             CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
             tx->Append(
                 "UPDATE `party_loadout` SET `priority_actions_json` = '' WHERE `guid` = {}", guid);
             CharacterDatabase.CommitTransaction(tx);
             WowPsParty::RotationCacheClear(guid);
             ChatHandler(player->GetSession()).PSendSysMessage(
-                "|cff66ccff[WowPsParty]|r Cleared rotation for slot {}.", slot);
+                "|cff66ccff[WowPsParty]|r Cleared rotation.");
         }
         else if (command == "PING")
         {

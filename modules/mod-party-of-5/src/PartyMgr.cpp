@@ -330,20 +330,39 @@ namespace WowPsParty
         // account random-pool char in.
         WowPsParty::AddHenchmanDirective(account, henchGuid, requester->GetGUID(), useRole);
 
-        // Load a class-default rotation so the henchman runs OUR combat AI
-        // (AssistTarget positioning, LoS approach, no melee-stacking) with
-        // sensible spells — the same engine the heroes use. Without a cached
-        // rotation it would just auto-attack.
-        WowPsParty::RotationCacheSet(candidateGuid,
-            WowPsParty::ParseRotationString(DefaultRotationForClass(cls)));
+        // Restore this henchman's persisted loadout. party_loadout is keyed by
+        // character guid, so a henchman the player edited in a PRIOR hire keeps
+        // those changes when re-invited (Kevin's "next time I invite this guy he
+        // still has my rotation"). Falls back to sensible defaults when the bot
+        // has never been customised:
+        //   rotation  : saved priority_actions_json, else class default — so the
+        //               henchman runs OUR combat AI (LoS approach, no melee-
+        //               stacking) with sensible spells, same engine as heroes.
+        //   targetmode: saved strategies_csv, else tank -> "loose" / "master".
+        //   lead       : saved glyphs_csv ("0" = off), else ON.
+        {
+            QueryResult lq = CharacterDatabase.Query(
+                "SELECT `priority_actions_json`,`strategies_csv`,`glyphs_csv` "
+                "FROM `party_loadout` WHERE `guid` = {}", candidateGuid);
+            std::string savedRot, savedMode, savedLead;
+            if (lq)
+            {
+                Field* lf = lq->Fetch();
+                savedRot  = lf[0].Get<std::string>();
+                savedMode = lf[1].Get<std::string>();
+                savedLead = lf[2].Get<std::string>();
+            }
 
-        // Tank henchmen default to "loose" target mode: grab the nearest
-        // hostile that ISN'T already on the tank, so they peel adds off the
-        // casters/healer instead of tunneling whatever the leader hits. Set
-        // unconditionally (tank -> loose, otherwise -> master) so a recycled
-        // rndbot GUID never inherits a stale mode from a prior hire.
-        WowPsParty::TargetModeCacheSet(candidateGuid,
-                                       useRole == "tank" ? "loose" : "master");
+            WowPsParty::RotationCacheSet(candidateGuid,
+                WowPsParty::ParseRotationString(
+                    savedRot.empty() ? DefaultRotationForClass(cls) : savedRot));
+
+            WowPsParty::TargetModeCacheSet(candidateGuid,
+                !savedMode.empty() ? savedMode
+                                   : (useRole == "tank" ? "loose" : "master"));
+
+            WowPsParty::LeadDungeonCacheSet(candidateGuid, savedLead != "0");
+        }
 
         mgr->AddPlayerBot(henchGuid, account);
 
