@@ -1524,7 +1524,12 @@ public:
                     "SELECT `class` FROM `characters` WHERE `guid` = {}", guid);
                 if (q) cls = q->Fetch()[0].Get<uint8>();
             }
-            std::string dsl = WowPsParty::DefaultRotationForClass(cls);
+            // Match the role the bot actually runs (henchman/alt directive),
+            // so Generate previews the same rotation hire applied; falls back
+            // to the class default role when there's no directive.
+            std::string const genRole = WowPsParty::RoleForGuid(
+                ObjectGuid::Create<HighGuid::Player>(guid));
+            std::string dsl = WowPsParty::DefaultRotationForClass(cls, genRole);
             std::replace(dsl.begin(), dsl.end(), '|', '~');
             std::ostringstream out;
             out << "GENROT\t" << token << '\t' << dsl;

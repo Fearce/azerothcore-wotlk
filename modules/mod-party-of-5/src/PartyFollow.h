@@ -51,6 +51,10 @@ namespace WowPsParty
     uint32 CountFollowersFor(ObjectGuid leaderGuid);   // alts + henchmen
     int    FormationIndexFor(ObjectGuid follower, ObjectGuid leaderGuid);
     bool   IsLeadTank(ObjectGuid botGuid);   // role-based; works for henchmen
+    // The follow directive's role ("tank"/"healer"/"dps") for a follower
+    // (alt or henchman), or "" if it has no directive. Lets the rotation
+    // editor's "Generate" button match the role the bot actually runs.
+    std::string RoleForGuid(ObjectGuid botGuid);
 
     // Wires up the per-tick re-asserter. Called once from
     // PartyBootstrapWorldScript::OnStartup. Idempotent; subsequent

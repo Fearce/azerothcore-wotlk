@@ -100,7 +100,7 @@ namespace WowPsParty
     // by the `.party preset` command and henchman hire so henchmen run our
     // rotation engine + combat AI (positioning, LoS approach) with sensible
     // class spells, instead of the default playerbot AI. Empty for unknown.
-    std::string DefaultRotationForClass(uint8 cls);
+    std::string DefaultRotationForClass(uint8 cls, std::string const& role = "");
 
     // Hire `candidateGuid` for `requester`. Validates gold + party space,
     // deducts the fee, spawns the bot and registers the follow directive.

@@ -10,6 +10,7 @@
 #include "CharacterCache.h"
 #include "CharmInfo.h"
 #include "DatabaseEnv.h"
+#include "DBCStores.h"
 #include "Group.h"
 #include "GroupMgr.h"
 #include "LootMgr.h"
@@ -172,25 +173,365 @@ namespace WowPsParty
         return uint32(level) * 250u;
     }
 
-    // Canonical per-class starter rotation (spell NAMES, so the engine picks
-    // the highest known rank at any level). Shared by `.party preset` and
-    // henchman hire. Keep in sync — this is the single source.
-    std::string DefaultRotationForClass(uint8 cls)
+    // Infer a henchman's combat role from its ACTUAL talent spec. The candidate
+    // is offline at hire, so we read `character_talent` and resolve each learned
+    // talent to its tree (tabpage 0/1/2) via the Talent DBC, summing points spent
+    // per tree and taking the dominant one. Without this, role would be the flat
+    // class default (every warrior "tank", every priest "healer"), so a Fury
+    // warrior or Shadow priest would get the wrong role-aware rotation. Falls back
+    // to `fallback` when the char has no talents yet (very low level).
+    static std::string InferHenchmanRole(uint32 guid, uint8 cls,
+                                         std::string const& fallback)
     {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `spell` FROM `character_talent` WHERE `guid` = {}", guid);
+        if (!q) return fallback;
+
+        std::unordered_set<uint32> known;
+        do { known.insert(q->Fetch()[0].Get<uint32>()); } while (q->NextRow());
+        if (known.empty()) return fallback;
+
+        uint32 points[3] = { 0, 0, 0 };
+        for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
+        {
+            TalentEntry const* tal = sTalentStore.LookupEntry(i);
+            if (!tal) continue;
+            TalentTabEntry const* tab = sTalentTabStore.LookupEntry(tal->TalentTab);
+            if (!tab || tab->tabpage > 2) continue;
+            // Highest known rank of this talent = points spent in it.
+            for (int rank = int(tal->RankID.size()) - 1; rank >= 0; --rank)
+                if (tal->RankID[rank] && known.count(tal->RankID[rank]))
+                {
+                    points[tab->tabpage] += uint32(rank + 1);
+                    break;
+                }
+        }
+        if (!points[0] && !points[1] && !points[2]) return fallback;
+
+        uint8 tree = 0;
+        if (points[1] > points[tree]) tree = 1;
+        if (points[2] > points[tree]) tree = 2;
+
+        // tabpage order is the standard WotLK tree layout per class.
         switch (cls)
         {
-            case 1:  return "self_health<40|cast_self:Battle Shout|80;has_target|cast:Heroic Strike|50;has_target|cast:Rend|30";
-            case 2:  return "self_health<35|cast_self:Holy Light|90;always|cast_self:Devotion Aura|70;has_target|cast:Judgement of Light|40";
-            case 3:  return "has_target|cast:Serpent Sting|60;has_target|cast:Arcane Shot|40;has_target|cast:Auto Shot|20";
-            case 4:  return "out_of_combat|cast_self:Stealth|95;has_target|cast:Sinister Strike|50";
-            case 5:  return "party_lowest_health<55|cast_party_lowest:Lesser Heal|95;has_target|cast:Smite|30;always|buff_self:Power Word: Fortitude|70";
-            case 6:  return "self_health<35|cast_self:Death Strike|90;has_target|cast:Plague Strike|60;has_target|cast:Blood Strike|40";
-            case 7:  return "party_lowest_health<40|cast_party_lowest:Healing Wave|90;has_target|cast:Lightning Bolt|50;always|buff_self:Lightning Shield|70";
-            case 8:  return "self_health<35|cast_self:Frost Nova|95;has_target|cast:Frostbolt|50;has_target|cast:Fireball|40";
-            case 9:  return "has_target|cast:Corruption|60;has_target|cast:Shadow Bolt|40;self_health<30|cast:Drain Life|95";
-            case 11: return "party_lowest_health<40|cast_party_lowest:Rejuvenation|90;has_target|cast:Wrath|50;has_target|cast:Moonfire|30";
-            default: return "";
+            case 1:  return tree == 2 ? "tank" : "dps";                       // Warrior: Prot
+            case 2:  return tree == 0 ? "healer" : (tree == 1 ? "tank" : "dps"); // Paladin: Holy/Prot/Ret
+            case 5:  return tree == 2 ? "dps" : "healer";                     // Priest: Shadow vs Disc/Holy
+            case 6:  return tree == 0 ? "tank" : "dps";                       // DK: Blood
+            case 7:  return tree == 2 ? "healer" : "dps";                     // Shaman: Resto
+            case 11: return tree == 2 ? "healer" : (tree == 1 ? "tank" : "dps"); // Druid: Balance/Feral/Resto
+            default: return "dps";                                            // Hunter/Rogue/Mage/Warlock
         }
+    }
+
+    // Canonical per-class, per-role starter rotation. Built as a priority list
+    // (the engine fires the highest-priority rule whose conditions pass and whose
+    // spell is castable, falling through on cooldown/unknown). Two properties make
+    // these robust without knowing the bot's spec or level:
+    //   * spell NAMES, so the engine resolves the highest rank the bot knows;
+    //   * unknown spells fall through (FindKnownSpellByName == 0), so a single
+    //     rotation can list EVERY spec's key abilities and degrade gracefully —
+    //     a low-level or off-spec bot simply skips what it hasn't learned and
+    //     drops to the filler it does know.
+    // `role` ("tank"/"healer"/"dps") tunes the warrior/DK stance/presence, the
+    // hybrids' heal aggressiveness, and tank threat/taunt rules. Empty role →
+    // the class's default role. Shared by `.party preset` and henchman hire.
+    std::string DefaultRotationForClass(uint8 cls, std::string const& role)
+    {
+        std::string r = role.empty() ? std::string(ClassDefaultRole(cls)) : role;
+        bool const isTank   = (r == "tank");
+        bool const isHealer = (r == "healer");
+
+        std::vector<std::string> rules;
+        auto add = [&rules](char const* cond, char const* action, int prio)
+        {
+            rules.emplace_back(std::string(cond) + '|' + action + '|' + std::to_string(prio));
+        };
+
+        switch (cls)
+        {
+            case 1: // Warrior
+                if (isTank)
+                {
+                    add("target_casting&target_interruptible", "cast:Shield Bash", 92);
+                    add("enemy_loose_in_range", "cast_loose_enemy:Taunt", 90);
+                    add("always", "buff_self:Defensive Stance", 84);
+                    add("always", "buff_self:Commanding Shout", 80);
+                    add("has_target", "cast:Shield Slam", 74);
+                    add("enemies_in_melee>2", "cast:Thunder Clap", 70);
+                    add("has_target", "cast:Revenge", 66);
+                    add("enemies_in_melee>2", "cast:Demoralizing Shout", 58);
+                    add("has_target", "cast:Devastate", 52);
+                    add("has_target", "cast:Sunder Armor", 44);
+                    add("self_rage>45", "cast:Heroic Strike", 30);
+                }
+                else
+                {
+                    add("target_casting&target_interruptible", "cast:Pummel", 92);
+                    add("target_health<20", "cast:Execute", 90);
+                    add("always", "buff_self:Battle Stance", 82);
+                    add("always", "buff_self:Battle Shout", 80);
+                    add("has_target", "cast:Mortal Strike", 72);
+                    add("has_target", "cast:Bloodthirst", 71);
+                    add("has_target", "cast:Overpower", 68);
+                    add("enemies_in_melee>1", "cast:Whirlwind", 62);
+                    add("enemies_in_melee>2", "cast:Thunder Clap", 56);
+                    add("target_missing_aura:Rend", "cast:Rend", 48);
+                    add("has_target", "cast:Slam", 40);
+                    add("self_rage>55", "cast:Heroic Strike", 30);
+                }
+                break;
+
+            case 2: // Paladin
+                if (isHealer)
+                {
+                    add("party_lowest_health<60", "cast_party_lowest:Holy Shock", 94);
+                    add("party_lowest_health<35", "cast_party_lowest:Holy Light", 90);
+                    add("tank_health<55", "cast_party_lowest:Flash of Light", 86);
+                    add("party_has_dead", "rez_party:Redemption", 82);
+                    add("party_has_magic", "cure_party:Cleanse", 78);
+                    add("party_has_poison", "cure_party:Cleanse", 77);
+                    add("party_has_disease", "cure_party:Cleanse", 76);
+                    add("party_lowest_health<75", "cast_party_lowest:Flash of Light", 70);
+                    add("always", "buff_self:Devotion Aura", 62);
+                    add("always", "buff_self:Seal of Wisdom", 58);
+                    add("has_target", "cast:Judgement of Light", 36);
+                }
+                else if (isTank)
+                {
+                    add("enemy_loose_in_range", "cast_loose_enemy:Hand of Reckoning", 92);
+                    add("party_lowest_health<35", "cast_party_lowest:Flash of Light", 86);
+                    add("always", "buff_self:Righteous Fury", 82);
+                    add("always", "buff_self:Devotion Aura", 80);
+                    add("always", "buff_self:Seal of Righteousness", 78);
+                    add("party_has_magic", "cure_party:Cleanse", 74);
+                    add("has_target", "cast:Avenger's Shield", 70);
+                    add("enemies_in_melee>2", "cast:Consecration", 66);
+                    add("enemies_in_melee>2", "cast:Holy Wrath", 58);
+                    add("has_target", "cast:Hammer of the Righteous", 54);
+                    add("has_target", "cast:Judgement of Light", 48);
+                    add("has_target", "cast:Crusader Strike", 40);
+                }
+                else
+                {
+                    add("party_lowest_health<35", "cast_party_lowest:Flash of Light", 86);
+                    add("target_health<20", "cast:Hammer of Wrath", 84);
+                    add("always", "buff_self:Retribution Aura", 78);
+                    add("always", "buff_self:Seal of Righteousness", 76);
+                    add("has_target", "cast:Judgement of Wisdom", 70);
+                    add("has_target", "cast:Crusader Strike", 64);
+                    add("has_target", "cast:Divine Storm", 60);
+                    add("enemies_in_melee>2", "cast:Consecration", 54);
+                    add("enemies_in_melee>2", "cast:Holy Wrath", 48);
+                    add("has_target", "cast:Exorcism", 42);
+                }
+                break;
+
+            case 3: // Hunter
+                add("pet_missing", "cast_self:Call Pet", 90);
+                add("pet_dead", "cast_self:Revive Pet", 88);
+                add("target_casting&target_interruptible", "cast:Silencing Shot", 87);
+                add("target_health<20", "cast:Kill Shot", 86);
+                add("pet_health<50", "cast_pet:Mend Pet", 78);
+                add("always", "buff_self:Aspect of the Hawk", 74);
+                add("target_missing_aura:Hunter's Mark", "cast:Hunter's Mark", 70);
+                add("target_missing_aura:Serpent Sting", "cast:Serpent Sting", 66);
+                add("has_target", "cast:Chimera Shot", 62);
+                add("has_target", "cast:Explosive Shot", 61);
+                add("has_target", "cast:Aimed Shot", 56);
+                add("enemies_in_range>2", "cast:Multi-Shot", 52);
+                add("has_target", "cast:Arcane Shot", 46);
+                add("has_target", "cast:Steady Shot", 36);
+                break;
+
+            case 4: // Rogue
+                add("target_casting&target_interruptible", "cast:Kick", 92);
+                add("out_of_combat", "cast_self:Stealth", 80);
+                add("self_missing_aura:Slice and Dice&self_combo>1", "cast:Slice and Dice", 76);
+                add("self_combo>4&target_missing_aura:Rupture", "cast:Rupture", 70);
+                add("self_combo>4&target_health<35", "cast:Eviscerate", 66);
+                add("enemies_in_melee>2", "cast:Fan of Knives", 58);
+                add("has_target", "cast:Mutilate", 46);
+                add("has_target", "cast:Hemorrhage", 44);
+                add("has_target", "cast:Sinister Strike", 40);
+                break;
+
+            case 5: // Priest
+                if (isHealer)
+                {
+                    add("party_lowest_health<30", "cast_party_lowest:Flash Heal", 96);
+                    add("tank_health<50", "cast_party_lowest:Greater Heal", 90);
+                    add("party_has_dead", "rez_party:Resurrection", 84);
+                    add("party_has_magic", "cure_party:Dispel Magic", 80);
+                    add("party_has_disease", "cure_party:Cure Disease", 79);
+                    add("party_lowest_health<95", "cast_party_lowest:Power Word: Shield", 74);
+                    add("party_lowest_health<70", "cast_party_lowest_hot:Renew", 68);
+                    add("party_lowest_health<75", "cast_party_lowest:Flash Heal", 62);
+                    add("always", "cast_party_missing:Power Word: Fortitude", 54);
+                    add("has_target", "cast:Shadow Word: Pain", 34);
+                    add("has_target", "cast:Smite", 30);
+                }
+                else
+                {
+                    add("party_lowest_health<30", "cast_party_lowest:Flash Heal", 86);
+                    add("target_casting&target_interruptible", "cast:Silence", 80);
+                    add("always", "buff_self:Shadowform", 76);
+                    add("always", "cast_party_missing:Power Word: Fortitude", 56);
+                    add("target_missing_aura:Shadow Word: Pain", "cast:Shadow Word: Pain", 70);
+                    add("target_missing_aura:Vampiric Touch", "cast:Vampiric Touch", 66);
+                    add("target_missing_aura:Devouring Plague", "cast:Devouring Plague", 62);
+                    add("has_target", "cast:Mind Blast", 54);
+                    add("has_target", "cast:Mind Flay", 40);
+                    add("has_target", "cast:Smite", 28);
+                }
+                break;
+
+            case 6: // Death Knight
+                if (isTank)
+                {
+                    add("enemy_loose_in_range", "cast_loose_enemy:Dark Command", 90);
+                    add("target_casting&target_interruptible", "cast:Mind Freeze", 86);
+                    add("self_health<55", "cast_self:Death Strike", 80);
+                    add("self_health<40", "cast_self:Rune Tap", 78);
+                    add("always", "buff_self:Blood Presence", 74);
+                    add("target_missing_aura:Frost Fever", "cast:Icy Touch", 70);
+                    add("target_missing_aura:Blood Plague", "cast:Plague Strike", 69);
+                    add("enemies_in_melee>2", "cast:Death and Decay", 64);
+                    add("enemies_in_melee>2", "cast:Pestilence", 58);
+                    add("has_target", "cast:Heart Strike", 52);
+                    add("has_target", "cast:Blood Strike", 48);
+                    add("has_target", "cast:Rune Strike", 44);
+                    add("has_target", "cast:Death Coil", 38);
+                }
+                else
+                {
+                    add("target_casting&target_interruptible", "cast:Mind Freeze", 86);
+                    add("self_health<50", "cast_self:Death Strike", 80);
+                    add("always", "buff_self:Unholy Presence", 74);
+                    add("target_missing_aura:Frost Fever", "cast:Icy Touch", 70);
+                    add("target_missing_aura:Blood Plague", "cast:Plague Strike", 69);
+                    add("enemies_in_melee>2", "cast:Death and Decay", 64);
+                    add("enemies_in_melee>2", "cast:Pestilence", 58);
+                    add("has_target", "cast:Scourge Strike", 54);
+                    add("has_target", "cast:Obliterate", 53);
+                    add("has_target", "cast:Heart Strike", 50);
+                    add("has_target", "cast:Blood Strike", 46);
+                    add("has_target", "cast:Frost Strike", 42);
+                    add("has_target", "cast:Death Coil", 40);
+                }
+                break;
+
+            case 7: // Shaman
+                if (isHealer)
+                {
+                    add("party_lowest_health<30", "cast_party_lowest:Healing Wave", 96);
+                    add("tank_health<55", "cast_party_lowest:Lesser Healing Wave", 90);
+                    add("party_has_dead", "rez_party:Ancestral Spirit", 84);
+                    add("party_has_poison", "cure_party:Cure Toxins", 80);
+                    add("party_has_disease", "cure_party:Cure Toxins", 79);
+                    add("party_has_curse", "cure_party:Cleanse Spirit", 78);
+                    add("party_lowest_health<70", "cast_party_lowest_hot:Riptide", 72);
+                    add("party_lowest_health<75", "cast_party_lowest:Lesser Healing Wave", 64);
+                    add("always", "buff_self:Water Shield", 58);
+                    add("has_target", "cast:Flame Shock", 34);
+                    add("has_target", "cast:Lightning Bolt", 30);
+                }
+                else
+                {
+                    add("party_lowest_health<30", "cast_party_lowest:Healing Wave", 86);
+                    add("target_casting&target_interruptible", "cast:Wind Shear", 82);
+                    add("always", "buff_self:Lightning Shield", 78);
+                    add("target_missing_aura:Flame Shock", "cast:Flame Shock", 72);
+                    add("has_target", "cast:Lava Burst", 66);
+                    add("has_target", "cast:Stormstrike", 64);
+                    add("enemies_in_range>2", "cast:Chain Lightning", 56);
+                    add("enemies_in_melee>2", "cast_self:Magma Totem", 50);
+                    add("has_target", "cast:Earth Shock", 46);
+                    add("has_target", "cast:Lightning Bolt", 38);
+                }
+                break;
+
+            case 8: // Mage
+                add("target_casting&target_interruptible", "cast:Counterspell", 88);
+                add("self_missing_aura:Ice Barrier", "cast_self:Ice Barrier", 80);
+                add("enemies_in_melee>0", "cast_self:Frost Nova", 76);
+                add("always", "buff_self:Frost Armor", 72);
+                add("target_missing_aura:Living Bomb", "cast:Living Bomb", 68);
+                add("always", "cast_party_missing:Arcane Intellect", 60);
+                add("enemies_in_range>2", "cast:Flamestrike", 58);
+                add("enemies_in_range>2", "cast:Blizzard", 56);
+                add("has_target", "cast:Frostbolt", 44);
+                add("has_target", "cast:Fireball", 42);
+                add("has_target", "cast:Arcane Blast", 40);
+                add("out_of_combat", "cast_self:Conjure Water", 18);
+                add("out_of_combat", "cast_self:Conjure Food", 16);
+                break;
+
+            case 9: // Warlock
+                add("pet_missing", "cast_self:Summon Imp", 88);
+                add("self_health<35", "cast_self:Death Coil", 82);
+                add("self_missing_aura:Demon Armor", "cast_self:Demon Armor", 76);
+                add("target_missing_aura:Immolate", "cast:Immolate", 72);
+                add("target_missing_aura:Corruption", "cast:Corruption", 70);
+                add("target_missing_aura:Curse of Agony", "cast:Curse of Agony", 66);
+                add("target_missing_aura:Unstable Affliction", "cast:Unstable Affliction", 62);
+                add("enemies_in_range>2", "cast:Seed of Corruption", 58);
+                add("target_health<25", "cast:Drain Soul", 54);
+                add("has_target", "cast:Haunt", 50);
+                add("has_target", "cast:Incinerate", 44);
+                add("has_target", "cast:Shadow Bolt", 42);
+                break;
+
+            case 11: // Druid
+                if (isHealer)
+                {
+                    add("party_lowest_health<30", "cast_party_lowest:Healing Touch", 96);
+                    add("tank_health<55", "cast_party_lowest:Regrowth", 90);
+                    add("party_has_dead", "rez_party:Revive", 84);
+                    add("party_has_curse", "cure_party:Remove Curse", 80);
+                    add("party_has_poison", "cure_party:Abolish Poison", 79);
+                    add("party_lowest_health<70", "cast_party_lowest_hot:Rejuvenation", 72);
+                    add("party_lowest_health<75", "cast_party_lowest_hot:Regrowth", 66);
+                    add("party_lowest_health<85", "cast_party_lowest:Nourish", 60);
+                    add("always", "cast_party_missing:Mark of the Wild", 54);
+                    add("has_target", "cast:Moonfire", 32);
+                    add("has_target", "cast:Wrath", 28);
+                }
+                else if (isTank)
+                {
+                    add("enemy_loose_in_range", "cast_loose_enemy:Growl", 90);
+                    add("always", "buff_self:Bear Form", 84);
+                    add("enemies_in_melee>2", "cast:Swipe", 70);
+                    add("has_target", "cast:Mangle (Bear)", 68);
+                    add("target_missing_aura:Lacerate", "cast:Lacerate", 64);
+                    add("has_target", "cast:Lacerate", 58);
+                    add("target_missing_aura:Faerie Fire (Feral)", "cast:Faerie Fire (Feral)", 54);
+                    add("has_target", "cast:Maul", 40);
+                }
+                else
+                {
+                    add("party_lowest_health<30", "cast_party_lowest:Healing Touch", 84);
+                    add("always", "cast_party_missing:Mark of the Wild", 60);
+                    add("target_missing_aura:Moonfire", "cast:Moonfire", 72);
+                    add("target_missing_aura:Insect Swarm", "cast:Insect Swarm", 68);
+                    add("enemies_in_range>2", "cast:Hurricane", 58);
+                    add("has_target", "cast:Starfire", 46);
+                    add("has_target", "cast:Wrath", 44);
+                }
+                break;
+
+            default:
+                return "";
+        }
+
+        std::string out;
+        for (size_t i = 0; i < rules.size(); ++i)
+        {
+            if (i) out += ';';
+            out += rules[i];
+        }
+        return out;
     }
 
     // Query offline random-pool chars of the given classes near `level`, of the
@@ -332,7 +673,11 @@ namespace WowPsParty
         requester->ModifyMoney(-int32(cost));
 
         ObjectGuid const henchGuid = ObjectGuid::Create<HighGuid::Player>(candidateGuid);
-        std::string const useRole = role.empty() ? "dps" : role;
+        // The client sends the class-default role; override it with the bot's
+        // real spec so the role-aware rotation + directive (targeting, lead-tank)
+        // match what the henchman actually is. Falls back to the sent role.
+        std::string const useRole =
+            InferHenchmanRole(candidateGuid, cls, role.empty() ? std::string("dps") : role);
 
         // Register as a henchman BEFORE spawning so the patched AddPlayerBot
         // permission check (WowPsParty_IsHenchman_Trampoline) lets the cross-
@@ -364,7 +709,7 @@ namespace WowPsParty
 
             WowPsParty::RotationCacheSet(candidateGuid,
                 WowPsParty::ParseRotationString(
-                    savedRot.empty() ? DefaultRotationForClass(cls) : savedRot));
+                    savedRot.empty() ? DefaultRotationForClass(cls, useRole) : savedRot));
 
             WowPsParty::TargetModeCacheSet(candidateGuid,
                 !savedMode.empty() ? savedMode

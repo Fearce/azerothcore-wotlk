@@ -252,6 +252,14 @@ namespace WowPsParty
         return n;
     }
 
+    std::string RoleForGuid(ObjectGuid botGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (auto const& d : g_directives)
+            if (d.followerGuid == botGuid) return d.role;
+        return std::string();
+    }
+
     // True if `botGuid` is the account's designated dungeon lead tank, decided
     // by DIRECTIVE ROLE (the lowest-guid follower with role "tank"), so a hired
     // HENCHMAN tank can lead the route too — the old slot-based check excluded
