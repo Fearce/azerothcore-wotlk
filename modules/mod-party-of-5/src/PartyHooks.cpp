@@ -459,7 +459,24 @@ public:
     {
         if (!WowPsParty::IsEnabled()) return;
         if (WowPsParty::IsHenchman(guid))
+        {
             WowPsParty::DismissHenchmanByGuid(guid);
+            return;
+        }
+        // The henchman OWNER (the player who hired them) left / was removed from
+        // the group — e.g. leaving an LFG dungeon. Dismiss their henchmen rather
+        // than let them teleport out and keep orphan-following the ex-leader.
+        // (If the group fully DISBANDS, each henchman's own removal hits the
+        // branch above; this covers the case where the group survives without
+        // the owner — e.g. matched LFG players stay behind.)
+        if (WowPsParty::CountHenchmenFor(guid) > 0)
+        {
+            std::vector<ObjectGuid> members;
+            WowPsParty::GetPartyGuidsFor(guid, members);
+            for (ObjectGuid const& m : members)
+                if (WowPsParty::IsHenchman(m))
+                    WowPsParty::DismissHenchmanByGuid(m);
+        }
     }
 };
 
