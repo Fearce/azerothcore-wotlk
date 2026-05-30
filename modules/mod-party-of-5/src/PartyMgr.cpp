@@ -26,7 +26,8 @@
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 #include "RandomPlayerbotMgr.h"
-#include "RandomItemMgr.h"   // sRandomItemMgr.GetAmmo
+#include "RandomItemMgr.h"      // sRandomItemMgr.GetAmmo
+#include "PlayerbotFactory.h"   // re-level a widened henchman pick to the player
 #include "AiObjectContext.h"
 #include "Value.h"
 
@@ -626,6 +627,36 @@ namespace WowPsParty
             for (auto const& d : deduped) if (d.guid == c.guid) { seen = true; break; }
             if (!seen) deduped.push_back(c);
         }
+
+        // Coverage guarantee: every faction-valid class should be hirable in
+        // THIS bracket. If the ±4 band produced no candidate for a class, pull
+        // the nearest-level pool char of that class (any level) and present it at
+        // the player's level — it's re-leveled to the player when hired (see the
+        // spawn handler in HireHenchman). The RNDBOT pool holds every class per
+        // faction (CreateRandomBots makes one per class per account), so this
+        // needs no new characters; the rare empty case just leaves that class out.
+        bool present[12] = { false };
+        for (auto const& c : deduped) if (c.cls < 12) present[c.cls] = true;
+        static uint8 const kAllClasses[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 11 };
+        for (uint8 cls : kAllClasses)
+        {
+            if (present[cls]) continue;
+            if (cls == 6 && L < 55) continue;   // Death Knights start at level 55
+            QueryResult mq = CharacterDatabase.Query(
+                "SELECT `guid`,`name` FROM `characters` "
+                "WHERE `account` IN ({}) AND `online` = 0 AND `class` = {} AND `race` IN ({}) "
+                "ORDER BY ABS(CAST(`level` AS SIGNED) - {}) ASC LIMIT 1",
+                acctCsv, uint32(cls), raceCsv, uint32(L));
+            if (!mq) continue;   // pool genuinely lacks this faction+class
+            Field* mf = mq->Fetch();
+            HenchmanCandidate c;
+            c.guid  = mf[0].Get<uint32>();
+            c.name  = mf[1].Get<std::string>();
+            c.cls   = cls;
+            c.level = L;   // shown + costed at the player's level; re-leveled on hire
+            c.role  = ClassDefaultRole(cls);
+            deduped.push_back(std::move(c));
+        }
         return deduped;
     }
 
@@ -884,8 +915,14 @@ namespace WowPsParty
             return false;
         }
 
-        // Gold check + deduct (after all synchronous validation).
-        uint32 const cost = HenchmanHireCost(level);
+        // Gold check + deduct (after all synchronous validation). A candidate
+        // drawn from outside the ±4 band (a widened pick covering a class missing
+        // from this bracket) is re-leveled to the player on spawn, so cost it at
+        // the player's level, not its stored pool level.
+        int  const lvlDiff   = int(level) - int(requester->GetLevel());
+        bool const outOfBand = lvlDiff > 4 || lvlDiff < -4;
+        uint8 const effLevel = outOfBand ? uint8(requester->GetLevel()) : level;
+        uint32 const cost = HenchmanHireCost(effLevel);
         if (requester->GetMoney() < cost)
         {
             outMsg = "Not enough gold to hire.";
@@ -978,6 +1015,31 @@ namespace WowPsParty
                 return;
             }
             if (!lead) return;
+
+            // Level-match a henchman drawn from outside the ±4 band (a widened
+            // pick covering a class missing from this bracket) to the leader, so
+            // it's level-appropriate. Same in-world factory path playerbots uses
+            // in RandomizeFirst. Done BEFORE grouping so any group side-effect of
+            // Randomize is absorbed by the AddMember below. NOTE: Randomize
+            // regenerates level-appropriate GEAR for the new level (the pool
+            // char's old gear was the wrong level anyway) — the saved rotation/
+            // loadout is keyed by guid in our own cache, so it is untouched. Only
+            // out-of-band picks hit this; in-band hires keep their gear.
+            {
+                int const d = int(hen->GetLevel()) - int(lead->GetLevel());
+                if (d > 4 || d < -4)
+                {
+                    uint32 const oldLvl = hen->GetLevel();
+                    uint32 const target = lead->GetLevel();
+                    PlayerbotFactory factory(hen, target);
+                    factory.Randomize(false);
+                    hen->SaveToDB(false, false);
+                    LOG_INFO("module",
+                        "[WowPsParty Henchmen] re-leveled hench guid={} {} -> {} to match leader",
+                        henchGuid.GetCounter(), oldLvl, target);
+                }
+            }
+
             Group* g = lead->GetGroup();
             if (!g)
             {
