@@ -41,6 +41,11 @@
 #include "SpellAuras.h"
 #include "WorldSession.h"
 
+// [WowPsParty] Defined in the mod-party-of-5 module (PartyFollow.cpp). Declared
+// at GLOBAL scope on purpose: a block-scope `extern` inside `namespace lfg`
+// would bind to `lfg::...` and fail to link against the global definition.
+void WowPsParty_SetPartyBotLfgRoles_Trampoline(ObjectGuid groupGuid);
+
 namespace lfg
 {
     LFGMgr::LFGMgr(): m_lfgProposalId(1), m_options(sWorld->getIntConfig(CONFIG_LFG_OPTIONSMASK)), m_Testing(sWorld->getBoolConfig(CONFIG_DEBUG_LFG))
@@ -864,6 +869,11 @@ namespace lfg
             }
             // Update leader role
             UpdateRoleCheck(gguid, guid, roles);
+
+            // [WowPsParty] Managed party bots (alts + henchmen) have paused AI and
+            // never answer the role check themselves, so it would stall and time
+            // out. Auto-answer for them using each bot's assigned party role.
+            ::WowPsParty_SetPartyBotLfgRoles_Trampoline(gguid);
         }
         else                                                   // Add player to queue
         {

@@ -29,6 +29,8 @@
 
 #include "DatabaseEnv.h"
 #include "Group.h"
+#include "GroupMgr.h"
+#include "LFGMgr.h"
 #include "Log.h"
 #include "MotionMaster.h"
 #include "StringFormat.h"
@@ -1429,4 +1431,40 @@ void WowPsParty_TankFollowPath_Trampoline(Player* bot)
 void WowPsParty_TickGathering_Trampoline(Player* bot)
 {
     WowPsParty::TickGathering(bot);
+}
+
+// Trampoline from the patched core LFGMgr::JoinLfg: our managed party bots
+// (alts + henchmen) have their AI paused, so they never answer the dungeon-
+// finder role check on their own — it would stall until it times out. Set each
+// one's role-check role from its assigned WowPsParty role (account_party.role
+// for alts / the henchman directive), so the role check completes with the
+// party's real tank/healer/dps layout. No-op when the group has no party bots.
+void WowPsParty_SetPartyBotLfgRoles_Trampoline(ObjectGuid groupGuid)
+{
+    Group* grp = sGroupMgr->GetGroupByGUID(groupGuid.GetCounter());
+    if (!grp)
+        return;
+
+    for (GroupReference* itr = grp->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* m = itr->GetSource();
+        if (!m)
+            continue;
+        ObjectGuid const g = m->GetGUID();
+        // Only our managed party bots (alts + henchmen) — never the real player.
+        if (!WowPsParty::BotHasActiveFollowDirective(g))
+            continue;
+
+        std::string const role = WowPsParty::RoleForGuid(g);
+        uint8 lfgRole = lfg::PLAYER_ROLE_DAMAGE;
+        if (role == "tank")
+            lfgRole = lfg::PLAYER_ROLE_TANK;
+        else if (role == "healer")
+            lfgRole = lfg::PLAYER_ROLE_HEALER;
+
+        sLFGMgr->UpdateRoleCheck(groupGuid, g, lfgRole);
+        LOG_INFO("module",
+            "[WowPsParty LFG] role-check: bot guid={} -> {}",
+            g.GetCounter(), role.empty() ? "dps" : role.c_str());
+    }
 }
