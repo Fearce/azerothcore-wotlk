@@ -1295,6 +1295,28 @@ namespace WowPsParty
             bool const inDungeon = leader->GetMap() && leader->GetMap()->IsDungeon();
             bool const isLeadTank = inDungeon && IsLeadTank(d.followerGuid);
 
+            // [WowPsParty LeadDiag] "tank follows behind instead of leading" —
+            // log the decision inputs for any tank-role follower (throttled 8s)
+            // so we can see WHICH gate is failing: not in a dungeon, not picked
+            // as lead tank (role/guid), leading toggled off, or a stale path.
+            if (d.role == "tank")
+            {
+                static thread_local std::unordered_map<uint32, uint32> ldLast;
+                uint32 const ldNow = getMSTime();
+                uint32& ldT = ldLast[d.followerGuid.GetCounter()];
+                if (ldNow - ldT > 8000)
+                {
+                    ldT = ldNow;
+                    LOG_INFO("module",
+                        "[WowPsParty LeadDiag] {} (guid={}) inDungeon={} IsLeadTank={} leadOn={} pathWp={} mapId={} dist={:.0f}",
+                        follower->GetName(), d.followerGuid.GetCounter(),
+                        inDungeon ? 1 : 0, IsLeadTank(d.followerGuid) ? 1 : 0,
+                        GetLeadInDungeon(d.followerGuid.GetCounter()) ? 1 : 0,
+                        WowPsParty::GetPathWaypointCount(leader->GetMapId()),
+                        leader->GetMapId(), follower->GetDistance(leader));
+                }
+            }
+
             float angle = follower->GetFollowAngle();
             float followDist = PET_FOLLOW_DIST;
             if (isLeadTank)
