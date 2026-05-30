@@ -121,6 +121,29 @@ namespace WowPsParty
         g_rotationCache.erase(guid);
     }
 
+    // Defined further down; forward-declared so BotIsKiting uses the SAME
+    // disabled-flag predicate as the rule loop (lowercased, comma-tokenised) and
+    // the two can't disagree — a mismatch would freeze a bot whose kite rule is
+    // disabled (AssistTarget yields to a rotation that never hops).
+    static std::string Lower(std::string s);
+    static bool CsvContains(std::string const& csv, std::string const& kw);
+
+    // True if the bot's rotation opts into rotation-driven positioning — a
+    // keep_distance_enemy (kite) or keep_distance_healer rule. AssistTarget reads
+    // this to STOP installing its chase/dead-zone movement, handing the feet to
+    // the rotation so the two don't fight (only one mover at a time).
+    bool BotIsKiting(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
+        auto it = g_rotationCache.find(guid.GetCounter());
+        if (it == g_rotationCache.end()) return false;
+        for (RotationRule const& r : it->second)
+            if (r.action.rfind("keep_distance", 0) == 0
+                && !CsvContains(Lower(r.flags), "disabled"))
+                return true;
+        return false;
+    }
+
     void RotationCacheRefreshFromDB(uint32 guid)
     {
         QueryResult q = CharacterDatabase.Query(
@@ -2052,6 +2075,52 @@ namespace WowPsParty
             bot->StopMoving();
             bot->GetMotionMaster()->Clear();
             WowPsParty::HoldFollower(bot->GetGUID(), 1500);
+            return true;
+        }
+
+        // "keep_distance_enemy:N" — kite. When the target is closer than N yards,
+        // hop straight away to N+4 and return true. As the LOWEST-priority rule it
+        // only fires between casts: instant casts (higher rules, no is_not_moving
+        // gate) keep firing while the hop runs; once the hop lands the bot is
+        // briefly still and a hard cast (gate it is_not_moving) can go off before
+        // the next hop. Re-issued only when not already hopping, so it's discrete
+        // shoot-and-scoot rather than a per-tick stutter. Never interrupts an
+        // in-flight cast. AssistTarget yields all movement while this rule exists.
+        if (verb == "keep_distance_enemy")
+        {
+            Unit* enemy = bot->GetVictim();
+            if (!enemy || !enemy->IsAlive()) return false;
+            if (bot->IsNonMeleeSpellCast(false, false, true)) return false;
+            float const want = float(std::atof(arg.c_str()));
+            if (want <= 0.0f) return false;
+            if (bot->GetDistance(enemy) >= want) return false;   // far enough — stand & cast
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+            {
+                float x, y, z;
+                enemy->GetNearPoint(bot, x, y, z, 0.0f, want + 4.0f, enemy->GetAngle(bot));
+                bot->GetMotionMaster()->MovePoint(0, x, y, z);
+            }
+            return true;
+        }
+
+        // "keep_distance_healer:N" — stay within N yards of the party healer. Steps
+        // toward the healer when further than N. Pairs with keep_distance_enemy so
+        // a kiter doesn't backpedal out of heal range. Same between-casts timing.
+        if (verb == "keep_distance_healer")
+        {
+            Player* healer = FindPartyMemberByRole(bot, "healer");
+            if (!healer || healer == bot || !healer->IsAlive()) return false;
+            if (bot->IsNonMeleeSpellCast(false, false, true)) return false;
+            float const want = float(std::atof(arg.c_str()));
+            if (want <= 0.0f) return false;
+            if (bot->GetDistance(healer) <= want) return false;  // close enough
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+            {
+                float x, y, z;
+                healer->GetNearPoint(bot, x, y, z, 0.0f, std::max(want - 2.0f, 3.0f),
+                                     healer->GetAngle(bot));
+                bot->GetMotionMaster()->MovePoint(0, x, y, z);
+            }
             return true;
         }
 

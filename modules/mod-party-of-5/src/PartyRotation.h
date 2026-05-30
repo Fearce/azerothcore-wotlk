@@ -63,6 +63,7 @@
 #define WOWPSPARTY_PARTYROTATION_H
 
 #include "Define.h"
+#include "ObjectGuid.h"
 
 #include <string>
 #include <vector>
@@ -94,6 +95,11 @@ namespace WowPsParty
     void RotationCacheSet(uint32 guid, std::vector<RotationRule> rules);
     void RotationCacheClear(uint32 guid);
     void RotationCacheRefreshFromDB(uint32 guid);
+
+    // True when the rotation contains a keep_distance_* rule, i.e. the user has
+    // opted the bot into rotation-driven positioning (kiting). AssistTarget then
+    // stops chasing and lets the rotation own movement.
+    bool BotIsKiting(ObjectGuid guid);
 
     // Returns true if the bot has at least one cached rule (cheap check, called
     // every UpdateAI tick).
