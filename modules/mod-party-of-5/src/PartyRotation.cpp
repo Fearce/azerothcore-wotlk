@@ -1438,6 +1438,16 @@ namespace WowPsParty
                     castBlock = CastBlock::Position;
                     return reject("out of range");
                 }
+                // Ranged dead-zone: a hunter shot etc. has a minimum range and
+                // fails SPELL_FAILED_TOO_CLOSE in melee. Treat as a positioning
+                // block so the bot backs OUT to range (repositionToCast handles
+                // the direction) instead of firing it every tick and failing.
+                float const minRange = info->GetMinRange(info->IsPositive());
+                if (minRange > 0.0f && bot->IsWithinDistInMap(target, minRange))
+                {
+                    castBlock = CastBlock::Position;
+                    return reject("too close");
+                }
                 if (!bot->IsWithinLOSInMap(target))
                 {
                     castBlock = CastBlock::Position;
@@ -1491,9 +1501,19 @@ namespace WowPsParty
             SpellCastResult const r = bot->CastSpell(target, spellId, false);
             if (r != SPELL_CAST_OK)
             {
-                LOG_INFO("module",
-                    "[WowPsParty Rotation] cast {} failed on guid={} result={}",
-                    spellId, bot->GetGUID().GetCounter(), uint32(r));
+                // Throttle per (bot, spell) — a cast that keeps failing must not
+                // flood the log every tick.
+                static thread_local std::unordered_map<uint64, uint32> failLogMs;
+                uint64 const fk = (uint64(bot->GetGUID().GetCounter()) << 32) | spellId;
+                uint32 const fn = getMSTime();
+                uint32& fl = failLogMs[fk];
+                if (fn - fl > 5000)
+                {
+                    fl = fn;
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation] cast {} failed on guid={} result={}",
+                        spellId, bot->GetGUID().GetCounter(), uint32(r));
+                }
                 return false;
             }
             return true;
@@ -1520,9 +1540,17 @@ namespace WowPsParty
             SpellCastResult const r = bot->CastSpell(x, y, z, spellId, false);
             if (r != SPELL_CAST_OK)
             {
-                LOG_INFO("module",
-                    "[WowPsParty Rotation] ground-cast {} failed on guid={} result={}",
-                    spellId, bot->GetGUID().GetCounter(), uint32(r));
+                static thread_local std::unordered_map<uint64, uint32> gFailLogMs;
+                uint64 const fk = (uint64(bot->GetGUID().GetCounter()) << 32) | spellId;
+                uint32 const fn = getMSTime();
+                uint32& fl = gFailLogMs[fk];
+                if (fn - fl > 5000)
+                {
+                    fl = fn;
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation] ground-cast {} failed on guid={} result={}",
+                        spellId, bot->GetGUID().GetCounter(), uint32(r));
+                }
                 return false;
             }
             return true;
@@ -1542,6 +1570,15 @@ namespace WowPsParty
             // Suppress the follow/assist ticker for the approach window.
             WowPsParty::HoldFollower(bot->GetGUID(), 1200);
 
+            // Too close for a min-range (ranged) spell? Back STRAIGHT OUT to
+            // just past min range rather than chasing inward. Without this a
+            // hunter shoved into melee chases the mob forever and every shot
+            // fails TOO_CLOSE.
+            float minRange = 0.0f;
+            if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
+                minRange = si->GetMinRange(si->IsPositive());
+            bool const tooClose = minRange > 0.0f && bot->IsWithinDistInMap(target, minRange);
+
             uint32 const gLow = bot->GetGUID().GetCounter();
             uint32 const tLow = target->GetGUID().GetCounter();
             uint32 const now  = getMSTime();
@@ -1549,27 +1586,41 @@ namespace WowPsParty
             {
                 std::lock_guard<std::mutex> lock(g_useThrottleMutex);
                 auto& e = g_approachState[gLow];   // (targetGuidLow, lastMoveMs)
-                bool const chasing = bot->GetMotionMaster()
-                    ->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE;
-                if (e.first == tLow && (now - e.second) < 700 && chasing)
+                MovementGeneratorType const mg =
+                    bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
+                bool const moving = tooClose ? (mg == POINT_MOTION_TYPE)
+                                             : (mg == CHASE_MOTION_TYPE);
+                if (e.first == tLow && (now - e.second) < 700 && moving)
                     reissue = false;
                 else { e.first = tLow; e.second = now; }
             }
 
             if (reissue)
             {
-                // No LoS → close right in (small follow distance) so the bot
-                // keeps moving until it rounds the corner. LoS but out of
-                // range → settle just inside max range.
-                float chaseDist = 2.0f;
-                if (bot->IsWithinLOSInMap(target))
+                if (tooClose)
                 {
-                    float maxRange = 0.0f;
-                    if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
-                        maxRange = si->GetMaxRange(si->IsPositive(), bot);
-                    chaseDist = (maxRange > 6.0f) ? (maxRange - 3.0f) : 3.0f;
+                    // A point (minRange + 3)y from the target along the bot's
+                    // current bearing — i.e. straight back the way it came.
+                    float bx, by, bz;
+                    target->GetNearPoint(bot, bx, by, bz, 0.0f,
+                        minRange + 3.0f, target->GetAngle(bot));
+                    bot->GetMotionMaster()->MovePoint(0, bx, by, bz);
                 }
-                bot->GetMotionMaster()->MoveChase(target, chaseDist);
+                else
+                {
+                    // No LoS → close right in (small follow distance) so the bot
+                    // keeps moving until it rounds the corner. LoS but out of
+                    // range → settle just inside max range.
+                    float chaseDist = 2.0f;
+                    if (bot->IsWithinLOSInMap(target))
+                    {
+                        float maxRange = 0.0f;
+                        if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
+                            maxRange = si->GetMaxRange(si->IsPositive(), bot);
+                        chaseDist = (maxRange > 6.0f) ? (maxRange - 3.0f) : 3.0f;
+                    }
+                    bot->GetMotionMaster()->MoveChase(target, chaseDist);
+                }
             }
 
             static thread_local std::unordered_map<uint64, uint32> lastLog;
