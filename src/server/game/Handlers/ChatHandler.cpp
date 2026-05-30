@@ -630,6 +630,13 @@ void WorldSession::HandleMessagechatOpcode(WorldPacket& recvData)
 
                 break;
             }
+        case CHAT_MSG_SYSTEM:
+            // A module chat hook (e.g. WowPsParty's addon protocol) consumes an
+            // incoming addon message and neutralises its type to
+            // CHAT_MSG_SYSTEM (0) so the core doesn't re-deliver it. Clients
+            // never legitimately send type 0, so swallow it silently instead of
+            // error-logging "unknown message type 0" on every addon command.
+            break;
         default:
             LOG_ERROR("network.opcode", "CHAT: unknown message type {}, lang: {}", type, lang);
             break;
