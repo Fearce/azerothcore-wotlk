@@ -121,3 +121,7 @@ compile_commands.json
 # WowPs: track our party-of-5 module that lives inside modules/.
 !/modules/mod-party-of-5/
 !/modules/mod-party-of-5/**
+
+# WowPs: vendor mod-playerbots (our patched fork) into the server repo.
+!/modules/mod-playerbots/
+!/modules/mod-playerbots/**
