@@ -102,6 +102,14 @@ namespace WowPsParty
     // class spells, instead of the default playerbot AI. Empty for unknown.
     std::string DefaultRotationForClass(uint8 cls, std::string const& role = "");
 
+    // Keep a managed bot's consumables topped up: hunters (and anyone with a
+    // bow/gun) get level-appropriate ammo and never run dry; rogues get
+    // level-appropriate poisons applied to their weapons. Throttled internally,
+    // safe to call every rotation tick. Our bots hard-return out of
+    // mod-playerbots' UpdateAI, so its own ammo/imbue maintenance never runs for
+    // them — this is the replacement.
+    void MaintainBotConsumables(Player* bot);
+
     // Hire `candidateGuid` for `requester`. Validates gold + party space,
     // deducts the fee, spawns the bot and registers the follow directive.
     bool HireHenchman(Player* requester, uint32 candidateGuid, std::string const& role,

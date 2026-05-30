@@ -26,6 +26,7 @@
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 #include "RandomPlayerbotMgr.h"
+#include "RandomItemMgr.h"   // sRandomItemMgr.GetAmmo
 #include "AiObjectContext.h"
 #include "Value.h"
 
@@ -635,6 +636,160 @@ namespace WowPsParty
         g->SendUpdate();
         LOG_INFO("module", "[WowPsParty Henchmen] loot method -> {} (henchmen present={})",
                  hasHench ? "GROUP_LOOT" : "FREE_FOR_ALL", hasHench);
+    }
+
+    // ===== Consumable upkeep (ammo + poisons) ===============================
+    //
+    // Managed bots hard-return out of mod-playerbots' UpdateAI, so its InitAmmo /
+    // ImbueWithPoisonAction upkeep never fires for them — a hunter henchman
+    // spawns with an empty quiver and a rogue never poisons its blades. This
+    // restores both, item-based (so it depletes and refills naturally) and
+    // level-appropriate, without dumping stacks the user didn't ask for.
+
+    // Add `count` of `itemId` into the bot's bags. Returns the resulting Item* or
+    // nullptr if there was no room (we never force / overflow).
+    static Item* GiveItem(Player* bot, uint32 itemId, uint32 count)
+    {
+        if (!bot || !itemId || !count) return nullptr;
+        ItemPosCountVec dest;
+        if (bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, count) != EQUIP_ERR_OK)
+            return nullptr;
+        return bot->StoreNewItem(dest, itemId, true,
+                                 Item::GenerateItemRandomPropertyId(itemId));
+    }
+
+    // Highest-rank consumable from a priority-ordered (best-first) list whose
+    // RequiredLevel the bot meets. 0 if none usable yet.
+    static uint32 BestUsable(Player* bot, std::vector<uint32> const& prioritized)
+    {
+        for (uint32 id : prioritized)
+        {
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(id);
+            if (proto && proto->RequiredLevel <= bot->GetLevel())
+                return id;
+        }
+        return 0;
+    }
+
+    // Hunters (and any bot wielding a bow/gun/crossbow) keep ~1 stack of the
+    // right ammo and refill before it runs dry. We respect an ammo the bot
+    // already has set — only topping that same type up — so a player-chosen
+    // arrow isn't swapped out from under them.
+    static void MaintainAmmo(Player* bot)
+    {
+        Item* ranged = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+        if (!ranged) return;
+        uint32 subClass = 0;
+        switch (ranged->GetTemplate()->SubClass)
+        {
+            case ITEM_SUBCLASS_WEAPON_GUN:                                  subClass = ITEM_SUBCLASS_BULLET; break;
+            case ITEM_SUBCLASS_WEAPON_BOW:
+            case ITEM_SUBCLASS_WEAPON_CROSSBOW:                            subClass = ITEM_SUBCLASS_ARROW;  break;
+            default: return;   // thrown / wand: no ammo slot
+        }
+
+        uint32 const REFILL_TO    = 1000;  // one stack — enough, not a bag-filler
+        uint32 const REFILL_BELOW = 250;
+
+        uint32 entry = bot->GetUInt32Value(PLAYER_AMMO_ID);
+        if (entry)
+        {
+            // Already has ammo set — leave it unless it's running low.
+            uint32 const have = bot->GetItemCount(entry);
+            if (have >= REFILL_BELOW) return;
+            GiveItem(bot, entry, REFILL_TO - have);
+            bot->SetAmmo(entry);
+            return;
+        }
+
+        // No ammo set — pick the level/type-appropriate one playerbots would.
+        for (uint32 candidate : sRandomItemMgr.GetAmmo(bot->GetLevel(), subClass))
+        {
+            if (sObjectMgr->GetItemTemplate(candidate)) { entry = candidate; break; }
+        }
+        if (!entry) return;
+        uint32 const have = bot->GetItemCount(entry);
+        if (have < REFILL_TO) GiveItem(bot, entry, REFILL_TO - have);
+        bot->SetAmmo(entry);
+    }
+
+    // Rogues keep a small supply of the best instant + deadly poison they can
+    // use and apply them (instant MH / deadly OH) whenever a weapon's temporary
+    // enchant slot is empty. ImbueItem queues the real use-item packet, so the
+    // poison is consumed and refilled like a player's would be.
+    static void MaintainPoisons(Player* bot)
+    {
+        if (bot->IsInCombat()) return;            // can't imbue mid-fight
+        PlayerbotAI* botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+        if (!botAI) return;
+
+        static std::vector<uint32> const instant = {
+            INSTANT_POISON_IX, INSTANT_POISON_VIII, INSTANT_POISON_VII, INSTANT_POISON_VI,
+            INSTANT_POISON_V, INSTANT_POISON_IV, INSTANT_POISON_III, INSTANT_POISON_II, INSTANT_POISON };
+        static std::vector<uint32> const deadly = {
+            DEADLY_POISON_IX, DEADLY_POISON_VIII, DEADLY_POISON_VII, DEADLY_POISON_VI,
+            DEADLY_POISON_V, DEADLY_POISON_IV, DEADLY_POISON_III, DEADLY_POISON_II, DEADLY_POISON };
+
+        uint32 const instantId = BestUsable(bot, instant);
+        uint32 const deadlyId  = BestUsable(bot, deadly);
+        if (!instantId && !deadlyId) return;     // too low level for any poison
+
+        // Keep a few on hand; top a depleted type back up to 20 (one slot).
+        auto ensure = [bot](uint32 id) {
+            if (!id) return;
+            uint32 const have = bot->GetItemCount(id);
+            if (have < 5) GiveItem(bot, id, 20 - have);
+        };
+        ensure(instantId);
+        ensure(deadlyId);
+
+        // Resolve the poison actually in the bags by walking the WHOLE rank list
+        // (best-first). If the top rank couldn't be stored — full bags — a lower
+        // rank already on hand still beats leaving the blade clean.
+        auto held = [botAI](std::vector<uint32> const& list) -> Item* {
+            for (uint32 id : list)
+                if (Item* it = botAI->FindConsumable(id)) return it;
+            return nullptr;
+        };
+        Item* const heldInstant = held(instant);
+        Item* const heldDeadly  = held(deadly);
+
+        // Applying breaks stealth; drop it so the imbue lands, the rotation
+        // re-stealths next tick. Only happens when a weapon is actually unpoisoned
+        // (~hourly), so the flicker is negligible.
+        auto imbue = [&](uint8 slot, Item* first, Item* second) {
+            Item* w = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (!w || w->GetTemplate()->Class != ITEM_CLASS_WEAPON) return;
+            if (w->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT) != 0) return;
+            Item* poison = first ? first : second;
+            if (!poison) return;
+            if (bot->HasAuraType(SPELL_AURA_MOD_STEALTH))
+                bot->RemoveAurasByType(SPELL_AURA_MOD_STEALTH);
+            botAI->ImbueItem(poison, slot);
+        };
+        imbue(EQUIPMENT_SLOT_MAINHAND, heldInstant, heldDeadly);
+        imbue(EQUIPMENT_SLOT_OFFHAND,  heldDeadly, heldInstant);
+    }
+
+    void MaintainBotConsumables(Player* bot)
+    {
+        if (!bot || !bot->IsInWorld() || !bot->IsAlive() || !bot->GetSession()) return;
+
+        // Throttle hard — this touches inventory and queues packets. Once every
+        // ~12s per bot is plenty for "never run dry / stay poisoned".
+        static std::unordered_map<uint32, uint32> lastMs;
+        static std::mutex lastMsMutex;
+        {
+            std::lock_guard<std::mutex> lock(lastMsMutex);
+            uint32 const now = getMSTime();
+            uint32& last = lastMs[bot->GetGUID().GetCounter()];
+            if (last != 0 && now - last < 12000) return;
+            last = now;
+        }
+
+        uint8 const cls = bot->getClass();
+        if (cls == CLASS_ROGUE) MaintainPoisons(bot);
+        MaintainAmmo(bot);   // any class that wields a bow/gun benefits
     }
 
     bool HireHenchman(Player* requester, uint32 candidateGuid,

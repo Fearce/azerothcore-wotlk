@@ -4,6 +4,7 @@
 
 #include "PartyRotation.h"
 #include "PartyFollow.h"
+#include "PartyMgr.h"   // MaintainBotConsumables
 
 #include "Bag.h"
 #include "Cell.h"
@@ -2076,6 +2077,12 @@ namespace WowPsParty
         // out_of_combat Stealth fire and fail SPELL_FAILED_CASTER_DEAD every
         // tick. (Resurrect-accept is handled separately in ApplyDirective.)
         if (!bot->IsAlive()) return false;
+
+        // Keep ammo/poisons topped up (self-throttled). Runs before the rotation
+        // so a freshly-spawned hunter has arrows on its first idle tick and a
+        // rogue stays poisoned — playerbots' own upkeep is gated out for us.
+        WowPsParty::MaintainBotConsumables(bot);
+
         std::vector<RotationRule> rules;
         {
             std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
