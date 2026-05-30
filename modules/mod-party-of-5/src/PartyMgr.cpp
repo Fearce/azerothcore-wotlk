@@ -261,23 +261,27 @@ namespace WowPsParty
                     add("has_target", "cast:Shield Slam", 74);
                     add("enemies_in_melee>2", "cast:Thunder Clap", 70);
                     add("has_target", "cast:Revenge", 66);
-                    add("enemies_in_melee>2", "cast:Demoralizing Shout", 58);
+                    add("enemies_in_melee>2&target_missing_aura:Demoralizing Shout", "cast:Demoralizing Shout", 58);
                     add("has_target", "cast:Devastate", 52);
                     add("has_target", "cast:Sunder Armor", 44);
                     add("self_rage>45", "cast:Heroic Strike", 30);
                 }
                 else
                 {
+                    // Berserker Stance, not Battle: it's the only stance that
+                    // enables both the interrupt (Pummel) and Whirlwind, and the
+                    // core strikes (Mortal Strike/Bloodthirst/Slam/Execute/Heroic
+                    // Strike/Cleave) are stanceless. Battle-only abilities
+                    // (Overpower/Rend/Thunder Clap) are dropped — they'd be dead
+                    // weight here and Pummel is the more valuable pick.
                     add("target_casting&target_interruptible", "cast:Pummel", 92);
                     add("target_health<20", "cast:Execute", 90);
-                    add("always", "buff_self:Battle Stance", 82);
+                    add("always", "buff_self:Berserker Stance", 82);
                     add("always", "buff_self:Battle Shout", 80);
                     add("has_target", "cast:Mortal Strike", 72);
                     add("has_target", "cast:Bloodthirst", 71);
-                    add("has_target", "cast:Overpower", 68);
                     add("enemies_in_melee>1", "cast:Whirlwind", 62);
-                    add("enemies_in_melee>2", "cast:Thunder Clap", 56);
-                    add("target_missing_aura:Rend", "cast:Rend", 48);
+                    add("enemies_in_melee>2&self_rage>45", "cast:Cleave", 50);
                     add("has_target", "cast:Slam", 40);
                     add("self_rage>55", "cast:Heroic Strike", 30);
                 }
@@ -347,10 +351,10 @@ namespace WowPsParty
 
             case 4: // Rogue
                 add("target_casting&target_interruptible", "cast:Kick", 92);
-                add("out_of_combat", "cast_self:Stealth", 80);
+                add("out_of_combat&self_missing_aura:Stealth", "cast_self:Stealth", 80);
                 add("self_missing_aura:Slice and Dice&self_combo>1", "cast:Slice and Dice", 76);
                 add("self_combo>4&target_missing_aura:Rupture", "cast:Rupture", 70);
-                add("self_combo>4&target_health<35", "cast:Eviscerate", 66);
+                add("self_combo>4", "cast:Eviscerate", 66);
                 add("enemies_in_melee>2", "cast:Fan of Knives", 58);
                 add("has_target", "cast:Mutilate", 46);
                 add("has_target", "cast:Hemorrhage", 44);
@@ -365,11 +369,11 @@ namespace WowPsParty
                     add("party_has_dead", "rez_party:Resurrection", 84);
                     add("party_has_magic", "cure_party:Dispel Magic", 80);
                     add("party_has_disease", "cure_party:Cure Disease", 79);
-                    add("party_lowest_health<95", "cast_party_lowest:Power Word: Shield", 74);
+                    add("party_lowest_health<75", "cast_party_lowest:Power Word: Shield", 74);
                     add("party_lowest_health<70", "cast_party_lowest_hot:Renew", 68);
                     add("party_lowest_health<75", "cast_party_lowest:Flash Heal", 62);
                     add("always", "cast_party_missing:Power Word: Fortitude", 54);
-                    add("has_target", "cast:Shadow Word: Pain", 34);
+                    add("target_missing_aura:Shadow Word: Pain", "cast:Shadow Word: Pain", 34);
                     add("has_target", "cast:Smite", 30);
                 }
                 else
@@ -392,7 +396,7 @@ namespace WowPsParty
                 {
                     add("enemy_loose_in_range", "cast_loose_enemy:Dark Command", 90);
                     add("target_casting&target_interruptible", "cast:Mind Freeze", 86);
-                    add("self_health<55", "cast_self:Death Strike", 80);
+                    add("self_health<55", "cast:Death Strike", 80);
                     add("self_health<40", "cast_self:Rune Tap", 78);
                     add("always", "buff_self:Blood Presence", 74);
                     add("target_missing_aura:Frost Fever", "cast:Icy Touch", 70);
@@ -407,7 +411,7 @@ namespace WowPsParty
                 else
                 {
                     add("target_casting&target_interruptible", "cast:Mind Freeze", 86);
-                    add("self_health<50", "cast_self:Death Strike", 80);
+                    add("self_health<50", "cast:Death Strike", 80);
                     add("always", "buff_self:Unholy Presence", 74);
                     add("target_missing_aura:Frost Fever", "cast:Icy Touch", 70);
                     add("target_missing_aura:Blood Plague", "cast:Plague Strike", 69);
@@ -434,7 +438,7 @@ namespace WowPsParty
                     add("party_lowest_health<70", "cast_party_lowest_hot:Riptide", 72);
                     add("party_lowest_health<75", "cast_party_lowest:Lesser Healing Wave", 64);
                     add("always", "buff_self:Water Shield", 58);
-                    add("has_target", "cast:Flame Shock", 34);
+                    add("target_missing_aura:Flame Shock", "cast:Flame Shock", 34);
                     add("has_target", "cast:Lightning Bolt", 30);
                 }
                 else
@@ -446,7 +450,6 @@ namespace WowPsParty
                     add("has_target", "cast:Lava Burst", 66);
                     add("has_target", "cast:Stormstrike", 64);
                     add("enemies_in_range>2", "cast:Chain Lightning", 56);
-                    add("enemies_in_melee>2", "cast_self:Magma Totem", 50);
                     add("has_target", "cast:Earth Shock", 46);
                     add("has_target", "cast:Lightning Bolt", 38);
                 }
@@ -464,19 +467,19 @@ namespace WowPsParty
                 add("has_target", "cast:Frostbolt", 44);
                 add("has_target", "cast:Fireball", 42);
                 add("has_target", "cast:Arcane Blast", 40);
-                add("out_of_combat", "cast_self:Conjure Water", 18);
-                add("out_of_combat", "cast_self:Conjure Food", 16);
+                add("out_of_combat&shared_drink<5", "cast_self:Conjure Water", 18);
+                add("out_of_combat&shared_food<5", "cast_self:Conjure Food", 16);
                 break;
 
             case 9: // Warlock
                 add("pet_missing", "cast_self:Summon Imp", 88);
-                add("self_health<35", "cast_self:Death Coil", 82);
+                add("self_health<35", "cast:Death Coil", 82);
                 add("self_missing_aura:Demon Armor", "cast_self:Demon Armor", 76);
                 add("target_missing_aura:Immolate", "cast:Immolate", 72);
                 add("target_missing_aura:Corruption", "cast:Corruption", 70);
                 add("target_missing_aura:Curse of Agony", "cast:Curse of Agony", 66);
                 add("target_missing_aura:Unstable Affliction", "cast:Unstable Affliction", 62);
-                add("enemies_in_range>2", "cast:Seed of Corruption", 58);
+                add("enemies_in_range>2&target_missing_aura:Seed of Corruption", "cast:Seed of Corruption", 58);
                 add("target_health<25", "cast:Drain Soul", 54);
                 add("has_target", "cast:Haunt", 50);
                 add("has_target", "cast:Incinerate", 44);
@@ -495,7 +498,7 @@ namespace WowPsParty
                     add("party_lowest_health<75", "cast_party_lowest_hot:Regrowth", 66);
                     add("party_lowest_health<85", "cast_party_lowest:Nourish", 60);
                     add("always", "cast_party_missing:Mark of the Wild", 54);
-                    add("has_target", "cast:Moonfire", 32);
+                    add("target_missing_aura:Moonfire", "cast:Moonfire", 32);
                     add("has_target", "cast:Wrath", 28);
                 }
                 else if (isTank)
