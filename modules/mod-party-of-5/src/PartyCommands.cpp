@@ -324,7 +324,8 @@ public:
         }
 
         auto rules = WowPsParty::ParseRotationString(dsl);
-        std::string const stored = WowPsParty::SerialiseRotationRules(rules);
+        std::string stored = WowPsParty::SerialiseRotationRules(rules);
+        CharacterDatabase.EscapeString(stored);  // spell names carry apostrophes (e.g. Avenger's Shield)
 
         CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
         tx->Append(
@@ -387,7 +388,8 @@ public:
             return false;
         }
 
-        std::string const stored = WowPsParty::SerialiseRotationRules(rules);
+        std::string stored = WowPsParty::SerialiseRotationRules(rules);
+        CharacterDatabase.EscapeString(stored);  // spell names carry apostrophes (e.g. Avenger's Shield)
         CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
         tx->Append(
             "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "

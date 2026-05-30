@@ -1819,7 +1819,11 @@ public:
                 [](WowPsParty::RotationRule const& a, WowPsParty::RotationRule const& b)
                 { return a.priority > b.priority; });
 
-            std::string const stored = WowPsParty::SerialiseRotationRules(rules);
+            std::string stored = WowPsParty::SerialiseRotationRules(rules);
+            // Spell names carry apostrophes ("Avenger's Shield", "Hunter's
+            // Mark") — escape before it goes into the '{}' literal or the ' ends
+            // the string and the INSERT throws a 1064 syntax error.
+            CharacterDatabase.EscapeString(stored);
             CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
             // The empty strings for the other columns are INSERT-path
             // placeholders only — the ON DUPLICATE KEY UPDATE touches just
@@ -1858,7 +1862,11 @@ public:
             uint32 const guid = q->Fetch()[0].Get<uint32>();
 
             auto rules = WowPsParty::ParseRotationString(dsl);
-            std::string const stored = WowPsParty::SerialiseRotationRules(rules);
+            std::string stored = WowPsParty::SerialiseRotationRules(rules);
+            // Spell names carry apostrophes ("Avenger's Shield", "Hunter's
+            // Mark") — escape before it goes into the '{}' literal or the ' ends
+            // the string and the INSERT throws a 1064 syntax error.
+            CharacterDatabase.EscapeString(stored);
 
             CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
             tx->Append(
