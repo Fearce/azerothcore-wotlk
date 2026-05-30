@@ -860,8 +860,14 @@ namespace WowPsParty
                 if (m->IsInCombat()) { any = true; break; }
             return cond == "party_in_combat" ? any : !any;
         }
-        if (cond == "has_target")    return bot->GetTarget() != ObjectGuid::Empty;
-        if (cond == "no_target")     return bot->GetTarget() == ObjectGuid::Empty;
+        // Gate on the VICTIM, not the selection field. Party bots engage via
+        // AssistTarget's bot->Attack(victim), which sets m_attacking (and drives
+        // auto-attack) but never touches UNIT_FIELD_TARGET — so GetTarget() stays
+        // empty even while the bot is swinging. Every cast:X action resolves its
+        // target from GetVictim(), so has_target must agree or the whole rotation
+        // NO_MATCHes for a bot that's clearly in melee ("only auto-attacks").
+        if (cond == "has_target")    return bot->GetVictim() != nullptr;
+        if (cond == "no_target")     return bot->GetVictim() == nullptr;
         // Movement gate — pair "is_moving" with instant-only rules, or
         // "is_not_moving" so a cast-time spell only queues when planted.
         if (cond == "is_moving")     return bot->isMoving();
@@ -1486,18 +1492,26 @@ namespace WowPsParty
         // lower-priority rule.
         auto faceAndCast = [bot](Unit* target, uint32 spellId) -> bool
         {
-            if (target && target != bot)
-                bot->SetFacingToObject(target);
             int32 castMs = 0;
             if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId))
                 castMs = info->CalcCastTime();
-            if (castMs > 0)
+            // Plant before a non-self cast when we have a cast bar OR we're
+            // moving. A moving unit's orientation is spline-driven, so
+            // SetFacingToObject won't hold and an INSTANT shot fires facing the
+            // travel direction — SPELL_FAILED_UNIT_NOT_INFRONT (134), e.g. a
+            // hunter mid-reposition. The short hold keeps AssistTarget from
+            // re-installing the chase before the shot lands (no stutter).
+            bool const plant = target && target != bot
+                               && (castMs > 0 || bot->isMoving());
+            if (plant)
             {
                 bot->StopMoving();
                 bot->GetMotionMaster()->Clear();
                 WowPsParty::HoldFollower(bot->GetGUID(),
-                    uint32(castMs) + 500);
+                    uint32(castMs > 0 ? castMs + 500 : 600));
             }
+            if (target && target != bot)
+                bot->SetFacingToObject(target);
             SpellCastResult const r = bot->CastSpell(target, spellId, false);
             if (r != SPELL_CAST_OK)
             {

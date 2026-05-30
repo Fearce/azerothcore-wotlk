@@ -333,8 +333,11 @@ namespace WowPsParty
                 break;
 
             case 3: // Hunter
-                add("pet_missing", "cast_self:Call Pet", 90);
-                add("pet_dead", "cast_self:Revive Pet", 88);
+                // Pet summon/revive only out of combat: both fail in combat
+                // (SPELL_FAILED_DONT_REPORT) and, left ungated, fire every tick —
+                // holding the hunter mid-fight while it tries to re-summon.
+                add("out_of_combat&pet_missing", "cast_self:Call Pet", 90);
+                add("out_of_combat&pet_dead", "cast_self:Revive Pet", 88);
                 add("target_casting&target_interruptible", "cast:Silencing Shot", 87);
                 add("target_health<20", "cast:Kill Shot", 86);
                 add("pet_health<50", "cast_pet:Mend Pet", 78);
