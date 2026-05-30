@@ -300,7 +300,8 @@ namespace WowPsParty
                     add("party_lowest_health<75", "cast_party_lowest:Flash of Light", 70);
                     add("always", "buff_self:Devotion Aura", 62);
                     add("always", "buff_self:Seal of Wisdom", 58);
-                    add("has_target", "cast:Judgement of Light", 36);
+                    // Healers only DPS at near-full mana — conserve for healing.
+                    add("self_mana>85&has_target", "cast:Judgement of Light", 36);
                 }
                 else if (isTank)
                 {
@@ -376,8 +377,9 @@ namespace WowPsParty
                     add("party_lowest_health<70", "cast_party_lowest_hot:Renew", 68);
                     add("party_lowest_health<75", "cast_party_lowest:Flash Heal", 62);
                     add("always", "cast_party_missing:Power Word: Fortitude", 54);
-                    add("target_missing_aura:Shadow Word: Pain", "cast:Shadow Word: Pain", 34);
-                    add("has_target", "cast:Smite", 30);
+                    // Healers only DPS at near-full mana — conserve for healing.
+                    add("self_mana>85&target_missing_aura:Shadow Word: Pain", "cast:Shadow Word: Pain", 34);
+                    add("self_mana>85&has_target", "cast:Smite", 30);
                 }
                 else
                 {
@@ -441,8 +443,9 @@ namespace WowPsParty
                     add("party_lowest_health<70", "cast_party_lowest_hot:Riptide", 72);
                     add("party_lowest_health<75", "cast_party_lowest:Lesser Healing Wave", 64);
                     add("always", "buff_self:Water Shield", 58);
-                    add("target_missing_aura:Flame Shock", "cast:Flame Shock", 34);
-                    add("has_target", "cast:Lightning Bolt", 30);
+                    // Healers only DPS at near-full mana — conserve for healing.
+                    add("self_mana>85&target_missing_aura:Flame Shock", "cast:Flame Shock", 34);
+                    add("self_mana>85&has_target", "cast:Lightning Bolt", 30);
                 }
                 else
                 {
@@ -501,8 +504,9 @@ namespace WowPsParty
                     add("party_lowest_health<75", "cast_party_lowest_hot:Regrowth", 66);
                     add("party_lowest_health<85", "cast_party_lowest:Nourish", 60);
                     add("always", "cast_party_missing:Mark of the Wild", 54);
-                    add("target_missing_aura:Moonfire", "cast:Moonfire", 32);
-                    add("has_target", "cast:Wrath", 28);
+                    // Healers only DPS at near-full mana — conserve for healing.
+                    add("self_mana>85&target_missing_aura:Moonfire", "cast:Moonfire", 32);
+                    add("self_mana>85&has_target", "cast:Wrath", 28);
                 }
                 else if (isTank)
                 {

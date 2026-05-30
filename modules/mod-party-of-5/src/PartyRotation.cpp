@@ -1495,28 +1495,20 @@ namespace WowPsParty
             int32 castMs = 0;
             if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId))
                 castMs = info->CalcCastTime();
-            // Plant before a non-self cast when we have a cast bar, OR when a
-            // RANGED caster is moving. A moving unit's orientation is
-            // spline-driven, so SetFacingToObject won't hold and an INSTANT shot
-            // fires facing the travel direction — SPELL_FAILED_UNIT_NOT_INFRONT
-            // (134), e.g. a hunter mid-reposition. The short hold keeps
-            // AssistTarget from re-installing the chase before the shot lands.
-            // Melee is excluded from the isMoving() trigger on purpose: its chase
-            // already keeps it facing the mob, and planting on every instant
-            // strike would drop the chase for 600ms and let a kiting mob walk out
-            // of melee range (hit-and-stall).
-            uint8 const fcCls = bot->getClass();
-            bool const fcRanged = fcCls == CLASS_MAGE || fcCls == CLASS_WARLOCK
-                || fcCls == CLASS_PRIEST || fcCls == CLASS_HUNTER
-                || fcCls == CLASS_SHAMAN || fcCls == CLASS_DRUID;
-            bool const plant = target && target != bot
-                               && (castMs > 0 || (fcRanged && bot->isMoving()));
-            if (plant)
+            // Plant ONLY for cast-time spells: a moving Player's motion update
+            // clears UNIT_STATE_CASTING and interrupts the cast, so freeze for
+            // the cast bar. Instant shots are NOT planted — doing so on every
+            // tick fought AssistTarget's chase (StopMoving+Clear, then the chase
+            // re-installs) and made the hunter stutter in place. A ranged bot
+            // settles at its standoff and shoots while stationary; the only cost
+            // is a transient UNIT_NOT_INFRONT on a shot fired mid-reposition,
+            // which simply retries next tick once planted at range.
+            if (target && target != bot && castMs > 0)
             {
                 bot->StopMoving();
                 bot->GetMotionMaster()->Clear();
                 WowPsParty::HoldFollower(bot->GetGUID(),
-                    uint32(castMs > 0 ? castMs + 500 : 600));
+                    uint32(castMs) + 500);
             }
             if (target && target != bot)
                 bot->SetFacingToObject(target);
@@ -1621,27 +1613,42 @@ namespace WowPsParty
             {
                 if (tooClose)
                 {
-                    // A point (minRange + 3)y from the target along the bot's
-                    // current bearing — i.e. straight back the way it came.
+                    // Back STRAIGHT OUT to the ranged standoff (16y), NOT to
+                    // minRange+3. Backing to ~8y put the bot inside AssistTarget's
+                    // 9y dead-zone threshold, which then shoved it to 16y — the two
+                    // systems fought and the hunter oscillated in place. One shared
+                    // standoff means neither re-triggers once the bot arrives.
                     float bx, by, bz;
                     target->GetNearPoint(bot, bx, by, bz, 0.0f,
-                        minRange + 3.0f, target->GetAngle(bot));
+                        std::max(minRange + 3.0f, 16.0f), target->GetAngle(bot));
                     bot->GetMotionMaster()->MovePoint(0, bx, by, bz);
                 }
                 else
                 {
-                    // No LoS → close right in (small follow distance) so the bot
-                    // keeps moving until it rounds the corner. LoS but out of
-                    // range → settle just inside max range.
-                    float chaseDist = 2.0f;
-                    if (bot->IsWithinLOSInMap(target))
+                    float maxRange = 0.0f;
+                    if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
+                        maxRange = si->GetMaxRange(si->IsPositive(), bot);
+                    bool const meleeSpell = maxRange > 0.0f && maxRange <= 6.0f;
+                    if (meleeSpell)
                     {
-                        float maxRange = 0.0f;
-                        if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
-                            maxRange = si->GetMaxRange(si->IsPositive(), bot);
-                        chaseDist = (maxRange > 6.0f) ? (maxRange - 3.0f) : 3.0f;
+                        // Melee ability out of range → chase to CONTACT. The old
+                        // MoveChase(target, 3.0) kept a 3y offset on top of the
+                        // bounding radii, so the bot stopped just short of actual
+                        // swing range and never auto-attacked ("walks close but
+                        // stops before it's really in range").
+                        bot->GetMotionMaster()->MoveChase(target);
                     }
-                    bot->GetMotionMaster()->MoveChase(target, chaseDist);
+                    else if (!bot->IsWithinLOSInMap(target))
+                    {
+                        // No LoS → close right in so the bot rounds the corner
+                        // until line of sight clears.
+                        bot->GetMotionMaster()->MoveChase(target, 2.0f);
+                    }
+                    else
+                    {
+                        // Ranged, LoS, just out of range → settle inside max range.
+                        bot->GetMotionMaster()->MoveChase(target, maxRange - 3.0f);
+                    }
                 }
             }
 
@@ -1710,7 +1717,11 @@ namespace WowPsParty
         {
             uint32 const spellId = FindKnownSpellByName(bot, arg);
             if (!spellId) return false;
-            if (HasAuraFromSpell(bot, spellId)) return false;
+            // Self-skip by NAME, not by the cast spell id. Seals (and some other
+            // buffs) apply an aura whose spell id differs from the spell you cast,
+            // so HasAura(castId) stayed false and the paladin re-cast Seal of
+            // Righteousness every tick, never falling through to Crusader Strike.
+            if (TargetHasNamedAura(bot, arg)) return false;
             if (!canFireSpellOn(spellId, bot)) return false;
             if (!channelClipOk()) return false;
             return faceAndCast(bot, spellId);
