@@ -265,6 +265,11 @@ namespace WowPsParty
                     add("enemies_in_melee>2&target_missing_aura:Demoralizing Shout", "cast:Demoralizing Shout", 58);
                     add("has_target", "cast:Devastate", 52);
                     add("has_target", "cast:Sunder Armor", 44);
+                    // Ranged pull + threat filler: 30y, instant. Low priority so
+                    // in melee the strikes above win, but when the tank is holding
+                    // at throwing range (lead-tank pull) every melee rule is out of
+                    // range and the rotation falls through to this to pull the mob.
+                    add("has_target", "cast:Heroic Throw", 42);
                     add("self_rage>45", "cast:Heroic Strike", 30);
                 }
                 else
@@ -771,6 +776,40 @@ namespace WowPsParty
         imbue(EQUIPMENT_SLOT_OFFHAND,  heldDeadly, heldInstant);
     }
 
+    // Warrior tanks pull from range (see TankLeadEngagement), which needs a
+    // thrown weapon in the ranged slot. Only WARRIORS can equip thrown weapons,
+    // so this is warrior-tank-only. Equips the best vendor-grade thrown weapon
+    // the bot's level allows, ONCE — only when the ranged slot is empty, so a
+    // player-chosen ranged item on an alt is never clobbered.
+    static void MaintainTankThrown(Player* bot)
+    {
+        if (bot->getClass() != CLASS_WARRIOR) return;
+        if (WowPsParty::RoleForGuid(bot->GetGUID()) != "tank") return;
+        if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED)) return;
+
+        // class=2 weapon, subclass=16 thrown, InventoryType=25 INVTYPE_THROWN.
+        // Common..rare only (no heirloom/artifact). Best item level the bot can
+        // actually use; CanEquipNewItem makes the final class/level call.
+        QueryResult q = WorldDatabase.Query(
+            "SELECT entry FROM item_template "
+            "WHERE class = 2 AND subclass = 16 AND InventoryType = 25 "
+            "AND RequiredLevel <= {} AND Quality BETWEEN 1 AND 3 "
+            "ORDER BY ItemLevel DESC, RequiredLevel DESC LIMIT 10", uint32(bot->GetLevel()));
+        if (!q) return;
+        do
+        {
+            uint32 const entry = (*q)[0].Get<uint32>();
+            uint16 dest = 0;
+            if (bot->CanEquipNewItem(NULL_SLOT, dest, entry, false) == EQUIP_ERR_OK)
+            {
+                bot->EquipNewItem(dest, entry, true);
+                LOG_INFO("module", "[WowPsParty Provision] equipped thrown weapon {} on {} (lvl {})",
+                         entry, bot->GetName(), uint32(bot->GetLevel()));
+                return;
+            }
+        } while (q->NextRow());
+    }
+
     void MaintainBotConsumables(Player* bot)
     {
         if (!bot || !bot->IsInWorld() || !bot->IsAlive() || !bot->GetSession()) return;
@@ -788,8 +827,9 @@ namespace WowPsParty
         }
 
         uint8 const cls = bot->getClass();
-        if (cls == CLASS_ROGUE) MaintainPoisons(bot);
-        MaintainAmmo(bot);   // any class that wields a bow/gun benefits
+        if (cls == CLASS_ROGUE)   MaintainPoisons(bot);
+        if (cls == CLASS_WARRIOR) MaintainTankThrown(bot);   // before ammo: equips the thrown wpn
+        MaintainAmmo(bot);   // any class that wields a bow/gun/thrown benefits
     }
 
     bool HireHenchman(Player* requester, uint32 candidateGuid,

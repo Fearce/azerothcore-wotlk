@@ -1582,6 +1582,18 @@ namespace WowPsParty
         {
             if (!target || target == bot) return false;
 
+            // Mid ranged-pull: never chase a MELEE ability into the pack — let the
+            // rule fall through (to Heroic Throw etc.) and AssistTarget's pull-hold
+            // keep the tank at throwing range. Without this the rotation's Shield
+            // Slam would drag the tank straight in, defeating the pull.
+            if (WowPsParty::IsTankPulling(bot->GetGUID()))
+            {
+                float maxR = 0.0f;
+                if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
+                    maxR = si->GetMaxRange(si->IsPositive(), bot);
+                if (maxR > 0.0f && maxR <= 6.0f) return false;   // melee spell: hold, don't approach
+            }
+
             // Suppress the follow/assist ticker for the approach window.
             WowPsParty::HoldFollower(bot->GetGUID(), 1200);
 

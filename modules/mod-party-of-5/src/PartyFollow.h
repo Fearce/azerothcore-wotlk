@@ -51,6 +51,10 @@ namespace WowPsParty
     uint32 CountFollowersFor(ObjectGuid leaderGuid);   // alts + henchmen
     int    FormationIndexFor(ObjectGuid follower, ObjectGuid leaderGuid);
     bool   IsLeadTank(ObjectGuid botGuid);   // role-based; works for henchmen
+    // True while a lead tank is mid ranged-pull (holding at throwing range so the
+    // pack closes on it). repositionToCast reads this to refuse chasing a melee
+    // ability into the pack during the pull.
+    bool   IsTankPulling(ObjectGuid tankGuid);
     // The follow directive's role ("tank"/"healer"/"dps") for a follower
     // (alt or henchman), or "" if it has no directive. Lets the rotation
     // editor's "Generate" button match the role the bot actually runs.

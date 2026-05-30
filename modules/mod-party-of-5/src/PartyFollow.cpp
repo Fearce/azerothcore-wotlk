@@ -354,6 +354,32 @@ namespace WowPsParty
         return true;
     }
 
+    // followerGuidLow -> ms until which a lead tank is mid ranged-pull. While set,
+    // AssistTarget holds the tank at throwing range and lets the pulled mob close
+    // instead of chasing into the pack ("don't face-pull a whole room"). Short
+    // window: once the mob reaches melee the hold ends naturally; if nothing comes
+    // (no ranged pull landed) it expires and the tank falls back to closing in.
+    static std::unordered_map<uint32, uint32> g_tankPullUntilMs;
+
+    static void MarkTankPulling(ObjectGuid tankGuid, uint32 durationMs)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_tankPullUntilMs[tankGuid.GetCounter()] = getMSTime() + durationMs;
+    }
+
+    bool IsTankPulling(ObjectGuid tankGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_tankPullUntilMs.find(tankGuid.GetCounter());
+        if (it == g_tankPullUntilMs.end()) return false;
+        if (getMSTime() >= it->second)
+        {
+            g_tankPullUntilMs.erase(it);
+            return false;
+        }
+        return true;
+    }
+
     ObjectGuid GetLeaderFor(ObjectGuid followerGuid)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -620,11 +646,31 @@ namespace WowPsParty
         if (!bot->IsValidAttackTarget(nearest)) return;
 
         bool const ok = bot->Attack(nearest, true);
-        bot->GetMotionMaster()->MoveChase(nearest);
         bot->SetFacingToObject(nearest);
-        LOG_INFO("module", "[WowPsParty TankLead] guid={} PULL mob_guid={} entry={} ok={}",
-                 bot->GetGUID().GetCounter(), nearest->GetGUID().GetCounter(),
-                 nearest->GetEntry(), ok);
+
+        // Ranged pull: a tank holding a thrown/gun/bow doesn't charge into the
+        // pack. It closes only to throwing range, then the rotation (Heroic Throw
+        // etc.) and the ranged auto-attack pull a single mob while AssistTarget
+        // holds it there (see IsTankPulling) so the mobs come to us instead of us
+        // running head-first into a room full of them. Melee-only tanks keep the
+        // old behaviour of closing straight in.
+        Item* const rangedW = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+        bool const canRangedPull = rangedW && rangedW->GetTemplate()->IsRangedWeapon();
+        float const dist = bot->GetDistance(nearest);
+        if (canRangedPull && dist > 8.0f)
+        {
+            if (dist > 26.0f)
+                bot->GetMotionMaster()->MoveChase(nearest, 22.0f);   // close to throw range
+            else
+                bot->GetMotionMaster()->Clear();                     // hold ground
+            MarkTankPulling(bot->GetGUID(), 8000);
+        }
+        else
+            bot->GetMotionMaster()->MoveChase(nearest);              // melee: close in
+
+        LOG_INFO("module", "[WowPsParty TankLead] guid={} {} mob_guid={} entry={} dist={:.1f} ok={}",
+                 bot->GetGUID().GetCounter(), canRangedPull ? "RANGE-PULL" : "PULL",
+                 nearest->GetGUID().GetCounter(), nearest->GetEntry(), dist, ok);
     }
 
     // ===== Gathering (mining / herbalism) ==================================
@@ -969,6 +1015,33 @@ namespace WowPsParty
                 AssistLog(gLow, "no-targets: AttackStop");
                 bot->AttackStop();
             }
+            return;
+        }
+
+        // Lead-tank ranged pull. While the pull window is live and the target
+        // hasn't closed to melee yet, hold ground (cancel any chase) and let the
+        // mob come — the rotation throws to pull, AssistTarget doesn't drag the
+        // tank into the pack. The instant the mob reaches melee (or the window
+        // lapses) this falls through to the normal chase/engage below.
+        if (IsTankPulling(bot->GetGUID()) && !bot->IsWithinMeleeRange(desired))
+        {
+            if (bot->GetVictim() != desired)
+            {
+                MarkRetarget(gLow, nowMs);
+                bot->Attack(desired, true);
+            }
+            float const d = bot->GetDistance(desired);
+            MovementGeneratorType const mg =
+                bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
+            if (d > 26.0f)
+            {
+                if (mg != CHASE_MOTION_TYPE)
+                    bot->GetMotionMaster()->MoveChase(desired, 22.0f);
+            }
+            else if (mg == CHASE_MOTION_TYPE)
+                bot->GetMotionMaster()->Clear();   // arrived at range — hold
+            bot->SetFacingToObject(desired);
+            AssistLog(gLow, "tank pull-hold: holding ground, letting mob close");
             return;
         }
 
