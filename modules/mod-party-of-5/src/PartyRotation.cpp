@@ -2039,6 +2039,10 @@ namespace WowPsParty
     bool TickRotation(Player* bot)
     {
         if (!bot) return false;
+        // A dead bot must not run its rotation — otherwise rules like
+        // out_of_combat Stealth fire and fail SPELL_FAILED_CASTER_DEAD every
+        // tick. (Resurrect-accept is handled separately in ApplyDirective.)
+        if (!bot->IsAlive()) return false;
         std::vector<RotationRule> rules;
         {
             std::lock_guard<std::mutex> lock(g_rotationCacheMutex);

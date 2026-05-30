@@ -1180,6 +1180,26 @@ namespace WowPsParty
             if (follower->GetVictim())    return true;
             if (follower->IsCharmed())    return true;
 
+            // The PARTY is fighting but THIS bot momentarily isn't — e.g. a tank
+            // that just lost all its threat, or a ranged dps between targets.
+            // Do NOT drag it to a follow/lead position; yield so AssistTarget
+            // re-engages it (the tank taunts loose mobs, ranged hold at range).
+            // Without this the lead tank walks to the front and stops holding
+            // aggro ("tank breaks mid-combat"), and ranged get pulled into the
+            // leader's melee.
+            {
+                std::vector<ObjectGuid> party;
+                GetPartyGuidsFor(d.followerGuid, party);
+                for (ObjectGuid const& gg : party)
+                {
+                    if (gg == d.followerGuid) continue;
+                    Player* m = ObjectAccessor::FindConnectedPlayer(gg);
+                    if (m && m->IsInWorld() && m->IsAlive()
+                        && m->GetMapId() == follower->GetMapId() && m->IsInCombat())
+                        return true;
+                }
+            }
+
             // Rotation engine has asked us to leave this bot stationary.
             // Active hold = drinking, holding-for-healer-mana, etc.
             if (IsFollowerHeld(d.followerGuid)) return true;
