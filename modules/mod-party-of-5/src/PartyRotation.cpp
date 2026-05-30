@@ -1495,14 +1495,22 @@ namespace WowPsParty
             int32 castMs = 0;
             if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId))
                 castMs = info->CalcCastTime();
-            // Plant before a non-self cast when we have a cast bar OR we're
-            // moving. A moving unit's orientation is spline-driven, so
-            // SetFacingToObject won't hold and an INSTANT shot fires facing the
-            // travel direction — SPELL_FAILED_UNIT_NOT_INFRONT (134), e.g. a
-            // hunter mid-reposition. The short hold keeps AssistTarget from
-            // re-installing the chase before the shot lands (no stutter).
+            // Plant before a non-self cast when we have a cast bar, OR when a
+            // RANGED caster is moving. A moving unit's orientation is
+            // spline-driven, so SetFacingToObject won't hold and an INSTANT shot
+            // fires facing the travel direction — SPELL_FAILED_UNIT_NOT_INFRONT
+            // (134), e.g. a hunter mid-reposition. The short hold keeps
+            // AssistTarget from re-installing the chase before the shot lands.
+            // Melee is excluded from the isMoving() trigger on purpose: its chase
+            // already keeps it facing the mob, and planting on every instant
+            // strike would drop the chase for 600ms and let a kiting mob walk out
+            // of melee range (hit-and-stall).
+            uint8 const fcCls = bot->getClass();
+            bool const fcRanged = fcCls == CLASS_MAGE || fcCls == CLASS_WARLOCK
+                || fcCls == CLASS_PRIEST || fcCls == CLASS_HUNTER
+                || fcCls == CLASS_SHAMAN || fcCls == CLASS_DRUID;
             bool const plant = target && target != bot
-                               && (castMs > 0 || bot->isMoving());
+                               && (castMs > 0 || (fcRanged && bot->isMoving()));
             if (plant)
             {
                 bot->StopMoving();
