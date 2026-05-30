@@ -1295,28 +1295,6 @@ namespace WowPsParty
             bool const inDungeon = leader->GetMap() && leader->GetMap()->IsDungeon();
             bool const isLeadTank = inDungeon && IsLeadTank(d.followerGuid);
 
-            // [WowPsParty LeadDiag] "tank follows behind instead of leading" —
-            // log the decision inputs for any tank-role follower (throttled 8s)
-            // so we can see WHICH gate is failing: not in a dungeon, not picked
-            // as lead tank (role/guid), leading toggled off, or a stale path.
-            if (d.role == "tank")
-            {
-                static thread_local std::unordered_map<uint32, uint32> ldLast;
-                uint32 const ldNow = getMSTime();
-                uint32& ldT = ldLast[d.followerGuid.GetCounter()];
-                if (ldNow - ldT > 8000)
-                {
-                    ldT = ldNow;
-                    LOG_INFO("module",
-                        "[WowPsParty LeadDiag] {} (guid={}) inDungeon={} IsLeadTank={} leadOn={} pathWp={} mapId={} dist={:.0f}",
-                        follower->GetName(), d.followerGuid.GetCounter(),
-                        inDungeon ? 1 : 0, IsLeadTank(d.followerGuid) ? 1 : 0,
-                        GetLeadInDungeon(d.followerGuid.GetCounter()) ? 1 : 0,
-                        WowPsParty::GetPathWaypointCount(leader->GetMapId()),
-                        leader->GetMapId(), follower->GetDistance(leader));
-                }
-            }
-
             float angle = follower->GetFollowAngle();
             float followDist = PET_FOLLOW_DIST;
             if (isLeadTank)
@@ -1326,8 +1304,13 @@ namespace WowPsParty
                 // two systems don't fight each other on every tick.
                 if (WowPsParty::GetPathWaypointCount(leader->GetMapId()) >= 2)
                     return true;
-                angle = float(M_PI);   // directly in front of the leader
-                followDist = 12.0f;    // walk a body-length ahead
+                // MoveFollow's angle is relative to the leader's facing:
+                // 0 = directly in front, M_PI = directly behind (see FORM_ANGLES
+                // above). The lead tank must be IN FRONT — the old M_PI here put
+                // it 12y BEHIND the leader, which is exactly the "tank trails far
+                // behind" bug. Keep it a few yards ahead so it body-pulls.
+                angle = 0.0f;
+                followDist = 8.0f;
             }
             else
             {
