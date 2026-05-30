@@ -122,6 +122,14 @@ compile_commands.json
 !/modules/mod-party-of-5/
 !/modules/mod-party-of-5/**
 
+# WowPs: vendor the ALE (Eluna) engine + MythicPlus integration. Track the engine
+# source, the MythicPlus Lua/SQL/AIO, and the deploy docs — but NOT the ~12MB of
+# binary client patch assets (textures/DBCs); fetch those from
+# github.com/huptiq/MythicPlus (Data/Client) when building the client MPQ patch.
+!/modules/mod-ale/
+!/modules/mod-ale/**
+/modules/mod-ale/MythicPlus/Data/Client/
+
 # WowPs: vendor mod-playerbots (our patched fork) into the server repo.
 !/modules/mod-playerbots/
 !/modules/mod-playerbots/**
