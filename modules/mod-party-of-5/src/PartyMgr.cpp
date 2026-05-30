@@ -707,15 +707,26 @@ namespace WowPsParty
             return;
         }
 
-        // No ammo set — pick the level/type-appropriate one playerbots would.
+        // No ammo set — pick the first level/type-appropriate ammo the bot can
+        // actually USE. SetAmmo silently rejects (via CanUseAmmo) anything the bot
+        // can't equip, which would leave the quiver empty and every shot failing
+        // NO_AMMO, so we pre-check CanUseAmmo and skip rejects instead of blindly
+        // taking the highest-ilvl entry.
         for (uint32 candidate : sRandomItemMgr.GetAmmo(bot->GetLevel(), subClass))
         {
-            if (sObjectMgr->GetItemTemplate(candidate)) { entry = candidate; break; }
+            if (sObjectMgr->GetItemTemplate(candidate)
+                && bot->CanUseAmmo(candidate) == EQUIP_ERR_OK)
+            {
+                entry = candidate;
+                break;
+            }
         }
         if (!entry) return;
         uint32 const have = bot->GetItemCount(entry);
         if (have < REFILL_TO) GiveItem(bot, entry, REFILL_TO - have);
         bot->SetAmmo(entry);
+        LOG_INFO("module", "[WowPsParty Provision] {} ammo set to {} (equipped={})",
+                 bot->GetName(), entry, bot->GetUInt32Value(PLAYER_AMMO_ID) == entry ? 1 : 0);
     }
 
     // Rogues keep a small supply of the best instant + deadly poison they can

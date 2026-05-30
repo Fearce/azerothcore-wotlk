@@ -2151,6 +2151,30 @@ namespace WowPsParty
         return true;
     }
 
+    // Hunters must ACTIVELY start the ranged auto-attack — spell 3018 "Shoot" —
+    // or they only ever fire rotation abilities and look idle (and never consume
+    // their arrows). Cast it once; the core auto-repeats it and cancels it on
+    // movement, so a kiting hunter resumes shooting the moment it plants. Requires
+    // ammo equipped (MaintainAmmo) — without it 3018 just fails NO_AMMO.
+    static void EnsureRangedAutoAttack(Player* bot)
+    {
+        if (bot->getClass() != CLASS_HUNTER) return;   // melee shouldn't stand and shoot
+        Unit* victim = bot->GetVictim();
+        if (!victim || !victim->IsAlive()) return;
+        if (bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL)) return;  // already auto-shooting
+        if (bot->isMoving()) return;                                 // can't start a shot mid-move
+        Item* ranged = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+        if (!ranged) return;
+        uint8 const sub = ranged->GetTemplate()->SubClass;
+        if (sub != ITEM_SUBCLASS_WEAPON_GUN && sub != ITEM_SUBCLASS_WEAPON_BOW
+            && sub != ITEM_SUBCLASS_WEAPON_CROSSBOW)
+            return;
+        if (bot->GetUInt32Value(PLAYER_AMMO_ID) == 0) return;  // no ammo — don't spam Shoot
+        if (bot->GetDistance(victim) > 40.0f) return;          // out of ranged range
+        if (!bot->IsWithinLOSInMap(victim)) return;
+        bot->CastSpell(victim, 3018, false);
+    }
+
     bool TickRotation(Player* bot)
     {
         if (!bot) return false;
@@ -2163,6 +2187,9 @@ namespace WowPsParty
         // so a freshly-spawned hunter has arrows on its first idle tick and a
         // rogue stays poisoned — playerbots' own upkeep is gated out for us.
         WowPsParty::MaintainBotConsumables(bot);
+
+        // Keep the hunter's auto-shot running between ability casts.
+        EnsureRangedAutoAttack(bot);
 
         std::vector<RotationRule> rules;
         {
