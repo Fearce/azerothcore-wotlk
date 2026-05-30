@@ -1212,18 +1212,27 @@ namespace WowPsParty
             //       consecutive ticks → it's stuck; teleport.
             // Tracker is keyed by follower guid.
             uint32 const guidLow = d.followerGuid.GetCounter();
-            static thread_local std::unordered_map<uint32, std::pair<float, uint32>> stuckTracker;
-            auto& tracked = stuckTracker[guidLow];
-            bool const sameAsLast = std::fabs(tracked.first - dist) < 0.5f;
-            if (sameAsLast)
-                tracked.second++;
-            else
-            {
-                tracked.first  = dist;
-                tracked.second = 0;
-            }
-            bool const farAway     = dist > 50.0f;
-            bool const stuckClose  = dist > 8.0f && tracked.second >= 3;
+            // Stuck = the follower is far from the leader AND has barely moved in
+            // WORLD space for several ticks. The previous detector compared the
+            // follower's DISTANCE TO THE LEADER and called it stuck when that
+            // stayed constant — but a bot FOLLOWING a moving leader holds that
+            // distance roughly constant (that IS following), so a bot walking a
+            // few yards behind a continuously-walking leader got falsely flagged
+            // and teleported on nearly every step (legs never moving). Tracking
+            // the follower's OWN movement fixes it: a walking bot is moving, so
+            // it's never flagged; only a genuinely frozen one is.
+            struct StuckSample { float x = 0.0f, y = 0.0f; uint32 idle = 0; };
+            static thread_local std::unordered_map<uint32, StuckSample> stuckTracker;
+            StuckSample& s = stuckTracker[guidLow];
+            float const dxs = follower->GetPositionX() - s.x;
+            float const dys = follower->GetPositionY() - s.y;
+            float const movedSelf = std::sqrt(dxs * dxs + dys * dys);
+            s.x = follower->GetPositionX();
+            s.y = follower->GetPositionY();
+            if (dist > 8.0f && movedSelf < 1.0f) ++s.idle;
+            else                                  s.idle = 0;
+            bool const farAway    = dist > 50.0f;
+            bool const stuckClose = s.idle >= 3;   // far + not moving for 3 ticks
             if (farAway || stuckClose)
             {
                 if (follower->IsBeingTeleported())  return true;
@@ -1233,9 +1242,9 @@ namespace WowPsParty
                     leader->GetPositionX(), leader->GetPositionY(),
                     leader->GetPositionZ(), leader->GetOrientation());
                 LOG_INFO("module",
-                    "[WowPsParty Follow] catch-up teleport: {} dist={:.1f} stuck_ticks={}",
-                    follower->GetName(), dist, tracked.second);
-                tracked = {0.0f, 0};
+                    "[WowPsParty Follow] catch-up teleport: {} dist={:.1f} idle_ticks={}",
+                    follower->GetName(), dist, s.idle);
+                s = StuckSample{};
                 return true;
             }
 
