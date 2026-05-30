@@ -972,6 +972,39 @@ namespace WowPsParty
             return;
         }
 
+        // Ranged dead-zone guard. AC's ChaseMovementGenerator::PositionOkay only
+        // checks the MAX range — it never enforces a minimum — so a hunter/caster
+        // dragged into melee just sits there, every shot failing TOO_CLOSE and
+        // the chase never pushing it back out ("shoots once then runs close and
+        // does nothing"). Detect too-close and MovePoint straight out to firing
+        // range; only hand back to the chase once we're clear. Re-issued only
+        // when not already walking the point, so it doesn't stutter.
+        {
+            uint8 const rcls = bot->getClass();
+            bool const ranged = rcls == CLASS_MAGE || rcls == CLASS_WARLOCK
+                || rcls == CLASS_PRIEST || rcls == CLASS_HUNTER
+                || rcls == CLASS_SHAMAN || rcls == CLASS_DRUID;
+            if (ranged && bot->IsWithinDistInMap(desired, 9.0f))
+            {
+                if (bot->GetVictim() != desired)
+                {
+                    MarkRetarget(gLow, nowMs);
+                    bot->Attack(desired, false);   // ranged: don't run into melee
+                }
+                if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType()
+                        != POINT_MOTION_TYPE)
+                {
+                    float bx, by, bz;
+                    desired->GetNearPoint(bot, bx, by, bz, 0.0f, 16.0f,
+                                          desired->GetAngle(bot));
+                    bot->GetMotionMaster()->MovePoint(0, bx, by, bz);
+                }
+                bot->SetFacingToObject(desired);
+                AssistLog(gLow, "ranged dead-zone: backing out to firing range");
+                return;
+            }
+        }
+
         // Install the correct chase: ranged casters hold at distance so they
         // don't run into melee and clip their own cast bar; melee close in.
         auto installChase = [&]()
