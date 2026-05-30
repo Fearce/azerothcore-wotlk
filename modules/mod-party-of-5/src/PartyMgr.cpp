@@ -528,6 +528,14 @@ namespace WowPsParty
                 return "";
         }
 
+        // Out-of-combat recovery (item-free — the drink/eat action regenerates
+        // for free). Lowest priority so it only kicks in with nothing else to
+        // do. Eat (health) for everyone; drink (mana) only for mana classes.
+        add("out_of_combat&self_health<60", "eat", 12);
+        if (cls == 2 || cls == 3 || cls == 5 || cls == 7
+            || cls == 8 || cls == 9 || cls == 11)   // Pala/Hunter/Priest/Shaman/Mage/Warlock/Druid
+            add("out_of_combat&self_mana<50", "drink", 14);
+
         std::string out;
         for (size_t i = 0; i < rules.size(); ++i)
         {

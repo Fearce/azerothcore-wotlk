@@ -504,7 +504,7 @@ namespace WowPsParty
     // Find a food/drink item anywhere in the shared inventory, decrement
     // one charge (destroy if last), and return the use-spell to apply.
     // Returns 0 if nothing was found.
-    static uint32 ConsumeSharedConsumable(Player* bot, bool drink)
+    [[maybe_unused]] static uint32 ConsumeSharedConsumable(Player* bot, bool drink)
     {
         uint32 castSpell = 0;
         ForEachSharedItem(bot, [drink, &castSpell](Player* owner, Item* it) -> bool {
@@ -1960,43 +1960,38 @@ namespace WowPsParty
             if (bot->getStandState() != UNIT_STAND_STATE_SIT)
                 bot->SetStandState(UNIT_STAND_STATE_SIT);
 
-            // Drink auras in 3.3.5a last 20-30 s. 20 s between consumes
-            // gives a tiny gap of passive regen before the next stack
-            // burns, which is the natural "drink → wait → drink" cadence
-            // a real player would use anyway.
-            static std::unordered_map<uint32, uint32> lastDrinkMs;
-            static std::unordered_map<uint32, uint32> lastEatMs;
-            uint32 const consumeKey = bot->GetGUID().GetCounter();
+            // NO ITEMS REQUIRED. Party bots — henchmen especially, who have no
+            // shared bags — recover for free while seated out of combat. Apply a
+            // generic Drink (430) / Food (433) aura for the sit-and-consume
+            // animation, then top the resource up a slice at a time so it's
+            // drink-speed (~18 s low→full), not an instant heal. Throttled by ms
+            // so the tick rate doesn't change the pace.
+            uint32 const auraId = wantDrink ? 430u : 433u;
+            if (!bot->HasAura(auraId))
+                bot->CastSpell(bot, auraId, true);
+
+            static std::unordered_map<uint32, uint32> lastRegenMs;
+            uint32 const regenKey = bot->GetGUID().GetCounter();
             uint32 const now = getMSTime();
-            uint32 last;
             {
                 std::lock_guard<std::mutex> lock(g_useThrottleMutex);
-                last = wantDrink ? lastDrinkMs[consumeKey] : lastEatMs[consumeKey];
-            }
-            if (now - last >= 20000)
-            {
-                uint32 const spellId = ConsumeSharedConsumable(bot, wantDrink);
-                if (spellId)
+                uint32& lr = lastRegenMs[regenKey];
+                if (now - lr >= 1500)
                 {
-                    bot->CastSpell(bot, spellId, true);  // triggered, no GCD/cost
+                    lr = now;
+                    if (wantDrink)
                     {
-                        std::lock_guard<std::mutex> lock(g_useThrottleMutex);
-                        (wantDrink ? lastDrinkMs[consumeKey]
-                                   : lastEatMs[consumeKey]) = now;
+                        uint32 const mx = bot->GetMaxPower(POWER_MANA);
+                        if (mx > 0)
+                            bot->SetPower(POWER_MANA, std::min(mx,
+                                bot->GetPower(POWER_MANA) + std::max<uint32>(1, mx / 12)));
                     }
-                    // Announce it so the player knows the bot is regenerating.
-                    bot->Say(wantDrink ? "Drinking to recover mana."
-                                       : "Sitting down to eat.",
-                             LANG_UNIVERSAL);
-                    LOG_INFO("module",
-                        "[WowPsParty Rotation] {} verb={} consumed shared item, cast spell={}",
-                        bot->GetName(), verb, spellId);
-                }
-                else
-                {
-                    LOG_INFO("module",
-                        "[WowPsParty Rotation] {} verb={} no shared {} in party bags",
-                        bot->GetName(), verb, wantDrink ? "drink" : "food");
+                    else
+                    {
+                        uint32 const mx = bot->GetMaxHealth();
+                        bot->SetHealth(std::min(mx,
+                            bot->GetHealth() + std::max<uint32>(1, mx / 12)));
+                    }
                 }
             }
             WowPsParty::HoldFollower(bot->GetGUID(), 1500);
