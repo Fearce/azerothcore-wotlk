@@ -545,12 +545,17 @@ namespace WowPsParty
         uint32 limit, std::vector<HenchmanCandidate>& out)
     {
         if (acctCsv.empty() || raceCsv.empty()) return;
+        (void)level;  // band already constrains proximity; order is pure random
+        // ORDER BY RAND(), not ABS(level-L): proximity ordering made the same
+        // few exact-level chars rank top every time, so "Refresh" re-rolled to
+        // an identical-looking list. Random within the (already tight) level
+        // band gives a genuinely different set each refresh.
         QueryResult q = CharacterDatabase.Query(
             "SELECT `guid`,`name`,`class`,`level` FROM `characters` "
             "WHERE `account` IN ({}) AND `online` = 0 AND `class` IN ({}) "
             "AND `race` IN ({}) AND `level` BETWEEN {} AND {} "
-            "ORDER BY ABS(CAST(`level` AS SIGNED) - {}) ASC, RAND() LIMIT {}",
-            acctCsv, classCsv, raceCsv, uint32(lo), uint32(hi), uint32(level), limit);
+            "ORDER BY RAND() LIMIT {}",
+            acctCsv, classCsv, raceCsv, uint32(lo), uint32(hi), limit);
         if (!q) return;
         do {
             Field* f = q->Fetch();
@@ -572,8 +577,11 @@ namespace WowPsParty
         if (acctCsv.empty()) return out;
 
         uint8 const L  = requester->GetLevel();
-        uint8 const lo = (L >= 80) ? 80 : uint8(std::max(1, int(L) - 2));
-        uint8 const hi = (L >= 80) ? 80 : uint8(std::min(80, int(L) + 2));
+        // ±4 band (was ±2): a wider eligible pool so each randomized Refresh
+        // shows a meaningfully different set instead of recycling the same
+        // handful of exact-level chars. Still "~your level".
+        uint8 const lo = uint8(std::max(1, int(L) - 4));
+        uint8 const hi = uint8(std::min(80, int(L) + 4));
 
         // Same-faction only — a Horde henchman can't group with / heal an
         // Alliance player. Race ids by team.
@@ -582,8 +590,8 @@ namespace WowPsParty
             : "2,5,6,8,10";  // Orc, Undead, Tauren, Troll, Blood Elf
 
         // ~20 candidates: 4 tanks (Warr/Pala/DK/Druid), 4 healers
-        // (Priest/Pala/Shaman/Druid), 12 dps (any class). Exact-band first; the
-        // ORDER BY closeness keeps them near the player's level.
+        // (Priest/Pala/Shaman/Druid), 12 dps (any class), each a random draw
+        // from the ±4 band so Refresh re-rolls.
         QueryHenchCandidates(acctCsv, "1,2,6,11", raceCsv, lo, hi, L, 4, out);
         QueryHenchCandidates(acctCsv, "2,5,7,11", raceCsv, lo, hi, L, 4, out);
         QueryHenchCandidates(acctCsv, "1,2,3,4,5,6,7,8,9,11", raceCsv, lo, hi, L, 12, out);

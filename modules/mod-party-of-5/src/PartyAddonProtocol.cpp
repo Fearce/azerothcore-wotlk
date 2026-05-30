@@ -148,7 +148,13 @@ namespace WowPsParty
                 << uint32(c.level) << ':' << c.role << ':'
                 << HenchmanHireCost(c.level);
         }
-        SendWPSP(player, out.str());
+        std::string const body = out.str();
+        LOG_INFO("module",
+            "[WowPsParty Henchmen] SendHenchmenTo guid={} level={} team={} "
+            "candidates={} payload_bytes={}",
+            player->GetGUID().GetCounter(), uint32(player->GetLevel()),
+            uint32(player->GetTeamId()), uint32(cands.size()), uint32(body.size()));
+        SendWPSP(player, body);
     }
 
 
