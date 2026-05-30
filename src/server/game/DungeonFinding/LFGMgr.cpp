@@ -41,10 +41,11 @@
 #include "SpellAuras.h"
 #include "WorldSession.h"
 
-// [WowPsParty] Defined in the mod-party-of-5 module (PartyFollow.cpp). Declared
-// at GLOBAL scope on purpose: a block-scope `extern` inside `namespace lfg`
-// would bind to `lfg::...` and fail to link against the global definition.
+// [WowPsParty] Defined in the mod-party-of-5 module. Declared at GLOBAL scope on
+// purpose: a block-scope `extern` inside `namespace lfg` would bind to `lfg::...`
+// and fail to link against the global definition (see LESSONS §6b).
 void WowPsParty_SetPartyBotLfgRoles_Trampoline(ObjectGuid groupGuid);
+bool WowPsParty_BotHasActiveFollowDirective_Trampoline(ObjectGuid guid);
 
 namespace lfg
 {
@@ -461,6 +462,15 @@ namespace lfg
                             SendLfgUpdatePlayer(guid, LfgUpdateData(LFG_UPDATETYPE_PROPOSAL_BEGIN, GetSelectedDungeons(guid), GetComment(guid)));
                         SendLfgUpdateProposal(guid, proposal);
                     }
+
+                    // [WowPsParty] Auto-accept the proposal ("dungeon ready,
+                    // accept?") for our managed party bots — their AI is paused,
+                    // so they never click Accept and the proposal would expire.
+                    // The real player stays pending until they accept in the UI,
+                    // so this never completes/erases the proposal mid-loop.
+                    for (LfgProposalPlayerContainer::const_iterator itBot = proposal.players.begin(); itBot != proposal.players.end(); ++itBot)
+                        if (::WowPsParty_BotHasActiveFollowDirective_Trampoline(itBot->first))
+                            UpdateProposal(proposalId, itBot->first, true);
 
                     if (proposal.state == LFG_PROPOSAL_SUCCESS) // pussywizard: no idea what's the purpose of this xD
                         UpdateProposal(proposalId, guid, true);
