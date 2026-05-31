@@ -411,11 +411,12 @@ namespace WowPsParty
                 add("enemies_clustered:8>2", "cast:Multi-Shot", 52);
                 // Forced into melee (no tank peeled the mob off us, so we stand
                 // our ground): a hunter can't shoot in the dead zone, so weave
-                // the melee strikes. Gated on a mob actually in melee range —
-                // the ranged shots above out-range these and win at distance, so
-                // they only fire once we're standing toe-to-toe.
-                add("enemies_in_melee>0", "cast:Raptor Strike", 51);
-                add("enemies_in_melee>0", "cast:Mongoose Bite", 50);
+                // the melee strikes. Gate on target_attacking_me (we have AGGRO)
+                // as well as a mob in melee range — otherwise, when the victim is
+                // our far ranged target, Raptor Strike fails out-of-range and the
+                // cast path walks us INTO melee, then we back out, forever.
+                add("enemies_in_melee>0&target_attacking_me", "cast:Raptor Strike", 51);
+                add("enemies_in_melee>0&target_attacking_me", "cast:Mongoose Bite", 50);
                 add("has_target", "cast:Arcane Shot", 46);
                 add("has_target", "cast:Steady Shot", 36);
                 break;

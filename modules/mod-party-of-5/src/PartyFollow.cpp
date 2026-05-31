@@ -1299,14 +1299,16 @@ namespace WowPsParty
                     AssistLog(gLow, "ranged: no tank, standing ground to fight in melee");
                     return;
                 }
-                // A tank will take it (or it's on someone else) — back straight
-                // out to firing range. Drop any melee we'd switched on.
+                // A tank will take it (or it's on someone else) — back out just
+                // PAST the dead zone (10y), NOT all the way to 18y. Staying close
+                // means less running (safer indoors / fewer accidental pulls) and
+                // it's still comfortably inside shooting range. Drop any melee.
                 if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
                     bot->Attack(desired, false);
                 if (mg != POINT_MOTION_TYPE)
                 {
                     float bx, by, bz;
-                    desired->GetNearPoint(bot, bx, by, bz, 0.0f, 18.0f, desired->GetAngle(bot));
+                    desired->GetNearPoint(bot, bx, by, bz, 0.0f, 10.0f, desired->GetAngle(bot));
                     bot->GetMotionMaster()->MovePoint(0, bx, by, bz);
                     AssistLog(gLow, "ranged: too close, backing out to firing range");
                 }

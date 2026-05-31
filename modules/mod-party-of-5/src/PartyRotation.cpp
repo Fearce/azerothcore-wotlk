@@ -946,6 +946,17 @@ namespace WowPsParty
         // NO_MATCHes for a bot that's clearly in melee ("only auto-attacks").
         if (cond == "has_target")    return bot->GetVictim() != nullptr;
         if (cond == "no_target")     return bot->GetVictim() == nullptr;
+        // "target_attacking_me" — the bot's victim is targeting the bot BACK,
+        // i.e. the bot has aggro on it. Gate a ranged bot's MELEE abilities on
+        // this: without it a hunter whose victim is its far ranged target would
+        // fire Raptor Strike (a melee ability), fail out-of-range, and the cast
+        // path would walk it INTO melee — then back out — forever. With aggro,
+        // the mob is already in melee on the bot, so the strike lands in place.
+        if (cond == "target_attacking_me")
+        {
+            Unit* const v = bot->GetVictim();
+            return v && v->GetVictim() == bot;
+        }
         // Movement gate — pair "is_moving" with instant-only rules, or
         // "is_not_moving" so a cast-time spell only queues when planted.
         if (cond == "is_moving")     return bot->isMoving();
