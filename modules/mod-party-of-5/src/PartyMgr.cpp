@@ -363,8 +363,17 @@ namespace WowPsParty
             case 4: // Rogue
                 add("target_casting&target_interruptible", "cast:Kick", 92);
                 add("out_of_combat&self_missing_aura:Stealth", "cast_self:Stealth", 80);
+                // Execute finisher: a dying target gets Eviscerated NOW with as few
+                // as 3 combo points rather than waiting for 5 (or wasting a bleed) —
+                // above Slice and Dice so we don't refresh a buff on a corpse.
+                add("target_health<20&self_combo>2", "cast:Eviscerate", 78);
                 add("self_missing_aura:Slice and Dice&self_combo>1", "cast:Slice and Dice", 76);
-                add("self_combo>4&target_missing_aura:Rupture", "cast:Rupture", 70);
+                // Rupture only if the bleed has time to pay off: target_ttd>8 is
+                // TRUE for an unmeasured/long-lived mob (fresh boss) and FALSE for a
+                // trash mob about to die — so we never waste a finisher's combo on a
+                // DoT that won't tick. (The <20% execute above already pre-empts it
+                // for dying targets at 3+ combo.)
+                add("self_combo>4&target_missing_aura:Rupture&target_ttd>8", "cast:Rupture", 70);
                 add("self_combo>4", "cast:Eviscerate", 66);
                 add("enemies_in_melee>2", "cast:Fan of Knives", 58);
                 add("has_target", "cast:Mutilate", 46);

@@ -1042,6 +1042,16 @@ namespace WowPsParty
                 if (!allowSwitch)
                     desired = current;   // keep finishing the current victim
             }
+
+            // Combo classes (rogue / feral druid) NEVER abandon a target they've
+            // built combo points on — combo is lost on a switch, so finish the
+            // cycle (build to a finisher) before moving on. This gives a rogue the
+            // "focus one mob, don't spread combo" behaviour WITHOUT the room-pulling
+            // "nearest" target mode. Once a finisher dumps combo back to 0 the
+            // normal retarget rules above resume. (GetComboPoints() is 0 for every
+            // non-combo class, so this is a no-op for them.)
+            if (bot->GetComboPoints() > 0)
+                desired = current;
         }
 
         if (!desired)
