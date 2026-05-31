@@ -617,6 +617,46 @@ namespace WowPsParty
         return castSpell;
     }
 
+    // Keep a seated bot FAST-restoring HP/mana until topped: (re)apply the food
+    // (433) / drink (430) auras whenever they lapse, and add a fraction of the max
+    // pool every 1.5 s so recovery to full is ~7.5 s at any level. Shared by the
+    // drink/eat verb AND the "commit to consuming" hold below — the bug was that
+    // the hold suppressed the WHOLE rotation (including the verb that does this),
+    // so a bot restored one slice then sat there with a lapsed aura crawling on
+    // natural regen ("consuming but mana stuck, takes forever"). Out-of-combat
+    // only is the caller's responsibility (the regen auras break in combat anyway).
+    static void SustainConsume(Player* bot)
+    {
+        if (!bot) return;
+        if (bot->getStandState() != UNIT_STAND_STATE_SIT)
+            bot->SetStandState(UNIT_STAND_STATE_SIT);
+
+        uint32 const mxMana = bot->GetMaxPower(POWER_MANA);   // 0 for non-mana classes
+        uint32 const mxHp   = bot->GetMaxHealth();
+        bool const needMana = mxMana > 0 && bot->GetPower(POWER_MANA) < mxMana;
+        bool const needHp   = bot->GetHealth() < mxHp;
+        if (needMana && !bot->HasAura(430)) bot->CastSpell(bot, 430, true);   // Drink
+        if (needHp   && !bot->HasAura(433)) bot->CastSpell(bot, 433, true);   // Food
+
+        static std::unordered_map<uint32, uint32> lastRegenMs;
+        uint32 const now = getMSTime();
+        {
+            std::lock_guard<std::mutex> lock(g_useThrottleMutex);
+            uint32& lr = lastRegenMs[bot->GetGUID().GetCounter()];
+            if (now - lr >= 1500)
+            {
+                lr = now;
+                if (needMana)
+                    bot->SetPower(POWER_MANA, std::min(mxMana,
+                        bot->GetPower(POWER_MANA) + std::max<uint32>(1, mxMana / 5)));
+                if (needHp)
+                    bot->SetHealth(std::min(mxHp,
+                        bot->GetHealth() + std::max<uint32>(1, mxHp / 5)));
+            }
+        }
+        WowPsParty::HoldFollower(bot->GetGUID(), 1500);
+    }
+
     // True if `target` carries any debuff with the given dispel type
     // (DISPEL_DISEASE / DISPEL_POISON / DISPEL_MAGIC / DISPEL_CURSE).
     // Used by the "cure" condition + action pair so a priest with Cure
@@ -2344,47 +2384,15 @@ namespace WowPsParty
             }
             bot->StopMoving();
             bot->GetMotionMaster()->Clear();
-            if (bot->getStandState() != UNIT_STAND_STATE_SIT)
-                bot->SetStandState(UNIT_STAND_STATE_SIT);
 
             // NO ITEMS REQUIRED. Party bots — henchmen especially, who have no
-            // shared bags — recover for free while seated out of combat.
-            //
-            // EAT AND DRINK AT THE SAME TIME: whichever rule fired (eat or
-            // drink), one sit restores BOTH health and mana so a bot low on both
-            // is ready in a single recovery instead of draining its drink to full
-            // and only THEN starting to eat. Food (433) and Drink (430) are
-            // independent auras, so we apply each for whatever still needs
-            // topping and top both up together. Each slice is a FRACTION of the
-            // max pool (which scales with level), so a level-80's huge pool
-            // refills in the same wall-clock time as a low-level one — ~7.5 s
-            // low→full at mx/5 per 1.5 s — instead of crawling on a flat amount.
-            // Throttled by ms so the tick rate doesn't change the pace.
-            uint32 const mxMana = bot->GetMaxPower(POWER_MANA);   // 0 for non-mana classes
-            uint32 const mxHp   = bot->GetMaxHealth();
-            bool const needMana = mxMana > 0 && bot->GetPower(POWER_MANA) < mxMana;
-            bool const needHp   = bot->GetHealth() < mxHp;
-            if (needMana && !bot->HasAura(430)) bot->CastSpell(bot, 430, true);
-            if (needHp   && !bot->HasAura(433)) bot->CastSpell(bot, 433, true);
-
-            static std::unordered_map<uint32, uint32> lastRegenMs;
-            uint32 const regenKey = bot->GetGUID().GetCounter();
-            uint32 const now = getMSTime();
-            {
-                std::lock_guard<std::mutex> lock(g_useThrottleMutex);
-                uint32& lr = lastRegenMs[regenKey];
-                if (now - lr >= 1500)
-                {
-                    lr = now;
-                    if (needMana)
-                        bot->SetPower(POWER_MANA, std::min(mxMana,
-                            bot->GetPower(POWER_MANA) + std::max<uint32>(1, mxMana / 5)));
-                    if (needHp)
-                        bot->SetHealth(std::min(mxHp,
-                            bot->GetHealth() + std::max<uint32>(1, mxHp / 5)));
-                }
-            }
-            WowPsParty::HoldFollower(bot->GetGUID(), 1500);
+            // shared bags — recover for free while seated out of combat. One sit
+            // restores BOTH health and mana (Food 433 + Drink 430 are independent
+            // auras), topped a fraction of the max pool per 1.5 s so a level-80's
+            // huge pool refills in the same ~7.5 s as a low-level one. The same
+            // SustainConsume drives the "commit to consuming" hold below, so the
+            // fast restore continues there too instead of stalling on one slice.
+            SustainConsume(bot);
             return true;
         }
 
@@ -2795,13 +2803,16 @@ namespace WowPsParty
 
         // Commit to drinking/eating. Once a bot is mid-consume and not yet at
         // full health/mana (and not in combat), suppress the WHOLE rotation so
-        // it keeps regenerating until topped off or the buff ends — instead of
-        // standing up to cast the instant it has enough mana for one spell.
+        // it keeps regenerating until topped off — instead of standing up to cast
+        // the instant it has enough mana for one spell. CRUCIAL: drive the SAME
+        // SustainConsume the drink verb uses, so the fast restore (and the aura
+        // re-apply when it lapses) keeps going — suppressing the rotation alone
+        // froze recovery at one slice ("consuming, mana stuck, takes forever").
         // Combat breaks the regen aura anyway, so the !IsInCombat gate hands
         // control straight back when a fight starts.
         if (!bot->IsInCombat() && BotIsConsuming(bot) && !BotIsTopped(bot))
         {
-            WowPsParty::HoldFollower(bot->GetGUID(), 1500);
+            SustainConsume(bot);
             if (trace)
                 LOG_INFO("module",
                     "[WowPsParty Rotation] {} consuming — holding until full/done "

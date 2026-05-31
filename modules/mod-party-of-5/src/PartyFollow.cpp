@@ -67,6 +67,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
+#include <utility>
 #include <vector>
 
 namespace WowPsParty
@@ -517,6 +518,11 @@ namespace WowPsParty
     // the party — covers ranged mobs that never walk into melee.
     static constexpr uint32 PULL_MAX_WAIT_MS = 10000;
 
+    // Settle window after a fight before the lead tank auto-pulls the next pack —
+    // gives the party time to loot, regroup, and start drinking instead of being
+    // yanked straight into the next group.
+    static constexpr uint32 POST_COMBAT_PULL_DELAY_MS = 5000;
+
     bool IsTankPulling(ObjectGuid tankGuid)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -825,6 +831,35 @@ namespace WowPsParty
         if (!leader || !leader->IsInWorld()) return;
         if (leader->GetMapId() != bot->GetMapId()) return;
         if (!leader->GetMap() || !leader->GetMap()->IsDungeon()) return;
+
+        // Don't auto-pull the instant a fight ends. Track the tank's combat edge
+        // and hold off for a few seconds after it drops combat, so the party can
+        // loot/regroup/start drinking before the next pack is yanked in.
+        {
+            static std::unordered_map<uint32, std::pair<bool, uint32>> combatState;  // gLow -> (wasInCombat, leftCombatMs)
+            bool const inCombat = bot->IsInCombat();
+            auto& cs = combatState[bot->GetGUID().GetCounter()];
+            if (cs.first && !inCombat) cs.second = getMSTime();   // just left combat
+            cs.first = inCombat;
+            if (!inCombat && cs.second != 0
+                && getMSTime() - cs.second < POST_COMBAT_PULL_DELAY_MS)
+                return;
+        }
+
+        // Don't pull while the party is recovering. Skip if ANY member is seated
+        // drinking/eating (Drink 430 / Food 433 aura) or still in combat — nobody
+        // wants a fresh pack dragged onto a sitting mage mid-drink.
+        {
+            std::vector<ObjectGuid> party;
+            GetPartyGuidsFor(bot->GetGUID(), party);
+            for (ObjectGuid const& g : party)
+            {
+                Player* m = ObjectAccessor::FindConnectedPlayer(g);
+                if (!m || !m->IsInWorld() || m->GetMapId() != bot->GetMapId()) continue;
+                if (m->IsInCombat() || m->HasAura(430) || m->HasAura(433))
+                    return;
+            }
+        }
 
         // 30-yard leash. If we've drifted out of leash, let PartyFollow's
         // MoveFollow yank us back instead of chasing a far mob.
@@ -1391,25 +1426,32 @@ namespace WowPsParty
             MovementGeneratorType const mg =
                 bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
             float rx, ry, rz;
-            if (d > closeThreshold)
+            if (GetTankPullRetreat(tankLow, rx, ry, rz))
+            {
+                // Already backing out / parked at the chosen point — HOLD here.
+                // MUST be checked FIRST: the back-out point is intentionally beyond
+                // pull range, so if the "d > closeThreshold -> close in" beat ran
+                // first it would re-approach and undo the back-up every tick (the
+                // "tank never backs up after it shoots" bug). Feet left alone; just
+                // face the mob.
+            }
+            else if (d > closeThreshold)
             {
                 if (mg != CHASE_MOTION_TYPE)
                     bot->GetMotionMaster()->MoveChase(desired, holdRange);   // close to pull range
             }
             else if (!bot->IsInCombat())
             {
+                // In range but the opener hasn't connected yet — hold so the shot/
+                // ability actually fires and lands (an auto-repeat needs us still &
+                // in range). The instant it connects (IsInCombat) we back up below.
                 if (mg == CHASE_MOTION_TYPE)
-                    bot->GetMotionMaster()->Clear();   // in range — hold, let the pull land
-            }
-            else if (GetTankPullRetreat(tankLow, rx, ry, rz))
-            {
-                // Already backing out / parked at the chosen point — leave the feet
-                // alone (MovePoint completes and holds), just keep facing the mob.
+                    bot->GetMotionMaster()->Clear();
             }
             else
             {
-                // Pull connected. Step straight back from the pack ONCE — the
-                // ability already landed, so leaving its range no longer matters.
+                // Pull connected — step straight back from the pack immediately and
+                // STICK (retreatSet makes the branch above own the feet next tick).
                 float bx, by, bz;
                 desired->GetNearPoint(bot, bx, by, bz, bot->GetObjectSize(),
                     d + PULL_RETREAT_YDS, desired->GetAngle(bot));
