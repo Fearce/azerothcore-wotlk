@@ -107,6 +107,12 @@ namespace WowPsParty
     // 20y one from ~16y). The engagement layer uses this instead of a fixed range.
     float TankPullHoldRange(Player* bot);
 
+    // The distance a ranged DPS bot should hold its victim at so its WHOLE
+    // single-target kit is in range — the shortest offensive `cast:` in its
+    // rotation, clamped to [18, 28]y. AssistTarget uses it as the ranged hold cap
+    // so a bot doesn't park at 30y unable to use its shorter-range abilities.
+    float BotRangedCastHold(Player* bot);
+
     // Cache management. Called by PartyMgr when a bot logs in / loadout changes.
     void RotationCacheSet(uint32 guid, std::vector<RotationRule> rules);
     void RotationCacheClear(uint32 guid);

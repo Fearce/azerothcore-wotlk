@@ -46,6 +46,14 @@ namespace WowPsParty
     static std::unordered_map<uint32, std::vector<RotationRule>> g_rotationCache;
     static std::mutex g_rotationCacheMutex;
 
+    // Cache for BotRangedCastHold (guidLow -> (yards, ms)). Invalidated whenever
+    // the rotation cache is written/cleared (below) so a loadout change re-derives
+    // the hold immediately; that eviction also keeps it from growing unbounded.
+    // Lock order if both are held: g_rotationCacheMutex OUTER, g_rangedHoldMutex
+    // INNER (BotRangedCastHold only ever takes them one at a time, never nested).
+    static std::unordered_map<uint32, std::pair<float, uint32>> g_rangedHoldCache;
+    static std::mutex g_rangedHoldMutex;
+
     // ----- string helpers -----------------------------------------------------
 
     static std::string Trim(std::string s)
@@ -108,6 +116,15 @@ namespace WowPsParty
 
     // ----- cache --------------------------------------------------------------
 
+    // Drop the derived ranged-hold for a bot whose rotation just changed (or who
+    // logged out). Nested INSIDE g_rotationCacheMutex by the callers below — the
+    // documented lock order.
+    static void EvictRangedHold(uint32 guid)
+    {
+        std::lock_guard<std::mutex> lock(g_rangedHoldMutex);
+        g_rangedHoldCache.erase(guid);
+    }
+
     void RotationCacheSet(uint32 guid, std::vector<RotationRule> rules)
     {
         std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
@@ -115,12 +132,14 @@ namespace WowPsParty
             g_rotationCache.erase(guid);
         else
             g_rotationCache[guid] = std::move(rules);
+        EvictRangedHold(guid);
     }
 
     void RotationCacheClear(uint32 guid)
     {
         std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
         g_rotationCache.erase(guid);
+        EvictRangedHold(guid);
     }
 
     // Defined further down; forward-declared so BotIsKiting uses the SAME
@@ -1320,6 +1339,60 @@ namespace WowPsParty
             if (uint32 id = FindKnownSpellByName(bot, n))
                 return id;
         return 0;
+    }
+
+    // The distance a ranged bot should hold at so its WHOLE single-target damage
+    // kit is in range — the shortest-range offensive `cast:` in its rotation, sat
+    // a couple yards inside, clamped to a sane ranged band. Without this the
+    // engagement layer parked the bot anywhere up to 30y, so a caster idling at
+    // ~28y could fire only its 30y filler and never closed to use a shorter nuke
+    // ("ranged attackers don't get closer to cast an out-of-range ability"). 18y
+    // floor so it never hugs the mob; 28y ceiling so a pure-30y kit still stands
+    // back. Default 28 when the rotation has no ranged cast (or isn't cached yet).
+    float BotRangedCastHold(Player* bot)
+    {
+        if (!bot) return 28.0f;
+        uint32 const low = bot->GetGUID().GetCounter();
+        uint32 const now = getMSTime();
+        {
+            std::lock_guard<std::mutex> lock(g_rangedHoldMutex);
+            auto it = g_rangedHoldCache.find(low);
+            if (it != g_rangedHoldCache.end() && now - it->second.second < 10000)
+                return it->second.first;
+        }
+
+        // Pull the offensive cast spell names out under the rotation lock, then do
+        // the (lock-free) spell lookups so we don't hold g_rotationCacheMutex long.
+        std::vector<std::string> names;
+        {
+            std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
+            auto it = g_rotationCache.find(low);
+            if (it != g_rotationCache.end())
+                for (RotationRule const& r : it->second)
+                    if (r.action.rfind("cast:", 0) == 0)   // plain offensive cast, NOT cast_self/_party/_pet
+                        names.push_back(r.action.substr(5));
+        }
+
+        float minRange = 0.0f;
+        for (std::string const& name : names)
+        {
+            uint32 const id = FindKnownSpellByName(bot, name);
+            if (!id) continue;
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(id);
+            if (!si) continue;
+            float const mr = si->GetMaxRange(false, bot);
+            if (mr <= 6.0f) continue;   // a melee ability in the list — irrelevant to ranged hold
+            if (minRange == 0.0f || mr < minRange) minRange = mr;
+        }
+
+        float hold = (minRange <= 0.0f) ? 28.0f : (minRange - 2.0f);
+        if (hold < 18.0f) hold = 18.0f;
+        if (hold > 28.0f) hold = 28.0f;
+        {
+            std::lock_guard<std::mutex> lock(g_rangedHoldMutex);
+            g_rangedHoldCache[low] = { hold, now };
+        }
+        return hold;
     }
 
     // Stand-off the tank holds at to fire its opener: a few yards inside the pull

@@ -1454,11 +1454,15 @@ namespace WowPsParty
             // face the bot the target point moves and the bot chases it forever:
             // the "spazz on the same spot". So: no angle, and DON'T MOVE when
             // already in a safe firing position.
-            //   < 8y        too close -> back straight out to ~18y
-            //   8..30y +LoS SAFE      -> stand still and shoot (no movement)
-            //   > 30y / noLoS         -> close in (plain chase, no angle), once
+            //   < 8y          too close -> back straight out to ~18y
+            //   8..hold +LoS  SAFE      -> stand still and shoot (no movement)
+            //   > hold / noLoS          -> close in (plain chase, no angle), once
+            // `hold` is per-bot: the shortest-range nuke in its rotation (clamped
+            // 18..28y) so it positions where its WHOLE kit reaches, not at a flat
+            // 30y where only the longest spell is usable.
             float const d   = bot->GetDistance(desired);
             bool  const los = bot->IsWithinLOSInMap(desired);
+            float const hold = WowPsParty::BotRangedCastHold(bot);
 
             if (d < 8.0f)
             {
@@ -1503,7 +1507,7 @@ namespace WowPsParty
                 return;
             }
 
-            if (d <= 30.0f && los)
+            if (d <= hold && los)
             {
                 // SAFE — the user's "don't move when it can ranged attack". Kill
                 // any leftover movement ONCE (so Auto Shot can fire), then leave
@@ -1533,10 +1537,12 @@ namespace WowPsParty
 
             // Out of range or no line of sight -> close in. Plain chase (no angle
             // = no orbit). Install once; a running chase keeps maintaining range.
+            // Upper bound = the per-bot hold, so the bot settles INSIDE its kit's
+            // reach (not back at 25y where a shorter nuke is still out of range).
             if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
                 bot->Attack(desired, false);   // chasing back to range — stop meleeing, resume shots
             if (mg != CHASE_MOTION_TYPE)
-                bot->GetMotionMaster()->MoveChase(desired, ChaseRange(15.0f, 25.0f));
+                bot->GetMotionMaster()->MoveChase(desired, ChaseRange(15.0f, hold));
             bot->SetFacingToObject(desired);
             return;
         }
