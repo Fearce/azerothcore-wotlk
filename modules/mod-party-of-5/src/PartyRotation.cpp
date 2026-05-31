@@ -175,6 +175,11 @@ namespace WowPsParty
     // but server-side so every bot sharing a target reuses the same samples.
     struct TtdSample { uint32 timeMs; uint64 health; };
     static std::unordered_map<uint64, std::deque<TtdSample>> g_ttdSamples;
+
+    // Last non-OK SpellCastResult per bot (low GUID), set by faceAndCast — so the
+    // "NO RULE FIRED" diagnostic can name WHY the last cast bailed (e.g. NO_AMMO).
+    static std::unordered_map<uint32, uint32> g_lastCastFail;
+    static std::mutex g_lastCastFailMutex;
     static std::mutex g_ttdMutex;
     static uint32 g_ttdLastSweepMs = 0;
 
@@ -1616,6 +1621,10 @@ namespace WowPsParty
             lastCastResult = r;
             if (r != SPELL_CAST_OK)
             {
+                {
+                    std::lock_guard<std::mutex> lk(g_lastCastFailMutex);
+                    g_lastCastFail[bot->GetGUID().GetCounter()] = uint32(r);
+                }
                 // Throttle per (bot, spell) — a cast that keeps failing must not
                 // flood the log every tick.
                 static thread_local std::unordered_map<uint64, uint32> failLogMs;
@@ -2640,16 +2649,24 @@ namespace WowPsParty
             {
                 last = nowMs;
                 Unit* const v = bot->GetVictim();
+                uint32 const ammoId = bot->GetUInt32Value(PLAYER_AMMO_ID);
+                uint32 lastFail = 0;
+                {
+                    std::lock_guard<std::mutex> lk(g_lastCastFailMutex);
+                    auto it = g_lastCastFail.find(bot->GetGUID().GetCounter());
+                    if (it != g_lastCastFail.end()) lastFail = it->second;
+                }
                 LOG_INFO("module",
                     "[WowPsParty Rotation] {} NO RULE FIRED (in combat): victim={} dist={:.1f} "
-                    "mana={}/{} ammo={} moving={} melee={}",
+                    "mana={}/{} ammoId={} ammoCount={} moving={} melee={} lastCastResult={}",
                     bot->GetName(),
                     v ? v->GetGUID().GetCounter() : 0u,
                     v ? bot->GetDistance(v) : -1.0f,
                     bot->GetPower(POWER_MANA), bot->GetMaxPower(POWER_MANA),
-                    bot->GetUInt32Value(PLAYER_AMMO_ID),
+                    ammoId, ammoId ? bot->GetItemCount(ammoId) : 0u,
                     bot->isMoving() ? 1 : 0,
-                    bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING) ? 1 : 0);
+                    bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING) ? 1 : 0,
+                    lastFail);
             }
         }
         return false;

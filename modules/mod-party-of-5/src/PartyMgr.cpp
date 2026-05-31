@@ -878,12 +878,26 @@ namespace WowPsParty
         uint32 entry = bot->GetUInt32Value(PLAYER_AMMO_ID);
         if (entry)
         {
-            // Already has ammo set — leave it unless it's running low.
-            uint32 const have = bot->GetItemCount(entry);
-            if (have >= REFILL_BELOW) return;
-            GiveItem(bot, entry, REFILL_TO - have);
-            bot->SetAmmo(entry);
-            return;
+            // RE-VALIDATE against the CURRENT weapon. A hunter that swapped
+            // bow<->gun keeps its old ammo selected (e.g. arrows on a gun), and
+            // the old code just topped that stale ammo up forever — every shot
+            // then failed NO_AMMO while Hunter's Mark (no ammo) still worked
+            // ("hunter only auto-attacks, shots exec_fail"). If the set ammo is
+            // the wrong subclass or the weapon can't use it, drop it and re-pick.
+            ItemTemplate const* at = sObjectMgr->GetItemTemplate(entry);
+            bool const usable = at && at->Class == ITEM_CLASS_PROJECTILE
+                && at->SubClass == subClass
+                && bot->CanUseAmmo(entry) == EQUIP_ERR_OK;
+            if (usable)
+            {
+                // Right ammo — top up only if running low.
+                uint32 const have = bot->GetItemCount(entry);
+                if (have >= REFILL_BELOW) return;
+                GiveItem(bot, entry, REFILL_TO - have);
+                bot->SetAmmo(entry);
+                return;
+            }
+            entry = 0;   // stale/mismatched — fall through to pick the right ammo
         }
 
         // No ammo set — pick the first level/type-appropriate ammo the bot can
