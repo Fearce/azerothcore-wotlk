@@ -1416,6 +1416,37 @@ namespace WowPsParty
                 return true;
             }
 
+            // Universal dead->alive scrub. ResurrectPlayer / ResurectUsingRequestData
+            // leave stale death-state motion on the MotionMaster; without a clean
+            // slate MoveFollow can't drive the revived bot and the catch-up-teleport
+            // stuck-detector pops it every few yards ("only teleports after a wipe").
+            // The auto-accept and `.party rez` already scrub, but a dungeon wipe can
+            // revive bots by a path that hits NEITHER (spirit healer at the graveyard,
+            // resurrect-at-corpse, a battle-rez we didn't auto-accept). Catch the
+            // dead->alive EDGE here so every revive path gets the same clean slate.
+            {
+                static thread_local std::unordered_map<uint32, bool> wasAlive;
+                uint32 const gl = d.followerGuid.GetCounter();
+                bool const nowAlive = follower->IsAlive();
+                auto it = wasAlive.find(gl);
+                // First sight: assume no transition (don't scrub a bot that was
+                // alive all along — only a genuine dead->alive edge matters).
+                bool const prevAlive = (it == wasAlive.end()) ? nowAlive : it->second;
+                wasAlive[gl] = nowAlive;
+                if (nowAlive && !prevAlive)
+                {
+                    follower->GetMotionMaster()->Clear();
+                    follower->GetMotionMaster()->MoveIdle();
+                    follower->StopMoving();
+                    if (follower->getStandState() != UNIT_STAND_STATE_STAND)
+                        follower->SetStandState(UNIT_STAND_STATE_STAND);
+                    LOG_INFO("module",
+                        "[WowPsParty Follow] {} revived — scrubbed death-state motion",
+                        follower->GetName());
+                    return true;   // one clean settle tick; MoveFollow re-asserts next tick
+                }
+            }
+
             // Cross-map: leader has entered a dungeon (or any other instance)
             // and the follower is still on the old map. Yank the follower
             // through with TeleportTo. Skip while the follower is mid-cast or
