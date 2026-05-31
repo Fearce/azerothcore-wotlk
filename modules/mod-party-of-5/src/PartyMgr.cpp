@@ -315,10 +315,14 @@ namespace WowPsParty
                     add("enemies_in_melee>2&target_missing_aura:Demoralizing Shout", "cast:Demoralizing Shout", 58);
                     add("has_target", "cast:Devastate", 52);
                     add("has_target", "cast:Sunder Armor", 44);
-                    // Ranged pull + threat filler: 30y, instant. Low priority so
-                    // in melee the strikes above win, but when the tank is holding
-                    // at throwing range (lead-tank pull) every melee rule is out of
-                    // range and the rotation falls through to this to pull the mob.
+                    // Ranged pull, preferred order. A fresh tank has ~0 rage, so
+                    // open with the FREE ranged weapon if one's equipped (gun/bow/
+                    // crossbow/thrown → `shoot`) — gated out_of_combat so it's the
+                    // pull opener, not an in-combat filler that'd cost melee uptime.
+                    // Heroic Throw (also free, 30y, but a 1-min cooldown) is the
+                    // fallback when there's no ranged weapon AND doubles as the
+                    // in-combat ranged threat filler while the pack closes.
+                    add("out_of_combat&has_target", "shoot", 43);
                     add("has_target", "cast:Heroic Throw", 42);
                     add("self_rage>45", "cast:Heroic Strike", 30);
                 }

@@ -50,6 +50,11 @@
  *     cast_loose_enemy / drink / eat / hold_position
  *     use_item:<item name>         use a consumable/trinket from shared bags
  *     pull:<spell name>            ranged opener (Throw/Shoot) for the tank
+ *     shoot                        fire the equipped physical ranged weapon
+ *                                  (gun/bow/crossbow = Shoot, thrown = Throw) —
+ *                                  free, no rage/mana; pair with out_of_combat
+ *                                  for a ranged-weapon pull opener
+ *     wand                         fire the equipped wand (free caster filler)
  *  Ground-targeted AoE spells (Blizzard, Flamestrike, Rain of Fire) used via
  *  cast:<spell> auto-aim at the densest enemy cluster, not the current target.
  *
@@ -69,6 +74,7 @@
 #include <vector>
 
 class Player;
+class Unit;
 
 namespace WowPsParty
 {
@@ -101,6 +107,13 @@ namespace WowPsParty
     // Icy Touch, Faerie Fire, ...), or 0. Lets the engagement layer hold an
     // ability-only tank (no ranged weapon) at range instead of charging in.
     uint32 TankRangedPullSpell(Player* bot);
+
+    // Fire the bot's equipped physical ranged weapon at `target` (gun/bow/crossbow
+    // = Shoot 3018 auto-repeat, thrown = Throw 2764). Free (no rage/mana) — the
+    // reliable pull opener for a fresh tank with ~0 rage. False if no physical
+    // ranged weapon / out of range / rejected (e.g. no ammo), so the caller can
+    // fall back to an ability. Used by the `shoot` verb and the lead-tank pull.
+    bool FireRangedWeaponShot(Player* bot, Unit* target);
 
     // The stand-off distance the lead tank should hold at to fire its opener,
     // derived from that opener's actual range (so a 30y ability pulls from ~26y, a

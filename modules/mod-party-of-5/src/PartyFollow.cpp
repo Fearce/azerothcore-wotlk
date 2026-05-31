@@ -1358,6 +1358,16 @@ namespace WowPsParty
                 bot->Attack(desired, true);
             }
 
+            // Open the pull with the FREE physical ranged weapon if one's equipped
+            // (gun/bow/crossbow/thrown). A fresh tank has ~0 rage, so relying on a
+            // rage-gated ability (or a cooldown'd Heroic Throw) can fail the pull
+            // outright; the ranged weapon never can. Self-guards on weapon/range/
+            // ammo and no-ops otherwise, so a paladin/DK/druid (no physical ranged
+            // weapon) just falls through to its rotation's ability opener. Runs
+            // each tick so it fires the instant we're in range, and the auto-repeat
+            // sustains while the pack closes.
+            WowPsParty::FireRangedWeaponShot(bot, desired);
+
             float const d = bot->GetDistance(desired);
             uint32 const tankLow = bot->GetGUID().GetCounter();
             // Rolling refresh (NOT a one-shot extend — each tick re-arms a fresh

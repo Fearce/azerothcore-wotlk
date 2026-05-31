@@ -1417,6 +1417,46 @@ namespace WowPsParty
         return hold;
     }
 
+    // Fire the bot's equipped PHYSICAL ranged weapon at `target`: gun/bow/crossbow
+    // → "Shoot" (3018, auto-repeat); thrown → "Throw" (2764, single). Free (no
+    // rage/mana), so it's a reliable pull opener for a fresh tank with ~0 rage.
+    // Returns false (caller falls back to an ability) when there's no physical
+    // ranged weapon, it's out of range/LoS, or the cast is rejected (e.g. no ammo
+    // for a gun/bow). Shared by the `shoot` rotation verb and the lead-tank pull.
+    bool FireRangedWeaponShot(Player* bot, Unit* target)
+    {
+        if (!bot || !target || !target->IsAlive()) return false;
+        Item* const ranged = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+        if (!ranged) return false;
+        uint32 shootSpell = 0;
+        bool   autoRepeat = false;
+        switch (ranged->GetTemplate()->SubClass)
+        {
+            case ITEM_SUBCLASS_WEAPON_BOW:
+            case ITEM_SUBCLASS_WEAPON_GUN:
+            case ITEM_SUBCLASS_WEAPON_CROSSBOW: shootSpell = 3018; autoRepeat = true; break;
+            case ITEM_SUBCLASS_WEAPON_THROWN:   shootSpell = 2764; break;
+            default: return false;   // wand (use the `wand` verb) or nothing
+        }
+        // Guns/bows/crossbows need ammo loaded; bail BEFORE the cast (matches the
+        // hunter Auto Shot helper) so a no-ammo tank falls back to its ability
+        // instead of attempting — and failing — the shot every tick. Thrown
+        // weapons are their own ammo, so they skip this.
+        if (autoRepeat && bot->GetUInt32Value(PLAYER_AMMO_ID) == 0) return false;
+        if (bot->GetDistance(target) > 30.0f) return false;
+        if (!bot->IsWithinLOSInMap(target)) return false;
+        if (autoRepeat)
+            if (Spell* repeat = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+            {
+                if (repeat->m_targets.GetUnitTarget() == target)
+                    return true;                          // already shooting this mob
+                bot->InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
+                return false;                             // wrong target — restart next tick
+            }
+        bot->SetFacingToObject(target);   // ranged attack fails NOT_INFRONT otherwise
+        return bot->CastSpell(target, shootSpell, false) == SPELL_CAST_OK;
+    }
+
     // Lowercase a class name for case-insensitive matching in the
     // class-filter list.
     static std::string Lower(std::string s)
@@ -2394,6 +2434,16 @@ namespace WowPsParty
             bot->SetFacingToObject(v);   // auto-repeat fails NOT_INFRONT otherwise
             return bot->CastSpell(v, 5019, false) == SPELL_CAST_OK;
         }
+
+        // "shoot" — fire the equipped PHYSICAL ranged weapon: a gun/bow/crossbow
+        // uses "Shoot" (3018, an auto-repeat like the wand); a thrown weapon uses
+        // "Throw" (2764, a single hit). Free — no rage/mana — so a warrior/rogue
+        // tank OPENS a pull with its ranged weapon instead of a rage-gated ability
+        // it may have no rage for. Returns false when there's no physical ranged
+        // weapon (or no ammo / out of range), so an ability fallback (Heroic Throw)
+        // still runs. Pair with `out_of_combat` to make it the pull opener.
+        if (verb == "shoot")
+            return FireRangedWeaponShot(bot, bot->GetVictim());
 
         // "keep_distance_enemy:N" — kite. When the target is closer than N yards,
         // hop straight away to N+4 and return true. As the LOWEST-priority rule it
