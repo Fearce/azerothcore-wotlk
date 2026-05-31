@@ -130,6 +130,13 @@ namespace WowPsParty
     void HoldFollower(ObjectGuid followerGuid, uint32 durationMs);
     bool IsFollowerHeld(ObjectGuid followerGuid);
 
+    // Force a freshly-revived / stuck bot back into a movable state. A bot has
+    // no game client to round-trip the unroot, so a movement-blocking unit-
+    // state (UNIT_STATE_NOT_MOVE bits / MOVEMENTFLAG_ROOT) can survive a revive
+    // and freeze the Follow/Chase MovementGenerators. Call after any revive or
+    // when a bot is detected frozen. Safe only out of combat (no legit CC).
+    void ForceMovableState(Player* p);
+
     // Out-of-combat gathering. If `bot` is one of the player's alts (not a
     // henchman) and was trained in Mining or Herbalism, harvest a nearby node
     // (within 30y, within the bot's skill) while travelling with the party,

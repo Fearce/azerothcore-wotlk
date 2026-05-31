@@ -8,6 +8,7 @@
  */
 
 #include "PartyMgr.h"
+#include "PartyFollow.h"
 #include "PartyRotation.h"
 #include "PartyTestRunner.h"
 
@@ -506,6 +507,7 @@ public:
             {
                 p->SpawnCorpseBones();
                 p->ResurrectPlayer(1.0f);
+                WowPsParty::ForceMovableState(p);
             }
             p->SetFullHealth();
             if (p->getPowerType() == POWER_MANA)
@@ -811,12 +813,12 @@ public:
             p->SetFullHealth();
             if (p->getPowerType() == POWER_MANA)
                 p->SetPower(POWER_MANA, p->GetMaxPower(POWER_MANA));
-            // ResurrectPlayer doesn't tear down whatever death-state
-            // motion was left on the MotionMaster. Without a clean slate
-            // here, MoveFollow can't actually drive the bot — they just
-            // sit still and the catch-up-teleport stuck-detector pops
-            // them every few seconds (= the "teleport every 5 yards"
-            // pattern Kevin reported).
+            // ResurrectPlayer leaves death-state motion on the MotionMaster AND
+            // a movement-blocking unit-state the bot's missing client never
+            // clears — without both being torn down, MoveFollow can't drive the
+            // bot: they sit still and the catch-up-teleport pops them every few
+            // seconds (the "teleport every 5 yards" pattern Kevin reported).
+            WowPsParty::ForceMovableState(p);
             p->GetMotionMaster()->Clear();
             p->GetMotionMaster()->MoveIdle();
             p->StopMoving();

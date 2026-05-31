@@ -1804,6 +1804,25 @@ namespace WowPsParty
         // rotation drags the bot into melee and it never settles to shoot ("only
         // auto-attacks, everything NO_MATCHes"). Offensive casts just fall through
         // and let AssistTarget reposition.
+        // Throttled diagnostic for the friendly buff/rez approach path: names
+        // which branch decided NOT to walk in, so a "bots don't move to
+        // buff/rez" report can be pinned without guessing. At most one line per
+        // (bot,spell) every 3 s.
+        auto logFriendly = [bot](uint32 spellId, Unit* target, char const* what,
+                                 uint32 detail = 0) {
+            static thread_local std::unordered_map<uint64, uint32> lastMs;
+            uint64 const key = (uint64(bot->GetGUID().GetCounter()) << 32) | spellId;
+            uint32 const now = getMSTime();
+            uint32& last = lastMs[key];
+            if (now - last <= 3000) return;
+            last = now;
+            LOG_INFO("module",
+                "[WowPsParty Rotation] {} friendly-cast spell={} target={} dist={:.1f}: {} (result={})",
+                bot->GetName(), spellId,
+                target ? target->GetGUID().GetCounter() : 0u,
+                target ? bot->GetDistance(target) : -1.0f, what, detail);
+        };
+
         auto castOrApproach = [&](Unit* target, uint32 spellId,
                                   bool friendlyApproach = false) -> bool
         {
@@ -1817,20 +1836,33 @@ namespace WowPsParty
                 // "walk in and retry". Non-positional (immune, already has a better
                 // aura, ...) falls through so we don't chase pointlessly.
                 if (friendlyApproach)
+                {
                     switch (lastCastResult)
                     {
                         case SPELL_FAILED_OUT_OF_RANGE:
                         case SPELL_FAILED_LINE_OF_SIGHT:
                         case SPELL_FAILED_UNIT_NOT_INFRONT:
                         case SPELL_FAILED_TOO_CLOSE:
+                            logFriendly(spellId, target, "server reject -> approaching",
+                                        uint32(lastCastResult));
                             return repositionToCast(target, spellId);
                         default:
+                            logFriendly(spellId, target,
+                                        "cast failed, not positional -> giving up",
+                                        uint32(lastCastResult));
                             break;
                     }
+                }
                 return false;
             }
             if (castBlock == CastBlock::Position)
+            {
+                if (friendlyApproach)
+                    logFriendly(spellId, target, "pre-check out of range/LoS -> approaching");
                 return repositionToCast(target, spellId);
+            }
+            if (friendlyApproach)
+                logFriendly(spellId, target, "hard block (cooldown/power/stance) -> not casting");
             return false;
         };
 

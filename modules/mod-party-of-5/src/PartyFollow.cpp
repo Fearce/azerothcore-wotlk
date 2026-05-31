@@ -418,6 +418,33 @@ namespace WowPsParty
         return true;
     }
 
+    // Force a freshly-revived / stuck bot back into a MOVABLE state.
+    //
+    // Root/stun/etc. live in two places: the unit-state mask (m_state, gated by
+    // the Follow/Chase MovementGenerators via UNIT_STATE_NOT_MOVE) and the
+    // movement-info flags (MOVEMENTFLAG_ROOT). A HUMAN player clears these on
+    // revive because the server round-trips the unroot through their game
+    // client; a BOT has no client (GetClientControlling() == nullptr), so a
+    // movement-blocking state can survive death->revive and silently freeze the
+    // generators — the bot then stands still and the catch-up teleport pops it
+    // every few seconds ("teleport around after a wipe"), and a revived healer
+    // can't walk to buff/rez anyone ("doesn't move to friendly targets").
+    // Clearing is safe here: callers run OUT OF COMBAT (revive edge, or the
+    // follow ticker which has already returned if IsInCombat), so no legitimate
+    // CC is active and death already stripped every aura.
+    void ForceMovableState(Player* p)
+    {
+        if (!p) return;
+        // The MovementGenerators gate only on the unit-state mask (m_state, via
+        // UNIT_STATE_NOT_MOVE) and the movement-info flags (MOVEMENTFLAG_ROOT).
+        // Clearing both directly is all a clientless bot needs to move again;
+        // SetRooted() (protected) would only re-send a packet no bot client
+        // reads. Auras were stripped on death, so nothing re-applies these.
+        p->ClearUnitState(UNIT_STATE_ROOT | UNIT_STATE_STUNNED | UNIT_STATE_DIED
+                          | UNIT_STATE_DISTRACTED | UNIT_STATE_NO_COMBAT_MOVEMENT);
+        p->RemoveUnitMovementFlag(MOVEMENTFLAG_ROOT);
+    }
+
     // followerGuidLow -> ms until which the bot is actively leading the
     // dungeon path. Distinct from HoldFollower (which TankFollowPath also
     // honours, so it can't hold itself): this signal is read ONLY by the
@@ -1422,6 +1449,7 @@ namespace WowPsParty
             if (!follower->IsAlive() && follower->isResurrectRequested())
             {
                 follower->ResurectUsingRequestData();
+                ForceMovableState(follower);
                 follower->GetMotionMaster()->Clear();
                 follower->GetMotionMaster()->MoveIdle();
                 follower->StopMoving();
@@ -1450,14 +1478,17 @@ namespace WowPsParty
                 wasAlive[gl] = nowAlive;
                 if (nowAlive && !prevAlive)
                 {
+                    uint32 const ustate = follower->GetUnitState();
+                    ForceMovableState(follower);
                     follower->GetMotionMaster()->Clear();
                     follower->GetMotionMaster()->MoveIdle();
                     follower->StopMoving();
                     if (follower->getStandState() != UNIT_STAND_STATE_STAND)
                         follower->SetStandState(UNIT_STAND_STATE_STAND);
                     LOG_INFO("module",
-                        "[WowPsParty Follow] {} revived — scrubbed death-state motion",
-                        follower->GetName());
+                        "[WowPsParty Follow] {} revived — scrubbed death-state motion "
+                        "(unitState was {:#x}, moveFlags {:#x})",
+                        follower->GetName(), ustate, follower->GetUnitMovementFlags());
                     return true;   // one clean settle tick; MoveFollow re-asserts next tick
                 }
             }
@@ -1662,19 +1693,30 @@ namespace WowPsParty
             s.y = follower->GetPositionY();
             if (dist > 8.0f && movedSelf < 1.0f) ++s.idle;
             else                                  s.idle = 0;
-            bool const farAway    = dist > 50.0f;
-            bool const stuckClose = s.idle >= 3;   // far + not moving for 3 ticks
-            if (farAway || stuckClose)
+            // Genuine long-distance gaps are already handled above (the >50y
+            // leash re-walks, >100y snaps), so by here dist <= 50: a "stuck" bot
+            // is idle-frozen, NOT far. Such a freeze is almost always a
+            // movement-blocking state the bot's missing client never cleared
+            // (post-revive root/etc.), so don't yank it to the leader — log what
+            // was set, force a movable slate, and re-assert MoveFollow IN PLACE
+            // so it walks from where it stands.
+            bool const stuckClose = s.idle >= 3;   // not moving for 3 ticks while >8y out
+            if (stuckClose)
             {
                 if (follower->IsBeingTeleported())  return true;
                 if (follower->IsNonMeleeSpellCast(false, false, true)) return true;
-                follower->TeleportTo(
-                    leader->GetMapId(),
-                    leader->GetPositionX(), leader->GetPositionY(),
-                    leader->GetPositionZ(), leader->GetOrientation());
+
+                uint32 const ustate = follower->GetUnitState();
+                ForceMovableState(follower);
+                follower->StopMoving();
+                follower->GetMotionMaster()->Clear();
+                follower->GetMotionMaster()->MoveFollow(
+                    leader, PET_FOLLOW_DIST, follower->GetFollowAngle());
                 LOG_INFO("module",
-                    "[WowPsParty Follow] catch-up teleport: {} dist={:.1f} idle_ticks={}",
-                    follower->GetName(), dist, s.idle);
+                    "[WowPsParty Follow] unstick-in-place: {} dist={:.1f} idle={} "
+                    "unitState={:#x} moveFlags={:#x}",
+                    follower->GetName(), dist, s.idle, ustate,
+                    follower->GetUnitMovementFlags());
                 s = StuckSample{};
                 return true;
             }
