@@ -1065,83 +1065,86 @@ namespace WowPsParty
             return;
         }
 
-        // Ranged dead-zone guard. AC's ChaseMovementGenerator::PositionOkay only
-        // checks the MAX range — it never enforces a minimum — so a hunter/caster
-        // dragged into melee just sits there, every shot failing TOO_CLOSE and
-        // the chase never pushing it back out ("shoots once then runs close and
-        // does nothing"). Detect too-close and MovePoint straight out to firing
-        // range; only hand back to the chase once we're clear. Re-issued only
-        // when not already walking the point, so it doesn't stutter.
-        {
-            uint8 const rcls = bot->getClass();
-            bool const ranged = rcls == CLASS_MAGE || rcls == CLASS_WARLOCK
-                || rcls == CLASS_PRIEST || rcls == CLASS_HUNTER
-                || rcls == CLASS_SHAMAN || rcls == CLASS_DRUID;
-            if (ranged && bot->IsWithinDistInMap(desired, 9.0f))
-            {
-                if (bot->GetVictim() != desired)
-                {
-                    MarkRetarget(gLow, nowMs);
-                    bot->Attack(desired, false);   // ranged: don't run into melee
-                }
-                if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType()
-                        != POINT_MOTION_TYPE)
-                {
-                    float bx, by, bz;
-                    desired->GetNearPoint(bot, bx, by, bz, 0.0f, 16.0f,
-                                          desired->GetAngle(bot));
-                    bot->GetMotionMaster()->MovePoint(0, bx, by, bz);
-                }
-                bot->SetFacingToObject(desired);
-                AssistLog(gLow, "ranged dead-zone: backing out to firing range");
-                return;
-            }
-        }
+        // ===== Engage + position ============================================
+        // Single source of truth for combat movement (one mover, no clashes).
+        uint8 const acls = bot->getClass();
+        bool const rangedCaster =
+            acls == CLASS_MAGE   || acls == CLASS_WARLOCK || acls == CLASS_PRIEST ||
+            acls == CLASS_HUNTER || acls == CLASS_SHAMAN  || acls == CLASS_DRUID;
 
-        // Install the correct chase: ranged casters hold at distance so they
-        // don't run into melee and clip their own cast bar; melee close in.
-        auto installChase = [&]()
-        {
-            uint8 const cls = bot->getClass();
-            bool const isRangedCaster =
-                cls == CLASS_MAGE     || cls == CLASS_WARLOCK ||
-                cls == CLASS_PRIEST   || cls == CLASS_HUNTER  ||
-                cls == CLASS_SHAMAN   || cls == CLASS_DRUID;
-            // Distinct bearing per companion so melee SURROUND the mob and
-            // ranged fan out, instead of every bot stacking on one point.
-            int const fi = FormationIndexFor(bot->GetGUID(), GetLeaderFor(bot->GetGUID()));
-            float const chaseAngle = float(fi) * (2.0f * float(M_PI) / 5.0f);
-            if (isRangedCaster)
-                bot->GetMotionMaster()->MoveChase(desired, ChaseRange(15.0f, 25.0f), ChaseAngle(chaseAngle));
-            else
-                bot->GetMotionMaster()->MoveChase(desired, {}, ChaseAngle(chaseAngle));
-            bot->SetFacingToObject(desired);
-            return isRangedCaster;
-        };
-
-        if (bot->GetVictim() != desired)
+        // Make sure the victim is set (drives auto-attack / has_target). Melee
+        // gets a melee swing; ranged does NOT (it must never run into melee).
+        bool const newVictim = bot->GetVictim() != desired;
+        if (newVictim)
         {
             MarkRetarget(gLow, nowMs);
-            bool const ok = bot->Attack(desired, true);
-            bool const ranged = installChase();
-            LOG_INFO("module", "[WowPsParty Assist] guid={} ENGAGE victim_guid={} attack_ok={} ranged={}",
-                     gLow, desired->GetGUID().GetCounter(), ok, ranged ? 1 : 0);
+            bot->Attack(desired, !rangedCaster);
+            LOG_INFO("module", "[WowPsParty Assist] guid={} ENGAGE victim_guid={} ranged={}",
+                     gLow, desired->GetGUID().GetCounter(), rangedCaster ? 1 : 0);
         }
-        else
+
+        MovementGeneratorType const mg =
+            bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
+
+        if (rangedCaster)
         {
-            // Already on the right victim. If our active movement isn't a chase
-            // — e.g. the tank's path-lead MovePoint was still running when the
-            // mob aggroed — (re)install the chase so we actually walk to the mob
-            // instead of finishing the recorded route. Otherwise just keep
-            // facing it so the next cast/swing lands.
-            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
+            // RANGED bands (AC's chase never enforces a MIN range, and ChaseAngle
+            // ORBITS — it's relative to the mob's facing, so as the mob turns to
+            // face the bot the target point moves and the bot chases it forever:
+            // the "spazz on the same spot". So: no angle, and DON'T MOVE when
+            // already in a safe firing position.
+            //   < 8y        too close -> back straight out to ~18y
+            //   8..30y +LoS SAFE      -> stand still and shoot (no movement)
+            //   > 30y / noLoS         -> close in (plain chase, no angle), once
+            float const d   = bot->GetDistance(desired);
+            bool  const los = bot->IsWithinLOSInMap(desired);
+
+            if (d < 8.0f)
             {
-                installChase();
-                AssistLog(gLow, "re-chase: stale movement (route?) replaced");
-            }
-            else if (!bot->HasInArc(float(M_PI), desired))
+                if (mg != POINT_MOTION_TYPE)
+                {
+                    float bx, by, bz;
+                    desired->GetNearPoint(bot, bx, by, bz, 0.0f, 18.0f, desired->GetAngle(bot));
+                    bot->GetMotionMaster()->MovePoint(0, bx, by, bz);
+                    AssistLog(gLow, "ranged: too close, backing out to firing range");
+                }
                 bot->SetFacingToObject(desired);
+                return;
+            }
+
+            if (d <= 30.0f && los)
+            {
+                // SAFE — the user's "don't move when it can ranged attack". Kill
+                // any leftover movement ONCE (so Auto Shot can fire), then leave
+                // the feet completely alone; just keep facing the target.
+                if (mg != IDLE_MOTION_TYPE)
+                {
+                    bot->StopMoving();
+                    bot->GetMotionMaster()->Clear();
+                    bot->GetMotionMaster()->MoveIdle();
+                    AssistLog(gLow, "ranged: in firing range — holding position");
+                }
+                if (!bot->HasInArc(float(M_PI), desired))
+                    bot->SetFacingToObject(desired);
+                return;
+            }
+
+            // Out of range or no line of sight -> close in. Plain chase (no angle
+            // = no orbit). Install once; a running chase keeps maintaining range.
+            if (mg != CHASE_MOTION_TYPE)
+                bot->GetMotionMaster()->MoveChase(desired, ChaseRange(15.0f, 25.0f));
+            bot->SetFacingToObject(desired);
+            return;
         }
+
+        // MELEE — close to contact, fanned out by formation angle so the melee
+        // companions surround the mob (orbiting is fine when you're in contact).
+        int const fi = FormationIndexFor(bot->GetGUID(), GetLeaderFor(bot->GetGUID()));
+        float const chaseAngle = float(fi) * (2.0f * float(M_PI) / 5.0f);
+        if (newVictim || mg != CHASE_MOTION_TYPE)
+            bot->GetMotionMaster()->MoveChase(desired, {}, ChaseAngle(chaseAngle));
+        else if (!bot->HasInArc(float(M_PI), desired))
+            bot->SetFacingToObject(desired);
     }
 
     void ClearFollowersForAccount(uint32 account)

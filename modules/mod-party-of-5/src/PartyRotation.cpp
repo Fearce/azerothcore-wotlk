@@ -2151,6 +2151,37 @@ namespace WowPsParty
         return true;
     }
 
+    // Re-summon a hunter's saved pet. Our bots hard-return out of mod-playerbots'
+    // UpdateAI, so its pet-resummon never runs — and the client request that
+    // normally summons a player's pet on login never comes for a bot. So a hunter
+    // bot fights petless unless we resummon it ourselves. Mirrors the factory:
+    // pull the saved pet (current → unslotted hunter pet → first stabled) by its
+    // PetNumber and LoadPetFromDB. Out of combat only; throttled.
+    static void EnsureHunterPet(Player* bot)
+    {
+        if (bot->getClass() != CLASS_HUNTER) return;
+        if (bot->IsInCombat() || bot->GetPet() || bot->IsMounted()) return;
+        if (bot->IsNonMeleeSpellCast(false, false, true)) return;
+
+        static std::unordered_map<uint32, uint32> lastTry;
+        uint32 const now = getMSTime();
+        uint32& last = lastTry[bot->GetGUID().GetCounter()];
+        if (last != 0 && now - last < 5000) return;   // don't hammer LoadPetFromDB
+        last = now;
+
+        PetStable* stable = bot->GetPetStable();
+        if (!stable) return;
+        PetStable::PetInfo const* info = nullptr;
+        if (stable->CurrentPet)                            info = &stable->CurrentPet.value();
+        else if (auto* up = stable->GetUnslottedHunterPet()) info = up;
+        else for (auto const& s : stable->StabledPets) if (s) { info = &s.value(); break; }
+        if (!info || !info->PetNumber) return;
+
+        Pet* pet = new Pet(bot, HUNTER_PET);
+        if (!pet->LoadPetFromDB(bot, 0, info->PetNumber, true))
+            delete pet;   // LoadPetFromDB self-cleans on success; delete only on failure
+    }
+
     // Hunters must ACTIVELY start the ranged auto-attack — spell 3018 "Shoot" —
     // or they only ever fire rotation abilities and look idle (and never consume
     // their arrows). Cast it once; the core auto-repeats it and cancels it on
@@ -2188,8 +2219,10 @@ namespace WowPsParty
         // rogue stays poisoned — playerbots' own upkeep is gated out for us.
         WowPsParty::MaintainBotConsumables(bot);
 
-        // Keep the hunter's auto-shot running between ability casts.
+        // Keep the hunter's auto-shot running between ability casts, and its pet
+        // summoned (both bypassed by our UpdateAI gate).
         EnsureRangedAutoAttack(bot);
+        EnsureHunterPet(bot);
 
         std::vector<RotationRule> rules;
         {
