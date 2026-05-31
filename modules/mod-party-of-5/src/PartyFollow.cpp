@@ -1578,6 +1578,15 @@ namespace WowPsParty
             // Without this the lead tank walks to the front and stops holding
             // aggro ("tank breaks mid-combat"), and ranged get pulled into the
             // leader's melee.
+            //
+            // GetVictim() as well as IsInCombat(): AC only flips IsInCombat() on
+            // a DAMAGE exchange, so during the pull window (tank charging in,
+            // sword raised, GetVictim() set, first hit not yet landed) the party
+            // still reads out-of-combat — and a trailing ranged bot follows the
+            // tank straight into melee before AssistTarget can hold it at range,
+            // then backs out once damage flips combat. That's the "runs forward
+            // into the mob for no reason, once per pull, then backs out". Yielding
+            // on a member's victim closes that gap so the hold happens first.
             {
                 std::vector<ObjectGuid> party;
                 GetPartyGuidsFor(d.followerGuid, party);
@@ -1586,7 +1595,8 @@ namespace WowPsParty
                     if (gg == d.followerGuid) continue;
                     Player* m = ObjectAccessor::FindConnectedPlayer(gg);
                     if (m && m->IsInWorld() && m->IsAlive()
-                        && m->GetMapId() == follower->GetMapId() && m->IsInCombat())
+                        && m->GetMapId() == follower->GetMapId()
+                        && (m->IsInCombat() || m->GetVictim()))
                         return true;
                 }
             }
