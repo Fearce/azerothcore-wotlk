@@ -1321,7 +1321,16 @@ namespace WowPsParty
                 // the feet completely alone; just keep facing the target.
                 if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
                     bot->Attack(desired, false);   // back at range — stop meleeing, resume shots
-                if (mg != IDLE_MOTION_TYPE)
+                // CRUCIAL: a back-out (POINT motion) carries the bot from the <8y
+                // dead zone out to ~18y, and it passes THROUGH this 8..30y band on
+                // the way. Stopping all non-idle motion here cut the back-out at
+                // the 8y edge, stranding the hunter next to the mob — next tick it
+                // was <8y again → back-out → stopped at 8y → "kite out, walk back
+                // into melee, forever". While the back-out is still running, leave
+                // it; only hold once it (or a chase) has actually arrived.
+                bool const backingOut =
+                    (mg == POINT_MOTION_TYPE) && bot->isMoving();
+                if (!backingOut && mg != IDLE_MOTION_TYPE)
                 {
                     bot->StopMoving();
                     bot->GetMotionMaster()->Clear();
