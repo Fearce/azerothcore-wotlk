@@ -1295,6 +1295,30 @@ namespace WowPsParty
         return bestId;
     }
 
+    // The lead tank's best-known RANGED pull ability, or 0 if it has none. Lets a
+    // tank with no thrown/gun/bow weapon (a paladin carries a libram in the ranged
+    // slot, a DK/druid nothing) still OPEN from range instead of charging the pack:
+    // the engagement layer holds it at range and the rotation's matching `cast:`
+    // rule fires the actual pull. Resolved by name (highest known rank) so it
+    // tracks whatever the bot has learned; preferred opener listed first.
+    uint32 TankRangedPullSpell(Player* bot)
+    {
+        if (!bot) return 0;
+        std::vector<char const*> names;
+        switch (bot->getClass())
+        {
+            case CLASS_WARRIOR:      names = { "Heroic Throw" }; break;
+            case CLASS_PALADIN:      names = { "Avenger's Shield", "Hand of Reckoning", "Exorcism" }; break;
+            case CLASS_DEATH_KNIGHT: names = { "Death Grip", "Dark Command", "Icy Touch" }; break;
+            case CLASS_DRUID:        names = { "Faerie Fire (Feral)", "Faerie Fire" }; break;
+            default: return 0;
+        }
+        for (char const* n : names)
+            if (uint32 id = FindKnownSpellByName(bot, n))
+                return id;
+        return 0;
+    }
+
     // Lowercase a class name for case-insensitive matching in the
     // class-filter list.
     static std::string Lower(std::string s)

@@ -473,31 +473,92 @@ namespace WowPsParty
         return true;
     }
 
-    // followerGuidLow -> ms until which a lead tank is mid ranged-pull. While set,
-    // AssistTarget holds the tank at throwing range and lets the pulled mob close
-    // instead of chasing into the pack ("don't face-pull a whole room"). Short
-    // window: once the mob reaches melee the hold ends naturally; if nothing comes
-    // (no ranged pull landed) it expires and the tank falls back to closing in.
-    static std::unordered_map<uint32, uint32> g_tankPullUntilMs;
+    // tankGuidLow -> live ranged-pull state. While the window is set, AssistTarget
+    // holds the tank at range and lets the pulled mob close instead of chasing into
+    // the pack ("don't face-pull a whole room"), and every OTHER party bot holds
+    // fire (IsPartyPullPending) until the pack reaches the tank. The window is
+    // refreshed each tick the mob is still inbound, so it survives the back-up; it
+    // expires shortly after the mob lands (or if nothing comes). `retreatSet` marks
+    // that the one-shot back-out point has been chosen so we don't kite forever.
+    struct TankPullState
+    {
+        uint32 untilMs    = 0;
+        uint32 startMs    = 0;
+        bool   retreatSet = false;
+        float  rx = 0.0f, ry = 0.0f, rz = 0.0f;
+    };
+    static std::unordered_map<uint32, TankPullState> g_tankPull;
 
     static void MarkTankPulling(ObjectGuid tankGuid, uint32 durationMs)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        g_tankPullUntilMs[tankGuid.GetCounter()] = getMSTime() + durationMs;
+        TankPullState& s = g_tankPull[tankGuid.GetCounter()];
+        if (getMSTime() >= s.untilMs)   // a FRESH pull (prior window lapsed)
+        {
+            s.retreatSet = false;       // — recompute the back-out point
+            s.startMs    = getMSTime(); // — and restart the overall wait clock
+        }
+        s.untilMs = getMSTime() + durationMs;
     }
+
+    // Total time since this pull began (0 if none) — caps how long the party
+    // waits for a mob to close, so a pulled RANGED mob that plinks the tank from
+    // afar (keeping it in combat) doesn't freeze the party indefinitely.
+    static uint32 TankPullElapsedMs(uint32 tankLow)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_tankPull.find(tankLow);
+        if (it == g_tankPull.end() || it->second.startMs == 0) return 0;
+        return getMSTime() - it->second.startMs;
+    }
+
+    // Hard cap on the pull-wait. Melee mobs cross even a long pull + back-up well
+    // inside this; past it the tank stops waiting and engages normally, releasing
+    // the party — covers ranged mobs that never walk into melee.
+    static constexpr uint32 PULL_MAX_WAIT_MS = 10000;
 
     bool IsTankPulling(ObjectGuid tankGuid)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        auto it = g_tankPullUntilMs.find(tankGuid.GetCounter());
-        if (it == g_tankPullUntilMs.end()) return false;
-        if (getMSTime() >= it->second)
+        auto it = g_tankPull.find(tankGuid.GetCounter());
+        if (it == g_tankPull.end()) return false;
+        if (getMSTime() >= it->second.untilMs)
         {
-            g_tankPullUntilMs.erase(it);
+            g_tankPull.erase(it);
             return false;
         }
         return true;
     }
+
+    // The tank's chosen back-out point during a pull, or false if not set yet.
+    static bool GetTankPullRetreat(uint32 tankLow, float& x, float& y, float& z)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_tankPull.find(tankLow);
+        if (it == g_tankPull.end() || !it->second.retreatSet) return false;
+        x = it->second.rx; y = it->second.ry; z = it->second.rz;
+        return true;
+    }
+
+    static void SetTankPullRetreat(uint32 tankLow, float x, float y, float z)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        TankPullState& s = g_tankPull[tankLow];
+        s.rx = x; s.ry = y; s.rz = z; s.retreatSet = true;
+    }
+
+    // How far the tank steps straight back after its ranged pull connects — pulls
+    // the pack into open space, away from neighbouring packs, and lets the tank
+    // lock threat before the melee piles in.
+    static constexpr float PULL_RETREAT_YDS = 12.0f;
+
+    // Stand-off the tank holds at to fire its opener. Chosen to fit the SHORTEST
+    // class pull ability (DK Icy Touch is 20y; Heroic Throw / Avenger's Shield /
+    // Faerie Fire / Dark Command are 30y), so whatever the rotation fires at the
+    // hold actually reaches — otherwise the tank would stand uselessly and then
+    // charge in when the window lapses. The real separation comes from the
+    // post-pull back-up (PULL_RETREAT_YDS), not from this stand-off.
+    static constexpr float PULL_HOLD_YDS = 18.0f;
 
     // Henchmen currently being MOVED between groups during a (re-)hire. While a
     // guid is in here, the group-removal dismiss hook ignores it — otherwise
@@ -795,21 +856,25 @@ namespace WowPsParty
         bool const ok = bot->Attack(nearest, true);
         bot->SetFacingToObject(nearest);
 
-        // Ranged pull: a tank holding a thrown/gun/bow doesn't charge into the
-        // pack. It closes only to throwing range, then the rotation (Heroic Throw
-        // etc.) and the ranged auto-attack pull a single mob while AssistTarget
-        // holds it there (see IsTankPulling) so the mobs come to us instead of us
-        // running head-first into a room full of them. Melee-only tanks keep the
-        // old behaviour of closing straight in.
+        // Ranged pull: a tank that can open from range doesn't charge into the
+        // pack. It closes only to ability range, then the rotation (Heroic Throw,
+        // Avenger's Shield, ...) pulls one mob while AssistTarget holds it there
+        // and backs it up (see IsTankPulling / the pull-hold), so the pack comes to
+        // US in open space instead of us running head-first into a room full of it.
+        // "Can range-pull" = a thrown/gun/bow weapon OR a class ranged-pull ability
+        // — the latter is what stops a paladin (libram in the ranged slot, no
+        // weapon) from barging in despite having Avenger's Shield. Melee-only tanks
+        // keep the old behaviour of closing straight in.
         Item* const rangedW = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
-        bool const canRangedPull = rangedW && rangedW->GetTemplate()->IsRangedWeapon();
+        bool const hasRangedWeapon = rangedW && rangedW->GetTemplate()->IsRangedWeapon();
+        bool const canRangedPull = hasRangedWeapon || WowPsParty::TankRangedPullSpell(bot) != 0;
         float const dist = bot->GetDistance(nearest);
         if (canRangedPull && dist > 8.0f)
         {
-            if (dist > 26.0f)
-                bot->GetMotionMaster()->MoveChase(nearest, 22.0f);   // close to throw range
+            if (dist > PULL_HOLD_YDS + 2.0f)
+                bot->GetMotionMaster()->MoveChase(nearest, PULL_HOLD_YDS);   // close to pull range
             else
-                bot->GetMotionMaster()->Clear();                     // hold ground
+                bot->GetMotionMaster()->Clear();                            // in range — hold; the pull-hold backs us up
             MarkTankPulling(bot->GetGUID(), 8000);
         }
         else
@@ -1028,6 +1093,38 @@ namespace WowPsParty
         }
     }
 
+    // True while the party's lead tank is mid ranged-pull and the pack hasn't
+    // reached it yet — the signal every other bot reads to hold fire. False once
+    // a hostile is in the tank's melee (pull complete → fight) or there's no
+    // active tank pull. Dungeon/raid only; a manual leader pull never sets the
+    // tank-pull window, so this stays false and normal assist applies.
+    static bool IsPartyPullPending(Player* bot)
+    {
+        if (!bot || !bot->IsInWorld()) return false;
+        if (!bot->GetMap() || !bot->GetMap()->IsDungeon()) return false;
+
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(bot->GetGUID(), party);
+        Player* tank = nullptr;
+        for (ObjectGuid const& g : party)
+        {
+            if (!IsLeadTank(g)) continue;
+            Player* p = ObjectAccessor::FindConnectedPlayer(g);
+            if (p && p->IsInWorld() && p->IsAlive() && p->GetMapId() == bot->GetMapId())
+            { tank = p; break; }
+        }
+        if (!tank || tank == bot) return false;
+        if (!IsTankPulling(tank->GetGUID())) return false;
+
+        // Engaged the instant a hostile reaches the tank's melee (victim or any
+        // attacker) — that's "the tank has the pack", so the party is free to go.
+        if (Unit* tv = tank->GetVictim())
+            if (tank->IsWithinMeleeRange(tv)) return false;
+        for (Unit* a : tank->getAttackers())
+            if (a && tank->IsWithinMeleeRange(a)) return false;
+        return true;
+    }
+
     void AssistTarget(Player* bot)
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
@@ -1060,6 +1157,28 @@ namespace WowPsParty
             if (bot->GetVictim()) bot->AttackStop();
             AssistLog(gLow, "skip: beyond party leash (>50y) — rejoining leader");
             return;
+        }
+
+        // Coordinated pull: while the lead tank is range-pulling and the pack
+        // hasn't reached it yet, every OTHER bot holds fire — no attacks, pets
+        // heel (AttackStop clears the victim the pet keys off) — so nobody chases
+        // a feared/running mob into the next pack before the tank has threat.
+        // Self-defence is exempt: a mob already swinging at us in melee is part of
+        // the pull we're waiting on, not a new pull, so we may fight back rather
+        // than stand and die. Lead tank itself is never gated (it IS the puller).
+        if (!IsLeadTank(bot->GetGUID()) && IsPartyPullPending(bot))
+        {
+            bool meleeThreatOnMe = false;
+            for (Unit* a : bot->getAttackers())
+                if (a && a->IsAlive() && bot->IsWithinMeleeRange(a)) { meleeThreatOnMe = true; break; }
+            if (!meleeThreatOnMe)
+            {
+                if (bot->GetVictim()) bot->AttackStop();
+                if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE)
+                    bot->GetMotionMaster()->Clear();
+                AssistLog(gLow, "pull pending: holding fire until the tank engages the pack");
+                return;
+            }
         }
 
         // Target priority:
@@ -1228,11 +1347,14 @@ namespace WowPsParty
             return;
         }
 
-        // Lead-tank ranged pull. While the pull window is live and the target
-        // hasn't closed to melee yet, hold ground (cancel any chase) and let the
-        // mob come — the rotation throws to pull, AssistTarget doesn't drag the
-        // tank into the pack. The instant the mob reaches melee (or the window
-        // lapses) this falls through to the normal chase/engage below.
+        // Lead-tank ranged pull, three beats while the mob hasn't reached melee:
+        //   1. out of range  -> close to ability/throw range so the pull can fire.
+        //   2. in range, not yet in combat -> hold and let the rotation pull.
+        //   3. pull connected (in combat) -> back STRAIGHT AWAY once (PULL_RETREAT_
+        //      YDS), then hold at that point so the pack is dragged into the open,
+        //      separated from neighbours, and the tank locks threat before melee.
+        // The window is refreshed each tick so it survives the back-up; the instant
+        // the mob reaches melee (or the window lapses) this falls through to engage.
         if (IsTankPulling(bot->GetGUID()) && !bot->IsWithinMeleeRange(desired))
         {
             if (bot->GetVictim() != desired)
@@ -1240,18 +1362,56 @@ namespace WowPsParty
                 MarkRetarget(gLow, nowMs);
                 bot->Attack(desired, true);
             }
+
             float const d = bot->GetDistance(desired);
+            uint32 const tankLow = bot->GetGUID().GetCounter();
+            // Rolling refresh (NOT a one-shot extend — each tick re-arms a fresh
+            // 4s) so the party stays held through the back-up. BUT only while the
+            // pull is genuinely progressing: in combat (mob fighting us) or still
+            // within pull range. If the mob EVADES — runs home, drops combat,
+            // out of range — stop refreshing so the window drains and the party
+            // releases in a couple of seconds instead of freezing until the mob
+            // de-leashes.
+            // Keep the party held while the pull is genuinely progressing: still
+            // closing to/at pull range, OR in combat but only up to the wait cap
+            // (so a ranged mob that never walks in, or an evade that drops combat,
+            // can't freeze the party — the window then drains and we engage).
+            float const closeThreshold = PULL_HOLD_YDS + 2.0f;
+            bool const stillPulling =
+                d <= closeThreshold ||
+                (bot->IsInCombat() && TankPullElapsedMs(tankLow) < PULL_MAX_WAIT_MS);
+            if (stillPulling)
+                MarkTankPulling(bot->GetGUID(), 4000);
             MovementGeneratorType const mg =
                 bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
-            if (d > 26.0f)
+            float rx, ry, rz;
+            if (d > closeThreshold)
             {
                 if (mg != CHASE_MOTION_TYPE)
-                    bot->GetMotionMaster()->MoveChase(desired, 22.0f);
+                    bot->GetMotionMaster()->MoveChase(desired, PULL_HOLD_YDS);   // close to pull range
             }
-            else if (mg == CHASE_MOTION_TYPE)
-                bot->GetMotionMaster()->Clear();   // arrived at range — hold
+            else if (!bot->IsInCombat())
+            {
+                if (mg == CHASE_MOTION_TYPE)
+                    bot->GetMotionMaster()->Clear();   // in range — hold, let the pull land
+            }
+            else if (GetTankPullRetreat(tankLow, rx, ry, rz))
+            {
+                // Already backing out / parked at the chosen point — leave the feet
+                // alone (MovePoint completes and holds), just keep facing the mob.
+            }
+            else
+            {
+                // Pull connected. Step straight back from the pack ONCE — the
+                // ability already landed, so leaving its range no longer matters.
+                float bx, by, bz;
+                desired->GetNearPoint(bot, bx, by, bz, bot->GetObjectSize(),
+                    d + PULL_RETREAT_YDS, desired->GetAngle(bot));
+                bot->GetMotionMaster()->MovePoint(0, bx, by, bz);
+                SetTankPullRetreat(tankLow, bx, by, bz);
+            }
             bot->SetFacingToObject(desired);
-            AssistLog(gLow, "tank pull-hold: holding ground, letting mob close");
+            AssistLog(gLow, "tank pull: range-pull, back up, let the pack close");
             return;
         }
 
