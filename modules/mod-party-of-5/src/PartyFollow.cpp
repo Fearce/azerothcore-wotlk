@@ -945,14 +945,18 @@ namespace WowPsParty
         // stands around" bug: only the leader's target made anything fire.
         auto pickPartyDefenseTarget = [&]() -> Unit*
         {
-            // self-defense
+            // self-defense — anything swinging at US, always (it's already on us).
             for (Unit* a : bot->getAttackers())
                 if (a && a->IsAlive() && bot->IsValidAttackTarget(a))
                     return a;
             // party-defense via our directive roster (leader + all bots +
             // henchmen), NOT the WoW group — the group can form incompletely,
             // which left bots ignoring a member under attack. This is what makes
-            // heroes and henchmen actually defend EACH OTHER.
+            // heroes and henchmen actually defend EACH OTHER. Capped to mobs
+            // already NEAR us (PARTY_DEFEND_RANGE): a DPS must not sprint across a
+            // room to peel for a distant ally — that pulls every pack on the way
+            // and wipes the group. Distant threats are the tank's / leader's job.
+            static constexpr float PARTY_DEFEND_RANGE = 30.0f;
             std::vector<ObjectGuid> party;
             GetPartyGuidsFor(bot->GetGUID(), party);
             for (ObjectGuid const& gg : party)
@@ -961,7 +965,8 @@ namespace WowPsParty
                 if (!m || !m->IsInWorld() || m == bot) continue;
                 if (m->GetMapId() != bot->GetMapId()) continue;
                 for (Unit* a : m->getAttackers())
-                    if (a && a->IsAlive() && bot->IsValidAttackTarget(a))
+                    if (a && a->IsAlive() && bot->IsValidAttackTarget(a)
+                        && bot->IsWithinDistInMap(a, PARTY_DEFEND_RANGE))
                         return a;
             }
             return nullptr;
@@ -1022,9 +1027,20 @@ namespace WowPsParty
             {
                 desired = current;   // nothing new worth switching to — stay put
             }
-            else if (desired != current && !RetargetReady(gLow, nowMs))
+            else if (desired != current)
             {
-                desired = current;   // too soon to switch — keep current victim
+                // Decide whether to abandon a LIVE victim for a different mob.
+                //  master (DPS): ONLY the leader explicitly retargeting pulls us
+                //    off — a party-defense pick must never make a DPS drop a
+                //    half-dead mob to chase a fresh add (the "interrupts itself /
+                //    pulls the room" bug). Finish the kill.
+                //  other modes (tank grabbing loose adds): keep the throttled
+                //    switch so the tank can peel.
+                bool const allowSwitch = (mode == "master")
+                    ? (leaderTargetValid && desired == leaderTarget && RetargetReady(gLow, nowMs))
+                    : RetargetReady(gLow, nowMs);
+                if (!allowSwitch)
+                    desired = current;   // keep finishing the current victim
             }
         }
 
