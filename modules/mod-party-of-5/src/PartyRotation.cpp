@@ -2228,6 +2228,14 @@ namespace WowPsParty
         // tick. (Resurrect-accept is handled separately in ApplyDirective.)
         if (!bot->IsAlive()) return false;
 
+        // Mounted (traveling with the leader): do NOTHING. An out_of_combat rule —
+        // a rogue's Stealth, a hunter's Call Pet, a self-buff, eat/drink — would
+        // cast and DISMOUNT the bot, which the follow ticker's mount-sync then
+        // re-mounts, and the rule re-fires: an endless mount/cast flicker. Combat
+        // auto-dismounts, so this only skips idle mounted travel; the rotation
+        // (and pet/ammo upkeep) resumes the moment the bot is off its mount.
+        if (bot->IsMounted()) return false;
+
         // Keep ammo/poisons topped up (self-throttled). Runs before the rotation
         // so a freshly-spawned hunter has arrows on its first idle tick and a
         // rogue stays poisoned — playerbots' own upkeep is gated out for us.
