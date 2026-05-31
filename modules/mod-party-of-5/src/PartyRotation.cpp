@@ -1431,7 +1431,16 @@ namespace WowPsParty
         bool const allowClip = CsvContains(Lower(flags), "clip");
         auto channelClipOk = [bot, allowClip]() -> bool
         {
-            if (!bot->IsNonMeleeSpellCast(false)) return true;
+            // skipAutorepeat=true: a hunter's Auto Shot auto-repeat is NOT a
+            // "cast in progress" you must wait for — special shots are woven
+            // BETWEEN auto-shots. Without skipping it, IsNonMeleeSpellCast was
+            // true the whole time the bot auto-shot, so every non-clip special
+            // shot (Steady/Arcane/Serpent Sting...) was skipped and the hunter
+            // "only auto-attacked, everything exec_failed" (cast never even
+            // attempted → lastCastResult stayed 0). Still blocks clipping a real
+            // generic/channeled cast (those aren't auto-repeat, so not skipped).
+            if (!bot->IsNonMeleeSpellCast(false, false, /*skipAutorepeat=*/true))
+                return true;
             if (!allowClip) return false;
             bot->InterruptNonMeleeSpells(false);
             return true;
