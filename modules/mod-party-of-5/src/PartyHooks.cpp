@@ -460,6 +460,10 @@ public:
         if (!WowPsParty::IsEnabled()) return;
         if (WowPsParty::IsHenchman(guid))
         {
+            // A (re-)hire is just MOVING this henchman out of a stale group into
+            // the player's party — don't dismiss it (the "hello / see you later"
+            // instant-leave after an LFG dungeon).
+            if (WowPsParty::IsHenchmanRegrouping(guid)) return;
             WowPsParty::DismissHenchmanByGuid(guid);
             return;
         }

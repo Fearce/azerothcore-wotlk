@@ -64,6 +64,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <vector>
 
@@ -379,6 +380,26 @@ namespace WowPsParty
             return false;
         }
         return true;
+    }
+
+    // Henchmen currently being MOVED between groups during a (re-)hire. While a
+    // guid is in here, the group-removal dismiss hook ignores it — otherwise
+    // pulling a freshly-spawned henchman out of a STALE group (one left over in
+    // the DB after leaving an LFG dungeon) would re-fire the dismiss hook and the
+    // henchman would greet then instantly leave ("hello / see you later").
+    static std::unordered_set<uint32> g_regrouping;
+
+    void SetHenchmanRegrouping(ObjectGuid henchGuid, bool on)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (on) g_regrouping.insert(henchGuid.GetCounter());
+        else    g_regrouping.erase(henchGuid.GetCounter());
+    }
+
+    bool IsHenchmanRegrouping(ObjectGuid henchGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        return g_regrouping.count(henchGuid.GetCounter()) != 0;
     }
 
     ObjectGuid GetLeaderFor(ObjectGuid followerGuid)

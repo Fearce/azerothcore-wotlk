@@ -1049,7 +1049,19 @@ namespace WowPsParty
             }
             if (!g->IsMember(henchGuid))
             {
-                if (hen->GetGroup()) hen->RemoveFromGroup();
+                // The henchman may still be in a STALE group left over in the DB
+                // from a previous LFG dungeon. Pull it out without tripping the
+                // dismiss hook (which would instantly un-hire it), then add it to
+                // the player's party. This also cleans up the stale group_member.
+                if (hen->GetGroup())
+                {
+                    struct RegroupGuard {
+                        ObjectGuid g;
+                        ~RegroupGuard() { WowPsParty::SetHenchmanRegrouping(g, false); }
+                    } guard{henchGuid};
+                    WowPsParty::SetHenchmanRegrouping(henchGuid, true);
+                    hen->RemoveFromGroup();   // flag cleared by guard, even on throw
+                }
                 g->AddMember(hen);
             }
             UpdateGroupLootForHenchmen(lead);
@@ -1109,6 +1121,14 @@ namespace WowPsParty
         {
             Player* l = ObjectAccessor::FindConnectedPlayer(leaderGuid);
             if (!l) return;
+            // Remove the henchman from any group BEFORE logging it out, so no
+            // stale group_member row survives (logout alone preserves group
+            // membership). Otherwise a later re-hire respawns it into that ghost
+            // group and the spawn re-grouping would re-trip the dismiss. The
+            // directive is already gone (RemoveFollower above), so this removal's
+            // own dismiss hook is a no-op.
+            if (Player* hen = ObjectAccessor::FindConnectedPlayer(henchGuid))
+                if (hen->GetGroup()) hen->RemoveFromGroup();
             if (PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(l))
                 mgr->LogoutPlayerBot(henchGuid);
             UpdateGroupLootForHenchmen(l);

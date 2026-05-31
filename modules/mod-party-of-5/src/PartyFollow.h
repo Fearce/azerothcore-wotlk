@@ -55,6 +55,10 @@ namespace WowPsParty
     // pack closes on it). repositionToCast reads this to refuse chasing a melee
     // ability into the pack during the pull.
     bool   IsTankPulling(ObjectGuid tankGuid);
+    // Suppress the group-removal dismiss hook while a (re-)hire moves a henchman
+    // between groups (so pulling it out of a stale LFG group doesn't dismiss it).
+    void   SetHenchmanRegrouping(ObjectGuid henchGuid, bool on);
+    bool   IsHenchmanRegrouping(ObjectGuid henchGuid);
     // The follow directive's role ("tank"/"healer"/"dps") for a follower
     // (alt or henchman), or "" if it has no directive. Lets the rotation
     // editor's "Generate" button match the role the bot actually runs.
