@@ -40,6 +40,7 @@
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "SpellAuraEffects.h"
+#include "SpellInfo.h"   // SpellInfo::Effects[] for the leader's mount-type check
 
 // Gathering (mining / herbalism) for follower bots.
 #include "Cell.h"
@@ -285,6 +286,57 @@ namespace WowPsParty
                 return true;
         }
         return false;
+    }
+
+    // Pick a LEVEL- and RACE-appropriate mount for the bot, matching the
+    // leader's GROUND-vs-FLYING type — instead of copying the leader's exact
+    // mount (a level-20 alt riding the player's epic flyer looked absurd).
+    // Racial mount IDs ported from mod-playerbots' factory table; tiers by the
+    // standard riding-skill levels (20 slow ground, 40 fast ground, 60 slow
+    // fly, 70 epic fly). Prefer a mount the bot actually owns (its own skin),
+    // else fall back to the first racial id and cast it triggered so a mountless
+    // henchman still gets the right model. Returns 0 if the bot can't ride yet.
+    static uint32 ChooseBotMountSpell(Player* bot, bool leaderFlying)
+    {
+        uint8 const level = bot->GetLevel();
+        if (level < 20) return 0;   // no riding skill yet
+
+        std::vector<uint32> slow, fast;
+        switch (bot->getRace())
+        {
+            case RACE_HUMAN:         slow={470,6648,458,472};       fast={23228,23227,23229}; break;
+            case RACE_ORC:           slow={6654,6653,580};          fast={23250,23252,23251}; break;
+            case RACE_DWARF:         slow={6899,6777,6898};         fast={23238,23239,23240}; break;
+            case RACE_NIGHTELF:      slow={10789,8394,10793};       fast={23219,23220,63637}; break;
+            case RACE_UNDEAD_PLAYER: slow={17463,17464,17462};      fast={17465,23246,66846}; break;
+            case RACE_TAUREN:        slow={18990,18989,64657};      fast={23249,23248,23247}; break;
+            case RACE_GNOME:         slow={10969,17453,10873,17454};fast={23225,23223,23222}; break;
+            case RACE_TROLL:         slow={10796,10799,8395};       fast={23241,23242,23243}; break;
+            case RACE_DRAENEI:       slow={34406,35711,35710};      fast={35713,35712,35714}; break;
+            case RACE_BLOODELF:      slow={33660,35020,35022,35018};fast={35025,35026,35027}; break;
+            default:
+                if (bot->GetTeamId() == TEAM_HORDE) { slow={6654,6653,580};    fast={23250,23252,23251}; }
+                else                                { slow={470,6648,458,472}; fast={23228,23227,23229}; }
+        }
+        std::vector<uint32> fslow, ffast;
+        if (bot->GetTeamId() == TEAM_ALLIANCE) { fslow={32235,32239,32240}; ffast={32242,32289,32290,32292}; }
+        else                                   { fslow={32244,32245,32243}; ffast={32295,32297,32246,32296}; }
+
+        // Fly only when the leader is flying AND the bot can actually fly here
+        // (level 60+, and Cold Weather Flying for Northrend). Otherwise ground.
+        bool canFly = leaderFlying && level >= 60;
+        if (canFly && bot->GetMapId() == 571 /*Northrend*/ && !bot->HasSpell(54197 /*Cold Weather Flying*/))
+            canFly = false;
+
+        std::vector<uint32> const& tier =
+            canFly ? (level >= 70 ? ffast : fslow)
+                   : (level >= 40 ? fast  : slow);
+        std::vector<uint32> const& use = tier.empty() ? slow : tier;
+        if (use.empty()) return 0;
+
+        for (uint32 id : use)
+            if (bot->HasSpell(id)) return id;   // its own learned skin
+        return use.front();                     // else cast a racial one triggered
     }
 
     // True if `botGuid` is the account's designated dungeon lead tank, decided
@@ -1363,9 +1415,10 @@ namespace WowPsParty
                 ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
 
             // Mount matching — keep the follower's mounted state synced with the
-            // leader's so the party doesn't trail on foot during travel. Mirror
-            // the leader's actual mount spell so the model matches. Skip while
-            // in combat / casting (can't mount then anyway).
+            // leader's so the party doesn't trail on foot during travel. The bot
+            // mounts its OWN level/race-appropriate mount (not a clone of the
+            // leader's), matching only the leader's ground-vs-flying type. Skip
+            // while in combat / casting (can't mount then anyway).
             if (!follower->IsInCombat()
                 && !follower->IsNonMeleeSpellCast(false, false, true))
             {
@@ -1373,10 +1426,19 @@ namespace WowPsParty
                 bool const botMounted    = follower->IsMounted();
                 if (leaderMounted && !botMounted)
                 {
+                    // Is the leader on a FLYING mount? (a mount aura whose speed
+                    // effect is flight speed, not ground.)
+                    bool leaderFlying = false;
                     Unit::AuraEffectList const& m =
                         leader->GetAuraEffectsByType(SPELL_AURA_MOUNTED);
                     if (!m.empty())
-                        follower->CastSpell(follower, m.front()->GetId(), true);
+                        if (SpellInfo const* ls = m.front()->GetSpellInfo())
+                            leaderFlying =
+                                ls->Effects[1].ApplyAuraName == SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED ||
+                                ls->Effects[2].ApplyAuraName == SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED;
+
+                    if (uint32 const mountSpell = ChooseBotMountSpell(follower, leaderFlying))
+                        follower->CastSpell(follower, mountSpell, true);
                 }
                 else if (!leaderMounted && botMounted)
                 {
