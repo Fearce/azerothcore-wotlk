@@ -1723,14 +1723,26 @@ namespace WowPsParty
             uint32 const gLow = bot->GetGUID().GetCounter();
             uint32 const tLow = target->GetGUID().GetCounter();
             uint32 const now  = getMSTime();
+            // MoveChase only drives the bot while the chased unit is its VICTIM:
+            // ChaseMovementGenerator::HasLostTarget is `GetVictim() != target`,
+            // so it StopMoving()s the instant the target isn't who we're fighting.
+            // A FRIENDLY buff/rez target is never the victim, so chasing it froze
+            // the bot just outside range ("walks to 49.9y and stops, won't close").
+            // FollowMovementGenerator has no such check — use MoveFollow for any
+            // non-victim target; keep MoveChase for the offensive case.
+            bool const targetIsVictim = (bot->GetVictim() == target);
+
             bool reissue = true;
             {
                 std::lock_guard<std::mutex> lock(g_useThrottleMutex);
                 auto& e = g_approachState[gLow];   // (targetGuidLow, lastMoveMs)
                 MovementGeneratorType const mg =
                     bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
-                bool const moving = tooClose ? (mg == POINT_MOTION_TYPE)
-                                             : (mg == CHASE_MOTION_TYPE);
+                // Already advancing on the SAME target? POINT for a back-out,
+                // CHASE for an offensive approach, FOLLOW for a friendly one.
+                bool const moving = tooClose      ? (mg == POINT_MOTION_TYPE)
+                                  : targetIsVictim ? (mg == CHASE_MOTION_TYPE)
+                                                   : (mg == FOLLOW_MOTION_TYPE);
                 if (e.first == tLow && (now - e.second) < 700 && moving)
                     reissue = false;
                 else { e.first = tLow; e.second = now; }
@@ -1754,26 +1766,18 @@ namespace WowPsParty
                     if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
                         maxRange = si->GetMaxRange(si->IsPositive(), bot);
                     bool const meleeSpell = maxRange > 0.0f && maxRange <= 6.0f;
-                    if (meleeSpell)
-                    {
-                        // Melee ability out of range → chase to CONTACT. The old
-                        // MoveChase(target, 3.0) kept a 3y offset on top of the
-                        // bounding radii, so the bot stopped just short of actual
-                        // swing range and never auto-attacked ("walks close but
-                        // stops before it's really in range").
-                        bot->GetMotionMaster()->MoveChase(target);
-                    }
-                    else if (!bot->IsWithinLOSInMap(target))
-                    {
-                        // No LoS → close right in so the bot rounds the corner
-                        // until line of sight clears.
-                        bot->GetMotionMaster()->MoveChase(target, 2.0f);
-                    }
+                    // How close to settle: contact for a melee spell, right in to
+                    // clear a corner when LoS is blocked, else just inside max range.
+                    float const settleDist =
+                        meleeSpell                       ? 0.0f
+                        : !bot->IsWithinLOSInMap(target) ? 2.0f
+                                                         : maxRange - 3.0f;
+                    if (!targetIsVictim)
+                        bot->GetMotionMaster()->MoveFollow(target, settleDist, 0.0f);
+                    else if (meleeSpell)
+                        bot->GetMotionMaster()->MoveChase(target);   // chase to contact
                     else
-                    {
-                        // Ranged, LoS, just out of range → settle inside max range.
-                        bot->GetMotionMaster()->MoveChase(target, maxRange - 3.0f);
-                    }
+                        bot->GetMotionMaster()->MoveChase(target, settleDist);
                 }
             }
 
