@@ -549,16 +549,10 @@ namespace WowPsParty
 
     // How far the tank steps straight back after its ranged pull connects — pulls
     // the pack into open space, away from neighbouring packs, and lets the tank
-    // lock threat before the melee piles in.
+    // lock threat before the melee piles in. (The stand-off the tank fires FROM is
+    // per-class via WowPsParty::TankPullHoldRange — a long opener pulls from ~26y,
+    // a short one like Icy Touch from ~16y.)
     static constexpr float PULL_RETREAT_YDS = 12.0f;
-
-    // Stand-off the tank holds at to fire its opener. Chosen to fit the SHORTEST
-    // class pull ability (DK Icy Touch is 20y; Heroic Throw / Avenger's Shield /
-    // Faerie Fire / Dark Command are 30y), so whatever the rotation fires at the
-    // hold actually reaches — otherwise the tank would stand uselessly and then
-    // charge in when the window lapses. The real separation comes from the
-    // post-pull back-up (PULL_RETREAT_YDS), not from this stand-off.
-    static constexpr float PULL_HOLD_YDS = 18.0f;
 
     // Henchmen currently being MOVED between groups during a (re-)hire. While a
     // guid is in here, the group-removal dismiss hook ignores it — otherwise
@@ -871,10 +865,11 @@ namespace WowPsParty
         float const dist = bot->GetDistance(nearest);
         if (canRangedPull && dist > 8.0f)
         {
-            if (dist > PULL_HOLD_YDS + 2.0f)
-                bot->GetMotionMaster()->MoveChase(nearest, PULL_HOLD_YDS);   // close to pull range
+            float const holdRange = WowPsParty::TankPullHoldRange(bot);
+            if (dist > holdRange + 2.0f)
+                bot->GetMotionMaster()->MoveChase(nearest, holdRange);   // close to pull range
             else
-                bot->GetMotionMaster()->Clear();                            // in range — hold; the pull-hold backs us up
+                bot->GetMotionMaster()->Clear();                        // in range — hold; the pull-hold backs us up
             MarkTankPulling(bot->GetGUID(), 8000);
         }
         else
@@ -1376,7 +1371,8 @@ namespace WowPsParty
             // closing to/at pull range, OR in combat but only up to the wait cap
             // (so a ranged mob that never walks in, or an evade that drops combat,
             // can't freeze the party — the window then drains and we engage).
-            float const closeThreshold = PULL_HOLD_YDS + 2.0f;
+            float const holdRange = WowPsParty::TankPullHoldRange(bot);
+            float const closeThreshold = holdRange + 2.0f;
             bool const stillPulling =
                 d <= closeThreshold ||
                 (bot->IsInCombat() && TankPullElapsedMs(tankLow) < PULL_MAX_WAIT_MS);
@@ -1388,7 +1384,7 @@ namespace WowPsParty
             if (d > closeThreshold)
             {
                 if (mg != CHASE_MOTION_TYPE)
-                    bot->GetMotionMaster()->MoveChase(desired, PULL_HOLD_YDS);   // close to pull range
+                    bot->GetMotionMaster()->MoveChase(desired, holdRange);   // close to pull range
             }
             else if (!bot->IsInCombat())
             {

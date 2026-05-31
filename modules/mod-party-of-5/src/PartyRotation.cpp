@@ -1295,12 +1295,15 @@ namespace WowPsParty
         return bestId;
     }
 
-    // The lead tank's best-known RANGED pull ability, or 0 if it has none. Lets a
-    // tank with no thrown/gun/bow weapon (a paladin carries a libram in the ranged
-    // slot, a DK/druid nothing) still OPEN from range instead of charging the pack:
-    // the engagement layer holds it at range and the rotation's matching `cast:`
-    // rule fires the actual pull. Resolved by name (highest known rank) so it
-    // tracks whatever the bot has learned; preferred opener listed first.
+    // The lead tank's RANGED pull ability, or 0 if it has none. Lets a tank with
+    // no thrown/gun/bow weapon (a paladin carries a libram in the ranged slot, a
+    // DK/druid nothing) still OPEN from range instead of charging the pack: the
+    // engagement layer holds it at range and the rotation's matching `cast:` rule
+    // fires the actual pull. IMPORTANT: each list is the spell the rotation
+    // actually opens with, highest-known-rank first — because TankPullHoldRange
+    // derives the hold stand-off from THIS spell's range, so it must be the one
+    // that really fires (e.g. the DK opener is Icy Touch via its Frost Fever rule;
+    // Death Grip / Dark Command are taunt/utility, not its has_target opener).
     uint32 TankRangedPullSpell(Player* bot)
     {
         if (!bot) return 0;
@@ -1309,7 +1312,7 @@ namespace WowPsParty
         {
             case CLASS_WARRIOR:      names = { "Heroic Throw" }; break;
             case CLASS_PALADIN:      names = { "Avenger's Shield", "Hand of Reckoning", "Exorcism" }; break;
-            case CLASS_DEATH_KNIGHT: names = { "Death Grip", "Dark Command", "Icy Touch" }; break;
+            case CLASS_DEATH_KNIGHT: names = { "Icy Touch" }; break;
             case CLASS_DRUID:        names = { "Faerie Fire (Feral)", "Faerie Fire" }; break;
             default: return 0;
         }
@@ -1317,6 +1320,28 @@ namespace WowPsParty
             if (uint32 id = FindKnownSpellByName(bot, n))
                 return id;
         return 0;
+    }
+
+    // Stand-off the tank holds at to fire its opener: a few yards inside the pull
+    // ability's actual reach so the cast doesn't fail at the very edge. A long
+    // opener (Heroic Throw / Avenger's Shield / Faerie Fire, 30y) pulls from ~26y;
+    // a DK on Icy Touch (20y) naturally holds closer (~16y) — no class special-
+    // case, it just falls out of the range. The post-pull back-up is what creates
+    // separation, so a closer stand-off for a short opener is fine. A ranged-
+    // WEAPON puller (no ability id) falls back to the long hold.
+    float TankPullHoldRange(Player* bot)
+    {
+        float maxRange = 30.0f;   // ranged weapon / unknown -> assume a long reach
+        if (uint32 id = TankRangedPullSpell(bot))
+            if (SpellInfo const* si = sSpellMgr->GetSpellInfo(id))
+            {
+                float const r = si->GetMaxRange(si->IsPositive(), bot);
+                if (r > 0.0f) maxRange = r;
+            }
+        float hold = maxRange - 4.0f;
+        if (hold < 12.0f) hold = 12.0f;
+        if (hold > 26.0f) hold = 26.0f;
+        return hold;
     }
 
     // Lowercase a class name for case-insensitive matching in the

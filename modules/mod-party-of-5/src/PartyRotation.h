@@ -97,10 +97,15 @@ namespace WowPsParty
     // talents yet.
     uint8 PrimaryTalentTree(Player* bot);
 
-    // The lead tank's best-known ranged pull ability id (Heroic Throw, Avenger's
-    // Shield, Death Grip, Faerie Fire, ...), or 0. Lets the engagement layer hold
-    // an ability-only tank (no ranged weapon) at range instead of charging in.
+    // The lead tank's ranged pull ability id (Heroic Throw, Avenger's Shield,
+    // Icy Touch, Faerie Fire, ...), or 0. Lets the engagement layer hold an
+    // ability-only tank (no ranged weapon) at range instead of charging in.
     uint32 TankRangedPullSpell(Player* bot);
+
+    // The stand-off distance the lead tank should hold at to fire its opener,
+    // derived from that opener's actual range (so a 30y ability pulls from ~26y, a
+    // 20y one from ~16y). The engagement layer uses this instead of a fixed range.
+    float TankPullHoldRange(Player* bot);
 
     // Cache management. Called by PartyMgr when a bot logs in / loadout changes.
     void RotationCacheSet(uint32 guid, std::vector<RotationRule> rules);
