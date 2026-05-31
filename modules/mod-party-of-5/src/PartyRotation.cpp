@@ -37,6 +37,7 @@
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace WowPsParty
@@ -2182,6 +2183,102 @@ namespace WowPsParty
             delete pet;   // LoadPetFromDB self-cleans on success; delete only on failure
     }
 
+    // Drive the hunter's pet. mod-playerbots normally runs the pet — sets its
+    // stance, toggles ability autocast, and commands attacks — but that's all
+    // gated out for our bots, so a re-summoned pet just heels passively and
+    // never uses Growl/Claw/Bite/etc. We re-implement the essentials:
+    //   * once per pet: defensive stance (so it defends the hunter on its own,
+    //     even when the leader hasn't tagged the mob) + enable autocast on every
+    //     autocastable ability it knows, so it weaves Growl/Claw/Bite/Rake/Swipe
+    //     itself;
+    //   * while the hunter is fighting: push the pet onto the hunter's victim so
+    //     it focuses the same mob (Growl pulls threat off the bot);
+    //   * out of combat: heel it back so it doesn't body-pull the next pack.
+    static void MaintainHunterPet(Player* bot)
+    {
+        if (bot->getClass() != CLASS_HUNTER) return;
+        Pet* pet = bot->GetPet();
+        if (!pet || !pet->IsAlive()) return;
+        CharmInfo* charm = pet->GetCharmInfo();
+        if (!charm) return;
+
+        // One-time per-pet setup, keyed on the pet's GUID so a fresh re-summon
+        // is reconfigured but we don't churn the autocast list every tick.
+        static std::unordered_map<uint32, uint32> setupFor;   // bot GUID low -> pet GUID low
+        uint32& configured = setupFor[bot->GetGUID().GetCounter()];
+        uint32 const petLow = pet->GetGUID().GetCounter();
+        if (configured != petLow)
+        {
+            configured = petLow;
+            if (pet->GetReactState() == REACT_PASSIVE)
+            {
+                pet->SetReactState(REACT_DEFENSIVE);
+                charm->SetPlayerReactState(REACT_DEFENSIVE);
+            }
+            // Don't autocast threat-droppers / stealth / utility the AI can't
+            // time (Cower lowers the threat we want Growl to build; Prowl, Leap,
+            // Spell Lock, Devour Magic are situational). Same exclusions as
+            // mod-playerbots' pet autocast.
+            static std::unordered_set<uint32> const noAutocast = {
+                24450, 24452, 24453,         // Prowl 1-3
+                1742, 47482,                 // Cower, Leap
+                19244, 19647,                // Spell Lock 1-2
+                19505, 19731, 19734, 19736,  // Devour Magic 1-4
+                27276, 27277, 48011,         // Devour Magic 5-7
+                58867                         // Spirit Wolf Leap
+            };
+            for (auto const& s : pet->m_spells)
+            {
+                if (s.second.state == PETSPELL_REMOVED) continue;
+                SpellInfo const* si = sSpellMgr->GetSpellInfo(s.first);
+                if (!si || !si->IsAutocastable()) continue;
+                bool const wanted = !noAutocast.count(s.first);
+                bool isAuto = false;
+                for (uint32 a : pet->m_autospells) if (a == s.first) { isAuto = true; break; }
+                // Toggle only on a mismatch — enables the abilities we want and
+                // actively turns OFF a re-summoned pet's excluded autocasts
+                // (e.g. a saved-on Cower that would shed the Growl threat).
+                if (wanted != isAuto) pet->ToggleAutocast(si, wanted);
+            }
+        }
+
+        Unit* victim = bot->GetVictim();
+        if (victim && victim->IsAlive() && bot->IsValidAttackTarget(victim))
+        {
+            // Already command-attacking the right mob — leave it; re-issuing
+            // AttackStart every tick resets the pet's swing/ability timers. But
+            // if the pet drifted onto this victim on its own (defensive aggro,
+            // not our command) re-issue so it's flagged command-attack and won't
+            // wander back to follow mid-fight.
+            if (pet->GetVictim() == victim && charm->IsCommandAttack()) return;
+            pet->ClearUnitState(UNIT_STATE_FOLLOW);
+            pet->AttackStop();
+            pet->SetTarget(victim->GetGUID());
+            charm->SetIsCommandAttack(true);
+            charm->SetIsAtStay(false);
+            charm->SetIsFollowing(false);
+            charm->SetIsCommandFollow(false);
+            charm->SetIsReturning(false);
+            if (pet->AI())
+                pet->AI()->AttackStart(victim);
+        }
+        else if (!bot->IsInCombat() && (pet->GetVictim() || charm->IsCommandAttack()))
+        {
+            // Hunter is genuinely out of combat — call the pet off so it heels
+            // instead of chasing the last mob into the next pack. (While the
+            // hunter is in combat but hasn't picked a victim yet, we leave the
+            // pet on whatever it's defensively engaging — don't yank it off a
+            // mob that's beating on it or the hunter.)
+            pet->AttackStop();
+            charm->SetIsCommandAttack(false);
+            charm->SetCommandState(COMMAND_FOLLOW);
+            charm->SetIsCommandFollow(true);
+            charm->SetIsFollowing(false);
+            charm->SetIsReturning(true);
+            pet->GetMotionMaster()->MoveFollow(bot, PET_FOLLOW_DIST, pet->GetFollowAngle());
+        }
+    }
+
     // Hunters must ACTIVELY start their ranged auto-attack — spell 75 "Auto Shot"
     // (NOT 3018 "Shoot", which is the warrior/rogue generic ranged attack; casting
     // the wrong spell never establishes the auto-repeat, so it re-fires every tick
@@ -2193,8 +2290,28 @@ namespace WowPsParty
     {
         if (bot->getClass() != CLASS_HUNTER) return;   // melee shouldn't stand and shoot
         Unit* victim = bot->GetVictim();
+
+        // Auto Shot, once cast, auto-repeats until something interrupts it —
+        // AttackStop() clears the melee swing, NOT the ranged auto-repeat. Two
+        // stale states have to be cancelled by hand, or the bot looks like it's
+        // shooting but lands nothing:
+        //   * no live victim → it keeps playing the shoot animation out of
+        //     combat ("auto-attacks at all times");
+        //   * locked on a unit we're no longer fighting → when a new mob is
+        //     pulled (e.g. one the leader didn't tag) the auto-repeat never
+        //     re-acquires it, so the hunter stands and "does nothing" while the
+        //     animation fires at the old corpse.
+        // Cancelling here lets the block below restart a fresh Auto Shot on the
+        // current victim.
+        if (Spell* repeat = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+        {
+            Unit* shotAt = repeat->m_targets.GetUnitTarget();
+            if (!victim || !victim->IsAlive() || shotAt != victim)
+                bot->InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
+            return;   // either already shooting the right target, or just cancelled — restart next tick
+        }
+
         if (!victim || !victim->IsAlive()) return;
-        if (bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL)) return;  // already auto-shooting
         if (bot->isMoving()) return;                                 // can't start a shot mid-move
         Item* ranged = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
         if (!ranged) return;
@@ -2241,10 +2358,12 @@ namespace WowPsParty
         // rogue stays poisoned — playerbots' own upkeep is gated out for us.
         WowPsParty::MaintainBotConsumables(bot);
 
-        // Keep the hunter's auto-shot running between ability casts, and its pet
-        // summoned (both bypassed by our UpdateAI gate).
+        // Keep the hunter's auto-shot running between ability casts, its pet
+        // summoned, and that pet defending + on-target (all bypassed by our
+        // UpdateAI gate).
         EnsureRangedAutoAttack(bot);
         EnsureHunterPet(bot);
+        MaintainHunterPet(bot);
 
         std::vector<RotationRule> rules;
         {
