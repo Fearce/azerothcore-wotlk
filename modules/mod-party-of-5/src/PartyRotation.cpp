@@ -2182,11 +2182,13 @@ namespace WowPsParty
             delete pet;   // LoadPetFromDB self-cleans on success; delete only on failure
     }
 
-    // Hunters must ACTIVELY start the ranged auto-attack — spell 3018 "Shoot" —
-    // or they only ever fire rotation abilities and look idle (and never consume
-    // their arrows). Cast it once; the core auto-repeats it and cancels it on
-    // movement, so a kiting hunter resumes shooting the moment it plants. Requires
-    // ammo equipped (MaintainAmmo) — without it 3018 just fails NO_AMMO.
+    // Hunters must ACTIVELY start their ranged auto-attack — spell 75 "Auto Shot"
+    // (NOT 3018 "Shoot", which is the warrior/rogue generic ranged attack; casting
+    // the wrong spell never establishes the auto-repeat, so it re-fires every tick
+    // — animation but no completed shot, no damage — AND its repeated cast blocks
+    // the ability casts). Cast it ONCE; the core then auto-repeats it (and cancels
+    // it on movement, so a kiting hunter resumes when it plants). Needs ammo
+    // equipped (MaintainAmmo).
     static void EnsureRangedAutoAttack(Player* bot)
     {
         if (bot->getClass() != CLASS_HUNTER) return;   // melee shouldn't stand and shoot
@@ -2200,10 +2202,22 @@ namespace WowPsParty
         if (sub != ITEM_SUBCLASS_WEAPON_GUN && sub != ITEM_SUBCLASS_WEAPON_BOW
             && sub != ITEM_SUBCLASS_WEAPON_CROSSBOW)
             return;
-        if (bot->GetUInt32Value(PLAYER_AMMO_ID) == 0) return;  // no ammo — don't spam Shoot
+        if (bot->GetUInt32Value(PLAYER_AMMO_ID) == 0) return;  // no ammo — don't spam
         if (bot->GetDistance(victim) > 40.0f) return;          // out of ranged range
         if (!bot->IsWithinLOSInMap(victim)) return;
-        bot->CastSpell(victim, 3018, false);
+        SpellCastResult const r = bot->CastSpell(victim, 75, false);  // 75 = Auto Shot
+        if (r != SPELL_CAST_OK)
+        {
+            static thread_local std::unordered_map<uint32, uint32> failMs;
+            uint32 const now = getMSTime();
+            uint32& last = failMs[bot->GetGUID().GetCounter()];
+            if (now - last > 5000)
+            {
+                last = now;
+                LOG_INFO("module", "[WowPsParty Rotation] {} Auto Shot (75) failed: result={}",
+                         bot->GetName(), uint32(r));
+            }
+        }
     }
 
     bool TickRotation(Player* bot)
