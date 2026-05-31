@@ -1774,29 +1774,40 @@ namespace WowPsParty
 
         // Validate + cast a directed spell; if the ONLY blocker is range or
         // line of sight, walk toward the target instead of bailing.
-        auto castOrApproach = [&](Unit* target, uint32 spellId) -> bool
+        //
+        // `friendlyApproach`: only for casts on an ALLY (buffs/rez/cure). When a
+        // pre-approved cast is rejected by the server for a POSITIONAL reason,
+        // walk in and retry. We do NOT do this for offensive casts on the bot's
+        // victim — AssistTarget owns ranged/melee positioning there, and a shot
+        // that briefly fails NOT_INFRONT/LoS mid-move would otherwise call
+        // repositionToCast → HoldFollower, which makes AssistTarget YIELD, so the
+        // rotation drags the bot into melee and it never settles to shoot ("only
+        // auto-attacks, everything NO_MATCHes"). Offensive casts just fall through
+        // and let AssistTarget reposition.
+        auto castOrApproach = [&](Unit* target, uint32 spellId,
+                                  bool friendlyApproach = false) -> bool
         {
             if (canFireSpellOn(spellId, target))
             {
                 if (!channelClipOk()) return false;
                 if (faceAndCast(target, spellId)) return true;
-                // Our pre-check OK'd it but the server rejected the cast. If the
-                // reason is POSITIONAL (out of range / no LoS / not facing /
-                // too close), walk in and retry instead of standing still — this
-                // is what was breaking friendly buffs/rezzes whose GetMaxRange /
-                // IsPositive under-reports the real range so the range pre-check
-                // was skipped. A non-positional failure (immune, already has a
-                // better aura, etc.) falls through so we don't chase pointlessly.
-                switch (lastCastResult)
-                {
-                    case SPELL_FAILED_OUT_OF_RANGE:
-                    case SPELL_FAILED_LINE_OF_SIGHT:
-                    case SPELL_FAILED_UNIT_NOT_INFRONT:
-                    case SPELL_FAILED_TOO_CLOSE:
-                        return repositionToCast(target, spellId);
-                    default:
-                        return false;
-                }
+                // Pre-check OK'd it but the server rejected it. For a FRIENDLY
+                // target whose GetMaxRange/IsPositive under-reports the real range
+                // (so the range pre-check was skipped), a positional failure means
+                // "walk in and retry". Non-positional (immune, already has a better
+                // aura, ...) falls through so we don't chase pointlessly.
+                if (friendlyApproach)
+                    switch (lastCastResult)
+                    {
+                        case SPELL_FAILED_OUT_OF_RANGE:
+                        case SPELL_FAILED_LINE_OF_SIGHT:
+                        case SPELL_FAILED_UNIT_NOT_INFRONT:
+                        case SPELL_FAILED_TOO_CLOSE:
+                            return repositionToCast(target, spellId);
+                        default:
+                            break;
+                    }
+                return false;
             }
             if (castBlock == CastBlock::Position)
                 return repositionToCast(target, spellId);
@@ -1832,6 +1843,10 @@ namespace WowPsParty
 
             Unit* target = (verb == "cast_self") ? bot : bot->GetVictim();
             if (!target) return false;
+            // Offensive cast on our victim: AssistTarget owns the positioning, so
+            // DON'T approach on a positional server reject (default friendlyApproach
+            // = false) — repositioning here would fight AssistTarget and pull the
+            // ranged bot into melee.
             return castOrApproach(target, spellId);
         }
 
@@ -1871,7 +1886,7 @@ namespace WowPsParty
             if (!target) return false;
             if (verb == "cast_party_lowest_hot" && HasAuraFromSpell(target, spellId))
                 return false;
-            return castOrApproach(target, spellId);
+            return castOrApproach(target, spellId, /*friendlyApproach=*/true);
         }
 
         // "cast_class_missing:<classes>:<spell>" — cast spell on the first
@@ -1888,7 +1903,7 @@ namespace WowPsParty
             if (!spellId) return false;
             Player* target = FindClassFilteredMissing(bot, classes, spellId);
             if (!target) return false;
-            return castOrApproach(target, spellId);
+            return castOrApproach(target, spellId, /*friendlyApproach=*/true);
         }
 
         // "cast_role_missing:<role>:<spell>" — same idea but filter by the
@@ -1904,7 +1919,7 @@ namespace WowPsParty
             if (!spellId) return false;
             Player* target = FindRoleFilteredMissing(bot, roleFilter, spellId);
             if (!target) return false;
-            return castOrApproach(target, spellId);
+            return castOrApproach(target, spellId, /*friendlyApproach=*/true);
         }
 
         if (verb == "cast_party_missing")
@@ -1913,7 +1928,7 @@ namespace WowPsParty
             if (!spellId) return false;
             Player* target = FindPartyMemberMissingAura(bot, spellId);
             if (!target) return false;
-            return castOrApproach(target, spellId);
+            return castOrApproach(target, spellId, /*friendlyApproach=*/true);
         }
 
         // "cast_loose_enemy:<spell>" — cast the spell on the nearest hostile
@@ -1927,7 +1942,7 @@ namespace WowPsParty
             if (!spellId) return false;
             Unit* target = FindLooseEnemy(bot, 30.0f);
             if (!target) return false;
-            return castOrApproach(target, spellId);
+            return castOrApproach(target, spellId, /*friendlyApproach=*/true);
         }
 
         // "pull:<spell>" — initiate a RANGED pull. Picks the nearest hostile
@@ -1966,7 +1981,7 @@ namespace WowPsParty
             if (!spellId) return false;
             Player* target = FindDeadPartyMember(bot);
             if (!target) return false;
-            return castOrApproach(target, spellId);
+            return castOrApproach(target, spellId, /*friendlyApproach=*/true);
         }
 
         // "cure_party:<spell>" — cast `spell` on the first afflicted member.
@@ -1996,7 +2011,7 @@ namespace WowPsParty
             if (targetType == DISPEL_NONE) return false;
             Player* target = FindPartyMemberWithDispelType(bot, targetType);
             if (!target) return false;
-            return castOrApproach(target, spellId);
+            return castOrApproach(target, spellId, /*friendlyApproach=*/true);
         }
 
         // "use_item:<item name>" — pop a potion / healthstone / bandage from
@@ -2599,6 +2614,32 @@ namespace WowPsParty
                     execOk ? "FIRED" : "exec_failed_falling_through");
             if (execOk)
                 return true;
+        }
+
+        // Diagnostic (throttled 3 s/bot): in combat but NOTHING fired this tick
+        // ("only auto-attacks, everything NO_MATCH"). Pins the cause without
+        // needing the per-rule trace — no victim (has_target false), out of mana,
+        // no ammo, or stuck moving / in melee.
+        if (bot->IsInCombat())
+        {
+            static thread_local std::unordered_map<uint32, uint32> lastNoneMs;
+            uint32 const nowMs = getMSTime();
+            uint32& last = lastNoneMs[bot->GetGUID().GetCounter()];
+            if (nowMs - last > 3000)
+            {
+                last = nowMs;
+                Unit* const v = bot->GetVictim();
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] {} NO RULE FIRED (in combat): victim={} dist={:.1f} "
+                    "mana={}/{} ammo={} moving={} melee={}",
+                    bot->GetName(),
+                    v ? v->GetGUID().GetCounter() : 0u,
+                    v ? bot->GetDistance(v) : -1.0f,
+                    bot->GetPower(POWER_MANA), bot->GetMaxPower(POWER_MANA),
+                    bot->GetUInt32Value(PLAYER_AMMO_ID),
+                    bot->isMoving() ? 1 : 0,
+                    bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING) ? 1 : 0);
+            }
         }
         return false;
     }
