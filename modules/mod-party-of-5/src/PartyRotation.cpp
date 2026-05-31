@@ -2077,24 +2077,30 @@ namespace WowPsParty
                     }
                 }
             }
-            bool const wantDrink = (verb == "drink");
             bot->StopMoving();
             bot->GetMotionMaster()->Clear();
             if (bot->getStandState() != UNIT_STAND_STATE_SIT)
                 bot->SetStandState(UNIT_STAND_STATE_SIT);
 
             // NO ITEMS REQUIRED. Party bots — henchmen especially, who have no
-            // shared bags — recover for free while seated out of combat. Apply a
-            // generic Drink (430) / Food (433) aura for the sit-and-consume
-            // animation, then top the resource up a slice at a time. Each slice
-            // is a FRACTION of the max pool (which itself scales with level), so
-            // a level-80 bot's huge pool refills in the same wall-clock time as
-            // a low-level one — ~7.5 s low→full at mx/5 per 1.5 s — instead of
-            // crawling because a flat amount can't keep up with a big pool.
+            // shared bags — recover for free while seated out of combat.
+            //
+            // EAT AND DRINK AT THE SAME TIME: whichever rule fired (eat or
+            // drink), one sit restores BOTH health and mana so a bot low on both
+            // is ready in a single recovery instead of draining its drink to full
+            // and only THEN starting to eat. Food (433) and Drink (430) are
+            // independent auras, so we apply each for whatever still needs
+            // topping and top both up together. Each slice is a FRACTION of the
+            // max pool (which scales with level), so a level-80's huge pool
+            // refills in the same wall-clock time as a low-level one — ~7.5 s
+            // low→full at mx/5 per 1.5 s — instead of crawling on a flat amount.
             // Throttled by ms so the tick rate doesn't change the pace.
-            uint32 const auraId = wantDrink ? 430u : 433u;
-            if (!bot->HasAura(auraId))
-                bot->CastSpell(bot, auraId, true);
+            uint32 const mxMana = bot->GetMaxPower(POWER_MANA);   // 0 for non-mana classes
+            uint32 const mxHp   = bot->GetMaxHealth();
+            bool const needMana = mxMana > 0 && bot->GetPower(POWER_MANA) < mxMana;
+            bool const needHp   = bot->GetHealth() < mxHp;
+            if (needMana && !bot->HasAura(430)) bot->CastSpell(bot, 430, true);
+            if (needHp   && !bot->HasAura(433)) bot->CastSpell(bot, 433, true);
 
             static std::unordered_map<uint32, uint32> lastRegenMs;
             uint32 const regenKey = bot->GetGUID().GetCounter();
@@ -2105,19 +2111,12 @@ namespace WowPsParty
                 if (now - lr >= 1500)
                 {
                     lr = now;
-                    if (wantDrink)
-                    {
-                        uint32 const mx = bot->GetMaxPower(POWER_MANA);
-                        if (mx > 0)
-                            bot->SetPower(POWER_MANA, std::min(mx,
-                                bot->GetPower(POWER_MANA) + std::max<uint32>(1, mx / 5)));
-                    }
-                    else
-                    {
-                        uint32 const mx = bot->GetMaxHealth();
-                        bot->SetHealth(std::min(mx,
-                            bot->GetHealth() + std::max<uint32>(1, mx / 5)));
-                    }
+                    if (needMana)
+                        bot->SetPower(POWER_MANA, std::min(mxMana,
+                            bot->GetPower(POWER_MANA) + std::max<uint32>(1, mxMana / 5)));
+                    if (needHp)
+                        bot->SetHealth(std::min(mxHp,
+                            bot->GetHealth() + std::max<uint32>(1, mxHp / 5)));
                 }
             }
             WowPsParty::HoldFollower(bot->GetGUID(), 1500);
