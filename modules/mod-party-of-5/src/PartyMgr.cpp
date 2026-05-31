@@ -423,7 +423,13 @@ namespace WowPsParty
                 // as 3 combo points rather than waiting for 5 (or wasting a bleed) —
                 // above Slice and Dice so we don't refresh a buff on a corpse.
                 add("target_health<20&self_combo>2", "cast:Eviscerate", 78);
-                add("self_missing_aura:Slice and Dice&self_combo>1", "cast:Slice and Dice", 76);
+                // Slice and Dice only on ELITES/bosses (long fights). On normal
+                // trash, maintaining SnD just burns the first 2 combo every time
+                // the short buff lapses, and with rogue energy being slow the mob
+                // dies before combo ever banks to 5 — so Rupture/Eviscerate never
+                // fire. Gating SnD to elites lets trash combo flow to the finisher
+                // (the <20% execute above, or a full Eviscerate) instead.
+                add("self_missing_aura:Slice and Dice&self_combo>1&target_is_elite", "cast:Slice and Dice", 76);
                 // Rupture only if the bleed has time to pay off: target_ttd>8 is
                 // TRUE for an unmeasured/long-lived mob (fresh boss) and FALSE for a
                 // trash mob about to die — so we never waste a finisher's combo on a

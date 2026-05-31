@@ -1218,31 +1218,7 @@ namespace WowPsParty
         }
         // Combo points are 0-5, compared RAW (not as a percent of anything).
         if (name == "self_combo")
-        {
-            // Diagnostic (throttled 3 s/bot): a rogue "never finishing" means
-            // GetComboPoints() reads low. Log the raw points, the combo TARGET,
-            // the current victim, and energy so we can see whether points
-            // accumulate, whether the combo target drifts off the victim, or
-            // whether the rogue is just energy-starved and rarely landing a
-            // builder.
-            int const cp = int(bot->GetComboPoints());
-            static thread_local std::unordered_map<uint32, uint32> lastLog;
-            uint32 const nowMs = getMSTime();
-            uint32& last = lastLog[bot->GetGUID().GetCounter()];
-            if (nowMs - last > 3000)
-            {
-                last = nowMs;
-                Unit* const victim = bot->GetVictim();
-                LOG_INFO("module",
-                    "[WowPsParty Rotation] {} self_combo eval: pts={} comboTarget={} victim={} energy={}/{} cmp_op={} threshold={}",
-                    bot->GetName(), cp,
-                    bot->GetComboTargetGUID().GetCounter(),
-                    victim ? victim->GetGUID().GetCounter() : 0u,
-                    bot->GetPower(POWER_ENERGY), bot->GetMaxPower(POWER_ENERGY),
-                    op, threshold);
-            }
-            return cmp(cp);
-        }
+            return cmp(int(bot->GetComboPoints()));
         // Pet health %, for Mend Pet gating.
         if (name == "pet_health")
         {
