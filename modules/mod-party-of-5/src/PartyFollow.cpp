@@ -1300,15 +1300,19 @@ namespace WowPsParty
                     return;
                 }
                 // A tank will take it (or it's on someone else) — back out just
-                // PAST the dead zone (10y), NOT all the way to 18y. Staying close
-                // means less running (safer indoors / fewer accidental pulls) and
-                // it's still comfortably inside shooting range. Drop any melee.
+                // PAST the dead zone (13y), NOT all the way to 18y. A ranged
+                // special shot's effective min range is ~10y for a normal mob
+                // (spell min + melee range), so 13y is just clear of it: close
+                // enough to stay (less running, safer indoors) yet far enough to
+                // actually fire — 10y left the bot IN the dead zone, only able to
+                // auto-shoot. The rotation's own too-close check nudges it further
+                // for big mobs. Drop any melee.
                 if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
                     bot->Attack(desired, false);
                 if (mg != POINT_MOTION_TYPE)
                 {
                     float bx, by, bz;
-                    desired->GetNearPoint(bot, bx, by, bz, 0.0f, 10.0f, desired->GetAngle(bot));
+                    desired->GetNearPoint(bot, bx, by, bz, 0.0f, 13.0f, desired->GetAngle(bot));
                     bot->GetMotionMaster()->MovePoint(0, bx, by, bz);
                     AssistLog(gLow, "ranged: too close, backing out to firing range");
                 }

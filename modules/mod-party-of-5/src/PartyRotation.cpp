@@ -1540,8 +1540,16 @@ namespace WowPsParty
                 // fails SPELL_FAILED_TOO_CLOSE in melee. Treat as a positioning
                 // block so the bot backs OUT to range (repositionToCast handles
                 // the direction) instead of firing it every tick and failing.
+                // CRITICAL: match the server (Spell::CheckRange) — the EFFECTIVE
+                // minimum is the spell's min range PLUS melee range, so a special
+                // shot fails ~10y out for a normal mob (5y spell + ~5y melee), not
+                // 5y. The old raw-min check passed at ~9.6y, the shot then failed
+                // server-side, and the bot stood there auto-attacking forever
+                // ("abilities exec_fail"). Auto Shot uses a different range path,
+                // which is why only the SPECIAL shots were affected.
                 float const minRange = info->GetMinRange(info->IsPositive());
-                if (minRange > 0.0f && bot->IsWithinDistInMap(target, minRange))
+                if (minRange > 0.0f
+                    && bot->IsWithinRange(target, minRange + bot->GetMeleeRange(target)))
                 {
                     castBlock = CastBlock::Position;
                     return reject("too close");
@@ -1696,7 +1704,12 @@ namespace WowPsParty
             float minRange = 0.0f;
             if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
                 minRange = si->GetMinRange(si->IsPositive());
-            bool const tooClose = minRange > 0.0f && bot->IsWithinDistInMap(target, minRange);
+            // EFFECTIVE min = spell min + melee range (matches the server, see
+            // canFireSpellOn). Standoff = just past it, so the bot ends up only a
+            // little outside shooting range (~13y for a normal mob) instead of a
+            // fixed 16y, and scales correctly for big mobs.
+            float const effMinRange = minRange > 0.0f ? minRange + bot->GetMeleeRange(target) : 0.0f;
+            bool const tooClose = effMinRange > 0.0f && bot->IsWithinRange(target, effMinRange);
 
             uint32 const gLow = bot->GetGUID().GetCounter();
             uint32 const tLow = target->GetGUID().GetCounter();
@@ -1718,14 +1731,12 @@ namespace WowPsParty
             {
                 if (tooClose)
                 {
-                    // Back STRAIGHT OUT to the ranged standoff (16y), NOT to
-                    // minRange+3. Backing to ~8y put the bot inside AssistTarget's
-                    // 9y dead-zone threshold, which then shoved it to 16y — the two
-                    // systems fought and the hunter oscillated in place. One shared
-                    // standoff means neither re-triggers once the bot arrives.
+                    // Back STRAIGHT OUT to just past the effective min range
+                    // (+3y), so the bot clears the dead zone with a small margin
+                    // and settles close rather than at a fixed 16y.
                     float bx, by, bz;
                     target->GetNearPoint(bot, bx, by, bz, 0.0f,
-                        std::max(minRange + 3.0f, 16.0f), target->GetAngle(bot));
+                        effMinRange + 3.0f, target->GetAngle(bot));
                     bot->GetMotionMaster()->MovePoint(0, bx, by, bz);
                 }
                 else
