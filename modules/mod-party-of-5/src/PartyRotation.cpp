@@ -1435,6 +1435,9 @@ namespace WowPsParty
         // through to a lower-priority rule).
         enum class CastBlock { None, Hard, Position };
         CastBlock castBlock = CastBlock::None;
+        // Result of the most recent faceAndCast(), so castOrApproach can tell a
+        // positional server-side rejection (walk in and retry) from a real one.
+        SpellCastResult lastCastResult = SPELL_CAST_OK;
 
         auto canFireSpellOn = [bot, &castBlock](uint32 spellId, Unit* target) -> bool
         {
@@ -1568,7 +1571,7 @@ namespace WowPsParty
         // immune, out of LoS at cast time, etc.) — the caller treats that
         // as "rule didn't fire" so the rotation falls through to the next
         // lower-priority rule.
-        auto faceAndCast = [bot](Unit* target, uint32 spellId) -> bool
+        auto faceAndCast = [bot, &lastCastResult](Unit* target, uint32 spellId) -> bool
         {
             int32 castMs = 0;
             if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId))
@@ -1591,6 +1594,7 @@ namespace WowPsParty
             if (target && target != bot)
                 bot->SetFacingToObject(target);
             SpellCastResult const r = bot->CastSpell(target, spellId, false);
+            lastCastResult = r;
             if (r != SPELL_CAST_OK)
             {
                 // Throttle per (bot, spell) — a cast that keeps failing must not
@@ -1764,7 +1768,24 @@ namespace WowPsParty
             if (canFireSpellOn(spellId, target))
             {
                 if (!channelClipOk()) return false;
-                return faceAndCast(target, spellId);
+                if (faceAndCast(target, spellId)) return true;
+                // Our pre-check OK'd it but the server rejected the cast. If the
+                // reason is POSITIONAL (out of range / no LoS / not facing /
+                // too close), walk in and retry instead of standing still — this
+                // is what was breaking friendly buffs/rezzes whose GetMaxRange /
+                // IsPositive under-reports the real range so the range pre-check
+                // was skipped. A non-positional failure (immune, already has a
+                // better aura, etc.) falls through so we don't chase pointlessly.
+                switch (lastCastResult)
+                {
+                    case SPELL_FAILED_OUT_OF_RANGE:
+                    case SPELL_FAILED_LINE_OF_SIGHT:
+                    case SPELL_FAILED_UNIT_NOT_INFRONT:
+                    case SPELL_FAILED_TOO_CLOSE:
+                        return repositionToCast(target, spellId);
+                    default:
+                        return false;
+                }
             }
             if (castBlock == CastBlock::Position)
                 return repositionToCast(target, spellId);
