@@ -264,6 +264,29 @@ namespace WowPsParty
         return std::string();
     }
 
+    // True if the bot's party has a LIVE tank-role member (enrolled alt or
+    // hired henchman) on the same map. Lets a ranged bot decide between kiting
+    // (a tank will peel the mob) and planting to fight (nobody will, so running
+    // just drags the mob around forever). The human leader's own spec is
+    // unknown to us, so a player who tanks personally reads as "no tank" — fine,
+    // since the mob returns to them on threat and the bot only stands its ground
+    // while the mob is actually on it.
+    static bool PartyHasLiveTank(Player* bot)
+    {
+        if (!bot) return false;
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(bot->GetGUID(), party);
+        for (ObjectGuid const& gg : party)
+        {
+            if (RoleForGuid(gg) != "tank") continue;
+            Player* t = ObjectAccessor::FindConnectedPlayer(gg);
+            if (t && t->IsInWorld() && t->IsAlive()
+                && t->GetMapId() == bot->GetMapId())
+                return true;
+        }
+        return false;
+    }
+
     // True if `botGuid` is the account's designated dungeon lead tank, decided
     // by DIRECTIVE ROLE (the lowest-guid follower with role "tank"), so a hired
     // HENCHMAN tank can lead the route too — the old slot-based check excluded
@@ -590,8 +613,15 @@ namespace WowPsParty
             if (d > LOOSE_MAX_RANGE) return;            // out of grab range
             if (d < bestDist) { bestDist = d; best = a; }
         };
-        for (Unit* a : bot->getAttackers())             // mobs on me but not targeting me (taunted off, etc.)
-            consider(a);
+        auto considerAttackersOf = [&](Unit* u)
+        {
+            if (!u || u->IsTotem()) return;   // don't grab a mob just hitting a totem
+            for (Unit* a : u->getAttackers())
+                consider(a);
+        };
+        considerAttackersOf(bot);                       // mobs on me but not targeting me (taunted off, etc.)
+        for (Unit* ctrl : bot->m_Controlled)            // and mobs on my own pet
+            considerAttackersOf(ctrl);
         if (Group* g = bot->GetGroup())
         {
             for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
@@ -599,8 +629,9 @@ namespace WowPsParty
                 Player* m = itr->GetSource();
                 if (!m || !m->IsInWorld() || m == bot) continue;
                 if (m->GetMapId() != bot->GetMapId()) continue;
-                for (Unit* a : m->getAttackers())
-                    consider(a);
+                considerAttackersOf(m);
+                for (Unit* ctrl : m->m_Controlled)      // a mob that pulled onto a member's PET
+                    considerAttackersOf(ctrl);
             }
         }
         return best;
@@ -945,10 +976,17 @@ namespace WowPsParty
         // stands around" bug: only the leader's target made anything fire.
         auto pickPartyDefenseTarget = [&]() -> Unit*
         {
-            // self-defense — anything swinging at US, always (it's already on us).
+            static constexpr float PARTY_DEFEND_RANGE = 30.0f;
+            // self-defense — anything swinging at US or OUR pet, always (it's
+            // already on us / right next to us, no range cap).
             for (Unit* a : bot->getAttackers())
                 if (a && a->IsAlive() && bot->IsValidAttackTarget(a))
                     return a;
+            for (Unit* ctrl : bot->m_Controlled)
+                if (ctrl && !ctrl->IsTotem())   // a pet/guardian, not a fire-and-forget totem
+                    for (Unit* a : ctrl->getAttackers())
+                        if (a && a->IsAlive() && bot->IsValidAttackTarget(a))
+                            return a;
             // party-defense via our directive roster (leader + all bots +
             // henchmen), NOT the WoW group — the group can form incompletely,
             // which left bots ignoring a member under attack. This is what makes
@@ -956,7 +994,19 @@ namespace WowPsParty
             // already NEAR us (PARTY_DEFEND_RANGE): a DPS must not sprint across a
             // room to peel for a distant ally — that pulls every pack on the way
             // and wipes the group. Distant threats are the tank's / leader's job.
-            static constexpr float PARTY_DEFEND_RANGE = 30.0f;
+            // A member's PET counts too: a mob that aggroed onto the leader's
+            // (or a bot's) pet never shows in the player's getAttackers, so
+            // without the pet scan the tank just stands around while a pet-pull
+            // fight rages ("my pet pulls, the paladin does nothing").
+            auto scanAttackers = [&](Unit* u) -> Unit*
+            {
+                if (!u || u->IsTotem()) return nullptr;   // don't peel for a totem
+                for (Unit* a : u->getAttackers())
+                    if (a && a->IsAlive() && bot->IsValidAttackTarget(a)
+                        && bot->IsWithinDistInMap(a, PARTY_DEFEND_RANGE))
+                        return a;
+                return nullptr;
+            };
             std::vector<ObjectGuid> party;
             GetPartyGuidsFor(bot->GetGUID(), party);
             for (ObjectGuid const& gg : party)
@@ -964,10 +1014,9 @@ namespace WowPsParty
                 Player* m = ObjectAccessor::FindConnectedPlayer(gg);
                 if (!m || !m->IsInWorld() || m == bot) continue;
                 if (m->GetMapId() != bot->GetMapId()) continue;
-                for (Unit* a : m->getAttackers())
-                    if (a && a->IsAlive() && bot->IsValidAttackTarget(a)
-                        && bot->IsWithinDistInMap(a, PARTY_DEFEND_RANGE))
-                        return a;
+                if (Unit* a = scanAttackers(m)) return a;
+                for (Unit* ctrl : m->m_Controlled)
+                    if (Unit* a = scanAttackers(ctrl)) return a;
             }
             return nullptr;
         };
@@ -1148,6 +1197,30 @@ namespace WowPsParty
 
             if (d < 8.0f)
             {
+                // Forced into melee with no tank to peel: STAND AND FIGHT rather
+                // than kite forever (backing out only drags the mob around the
+                // room). Holding still also buys the pet time to reach the mob
+                // and Growl it off; once the mob leaves us we resume ranged next
+                // tick. Hunters flip on melee swings (their shots are dead-zoned
+                // this close); casters just hold and keep casting point-blank.
+                if (desired->GetVictim() == bot && !PartyHasLiveTank(bot))
+                {
+                    if (mg != IDLE_MOTION_TYPE)
+                    {
+                        bot->StopMoving();
+                        bot->GetMotionMaster()->Clear();
+                        bot->GetMotionMaster()->MoveIdle();
+                    }
+                    if (acls == CLASS_HUNTER)
+                        bot->Attack(desired, true);   // white melee swings in the dead zone
+                    bot->SetFacingToObject(desired);
+                    AssistLog(gLow, "ranged: no tank, standing ground to fight in melee");
+                    return;
+                }
+                // A tank will take it (or it's on someone else) — back straight
+                // out to firing range. Drop any melee we'd switched on.
+                if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
+                    bot->Attack(desired, false);
                 if (mg != POINT_MOTION_TYPE)
                 {
                     float bx, by, bz;
@@ -1164,6 +1237,8 @@ namespace WowPsParty
                 // SAFE — the user's "don't move when it can ranged attack". Kill
                 // any leftover movement ONCE (so Auto Shot can fire), then leave
                 // the feet completely alone; just keep facing the target.
+                if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
+                    bot->Attack(desired, false);   // back at range — stop meleeing, resume shots
                 if (mg != IDLE_MOTION_TYPE)
                 {
                     bot->StopMoving();
@@ -1178,6 +1253,8 @@ namespace WowPsParty
 
             // Out of range or no line of sight -> close in. Plain chase (no angle
             // = no orbit). Install once; a running chase keeps maintaining range.
+            if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
+                bot->Attack(desired, false);   // chasing back to range — stop meleeing, resume shots
             if (mg != CHASE_MOTION_TYPE)
                 bot->GetMotionMaster()->MoveChase(desired, ChaseRange(15.0f, 25.0f));
             bot->SetFacingToObject(desired);

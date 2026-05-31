@@ -370,6 +370,13 @@ namespace WowPsParty
                 // pack; Multi-Shot is the instant fallback.
                 add("enemies_clustered:8>2", "cast:Volley", 54);
                 add("enemies_clustered:8>2", "cast:Multi-Shot", 52);
+                // Forced into melee (no tank peeled the mob off us, so we stand
+                // our ground): a hunter can't shoot in the dead zone, so weave
+                // the melee strikes. Gated on a mob actually in melee range —
+                // the ranged shots above out-range these and win at distance, so
+                // they only fire once we're standing toe-to-toe.
+                add("enemies_in_melee>0", "cast:Raptor Strike", 51);
+                add("enemies_in_melee>0", "cast:Mongoose Bite", 50);
                 add("has_target", "cast:Arcane Shot", 46);
                 add("has_target", "cast:Steady Shot", 36);
                 break;
@@ -595,6 +602,14 @@ namespace WowPsParty
         if (cls == 2 || cls == 3 || cls == 5 || cls == 7
             || cls == 8 || cls == 9 || cls == 11)   // Pala/Hunter/Priest/Shaman/Mage/Warlock/Druid
             add("out_of_combat&self_mana<90", "drink", 14);
+
+        // Wand filler for the classes that can equip one (Priest/Mage/Warlock).
+        // Lowest combat priority by design: a DPS caster only falls to it when
+        // its mana-gated nukes can't fire (i.e. it's out of mana — the cast
+        // fails and the engine drops through to here), and a healer only when
+        // nothing higher needs doing. Free damage, no mana, no cooldown.
+        if (cls == 5 || cls == 8 || cls == 9)   // Priest / Mage / Warlock
+            add("has_target", "wand", 11);
 
         std::string out;
         for (size_t i = 0; i < rules.size(); ++i)

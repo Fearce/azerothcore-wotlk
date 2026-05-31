@@ -2135,6 +2135,31 @@ namespace WowPsParty
             return true;
         }
 
+        // "wand" — fire the equipped wand (spell 5019, an auto-repeat like Auto
+        // Shot). Free, no-mana filler so an out-of-mana caster or an idle healer
+        // still chips at the target instead of standing there. Cast ONCE; the
+        // core auto-repeats it. Keep it running on the current victim, re-acquire
+        // on a target switch (a stale auto-repeat shoots the old corpse forever).
+        if (verb == "wand")
+        {
+            Unit* v = bot->GetVictim();
+            if (!v || !v->IsAlive()) return false;
+            if (Spell* repeat = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+            {
+                if (repeat->m_targets.GetUnitTarget() == v)
+                    return true;                              // already wanding this mob
+                bot->InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
+                return false;                                 // wrong target — restart next tick
+            }
+            Item* ranged = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+            if (!ranged || ranged->GetTemplate()->SubClass != ITEM_SUBCLASS_WEAPON_WAND)
+                return false;                                 // no wand equipped
+            if (bot->GetDistance(v) > 30.0f) return false;    // wands are 30y
+            if (!bot->IsWithinLOSInMap(v)) return false;
+            bot->SetFacingToObject(v);   // auto-repeat fails NOT_INFRONT otherwise
+            return bot->CastSpell(v, 5019, false) == SPELL_CAST_OK;
+        }
+
         // "keep_distance_enemy:N" — kite. When the target is closer than N yards,
         // hop straight away to N+4 and return true. As the LOWEST-priority rule it
         // only fires between casts: instant casts (higher rules, no is_not_moving
@@ -2243,10 +2268,9 @@ namespace WowPsParty
     // stance, toggles ability autocast, and commands attacks — but that's all
     // gated out for our bots, so a re-summoned pet just heels passively and
     // never uses Growl/Claw/Bite/etc. We re-implement the essentials:
-    //   * once per pet: defensive stance (so it defends the hunter on its own,
-    //     even when the leader hasn't tagged the mob) + enable autocast on every
-    //     autocastable ability it knows, so it weaves Growl/Claw/Bite/Rake/Swipe
-    //     itself;
+    //   * defensive stance (so it defends the hunter on its own, even when the
+    //     leader hasn't tagged the mob) + autocast on every autocastable ability
+    //     it knows, so it weaves Growl/Claw/Bite/Rake/Swipe itself;
     //   * while the hunter is fighting: push the pet onto the hunter's victim so
     //     it focuses the same mob (Growl pulls threat off the bot);
     //   * out of combat: heel it back so it doesn't body-pull the next pack.
@@ -2258,44 +2282,43 @@ namespace WowPsParty
         CharmInfo* charm = pet->GetCharmInfo();
         if (!charm) return;
 
-        // One-time per-pet setup, keyed on the pet's GUID so a fresh re-summon
-        // is reconfigured but we don't churn the autocast list every tick.
-        static std::unordered_map<uint32, uint32> setupFor;   // bot GUID low -> pet GUID low
-        uint32& configured = setupFor[bot->GetGUID().GetCounter()];
-        uint32 const petLow = pet->GetGUID().GetCounter();
-        if (configured != petLow)
+        // Stance + autocast every tick rather than once-per-pet. The walk is
+        // cheap (the pet's spell list is tiny) and idempotent — ToggleAutocast
+        // only fires on a real mismatch, so steady state is just the scan. A
+        // one-shot was unreliable: ToggleAutocast no-ops on a spell that isn't
+        // in m_spells yet, so if the one-shot ran on the tick the pet was still
+        // loading its spell list, autocast was never enabled and the pet sat
+        // there swinging but never using Growl/Claw/Bite. Re-running self-heals
+        // that (and avoids a cross-thread static-map write for bots on
+        // different maps).
+        if (pet->GetReactState() == REACT_PASSIVE)
         {
-            configured = petLow;
-            if (pet->GetReactState() == REACT_PASSIVE)
-            {
-                pet->SetReactState(REACT_DEFENSIVE);
-                charm->SetPlayerReactState(REACT_DEFENSIVE);
-            }
-            // Don't autocast threat-droppers / stealth / utility the AI can't
-            // time (Cower lowers the threat we want Growl to build; Prowl, Leap,
-            // Spell Lock, Devour Magic are situational). Same exclusions as
-            // mod-playerbots' pet autocast.
-            static std::unordered_set<uint32> const noAutocast = {
-                24450, 24452, 24453,         // Prowl 1-3
-                1742, 47482,                 // Cower, Leap
-                19244, 19647,                // Spell Lock 1-2
-                19505, 19731, 19734, 19736,  // Devour Magic 1-4
-                27276, 27277, 48011,         // Devour Magic 5-7
-                58867                         // Spirit Wolf Leap
-            };
-            for (auto const& s : pet->m_spells)
-            {
-                if (s.second.state == PETSPELL_REMOVED) continue;
-                SpellInfo const* si = sSpellMgr->GetSpellInfo(s.first);
-                if (!si || !si->IsAutocastable()) continue;
-                bool const wanted = !noAutocast.count(s.first);
-                bool isAuto = false;
-                for (uint32 a : pet->m_autospells) if (a == s.first) { isAuto = true; break; }
-                // Toggle only on a mismatch — enables the abilities we want and
-                // actively turns OFF a re-summoned pet's excluded autocasts
-                // (e.g. a saved-on Cower that would shed the Growl threat).
-                if (wanted != isAuto) pet->ToggleAutocast(si, wanted);
-            }
+            pet->SetReactState(REACT_DEFENSIVE);
+            charm->SetPlayerReactState(REACT_DEFENSIVE);
+        }
+        // Don't autocast threat-droppers / stealth / utility the AI can't time
+        // (Cower lowers the threat we want Growl to build; Prowl, Leap, Spell
+        // Lock, Devour Magic are situational). Same exclusions as mod-playerbots.
+        static std::unordered_set<uint32> const noAutocast = {
+            24450, 24452, 24453,         // Prowl 1-3
+            1742, 47482,                 // Cower, Leap
+            19244, 19647,                // Spell Lock 1-2
+            19505, 19731, 19734, 19736,  // Devour Magic 1-4
+            27276, 27277, 48011,         // Devour Magic 5-7
+            58867                         // Spirit Wolf Leap
+        };
+        for (auto const& s : pet->m_spells)
+        {
+            if (s.second.state == PETSPELL_REMOVED) continue;
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(s.first);
+            if (!si || !si->IsAutocastable()) continue;
+            bool const wanted = !noAutocast.count(s.first);
+            bool isAuto = false;
+            for (uint32 a : pet->m_autospells) if (a == s.first) { isAuto = true; break; }
+            // Toggle only on a mismatch — enables the abilities we want and
+            // actively turns OFF a re-summoned pet's excluded autocasts
+            // (e.g. a saved-on Cower that would shed the Growl threat).
+            if (wanted != isAuto) pet->ToggleAutocast(si, wanted);
         }
 
         Unit* victim = bot->GetVictim();
@@ -2346,6 +2369,18 @@ namespace WowPsParty
     {
         if (bot->getClass() != CLASS_HUNTER) return;   // melee shouldn't stand and shoot
         Unit* victim = bot->GetVictim();
+
+        // Standing our ground in melee (no tank, mob in our face): AssistTarget
+        // switched on melee swings, and Auto Shot is dead-zoned this close
+        // anyway. Cancel any auto-repeat and don't start one — let the white
+        // swings + melee abilities do the work until the mob is peeled and we
+        // back out to firing range (which drops the melee state, so we resume).
+        if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
+        {
+            if (bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+                bot->InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
+            return;
+        }
 
         // Auto Shot, once cast, auto-repeats until something interrupts it —
         // AttackStop() clears the melee swing, NOT the ranged auto-repeat. Two
