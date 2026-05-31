@@ -533,7 +533,9 @@ namespace WowPsParty
                     add("target_missing_aura:Flame Shock", "cast:Flame Shock", 72);
                     add("has_target", "cast:Lava Burst", 66);
                     add("has_target", "cast:Stormstrike", 64);
-                    add("enemies_in_range>2", "cast:Chain Lightning", 56);
+                    // Cluster-gated, not bot-centred: an elemental shaman casts
+                    // from range, so count enemies bunched near the TARGET.
+                    add("enemies_clustered:8>2", "cast:Chain Lightning", 56);
                     add("has_target", "cast:Earth Shock", 46);
                     add("has_target", "cast:Lightning Bolt", 38);
                 }
@@ -621,7 +623,9 @@ namespace WowPsParty
                     add("always", "cast_party_missing:Mark of the Wild", 60);
                     add("target_missing_aura:Moonfire", "cast:Moonfire", 72);
                     add("target_missing_aura:Insect Swarm", "cast:Insect Swarm", 68);
-                    add("enemies_in_range>2", "cast:Hurricane", 58);
+                    // Cluster-gated ground AoE: a balance druid casts from range,
+                    // so detect the mob knot, not hostiles near the druid.
+                    add("enemies_clustered:8>2", "cast:Hurricane", 58);
                     add("has_target", "cast:Starfire", 46);
                     add("has_target", "cast:Wrath", 44);
                 }
