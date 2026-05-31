@@ -45,6 +45,7 @@ namespace WowPsParty
     // AI. Tracked as a follow directive flagged henchman=true.
     void   AddHenchmanDirective(uint32 account, ObjectGuid henchGuid,
                                 ObjectGuid leaderGuid, std::string const& role);
+    void   SetHenchmanRole(ObjectGuid followerGuid, std::string const& role);  // refresh after re-spec
     void   RemoveFollower(ObjectGuid followerGuid);   // dismiss / logout
     bool   IsHenchman(ObjectGuid guid);
     uint32 CountHenchmenFor(ObjectGuid leaderGuid);

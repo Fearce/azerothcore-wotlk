@@ -218,6 +218,21 @@ namespace WowPsParty
             leaderGuid.GetCounter(), role);
     }
 
+    // Update a tracked follower's role in place (e.g. a henchman whose spec was
+    // re-rolled by the level-match factory after spawn — its directive role
+    // drives targeting mode and lead-tank selection, so it must follow the new
+    // spec, not the pre-spawn guess).
+    void SetHenchmanRole(ObjectGuid followerGuid, std::string const& role)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (auto& d : g_directives)
+            if (d.followerGuid == followerGuid)
+            {
+                d.role = role.empty() ? "dps" : role;
+                return;
+            }
+    }
+
     // Drop a single follower's directive (henchman dismiss / logout).
     void RemoveFollower(ObjectGuid followerGuid)
     {

@@ -175,24 +175,16 @@ namespace WowPsParty
         return uint32(level) * 250u;
     }
 
-    // Infer a henchman's combat role from its ACTUAL talent spec. The candidate
-    // is offline at hire, so we read `character_talent` and resolve each learned
-    // talent to its tree (tabpage 0/1/2) via the Talent DBC, summing points spent
-    // per tree and taking the dominant one. Without this, role would be the flat
-    // class default (every warrior "tank", every priest "healer"), so a Fury
-    // warrior or Shadow priest would get the wrong role-aware rotation. Falls back
-    // to `fallback` when the char has no talents yet (very low level).
-    static std::string InferHenchmanRole(uint32 guid, uint8 cls,
-                                         std::string const& fallback)
+    // Map a set of learned talent-rank spell ids to a combat role, by resolving
+    // each to its tree (tabpage 0/1/2) via the Talent DBC, summing points spent
+    // per tree and taking the dominant one. This is what keeps a Fury warrior or
+    // Shadow priest from getting the flat class-default role-aware rotation.
+    // Falls back to `fallback` when the char has no talents yet (very low level).
+    static std::string RoleFromTalents(uint8 cls,
+                                       std::unordered_set<uint32> const& known,
+                                       std::string const& fallback)
     {
-        QueryResult q = CharacterDatabase.Query(
-            "SELECT `spell` FROM `character_talent` WHERE `guid` = {}", guid);
-        if (!q) return fallback;
-
-        std::unordered_set<uint32> known;
-        do { known.insert(q->Fetch()[0].Get<uint32>()); } while (q->NextRow());
         if (known.empty()) return fallback;
-
         uint32 points[3] = { 0, 0, 0 };
         for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
         {
@@ -222,9 +214,52 @@ namespace WowPsParty
             case 5:  return tree == 2 ? "dps" : "healer";                     // Priest: Shadow vs Disc/Holy
             case 6:  return tree == 0 ? "tank" : "dps";                       // DK: Blood
             case 7:  return tree == 2 ? "healer" : "dps";                     // Shaman: Resto
-            case 11: return tree == 2 ? "healer" : (tree == 1 ? "tank" : "dps"); // Druid: Balance/Feral/Resto
+            case 11: // Druid: Balance=dps, Resto=healer, Feral=bear(tank)/cat(dps)
+                if (tree == 0) return "dps";       // Balance
+                if (tree == 2) return "healer";    // Restoration
+                // Feral covers BOTH the bear tank and the cat DPS build, so a
+                // tree-only check wrongly tanks every feral. Disambiguate the
+                // way mod-playerbots does: a bear maxes Thick Hide (rank 3,
+                // talent spell 16931); a cat doesn't. No rank 3 → it's a cat.
+                return known.count(16931) ? "tank" : "dps";
             default: return "dps";                                            // Hunter/Rogue/Mage/Warlock
         }
+    }
+
+    // Role of an OFFLINE candidate, read from character_talent in the DB. Used
+    // pre-hire (the bot isn't in world yet).
+    static std::string InferHenchmanRole(uint32 guid, uint8 cls,
+                                         std::string const& fallback)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `spell` FROM `character_talent` WHERE `guid` = {}", guid);
+        if (!q) return fallback;
+        std::unordered_set<uint32> known;
+        do { known.insert(q->Fetch()[0].Get<uint32>()); } while (q->NextRow());
+        return RoleFromTalents(cls, known, fallback);
+    }
+
+    // Role of a LIVE bot, read from its in-memory learned talents. Used right
+    // after a re-level re-rolls the spec, when the DB write is still an async
+    // transaction in flight (a DB read would race and return the old spec).
+    static std::string InferHenchmanRoleLive(Player* p, std::string const& fallback)
+    {
+        if (!p) return fallback;
+        std::unordered_set<uint32> known;
+        for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
+        {
+            TalentEntry const* tal = sTalentStore.LookupEntry(i);
+            if (!tal) continue;
+            for (int rank = int(tal->RankID.size()) - 1; rank >= 0; --rank)
+                // HasTalent (not HasSpell): keyed exactly by talent-rank spell id,
+                // so a trained class spell can't masquerade as a spent talent.
+                if (tal->RankID[rank] && p->HasTalent(tal->RankID[rank], p->GetActiveSpec()))
+                {
+                    known.insert(tal->RankID[rank]);
+                    break;
+                }
+        }
+        return RoleFromTalents(p->getClass(), known, fallback);
     }
 
     // Canonical per-class, per-role starter rotation. Built as a priority list
@@ -647,7 +682,11 @@ namespace WowPsParty
             c.name  = f[1].Get<std::string>();
             c.cls   = f[2].Get<uint8>();
             c.level = f[3].Get<uint8>();
-            c.role  = ClassDefaultRole(c.cls);
+            // Show the role the bot ACTUALLY is (from its talents) — the same
+            // inference the hire uses — not the flat class default. Otherwise
+            // the list "marks" every druid a healer while a feral one hires in
+            // as a tank (the reported bug).
+            c.role  = InferHenchmanRole(c.guid, c.cls, ClassDefaultRole(c.cls));
             out.push_back(std::move(c));
         } while (q->NextRow());
     }
@@ -715,7 +754,11 @@ namespace WowPsParty
             c.name  = mf[1].Get<std::string>();
             c.cls   = cls;
             c.level = L;   // shown + costed at the player's level; re-leveled on hire
-            c.role  = ClassDefaultRole(cls);
+            // Inferred from current talents like the other path. NOTE: an
+            // out-of-band pick is re-rolled by Randomize on spawn, so the role
+            // is re-derived AFTER that re-roll in HireHenchman — this label is
+            // the best pre-hire estimate.
+            c.role  = InferHenchmanRole(c.guid, cls, ClassDefaultRole(cls));
             deduped.push_back(std::move(c));
         }
         return deduped;
@@ -1024,6 +1067,7 @@ namespace WowPsParty
         //               stacking) with sensible spells, same engine as heroes.
         //   targetmode: saved strategies_csv, else tank -> "loose" / "master".
         //   lead       : saved glyphs_csv ("0" = off), else ON.
+        bool hadCustomRotation = false;   // gates the post-relevel rebuild below
         {
             QueryResult lq = CharacterDatabase.Query(
                 "SELECT `priority_actions_json`,`strategies_csv`,`glyphs_csv` "
@@ -1036,6 +1080,7 @@ namespace WowPsParty
                 savedMode = lf[1].Get<std::string>();
                 savedLead = lf[2].Get<std::string>();
             }
+            hadCustomRotation = !savedRot.empty();
 
             WowPsParty::RotationCacheSet(candidateGuid,
                 WowPsParty::ParseRotationString(
@@ -1055,7 +1100,7 @@ namespace WowPsParty
         // (drop the directive, refund the gold) so we never leak a directive or
         // charge the player for a no-show.
         ObjectGuid const leaderGuid = requester->GetGUID();
-        requester->m_Events.AddEventAtOffset([leaderGuid, henchGuid, cost]()
+        requester->m_Events.AddEventAtOffset([leaderGuid, henchGuid, cost, cls, hadCustomRotation]()
         {
             Player* lead = ObjectAccessor::FindConnectedPlayer(leaderGuid);
             Player* hen  = ObjectAccessor::FindConnectedPlayer(henchGuid);
@@ -1098,6 +1143,24 @@ namespace WowPsParty
                     LOG_INFO("module",
                         "[WowPsParty Henchmen] re-leveled hench guid={} {} -> {} to match leader",
                         henchGuid.GetCounter(), oldLvl, target);
+
+                    // Randomize re-rolled the talents, so the role we inferred
+                    // before spawn (and the rotation built from it) may no longer
+                    // match the spec. Re-derive from the now-saved talents and,
+                    // unless the player has a saved custom rotation, rebuild the
+                    // role-aware defaults — otherwise a re-leveled pick can keep a
+                    // tank rotation on a now-DPS spec (the hire bug, post-relevel).
+                    uint32 const guidLow = henchGuid.GetCounter();
+                    std::string const freshRole =
+                        InferHenchmanRoleLive(hen, ClassDefaultRole(cls));
+                    WowPsParty::SetHenchmanRole(henchGuid, freshRole);
+                    if (!hadCustomRotation)
+                    {
+                        WowPsParty::RotationCacheSet(guidLow,
+                            WowPsParty::ParseRotationString(DefaultRotationForClass(cls, freshRole)));
+                        WowPsParty::TargetModeCacheSet(guidLow,
+                            freshRole == "tank" ? "loose" : "master");
+                    }
                 }
             }
 
