@@ -408,7 +408,7 @@ namespace WowPsParty
     // talent DBC is cheap but pointless to repeat every tick, and a spec rarely
     // changes mid-pull. Returns 0 (the benign default) when the bot has no
     // talents yet. Mage trees: 0=Arcane, 1=Fire, 2=Frost.
-    static uint8 PrimaryTalentTree(Player* bot)
+    uint8 PrimaryTalentTree(Player* bot)   // declared in PartyRotation.h (used by the follow layer too)
     {
         static std::mutex mtx;
         static std::unordered_map<uint32, std::pair<uint32, uint8>> cache;  // guid -> (computedMs, tree)
@@ -2131,6 +2131,17 @@ namespace WowPsParty
             bot->StopMoving();
             bot->GetMotionMaster()->Clear();
             WowPsParty::HoldFollower(bot->GetGUID(), 1500);
+            return true;
+        }
+
+        // "cancel_form" — drop the current shapeshift (Cat/Moonkin/etc.). A feral
+        // cat or moonkin shifts IN combat but must leave the form out of combat to
+        // drink/eat, mount with the party, or buff Mark of the Wild. Gated by the
+        // rule on out_of_combat + having the form, so it only fires when needed.
+        if (verb == "cancel_form")
+        {
+            if (!bot->HasShapeshiftAura()) return false;
+            bot->RemoveAurasByType(SPELL_AURA_MOD_SHAPESHIFT);
             return true;
         }
 

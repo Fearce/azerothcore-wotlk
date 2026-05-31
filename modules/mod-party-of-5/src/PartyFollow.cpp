@@ -1234,14 +1234,21 @@ namespace WowPsParty
         bool rangedCaster =
             acls == CLASS_MAGE   || acls == CLASS_WARLOCK || acls == CLASS_PRIEST ||
             acls == CLASS_HUNTER || acls == CLASS_SHAMAN  || acls == CLASS_DRUID;
-        // Hybrids aren't ranged in every spec: a TANK is never ranged, and a
-        // druid in bear/cat form fights in melee. Without this a bear-tank druid
-        // was classed a caster and kited to "firing range" forever, only ever
-        // landing Faerie Fire while its melee threat abilities (Mangle/Lacerate/
-        // Maul) sat out of range. Role "tank" also covers the first tick before
-        // it has shifted into bear.
-        if (rangedCaster && (RoleForGuid(bot->GetGUID()) == "tank" || bot->IsInFeralForm()))
-            rangedCaster = false;
+        // Hybrids aren't ranged in every spec. A TANK is never ranged; an
+        // ENHANCEMENT shaman or a FERAL druid (talent tree 1) fights in melee;
+        // and a druid already shifted into bear/cat form is melee. Without this a
+        // bear-tank druid kited to "firing range" forever, and an enhancement
+        // shaman / feral cat would too. Role "tank" + the tree check both cover
+        // the first tick before the bot has shifted form.
+        if (rangedCaster)
+        {
+            bool const melee =
+                RoleForGuid(bot->GetGUID()) == "tank" ||
+                ((acls == CLASS_DRUID || acls == CLASS_SHAMAN)
+                    && WowPsParty::PrimaryTalentTree(bot) == 1) ||
+                bot->IsInFeralForm();
+            if (melee) rangedCaster = false;
+        }
 
         // Make sure the victim is set (drives auto-attack / has_target). Melee
         // gets a melee swing; ranged does NOT (it must never run into melee).

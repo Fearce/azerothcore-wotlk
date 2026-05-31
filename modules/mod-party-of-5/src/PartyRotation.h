@@ -91,6 +91,12 @@ namespace WowPsParty
     // Re-serialise rules back to the DSL form.
     std::string SerialiseRotationRules(std::vector<RotationRule> const& rules);
 
+    // Dominant talent tree (tabpage 0/1/2) of a live bot, by points spent;
+    // cached per-bot. Lets the follow/positioning layer tell a melee hybrid spec
+    // (enhancement shaman / feral druid = tree 1) from a ranged one. 0 if no
+    // talents yet.
+    uint8 PrimaryTalentTree(Player* bot);
+
     // Cache management. Called by PartyMgr when a bot logs in / loadout changes.
     void RotationCacheSet(uint32 guid, std::vector<RotationRule> rules);
     void RotationCacheClear(uint32 guid);

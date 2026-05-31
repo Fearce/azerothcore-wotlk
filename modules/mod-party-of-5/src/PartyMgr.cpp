@@ -271,6 +271,10 @@ namespace WowPsParty
     //     rotation can list EVERY spec's key abilities and degrade gracefully —
     //     a low-level or off-spec bot simply skips what it hasn't learned and
     //     drops to the filler it does know.
+    // The melee-vs-ranged hybrid DPS specs (enhancement shaman, feral cat vs
+    // balance druid) additionally gate rules on `primary_tree:N` so a melee spec
+    // doesn't try to stand and cast (and the follow layer kites/closes to match);
+    // each such branch keeps a non-spec-gated filler so no spec is left ruleless.
     // `role` ("tank"/"healer"/"dps") tunes the warrior/DK stance/presence, the
     // hybrids' heal aggressiveness, and tank threat/taunt rules. Empty role →
     // the class's default role. Shared by `.party preset` and henchman hire.
@@ -531,13 +535,19 @@ namespace WowPsParty
                     add("target_casting&target_interruptible", "cast:Wind Shear", 82);
                     add("always", "buff_self:Lightning Shield", 78);
                     add("target_missing_aura:Flame Shock", "cast:Flame Shock", 72);
-                    add("has_target", "cast:Lava Burst", 66);
-                    add("has_target", "cast:Stormstrike", 64);
-                    // Cluster-gated, not bot-centred: an elemental shaman casts
-                    // from range, so count enemies bunched near the TARGET.
+                    // ENHANCEMENT (talent tree 1): melee. Stormstrike/Lava Lash,
+                    // Earth Shock as the instant dump, and an INSTANT Lightning
+                    // Bolt at 5 stacks of Maelstrom Weapon. The follow layer
+                    // treats tree-1 shamans as melee so they close to contact.
+                    add("primary_tree:1&has_target", "cast:Stormstrike", 70);
+                    add("primary_tree:1&has_target", "cast:Lava Lash", 64);
+                    add("primary_tree:1&self_aura_stacks:Maelstrom Weapon>4", "cast:Lightning Bolt", 60);
+                    // ELEMENTAL (tree 0): ranged nuker.
+                    add("primary_tree:0&has_target", "cast:Lava Burst", 66);
+                    // Cluster-gated AoE (both specs cast it from range).
                     add("enemies_clustered:8>2", "cast:Chain Lightning", 56);
-                    add("has_target", "cast:Earth Shock", 46);
-                    add("has_target", "cast:Lightning Bolt", 38);
+                    add("has_target", "cast:Earth Shock", 46);     // enh dump / ele instant
+                    add("has_target", "cast:Lightning Bolt", 38);  // filler
                 }
                 break;
 
@@ -621,13 +631,36 @@ namespace WowPsParty
                 {
                     add("party_lowest_health<30", "cast_party_lowest:Healing Touch", 84);
                     add("always", "cast_party_missing:Mark of the Wild", 60);
-                    add("target_missing_aura:Moonfire", "cast:Moonfire", 72);
-                    add("target_missing_aura:Insect Swarm", "cast:Insect Swarm", 68);
-                    // Cluster-gated ground AoE: a balance druid casts from range,
-                    // so detect the mob knot, not hostiles near the druid.
-                    add("enemies_clustered:8>2", "cast:Hurricane", 58);
-                    add("has_target", "cast:Starfire", 46);
-                    add("has_target", "cast:Wrath", 44);
+                    // FERAL CAT (talent tree 1): melee combo build/spend, like a
+                    // rogue. The follow layer treats tree-1 druids as melee. Shift
+                    // to Cat Form only in combat (has_target) so it can still mount
+                    // / buff out of combat. Savage Roar gated to elites for the
+                    // same reason rogue Slice and Dice is — on trash it just eats
+                    // the combo the damage finishers need (see LESSONS).
+                    add("primary_tree:1&has_target&self_missing_aura:Cat Form", "buff_self:Cat Form", 82);
+                    add("primary_tree:1&has_target&self_energy<35", "cast_self:Tiger's Fury", 79);
+                    add("primary_tree:1&self_missing_aura:Savage Roar&self_combo>0&target_is_elite", "cast:Savage Roar", 77);
+                    add("primary_tree:1&target_health<25&self_combo>2", "cast:Ferocious Bite", 75);
+                    add("primary_tree:1&self_combo>4&target_missing_aura:Rip&target_ttd>8", "cast:Rip", 73);
+                    add("primary_tree:1&self_combo>4", "cast:Ferocious Bite", 70);
+                    add("primary_tree:1&target_missing_aura:Rake", "cast:Rake", 66);
+                    add("primary_tree:1&has_target", "cast:Mangle (Cat)", 58);
+                    add("primary_tree:1&has_target", "cast:Claw", 48);   // pre-Mangle fallback
+                    // Leave the form out of combat so the cat can drink/mount/buff
+                    // (above eat/drink at 12-14 so it drops form FIRST).
+                    add("primary_tree:1&out_of_combat&self_has_aura:Cat Form", "cancel_form", 16);
+                    // BALANCE — and the universal NON-feral fallback (!tree 1),
+                    // so a no-talent low-level druid OR one a user manually flips
+                    // to dps while Resto-specced still nukes instead of standing
+                    // idle. Moonkin Form falls through harmlessly if untalented.
+                    add("!primary_tree:1&has_target&self_missing_aura:Moonkin Form", "buff_self:Moonkin Form", 80);
+                    add("!primary_tree:1&target_missing_aura:Moonfire", "cast:Moonfire", 72);
+                    add("!primary_tree:1&target_missing_aura:Insect Swarm", "cast:Insect Swarm", 68);
+                    // Cluster-gated ground AoE: balance casts from range.
+                    add("!primary_tree:1&enemies_clustered:8>2", "cast:Hurricane", 58);
+                    add("!primary_tree:1&has_target", "cast:Starfire", 46);
+                    add("!primary_tree:1&has_target", "cast:Wrath", 44);
+                    add("!primary_tree:1&out_of_combat&self_has_aura:Moonkin Form", "cancel_form", 16);
                 }
                 break;
 
