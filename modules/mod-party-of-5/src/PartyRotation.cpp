@@ -11,6 +11,7 @@
 #include "CellImpl.h"
 #include "Creature.h"
 #include "DatabaseEnv.h"
+#include "DBCStores.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
 #include "Group.h"
@@ -398,6 +399,51 @@ namespace WowPsParty
             if (c > bestCount) { bestCount = c; best = a; }
         }
         return best;
+    }
+
+    // Dominant talent tree (tabpage 0/1/2) of a LIVE bot, by points spent.
+    // Mirrors PartyMgr's offline InferHenchmanRole but reads learned talent
+    // ranks straight from the player in memory (HasSpell), so it tracks the
+    // bot's CURRENT spec. Cached per-bot with a short TTL — the walk over the
+    // talent DBC is cheap but pointless to repeat every tick, and a spec rarely
+    // changes mid-pull. Returns 0 (the benign default) when the bot has no
+    // talents yet. Mage trees: 0=Arcane, 1=Fire, 2=Frost.
+    static uint8 PrimaryTalentTree(Player* bot)
+    {
+        static std::mutex mtx;
+        static std::unordered_map<uint32, std::pair<uint32, uint8>> cache;  // guid -> (computedMs, tree)
+        uint32 const guid = bot->GetGUID().GetCounter();
+        uint32 const now  = getMSTime();
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto it = cache.find(guid);
+            if (it != cache.end() && now - it->second.first < 10000)
+                return it->second.second;
+        }
+
+        uint32 points[3] = { 0, 0, 0 };
+        for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
+        {
+            TalentEntry const* tal = sTalentStore.LookupEntry(i);
+            if (!tal) continue;
+            TalentTabEntry const* tab = sTalentTabStore.LookupEntry(tal->TalentTab);
+            if (!tab || tab->tabpage > 2) continue;
+            for (int rank = int(tal->RankID.size()) - 1; rank >= 0; --rank)
+                if (tal->RankID[rank] && bot->HasSpell(tal->RankID[rank]))
+                {
+                    points[tab->tabpage] += uint32(rank + 1);
+                    break;
+                }
+        }
+        uint8 tree = 0;
+        if (points[1] > points[tree]) tree = 1;
+        if (points[2] > points[tree]) tree = 2;
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            cache[guid] = { now, tree };
+        }
+        return tree;
     }
 
     // Find an enemy within `radius` of the bot whose current victim is a
@@ -868,6 +914,13 @@ namespace WowPsParty
                 int const found  = int(MaxEnemyCluster(bot, radius));
                 return opA == '<' ? (found < countN) : (found > countN);
             }
+            // "primary_tree:N" — TRUE when the bot's dominant talent tree is
+            // tabpage N (0/1/2). Lets a rotation prefer a spec's signature
+            // ability, e.g. mage "primary_tree:1" = Fire (so a fire mage leads
+            // its AoE with Flamestrike instead of Blizzard). Combine with `!`
+            // for the inverse.
+            if (cname == "primary_tree")
+                return int(PrimaryTalentTree(bot)) == std::atoi(arg.c_str());
         }
         if (cond == "in_combat")     return bot->IsInCombat();
         if (cond == "out_of_combat") return !bot->IsInCombat();

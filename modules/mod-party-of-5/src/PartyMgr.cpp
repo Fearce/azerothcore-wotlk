@@ -365,7 +365,11 @@ namespace WowPsParty
                 add("has_target", "cast:Chimera Shot", 62);
                 add("has_target", "cast:Explosive Shot", 61);
                 add("has_target", "cast:Aimed Shot", 56);
-                add("enemies_in_range>2", "cast:Multi-Shot", 52);
+                // AoE on the densest mob CLUSTER, not hostiles near the hunter
+                // (who stands at range). Volley (placed ground AoE) leads on a
+                // pack; Multi-Shot is the instant fallback.
+                add("enemies_clustered:8>2", "cast:Volley", 54);
+                add("enemies_clustered:8>2", "cast:Multi-Shot", 52);
                 add("has_target", "cast:Arcane Shot", 46);
                 add("has_target", "cast:Steady Shot", 36);
                 break;
@@ -494,8 +498,15 @@ namespace WowPsParty
                 add("always", "buff_self:Frost Armor", 72);
                 add("target_missing_aura:Living Bomb", "cast:Living Bomb", 68);
                 add("always", "cast_party_missing:Arcane Intellect", 60);
-                add("enemies_in_range>2", "cast:Flamestrike", 58);
-                add("enemies_in_range>2", "cast:Blizzard", 56);
+                // Placed AoE keys off the densest mob CLUSTER (3+ enemies within
+                // ~8y of each OTHER), not hostiles near the mage — a ranged mage
+                // stands well back, so a bot-centred count reads 0 on a pack it
+                // could nuke. Blizzard leads by default; a Fire-specced mage
+                // (primary_tree:1) prefers Flamestrike. The lower Blizzard rule
+                // doubles as a Fire mage's fallback when Flamestrike is on CD.
+                add("enemies_clustered:8>2&primary_tree:1", "cast:Flamestrike", 60);
+                add("enemies_clustered:8>2", "cast:Blizzard", 58);
+                add("enemies_clustered:8>2", "cast:Flamestrike", 56);
                 add("has_target", "cast:Frostbolt", 44);
                 add("has_target", "cast:Fireball", 42);
                 add("has_target", "cast:Arcane Blast", 40);
@@ -517,7 +528,12 @@ namespace WowPsParty
                 add("target_missing_aura:Corruption", "cast:Corruption", 70);
                 add("target_missing_aura:Curse of Agony", "cast:Curse of Agony", 66);
                 add("target_missing_aura:Unstable Affliction", "cast:Unstable Affliction", 62);
-                add("enemies_in_range>2&target_missing_aura:Seed of Corruption", "cast:Seed of Corruption", 58);
+                // AoE on the densest mob CLUSTER, not hostiles near the warlock
+                // (who stands at range). Seed of Corruption (spreads off the
+                // current target) leads; Rain of Fire (placed ground AoE) backs
+                // it up on a fresh pack with no Seed yet.
+                add("enemies_clustered:8>2&target_missing_aura:Seed of Corruption", "cast:Seed of Corruption", 58);
+                add("enemies_clustered:8>2", "cast:Rain of Fire", 56);
                 add("target_health<25", "cast:Drain Soul", 54);
                 add("has_target", "cast:Haunt", 50);
                 add("has_target", "cast:Incinerate", 44);
