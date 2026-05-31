@@ -246,9 +246,19 @@ namespace WowPsParty
         bool const isHealer = (r == "healer");
 
         std::vector<std::string> rules;
-        auto add = [&rules](char const* cond, char const* action, int prio)
+        auto add = [&rules](char const* cond, char const* action, int prio,
+                            char const* flags = nullptr)
         {
-            rules.emplace_back(std::string(cond) + '|' + action + '|' + std::to_string(prio));
+            std::string rule = std::string(cond) + '|' + action + '|' + std::to_string(prio);
+            // Optional 4th DSL field (e.g. "disabled") — present in the default
+            // rotation but skipped by the engine until the user ticks it on in
+            // the editor.
+            if (flags && *flags)
+            {
+                rule += '|';
+                rule += flags;
+            }
+            rules.emplace_back(std::move(rule));
         };
 
         switch (cls)
@@ -489,8 +499,14 @@ namespace WowPsParty
                 add("has_target", "cast:Frostbolt", 44);
                 add("has_target", "cast:Fireball", 42);
                 add("has_target", "cast:Arcane Blast", 40);
-                add("out_of_combat&shared_drink<5", "cast_self:Conjure Water", 18);
-                add("out_of_combat&shared_food<5", "cast_self:Conjure Food", 16);
+                // Disabled by default: henchmen recover for free (eat/drink
+                // below) and don't need conjured items, and a henchman mage
+                // burning mana to conjure between pulls just slows the party.
+                // Kept in the rotation (flagged "disabled") so a player running
+                // a mage as one of their own alt-bots can tick it on in the
+                // editor to stock the shared bags.
+                add("out_of_combat&shared_drink<5", "cast_self:Conjure Water", 18, "disabled");
+                add("out_of_combat&shared_food<5", "cast_self:Conjure Food", 16, "disabled");
                 break;
 
             case 9: // Warlock
@@ -554,10 +570,15 @@ namespace WowPsParty
         // Out-of-combat recovery (item-free — the drink/eat action regenerates
         // for free). Lowest priority so it only kicks in with nothing else to
         // do. Eat (health) for everyone; drink (mana) only for mana classes.
-        add("out_of_combat&self_health<60", "eat", 12);
+        // Thresholds sit near-full: the rule engine is stateless, so the bot
+        // recovers up to the threshold and stops — a low <50 mana cap meant it
+        // quit at half and had to re-trigger several times to ever reach full.
+        // At <90 it tops off to near-full in one sitting, then natural regen
+        // closes the gap.
+        add("out_of_combat&self_health<90", "eat", 12);
         if (cls == 2 || cls == 3 || cls == 5 || cls == 7
             || cls == 8 || cls == 9 || cls == 11)   // Pala/Hunter/Priest/Shaman/Mage/Warlock/Druid
-            add("out_of_combat&self_mana<50", "drink", 14);
+            add("out_of_combat&self_mana<90", "drink", 14);
 
         std::string out;
         for (size_t i = 0; i < rules.size(); ++i)
