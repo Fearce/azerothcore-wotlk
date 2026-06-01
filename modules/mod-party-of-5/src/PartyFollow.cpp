@@ -1211,6 +1211,24 @@ namespace WowPsParty
         return true;
     }
 
+    // Rear-arc bearings for the range-pull tank anchor. MoveFollow's angle is
+    // relative to the ANCHOR's facing (0 = in front, M_PI = directly behind), and
+    // the tank faces the mob while winding up the pull — so M_PI is "straight back,
+    // away from the pack", exactly the safe backpedal direction. These cluster
+    // tightly around M_PI (a small spread just to stop bots stacking) and NEVER
+    // reach the ±M_PI/2 flanks, so the party backs off BEHIND the tank, not to the
+    // sides (the old FORM_ANGLES set included flank bearings — the "backed off to
+    // the sides instead" bug).
+    static constexpr float PULL_REAR_ANGLES[6] = {
+        float(M_PI),            // straight behind
+        float(M_PI) * 0.90f,    // behind, slightly left
+        float(M_PI) * 1.10f,    // behind, slightly right
+        float(M_PI) * 0.85f,    // behind-left
+        float(M_PI) * 1.15f,    // behind-right
+        float(M_PI) * 0.95f,    // behind, just off-centre (distinct so it can't
+                                // stack on index 0; 7+ followers ring out by dist)
+    };
+
     void AssistTarget(Player* bot)
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
@@ -1257,6 +1275,11 @@ namespace WowPsParty
         // Self-defence is exempt: a mob already swinging at us in melee is part of
         // the pull we're waiting on, not a new pull, so we may fight back rather
         // than stand and die. Lead tank itself is never gated (it IS the puller).
+        // guid -> captured tank standoff for the current pull (0 = not captured).
+        // map-update thread owns this bot, so thread_local is race-free (matches
+        // wasAlive / combatState). Dropped when the pull ends so the next one
+        // re-captures from the fresh geometry.
+        static thread_local std::unordered_map<uint32, float> g_pullAnchor;
         if (!IsLeadTank(bot->GetGUID()) && IsPartyPullPending(bot))
         {
             bool meleeThreatOnMe = false;
@@ -1265,12 +1288,54 @@ namespace WowPsParty
             if (!meleeThreatOnMe)
             {
                 if (bot->GetVictim()) bot->AttackStop();
-                if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE)
-                    bot->GetMotionMaster()->Clear();
-                AssistLog(gLow, "pull pending: holding fire until the tank engages the pack");
+                // Anchor to the TANK and ride its backward retreat — done HERE (the
+                // map-tick assist loop, ~30Hz) not in the 1Hz follow ticker, so it
+                // engages the instant the tank commits to the pull instead of a tick
+                // late (the bot was trailing the leader, then sprinting back). Hold
+                // the SAME standoff it had via the leader (captured once so the
+                // leader's roaming can't reel it in); melee anchor close, ready to
+                // fight. Backpedal STRAIGHT BEHIND the tank (PULL_REAR_ANGLES), away
+                // from the pack — never to the flanks.
+                MovementGeneratorType const mg =
+                    bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
+                Player* const tank = PartyLeadTank(bot);
+                if (tank && tank != bot)
+                {
+                    bool const melee = FollowerIsMelee(bot);
+                    float& held = g_pullAnchor[gLow];
+                    bool const firstTick = held <= 0.0f;
+                    if (firstTick)
+                    {
+                        held = melee ? 6.0f
+                                     : (leader ? bot->GetDistance(leader) + leader->GetDistance(tank)
+                                               : 12.0f);
+                        held = std::max(held, melee ? 5.0f : 12.0f);
+                        held = std::min(held, 45.0f);
+                    }
+                    // Force the anchor on the first pull tick even though we were
+                    // already FOLLOWing (the leader) — otherwise the stale leader
+                    // follow would persist. Re-assert too if the follow was lost.
+                    if (firstTick || mg != FOLLOW_MOTION_TYPE)
+                    {
+                        int const fi = FormationIndexFor(bot->GetGUID(), GetLeaderFor(bot->GetGUID()));
+                        // 7+ followers (party-of-5 + henchmen) wrap the 6-bearing
+                        // table; push each extra ring 2.5y further back so they
+                        // don't stack on the inner ring (mirrors the leader-follow).
+                        float const followDist = held + float(fi / 6) * 2.5f;
+                        if (bot->getStandState() != UNIT_STAND_STATE_STAND)
+                            bot->SetStandState(UNIT_STAND_STATE_STAND);
+                        bot->GetMotionMaster()->Clear();
+                        bot->GetMotionMaster()->MoveFollow(tank, followDist, PULL_REAR_ANGLES[fi % 6]);
+                    }
+                }
+                else if (mg == CHASE_MOTION_TYPE)
+                    bot->GetMotionMaster()->Clear();   // no tank found — just hold fire
+                AssistLog(gLow, "pull pending: anchoring behind the tank, holding fire");
                 return;
             }
         }
+        else
+            g_pullAnchor.erase(gLow);   // not pulling → re-capture next pull
 
         // Target priority:
         //   1. Leader's explicit victim (you click, everyone follows).
@@ -1988,41 +2053,11 @@ namespace WowPsParty
                 if (follower->IsInCombat())   return true;
                 if (follower->GetVictim())    return true;
 
-                // RANGE-PULL ANCHOR. While the lead tank is mid ranged-pull and the
-                // pack hasn't reached it, a NON-tank follower anchors to the TANK and
-                // follows its backward retreat — regardless of where the leader (the
-                // user) roams. This lets a stealthed leader flank/reposition without
-                // dragging the party into the pack. It OVERRIDES the party-combat
-                // guard below (the tank's victim would otherwise freeze everyone in
-                // place). Standoff: ranged hold the SAME distance they had via the
-                // leader (their leader gap + the leader's gap to the tank), captured
-                // ONCE so the leader's movement can't reel them in; melee anchor close,
-                // ready to engage the instant the pull lands. Fans out BEHIND the tank
-                // (it faces the mob), away from the pack. Reverts to the leader anchor
-                // the moment the pull ends (the captured standoff is dropped below).
-                static thread_local std::unordered_map<uint32, float> g_pullAnchorDist;
-                uint32 const flow = d.followerGuid.GetCounter();
-                Player* const leadTank = IsLeadTank(d.followerGuid) ? nullptr
-                                                                    : PartyLeadTank(follower);
-                if (leadTank && leadTank != follower && IsPartyPullPending(follower))
-                {
-                    bool const melee = FollowerIsMelee(follower);
-                    float& held = g_pullAnchorDist[flow];
-                    if (held <= 0.0f)   // capture once at pull start
-                    {
-                        held = melee ? 6.0f
-                                     : follower->GetDistance(leader) + leader->GetDistance(leadTank);
-                        held = std::max(held, melee ? 5.0f : 12.0f);
-                        held = std::min(held, 45.0f);
-                    }
-                    int const fi = FormationIndexFor(d.followerGuid, d.leaderGuid);
-                    if (follower->getStandState() != UNIT_STAND_STATE_STAND)
-                        follower->SetStandState(UNIT_STAND_STATE_STAND);
-                    follower->GetMotionMaster()->Clear();
-                    follower->GetMotionMaster()->MoveFollow(leadTank, held, FORM_ANGLES[fi % 6]);
-                    return true;
-                }
-                g_pullAnchorDist.erase(flow);   // not pulling → re-capture next pull
+                // (The range-pull TANK ANCHOR lives in AssistTarget now — the
+                // map-tick assist loop — so it engages the instant the tank commits
+                // to the pull instead of a follow-ticker tick late. During a pull
+                // the tank has a victim, so the party-combat guard below yields and
+                // AssistTarget owns the anchor; nothing to do here.)
 
                 // The PARTY is fighting but THIS bot momentarily isn't — e.g. a tank
                 // that just lost all its threat, or a ranged dps between targets.
