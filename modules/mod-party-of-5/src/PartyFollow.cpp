@@ -1108,6 +1108,32 @@ namespace WowPsParty
         }
     }
 
+    // The party's main combat target — the lead TANK's victim, else any party
+    // member's victim — for a bot that has nothing else to engage. Lets an idle /
+    // too-far bot (party-defense is range-capped, the leader isn't attacking) GAP-
+    // CLOSE to the fight and use its abilities instead of standing around out of
+    // combat while the party fights. Returns nullptr when NOBODY is actually
+    // fighting a valid target, so it's dormant out of combat.
+    static Unit* PartyMainCombatTarget(Player* bot)
+    {
+        if (!bot) return nullptr;
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(bot->GetGUID(), party);
+        Unit* anyVictim = nullptr;
+        for (ObjectGuid const& g : party)
+        {
+            if (g == bot->GetGUID()) continue;
+            Player* m = ObjectAccessor::FindConnectedPlayer(g);
+            if (!m || !m->IsInWorld() || !m->IsAlive() || m->GetMapId() != bot->GetMapId())
+                continue;
+            Unit* v = m->GetVictim();
+            if (!v || !v->IsAlive() || !bot->IsValidAttackTarget(v)) continue;
+            if (RoleForGuid(g) == "tank") return v;   // prefer the tank's target
+            if (!anyVictim) anyVictim = v;
+        }
+        return anyVictim;
+    }
+
     // True while the party's lead tank is mid ranged-pull and the pack hasn't
     // reached it yet — the signal every other bot reads to hold fire. False once
     // a hostile is in the tank's melee (pull complete → fight) or there's no
@@ -1335,6 +1361,13 @@ namespace WowPsParty
             if (bot->GetComboPoints() > 0)
                 desired = current;
         }
+
+        // Still nothing of our own, but the PARTY is fighting — we're idle/too far
+        // for party-defense to reach and the leader isn't attacking. GAP-CLOSE to
+        // the party's main fight (the tank's victim) instead of standing around out
+        // of combat; the engage/position bands below chase us to firing range.
+        if (!desired)
+            desired = PartyMainCombatTarget(bot);
 
         if (!desired)
         {
