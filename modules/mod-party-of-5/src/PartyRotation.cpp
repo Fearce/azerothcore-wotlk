@@ -2418,29 +2418,22 @@ namespace WowPsParty
             return true;
         }
 
-        // "wand" — fire the equipped wand (spell 5019, an auto-repeat like Auto
-        // Shot). Free, no-mana filler so an out-of-mana caster or an idle healer
-        // still chips at the target instead of standing there. Cast ONCE; the
-        // core auto-repeats it. Keep it running on the current victim, re-acquire
-        // on a target switch (a stale auto-repeat shoots the old corpse forever).
+        // "wand" — the actual wand shooting (spell 5019 "Shoot", an auto-repeat) is
+        // maintained as a BACKGROUND auto-attack in EnsureRangedAutoAttack so it's
+        // never toggled and never counts as casting. This rule just reports whether
+        // the bot CAN wand the current victim, so an out-of-mana / swarmed caster
+        // STOPS here (free, no-mana filler) instead of spending a GCD on a cast-time
+        // nuke below it. No CastSpell here — that would fight the background repeat
+        // (re-casting resets the swing, the "toggle on/off" the wand had before).
         if (verb == "wand")
         {
             Unit* v = bot->GetVictim();
             if (!v || !v->IsAlive()) return false;
-            if (Spell* repeat = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
-            {
-                if (repeat->m_targets.GetUnitTarget() == v)
-                    return true;                              // already wanding this mob
-                bot->InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
-                return false;                                 // wrong target — restart next tick
-            }
             Item* ranged = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
             if (!ranged || ranged->GetTemplate()->SubClass != ITEM_SUBCLASS_WEAPON_WAND)
                 return false;                                 // no wand equipped
             if (bot->GetDistance(v) > 30.0f) return false;    // wands are 30y
-            if (!bot->IsWithinLOSInMap(v)) return false;
-            bot->SetFacingToObject(v);   // auto-repeat fails NOT_INFRONT otherwise
-            return bot->CastSpell(v, 5019, false) == SPELL_CAST_OK;
+            return bot->IsWithinLOSInMap(v);
         }
 
         // "shoot" — fire the equipped PHYSICAL ranged weapon: a gun/bow/crossbow
@@ -2651,62 +2644,76 @@ namespace WowPsParty
         }
     }
 
-    // Hunters must ACTIVELY start their ranged auto-attack — spell 75 "Auto Shot"
-    // (NOT 3018 "Shoot", which is the warrior/rogue generic ranged attack; casting
-    // the wrong spell never establishes the auto-repeat, so it re-fires every tick
-    // — animation but no completed shot, no damage — AND its repeated cast blocks
-    // the ability casts). Cast it ONCE; the core then auto-repeats it (and cancels
-    // it on movement, so a kiting hunter resumes when it plants). Needs ammo
-    // equipped (MaintainAmmo).
+    // Maintain a bot's BACKGROUND ranged auto-attack — the same way for a hunter's
+    // Auto Shot and a caster's wand, because both are auto-repeat spells with the
+    // same pitfalls:
+    //   * hunter: spell 75 "Auto Shot" with a gun/bow/crossbow + ammo.
+    //   * caster (priest/mage/warlock): spell 5019 "Shoot" with a WAND equipped.
+    //     (NOTE: the action verb is `wand` but the real spell is 5019 "Shoot".)
+    // Cast it ONCE; the core then auto-repeats it (and cancels it on movement, so a
+    // bot resumes when it plants). It must NOT be re-cast every tick — re-casting
+    // resets the swing and the bot toggles it on/off without ever landing a shot —
+    // so this only (re)starts it when there is NO live auto-repeat, and otherwise
+    // just re-acquires on a target switch. It is NOT driven by a rotation rule (the
+    // `wand` verb just confirms it's running, to suppress cast-time nukes), and it
+    // never counts as "casting" because every gate passes skipAutorepeat=true, so
+    // abilities/nukes still fire on top. Cast 3018 (warrior/rogue Shoot) is the
+    // WRONG spell for a wand and never establishes the repeat.
     static void EnsureRangedAutoAttack(Player* bot)
     {
-        if (bot->getClass() != CLASS_HUNTER) return;   // melee shouldn't stand and shoot
+        Item* const ranged = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+        if (!ranged) return;
+        uint8 const sub = ranged->GetTemplate()->SubClass;
+
+        uint32 autoSpell = 0;
+        float  maxRange  = 0.0f;
+        bool   needAmmo  = false;
+        if (bot->getClass() == CLASS_HUNTER)
+        {
+            if (sub == ITEM_SUBCLASS_WEAPON_GUN || sub == ITEM_SUBCLASS_WEAPON_BOW
+                || sub == ITEM_SUBCLASS_WEAPON_CROSSBOW)
+            { autoSpell = 75; maxRange = 40.0f; needAmmo = true; }
+        }
+        else if (sub == ITEM_SUBCLASS_WEAPON_WAND)   // priest/mage/warlock with a wand
+        { autoSpell = 5019; maxRange = 30.0f; }
+        if (!autoSpell) return;
+
         Unit* victim = bot->GetVictim();
 
-        // Standing our ground in melee (no tank, mob in our face): AssistTarget
-        // switched on melee swings, and Auto Shot is dead-zoned this close
-        // anyway. Cancel any auto-repeat and don't start one — let the white
-        // swings + melee abilities do the work until the mob is peeled and we
-        // back out to firing range (which drops the melee state, so we resume).
-        if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
+        // HUNTER only: standing its ground in melee (no tank, mob in our face) —
+        // AssistTarget switched on melee swings and Auto Shot is dead-zoned this
+        // close, so cancel the repeat and let the swings work. Wands have NO dead
+        // zone, so a caster keeps wanding point-blank (don't cancel).
+        if (autoSpell == 75 && bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
         {
             if (bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
                 bot->InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
             return;
         }
 
-        // Auto Shot, once cast, auto-repeats until something interrupts it —
-        // AttackStop() clears the melee swing, NOT the ranged auto-repeat. Two
-        // stale states have to be cancelled by hand, or the bot looks like it's
-        // shooting but lands nothing:
-        //   * no live victim → it keeps playing the shoot animation out of
-        //     combat ("auto-attacks at all times");
-        //   * locked on a unit we're no longer fighting → when a new mob is
-        //     pulled (e.g. one the leader didn't tag) the auto-repeat never
-        //     re-acquires it, so the hunter stands and "does nothing" while the
-        //     animation fires at the old corpse.
-        // Cancelling here lets the block below restart a fresh Auto Shot on the
-        // current victim.
+        // The repeat, once cast, runs until interrupted — AttackStop() clears the
+        // melee swing, NOT the ranged repeat. Cancel only the two stale states so
+        // the block below restarts a fresh one on the CURRENT victim; otherwise
+        // leave the live repeat alone (re-casting it would reset the swing and
+        // "toggle it on/off"):
+        //   * no live victim → it keeps firing the animation out of combat;
+        //   * locked on a unit we're no longer fighting → it never re-acquires the
+        //     new mob and the bot "does nothing" while the animation hits a corpse.
         if (Spell* repeat = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
         {
             Unit* shotAt = repeat->m_targets.GetUnitTarget();
             if (!victim || !victim->IsAlive() || shotAt != victim)
                 bot->InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
-            return;   // either already shooting the right target, or just cancelled — restart next tick
+            return;   // already on the right target, or just cancelled — restart next tick
         }
 
         if (!victim || !victim->IsAlive()) return;
-        if (bot->isMoving()) return;                                 // can't start a shot mid-move
-        Item* ranged = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
-        if (!ranged) return;
-        uint8 const sub = ranged->GetTemplate()->SubClass;
-        if (sub != ITEM_SUBCLASS_WEAPON_GUN && sub != ITEM_SUBCLASS_WEAPON_BOW
-            && sub != ITEM_SUBCLASS_WEAPON_CROSSBOW)
-            return;
-        if (bot->GetUInt32Value(PLAYER_AMMO_ID) == 0) return;  // no ammo — don't spam
-        if (bot->GetDistance(victim) > 40.0f) return;          // out of ranged range
+        if (bot->isMoving()) return;                           // can't start a shot mid-move
+        if (needAmmo && bot->GetUInt32Value(PLAYER_AMMO_ID) == 0) return;
+        if (bot->GetDistance(victim) > maxRange) return;       // out of ranged range
         if (!bot->IsWithinLOSInMap(victim)) return;
-        SpellCastResult const r = bot->CastSpell(victim, 75, false);  // 75 = Auto Shot
+        if (autoSpell == 5019) bot->SetFacingToObject(victim); // wand repeat fails NOT_INFRONT otherwise
+        SpellCastResult const r = bot->CastSpell(victim, autoSpell, false);
         if (r != SPELL_CAST_OK)
         {
             static thread_local std::unordered_map<uint32, uint32> failMs;
@@ -2715,8 +2722,8 @@ namespace WowPsParty
             if (now - last > 5000)
             {
                 last = now;
-                LOG_INFO("module", "[WowPsParty Rotation] {} Auto Shot (75) failed: result={}",
-                         bot->GetName(), uint32(r));
+                LOG_INFO("module", "[WowPsParty Rotation] {} ranged auto-attack ({}) failed: result={}",
+                         bot->GetName(), autoSpell, uint32(r));
             }
         }
     }
