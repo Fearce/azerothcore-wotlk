@@ -1992,6 +1992,23 @@ namespace WowPsParty
             if (follower->IsNonMeleeSpellCast(false, false, true))
                 return true;
 
+            // Clientless-bot safety net. A party bot that is ALIVE and OUT OF
+            // COMBAT must never stay movement-blocked: a human clears a stale
+            // root/stun/death-state on revive because the unroot round-trips
+            // through their game client, but a bot has none
+            // (GetClientControlling() == nullptr), so the block can survive — and
+            // the `.revive` GM path (plus mod-playerbots re-touching movement
+            // state) RE-APPLIES it for many ticks, which the one-shot dead->alive
+            // scrub above misses. A rooted bot can't be driven by MoveFollow, so
+            // the catch-up teleport drags it instead — the "healer teleports every
+            // few yards after .revive" report. We OWN movement here (past the
+            // in-combat yield), so no legitimate CC is active; clear it every tick
+            // it's wrong so MoveFollow can walk the bot normally.
+            if (!follower->IsInCombat()
+                && (follower->HasUnitState(UNIT_STATE_NOT_MOVE)
+                    || follower->HasUnitMovementFlag(MOVEMENTFLAG_ROOT)))
+                ForceMovableState(follower);
+
             // (We used to skip re-asserting when the follower was within
             // PET_FOLLOW_DIST + 1.5y of the leader to save packets. That
             // broke role-aware positioning: a tank starting stacked on the
