@@ -1828,11 +1828,12 @@ namespace WowPsParty
 
     namespace
     {
-        // Rear-arc bearings (relative to the anchor's facing; M_PI = directly
+        // Rear-arc bearings (relative to the leader's facing; M_PI = directly
         // behind) so followers fan out instead of stacking on one point. Indexed
-        // by FORMATION ORDINAL. Used both for the normal leader-follow and the
-        // range-pull tank anchor. Hoisted to namespace scope so both the early
-        // pull-anchor branch and the formation block below can reference it.
+        // by FORMATION ORDINAL. Used by the normal leader-follow formation block
+        // below. The range-pull tank anchor (in AssistTarget) uses its OWN tighter
+        // PULL_REAR_ANGLES table instead — this fan deliberately includes the
+        // +-pi/2 flanks, which are wrong (sideways) for backing off a pull.
         static constexpr float FORM_ANGLES[6] = {
             float(M_PI),            // directly behind
             float(M_PI) * 0.72f,    // behind-left
