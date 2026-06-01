@@ -1149,6 +1149,45 @@ namespace WowPsParty
         return anyVictim;
     }
 
+    // The party's lead tank (alive, same map as `bot`), or null. Shared by the
+    // pull-pending check and the follow ticker's range-pull anchor.
+    static Player* PartyLeadTank(Player* bot)
+    {
+        if (!bot) return nullptr;
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(bot->GetGUID(), party);
+        for (ObjectGuid const& g : party)
+        {
+            if (!IsLeadTank(g)) continue;
+            Player* p = ObjectAccessor::FindConnectedPlayer(g);
+            if (p && p->IsInWorld() && p->IsAlive() && p->GetMapId() == bot->GetMapId())
+                return p;
+        }
+        return nullptr;
+    }
+
+    // True if this bot fights in MELEE (anchors closer to the tank during a pull,
+    // ready to engage). Mirrors AssistTarget's ranged/melee split: tanks and the
+    // physical classes are melee; healers and the caster classes are ranged,
+    // EXCEPT an enhancement shaman / feral druid (talent tree 1) or one already
+    // shifted into a feral form, which melee.
+    static bool FollowerIsMelee(Player* bot)
+    {
+        if (!bot) return false;
+        std::string const role = RoleForGuid(bot->GetGUID());
+        if (role == "tank")   return true;
+        if (role == "healer") return false;
+        uint8 const acls = bot->getClass();
+        bool const ranged =
+            acls == CLASS_MAGE   || acls == CLASS_WARLOCK || acls == CLASS_PRIEST ||
+            acls == CLASS_HUNTER || acls == CLASS_SHAMAN  || acls == CLASS_DRUID;
+        if (!ranged) return true;   // warrior / rogue / death knight
+        if ((acls == CLASS_DRUID || acls == CLASS_SHAMAN)
+            && WowPsParty::PrimaryTalentTree(bot) == 1) return true;
+        if (bot->IsInFeralForm()) return true;
+        return false;
+    }
+
     // True while the party's lead tank is mid ranged-pull and the pack hasn't
     // reached it yet — the signal every other bot reads to hold fire. False once
     // a hostile is in the tank's melee (pull complete → fight) or there's no
@@ -1159,16 +1198,7 @@ namespace WowPsParty
         if (!bot || !bot->IsInWorld()) return false;
         if (!bot->GetMap() || !bot->GetMap()->IsDungeon()) return false;
 
-        std::vector<ObjectGuid> party;
-        GetPartyGuidsFor(bot->GetGUID(), party);
-        Player* tank = nullptr;
-        for (ObjectGuid const& g : party)
-        {
-            if (!IsLeadTank(g)) continue;
-            Player* p = ObjectAccessor::FindConnectedPlayer(g);
-            if (p && p->IsInWorld() && p->IsAlive() && p->GetMapId() == bot->GetMapId())
-            { tank = p; break; }
-        }
+        Player* tank = PartyLeadTank(bot);
         if (!tank || tank == bot) return false;
         if (!IsTankPulling(tank->GetGUID())) return false;
 
@@ -1733,6 +1763,20 @@ namespace WowPsParty
 
     namespace
     {
+        // Rear-arc bearings (relative to the anchor's facing; M_PI = directly
+        // behind) so followers fan out instead of stacking on one point. Indexed
+        // by FORMATION ORDINAL. Used both for the normal leader-follow and the
+        // range-pull tank anchor. Hoisted to namespace scope so both the early
+        // pull-anchor branch and the formation block below can reference it.
+        static constexpr float FORM_ANGLES[6] = {
+            float(M_PI),            // directly behind
+            float(M_PI) * 0.72f,    // behind-left
+            float(M_PI) * 1.28f,    // behind-right
+            float(M_PI) * 0.5f,     // left flank
+            float(M_PI) * 1.5f,     // right flank
+            float(M_PI) * 0.9f,     // back-left inner
+        };
+
         // Auto-vote GREED on every pending group-loot roll for this bot. We
         // hard-return out of mod-playerbots' UpdateAI, suppressing its default
         // loot-roll action, so without this our party bots (heroes AND hired
@@ -1944,6 +1988,42 @@ namespace WowPsParty
                 if (follower->IsInCombat())   return true;
                 if (follower->GetVictim())    return true;
 
+                // RANGE-PULL ANCHOR. While the lead tank is mid ranged-pull and the
+                // pack hasn't reached it, a NON-tank follower anchors to the TANK and
+                // follows its backward retreat — regardless of where the leader (the
+                // user) roams. This lets a stealthed leader flank/reposition without
+                // dragging the party into the pack. It OVERRIDES the party-combat
+                // guard below (the tank's victim would otherwise freeze everyone in
+                // place). Standoff: ranged hold the SAME distance they had via the
+                // leader (their leader gap + the leader's gap to the tank), captured
+                // ONCE so the leader's movement can't reel them in; melee anchor close,
+                // ready to engage the instant the pull lands. Fans out BEHIND the tank
+                // (it faces the mob), away from the pack. Reverts to the leader anchor
+                // the moment the pull ends (the captured standoff is dropped below).
+                static thread_local std::unordered_map<uint32, float> g_pullAnchorDist;
+                uint32 const flow = d.followerGuid.GetCounter();
+                Player* const leadTank = IsLeadTank(d.followerGuid) ? nullptr
+                                                                    : PartyLeadTank(follower);
+                if (leadTank && leadTank != follower && IsPartyPullPending(follower))
+                {
+                    bool const melee = FollowerIsMelee(follower);
+                    float& held = g_pullAnchorDist[flow];
+                    if (held <= 0.0f)   // capture once at pull start
+                    {
+                        held = melee ? 6.0f
+                                     : follower->GetDistance(leader) + leader->GetDistance(leadTank);
+                        held = std::max(held, melee ? 5.0f : 12.0f);
+                        held = std::min(held, 45.0f);
+                    }
+                    int const fi = FormationIndexFor(d.followerGuid, d.leaderGuid);
+                    if (follower->getStandState() != UNIT_STAND_STATE_STAND)
+                        follower->SetStandState(UNIT_STAND_STATE_STAND);
+                    follower->GetMotionMaster()->Clear();
+                    follower->GetMotionMaster()->MoveFollow(leadTank, held, FORM_ANGLES[fi % 6]);
+                    return true;
+                }
+                g_pullAnchorDist.erase(flow);   // not pulling → re-capture next pull
+
                 // The PARTY is fighting but THIS bot momentarily isn't — e.g. a tank
                 // that just lost all its threat, or a ranged dps between targets.
                 // Do NOT drag it to a follow/lead position; yield so AssistTarget
@@ -2100,19 +2180,9 @@ namespace WowPsParty
             //     followers still fan out behind. MoveFollow's leash keeps
             //     the tank from running off — they only re-position once
             //     the leader walks, so if the user pauses the tank pauses.
-            // Distinct rear-arc bearings so companions fan out instead of
-            // stacking. Indexed by FORMATION ORDINAL (not account slot), so
-            // henchmen — which have no slot — also spread. Extra companions
-            // beyond the table wrap to an outer ring.
-            static constexpr float FORM_ANGLES[6] = {
-                float(M_PI),            // directly behind
-                float(M_PI) * 0.72f,    // behind-left
-                float(M_PI) * 1.28f,    // behind-right
-                float(M_PI) * 0.5f,     // left flank
-                float(M_PI) * 1.5f,     // right flank
-                float(M_PI) * 0.9f,     // back-left inner
-            };
-
+            // FORM_ANGLES (rear-arc fan-out bearings, indexed by formation
+            // ordinal) is defined at namespace scope above so the pull anchor
+            // shares it. Extra companions beyond the table wrap to an outer ring.
             bool const inDungeon = leader->GetMap() && leader->GetMap()->IsDungeon();
             bool const isLeadTank = inDungeon && IsLeadTank(d.followerGuid);
 
