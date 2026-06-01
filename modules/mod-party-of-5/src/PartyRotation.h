@@ -126,6 +126,13 @@ namespace WowPsParty
     // fly-by (everyone still riding past incidental aggro).
     bool PartyEngagedDismounted(Player* bot);
 
+    // True if the unit is actively drinking/eating: seated with a food
+    // (MOD_REGEN) or drink (MOD_POWER_REGEN) aura. Matched by aura TYPE, not a
+    // specific spell id, so it catches a real player's higher-rank water/food —
+    // the tank-pull resting check uses it on the human leader, who never has the
+    // rank-1 Drink 430 / Food 433 the bots cast on themselves.
+    bool BotIsConsuming(Player* bot);
+
     // The distance a ranged DPS bot should hold its victim at so its WHOLE
     // single-target kit is in range — the shortest offensive `cast:` in its
     // rotation, clamped to [18, 28]y. AssistTarget uses it as the ranged hold cap

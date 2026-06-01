@@ -842,9 +842,11 @@ namespace WowPsParty
                 return;
         }
 
-        // Don't pull while the party is recovering. Skip if ANY member is seated
-        // drinking/eating (Drink 430 / Food 433 aura) or still in combat — nobody
-        // wants a fresh pack dragged onto a sitting mage mid-drink.
+        // Don't pull while the party is recovering. Skip if ANY member (the human
+        // leader included) is seated drinking/eating or still in combat — nobody
+        // wants a fresh pack dragged onto a sitting mage mid-drink. BotIsConsuming
+        // matches the drink/food aura by TYPE, so it catches the leader's higher-
+        // rank water/food, not just the rank-1 Drink 430 / Food 433 the bots cast.
         {
             std::vector<ObjectGuid> party;
             GetPartyGuidsFor(bot->GetGUID(), party);
@@ -852,7 +854,7 @@ namespace WowPsParty
             {
                 Player* m = ObjectAccessor::FindConnectedPlayer(g);
                 if (!m || !m->IsInWorld() || m->GetMapId() != bot->GetMapId()) continue;
-                if (m->IsInCombat() || m->HasAura(430) || m->HasAura(433))
+                if (m->IsInCombat() || WowPsParty::BotIsConsuming(m))
                     return;
             }
         }

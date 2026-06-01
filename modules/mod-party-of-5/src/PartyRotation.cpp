@@ -2508,11 +2508,13 @@ namespace WowPsParty
 
     // ----- per-tick entry point -----------------------------------------------
 
-    // True if the bot is mid drink/eat: seated with a food (MOD_REGEN) or
+    // True if the unit is mid drink/eat: seated with a food (MOD_REGEN) or
     // drink (MOD_POWER_REGEN) aura active. Same aura types the shared-bag
     // food/drink classifier uses, gated on the sit state so an unrelated
-    // power-regen passive can't trip it.
-    static bool BotIsConsuming(Player* bot)
+    // power-regen passive can't trip it. Matched by aura TYPE, not a specific
+    // spell id, so it catches a real player's higher-rank water/food too (the
+    // tank-pull resting check needs this for the human leader).
+    bool BotIsConsuming(Player* bot)
     {
         if (!bot || bot->getStandState() != UNIT_STAND_STATE_SIT) return false;
         return bot->HasAuraType(SPELL_AURA_MOD_POWER_REGEN)
