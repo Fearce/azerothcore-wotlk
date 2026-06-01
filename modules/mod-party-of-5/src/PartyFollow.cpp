@@ -1552,6 +1552,50 @@ namespace WowPsParty
         MovementGeneratorType const mg =
             bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
 
+        // HEALER: never position on the ENEMY. A healer heals from wherever it
+        // stands, so the offensive ranged bands below were actively harmful — the
+        // ">hold -> chase the foe" beat ran it toward (often out-of-combat) packs
+        // to "maintain range", and the "<8y -> back out" beat kited it away from a
+        // mob on it; both pulled extra packs and wiped the group. Anchor on the
+        // LEADER instead: plant and heal while in healing range of the party
+        // (a mob that aggros then stays put for the tank to peel via Hand of
+        // Reckoning), and only re-close toward the LEADER — never the enemy — once
+        // drifted out of range. Moving to a specific heal target for LoS/range is
+        // owned by the rotation's friendly-cast approach, which sets HoldFollower
+        // and so pre-empts this via the "skip: held by rotation" guard above.
+        if (role == "healer")
+        {
+            float const leashDist = leader ? bot->GetDistance(leader) : 0.0f;
+            constexpr float HEAL_LEASH_FAR  = 30.0f;   // start catching up past this
+            constexpr float HEAL_LEASH_NEAR = 18.0f;   // settle once back within this
+            bool const following = (mg == FOLLOW_MOTION_TYPE) && bot->isMoving();
+            bool const needClose = leader &&
+                (leashDist > HEAL_LEASH_FAR || (following && leashDist > HEAL_LEASH_NEAR));
+            if (needClose)
+            {
+                // Re-close to the LEADER (MoveFollow — a friendly isn't our victim,
+                // so MoveChase would HasLostTarget instantly). Brings any mob on us
+                // back to the party rather than kiting it off into the unknown.
+                if (mg != FOLLOW_MOTION_TYPE)
+                    bot->GetMotionMaster()->MoveFollow(leader, 10.0f, bot->GetFollowAngle());
+                AssistLog(gLow, "healer: out of heal range — closing to the leader");
+            }
+            else
+            {
+                // In range — plant and heal. Never kite, never chase the foe.
+                if (mg != IDLE_MOTION_TYPE)
+                {
+                    bot->StopMoving();
+                    bot->GetMotionMaster()->Clear();
+                    bot->GetMotionMaster()->MoveIdle();
+                }
+                if (desired && !bot->HasInArc(float(M_PI), desired))
+                    bot->SetFacingToObject(desired);
+                AssistLog(gLow, "healer: holding near party — heal in place, no enemy chase");
+            }
+            return;
+        }
+
         if (rangedCaster)
         {
             // RANGED bands (AC's chase never enforces a MIN range, and ChaseAngle
