@@ -2063,9 +2063,20 @@ namespace WowPsParty
             }
             if (castBlock == CastBlock::Position)
             {
+                // Only a FRIENDLY cast self-repositions here. For an OFFENSIVE
+                // cast on the victim, fall through (return false) so the rule
+                // fails and AssistTarget owns positioning — its melee chase for a
+                // tank, its ranged firing band for a caster. Calling
+                // repositionToCast here would set HoldFollower, making AssistTarget
+                // YIELD ("skip: held by rotation"); the bot is then held but never
+                // actually closes, standing out of range while every rule reports
+                // exec_failed_falling_through (the "tank stuck at 21y" bug).
                 if (friendlyApproach)
+                {
                     logFriendly(spellId, target, "pre-check out of range/LoS -> approaching");
-                return repositionToCast(target, spellId);
+                    return repositionToCast(target, spellId);
+                }
+                return false;
             }
             if (friendlyApproach)
                 logFriendly(spellId, target, "hard block (cooldown/power/stance) -> not casting");
