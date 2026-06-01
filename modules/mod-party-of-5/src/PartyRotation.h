@@ -120,6 +120,12 @@ namespace WowPsParty
     // 20y one from ~16y). The engagement layer uses this instead of a fixed range.
     float TankPullHoldRange(Player* bot);
 
+    // True if the party is genuinely engaging ON FOOT — the leader is off its
+    // mount, or a member is in combat AND dismounted (knocked off by damage). Used
+    // by the mount guard AND the follow ticker to tell a real fight from a mounted
+    // fly-by (everyone still riding past incidental aggro).
+    bool PartyEngagedDismounted(Player* bot);
+
     // The distance a ranged DPS bot should hold its victim at so its WHOLE
     // single-target kit is in range — the shortest offensive `cast:` in its
     // rotation, clamped to [18, 28]y. AssistTarget uses it as the ranged hold cap

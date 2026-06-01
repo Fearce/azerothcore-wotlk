@@ -2728,7 +2728,7 @@ namespace WowPsParty
     // landing a hit because mounted is faster) it stays mounted and keeps moving;
     // only a genuine engagement — the leader stops and dismounts, or a member gets
     // caught and knocked off — pulls the rest of the party off their mounts too.
-    static bool PartyEngagedDismounted(Player* bot)
+    bool PartyEngagedDismounted(Player* bot)
     {
         if (!bot) return false;
 

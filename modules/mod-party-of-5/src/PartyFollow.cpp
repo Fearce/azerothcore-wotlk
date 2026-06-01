@@ -797,6 +797,10 @@ namespace WowPsParty
         if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) return;
         if (bot->IsNonMeleeSpellCast(false, false, true)) return;
         if (IsFollowerHeld(bot->GetGUID())) return;
+        // Mounted = transport fly-by: don't auto-pull (a mounted unit can't attack,
+        // and engaging here would fight the follow ticker keeping it riding). Once
+        // the party commits on foot, the mount guard dismounts the tank and it pulls.
+        if (bot->IsMounted()) return;
 
         // Is this the lead tank? Role-based so a hired henchman tank counts.
         if (!IsLeadTank(bot->GetGUID())) return;
@@ -1143,6 +1147,11 @@ namespace WowPsParty
 
         // User-controlled body: never touch its target/motion.
         if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) { AssistLog(gLow, "skip: possessed"); return; }
+        // Still MOUNTED while in combat = a transport fly-by (a real fight would have
+        // been dismounted by TickRotation's mount guard, which runs first). Don't
+        // engage/stand-ground — that's what froze the party on incidental aggro; let
+        // the follow ticker keep it riding after the leader.
+        if (bot->IsMounted()) { AssistLog(gLow, "skip: mounted (transport fly-by)"); return; }
         // Don't interrupt a cast in progress.
         if (bot->IsNonMeleeSpellCast(false, false, true)) { AssistLog(gLow, "skip: casting"); return; }
         // Rotation engine has parked this bot (drinking, etc).
@@ -1447,7 +1456,12 @@ namespace WowPsParty
         // ===== Engage + position ============================================
         // Single source of truth for combat movement (one mover, no clashes).
         uint8 const acls = bot->getClass();
+        std::string const role = RoleForGuid(bot->GetGUID());
+        // EVERY healer fights/heals from range — including a holy PALADIN, which
+        // isn't in the caster class list below — so it stays back near the group
+        // and never melees a mob it pulls.
         bool rangedCaster =
+            role == "healer" ||
             acls == CLASS_MAGE   || acls == CLASS_WARLOCK || acls == CLASS_PRIEST ||
             acls == CLASS_HUNTER || acls == CLASS_SHAMAN  || acls == CLASS_DRUID;
         // Hybrids aren't ranged in every spec. A TANK is never ranged; an
@@ -1459,7 +1473,7 @@ namespace WowPsParty
         if (rangedCaster)
         {
             bool const melee =
-                RoleForGuid(bot->GetGUID()) == "tank" ||
+                role == "tank" ||
                 ((acls == CLASS_DRUID || acls == CLASS_SHAMAN)
                     && WowPsParty::PrimaryTalentTree(bot) == 1) ||
                 bot->IsInFeralForm();
@@ -1498,33 +1512,40 @@ namespace WowPsParty
             bool  const los = bot->IsWithinLOSInMap(desired);
             float const hold = WowPsParty::BotRangedCastHold(bot);
 
+            // A mob is in melee on us → STAND and fight/heal, NEVER kite, no matter
+            // where `desired` is (could be the tank's far target). Kiting drags the
+            // mob off the tank and around the room; standing keeps it where the tank
+            // can grab it — and a HEALER that pulls aggro holds its ground instead of
+            // running off. The hunter swings in the dead zone (its shots are dead-
+            // zoned this close); casters/healers cast point-blank. Once nothing's on
+            // us (tank took it / it died) the bands below resume ranged positioning.
+            // (Hoisted above the <8y band so it covers aggro from a SECOND mob while
+            // we're at firing range of the first — that bot must plant too.)
+            // CLOSE gate (<8y): getAttackers() is populated the instant a mob
+            // aggros, while it may still be sprinting in from 30y — without this a
+            // far add would freeze a bot mid-approach to its target, out of range.
+            // 8y matches the dead-zone band, so the bot still holds at firing range
+            // for distant attackers and only plants once one is actually on it.
+            bool mobOnMe = false;
+            for (Unit* a : bot->getAttackers())
+                if (a && a->IsAlive() && bot->GetDistance(a) < 8.0f) { mobOnMe = true; break; }
+            if (mobOnMe)
+            {
+                if (mg != IDLE_MOTION_TYPE)
+                {
+                    bot->StopMoving();
+                    bot->GetMotionMaster()->Clear();
+                    bot->GetMotionMaster()->MoveIdle();
+                }
+                if (acls == CLASS_HUNTER)
+                    bot->Attack(desired, true);   // white melee swings in the dead zone
+                bot->SetFacingToObject(desired);
+                AssistLog(gLow, "ranged: mob in melee — stand and fight, don't run off");
+                return;
+            }
+
             if (d < 8.0f)
             {
-                // A mob is in our face. DON'T kite — backing out drags it away from
-                // the tank and around the room, so the tank can't grab it. STAND
-                // our ground (it's right where it broke off, near the tank), let the
-                // tank pull aggro, and meanwhile the hunter swings in melee (its
-                // shots are dead-zoned this close); casters hold and keep casting.
-                // The instant nothing is on us (tank took it, or it died) we fall
-                // through and back out to firing range. With NO tank nothing ever
-                // takes it, so we just keep fighting — same code, no special case.
-                bool mobOnMe = false;
-                for (Unit* a : bot->getAttackers())
-                    if (a && a->IsAlive()) { mobOnMe = true; break; }
-                if (mobOnMe)
-                {
-                    if (mg != IDLE_MOTION_TYPE)
-                    {
-                        bot->StopMoving();
-                        bot->GetMotionMaster()->Clear();
-                        bot->GetMotionMaster()->MoveIdle();
-                    }
-                    if (acls == CLASS_HUNTER)
-                        bot->Attack(desired, true);   // white melee swings in the dead zone
-                    bot->SetFacingToObject(desired);
-                    AssistLog(gLow, "ranged: mob in melee — stand and fight, let the tank grab it");
-                    return;
-                }
                 // Nothing on us but we're <8y (walked in, or the mob died / was
                 // taken). Back out just PAST the dead zone (13y) so we can shoot
                 // again — a ranged special shot's effective min range is ~10y for a
@@ -1797,27 +1818,39 @@ namespace WowPsParty
             // check only saw IsInCombat() so a warrior with a target but
             // no aggro got MoveFollow'd back to the leader and never
             // closed the distance.
-            if (follower->IsInCombat())   return true;
-            if (follower->GetVictim())    return true;
-            if (follower->IsCharmed())    return true;
+            if (follower->IsCharmed())    return true;   // charm is fragile — always yield
 
-            // The PARTY is fighting but THIS bot momentarily isn't — e.g. a tank
-            // that just lost all its threat, or a ranged dps between targets.
-            // Do NOT drag it to a follow/lead position; yield so AssistTarget
-            // re-engages it (the tank taunts loose mobs, ranged hold at range).
-            // Without this the lead tank walks to the front and stops holding
-            // aggro ("tank breaks mid-combat"), and ranged get pulled into the
-            // leader's melee.
-            //
-            // GetVictim() as well as IsInCombat(): AC only flips IsInCombat() on
-            // a DAMAGE exchange, so during the pull window (tank charging in,
-            // sword raised, GetVictim() set, first hit not yet landed) the party
-            // still reads out-of-combat — and a trailing ranged bot follows the
-            // tank straight into melee before AssistTarget can hold it at range,
-            // then backs out once damage flips combat. That's the "runs forward
-            // into the mob for no reason, once per pull, then backs out". Yielding
-            // on a member's victim closes that gap so the hold happens first.
+            // Mounted transport fly-by: this bot is mounted and the party hasn't
+            // dismounted (PartyEngagedDismounted false — see the mount guard), i.e.
+            // we're riding past incidental aggro, not committing to a fight. KEEP
+            // FOLLOWING the leader rather than yielding to combat AI (which would
+            // leave us standing still mounted — the "bots freeze on any aggro" bug).
+            // The instant it's a real fight (someone dismounts) the mount guard
+            // dismounts us, this flips false, and we yield to AssistTarget as normal.
+            bool const mountedFlyby =
+                follower->IsMounted()
+                && !WowPsParty::PartyEngagedDismounted(follower);
+            if (!mountedFlyby)
             {
+                if (follower->IsInCombat())   return true;
+                if (follower->GetVictim())    return true;
+
+                // The PARTY is fighting but THIS bot momentarily isn't — e.g. a tank
+                // that just lost all its threat, or a ranged dps between targets.
+                // Do NOT drag it to a follow/lead position; yield so AssistTarget
+                // re-engages it (the tank taunts loose mobs, ranged hold at range).
+                // Without this the lead tank walks to the front and stops holding
+                // aggro ("tank breaks mid-combat"), and ranged get pulled into the
+                // leader's melee.
+                //
+                // GetVictim() as well as IsInCombat(): AC only flips IsInCombat() on
+                // a DAMAGE exchange, so during the pull window (tank charging in,
+                // sword raised, GetVictim() set, first hit not yet landed) the party
+                // still reads out-of-combat — and a trailing ranged bot follows the
+                // tank straight into melee before AssistTarget can hold it at range,
+                // then backs out once damage flips combat. That's the "runs forward
+                // into the mob for no reason, once per pull, then backs out". Yielding
+                // on a member's victim closes that gap so the hold happens first.
                 std::vector<ObjectGuid> party;
                 GetPartyGuidsFor(d.followerGuid, party);
                 for (ObjectGuid const& gg : party)
