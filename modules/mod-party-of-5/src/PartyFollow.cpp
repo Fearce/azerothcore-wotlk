@@ -491,9 +491,12 @@ namespace WowPsParty
     }
 
     // Hard cap on the pull-wait. Melee mobs cross even a long pull + back-up well
-    // inside this; past it the tank stops waiting and engages normally, releasing
-    // the party — covers ranged mobs that never walk into melee.
-    static constexpr uint32 PULL_MAX_WAIT_MS = 10000;
+    // inside this; AT the cap the tank stops waiting and engages normally (closing
+    // to the mob), releasing the party — so a RANGED mob that never walks into
+    // melee can't kite the tank forever. The pull-hold ENDS the window at the cap
+    // (ClearTankPulling), it doesn't just stop refreshing, so the tank engages in
+    // ~5s, not 5s + the rolling-refresh residual.
+    static constexpr uint32 PULL_MAX_WAIT_MS = 5000;
 
     // Settle window after a fight before the lead tank auto-pulls the next pack —
     // gives the party time to loot, regroup, and start drinking instead of being
@@ -511,6 +514,14 @@ namespace WowPsParty
             return false;
         }
         return true;
+    }
+
+    // End a pull window NOW (so the tank engages normally and the party releases),
+    // not after the rolling-refresh window drains. Used when the wait cap is hit.
+    static void ClearTankPulling(uint32 tankLow)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_tankPull.erase(tankLow);
     }
 
     // The tank's chosen back-out point during a pull, or false if not set yet.
@@ -859,11 +870,13 @@ namespace WowPsParty
         if (Unit* v = bot->GetVictim())
             if (v->IsAlive()) return;
 
-        // Find the nearest hostile to the leader within 40y of them.
+        // Find the nearest hostile to the leader within 28y of them. (Was 40y —
+        // toned down ~30% so the tank doesn't go for a range-pull on a mob that's
+        // still quite far; it waits until the party is closer to the pack.)
         // SelectNearbyTarget(exclude, dist) returns the nearest unit that
         // `this` considers a valid attack target — perfect for "what's
         // about to fight us".
-        Unit* nearest = leader->SelectNearbyTarget(nullptr, 40.0f);
+        Unit* nearest = leader->SelectNearbyTarget(nullptr, 28.0f);
         if (!nearest || !nearest->IsAlive()) return;
         if (!bot->IsValidAttackTarget(nearest)) return;
 
@@ -1408,6 +1421,17 @@ namespace WowPsParty
         //      separated from neighbours, and the tank locks threat before melee.
         // The window is refreshed each tick so it survives the back-up; the instant
         // the mob reaches melee (or the window lapses) this falls through to engage.
+        //
+        // Wait cap: a RANGED mob never walks into melee — so at PULL_MAX_WAIT_MS,
+        // END the window NOW (don't just stop refreshing, which left a ~4s residual)
+        // so the tank stops holding/retreating, engages it normally (closes to the
+        // mob) via the bands below, and the party is released. Caps the "stood there
+        // taking ranged damage forever" at ~5s.
+        if (IsTankPulling(bot->GetGUID())
+            && !bot->IsWithinMeleeRange(desired)
+            && TankPullElapsedMs(bot->GetGUID().GetCounter()) >= PULL_MAX_WAIT_MS)
+            ClearTankPulling(bot->GetGUID().GetCounter());
+
         if (IsTankPulling(bot->GetGUID()) && !bot->IsWithinMeleeRange(desired))
         {
             if (bot->GetVictim() != desired)
@@ -1436,14 +1460,13 @@ namespace WowPsParty
             // releases in a couple of seconds instead of freezing until the mob
             // de-leashes.
             // Keep the party held while the pull is genuinely progressing: still
-            // closing to/at pull range, OR in combat but only up to the wait cap
-            // (so a ranged mob that never walks in, or an evade that drops combat,
-            // can't freeze the party — the window then drains and we engage).
+            // closing to/at pull range, OR in combat (mob inbound/fighting us). An
+            // EVADE (mob runs home, drops combat, out of range) stops refreshing so
+            // the window drains and we engage; the hard wait cap above (which ends
+            // the window outright) covers a ranged mob that stays in combat at range.
             float const holdRange = WowPsParty::TankPullHoldRange(bot);
             float const closeThreshold = holdRange + 2.0f;
-            bool const stillPulling =
-                d <= closeThreshold ||
-                (bot->IsInCombat() && TankPullElapsedMs(tankLow) < PULL_MAX_WAIT_MS);
+            bool const stillPulling = d <= closeThreshold || bot->IsInCombat();
             if (stillPulling)
                 MarkTankPulling(bot->GetGUID(), 4000);
             MovementGeneratorType const mg =
