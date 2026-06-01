@@ -1490,11 +1490,18 @@ namespace WowPsParty
             }
             else if (!bot->IsInCombat())
             {
-                // In range but the opener hasn't connected yet — hold so the shot/
-                // ability actually fires and lands (an auto-repeat needs us still &
-                // in range). The instant it connects (IsInCombat) we back up below.
-                if (mg == CHASE_MOTION_TYPE)
-                    bot->GetMotionMaster()->Clear();
+                // In range but the opener hasn't connected yet. Track the mob at
+                // hold range with a CHASE rather than stopping dead: a mob that
+                // WALKS AWAY (patrol, fear, repath) would otherwise stroll out of
+                // range while we stand frozen at the spot it just left, and since
+                // the opener never lands the pull never "connects" — the tank stuck
+                // out of range forever. A stationary mob settles the chase at
+                // holdRange with no jitter, so an auto-repeat opener still fires;
+                // a moving one is followed so an instant opener (Heroic Throw,
+                // Avenger's Shield, ...) keeps landing. The instant it connects
+                // (IsInCombat) we back up below.
+                if (mg != CHASE_MOTION_TYPE)
+                    bot->GetMotionMaster()->MoveChase(desired, holdRange);
             }
             else
             {
