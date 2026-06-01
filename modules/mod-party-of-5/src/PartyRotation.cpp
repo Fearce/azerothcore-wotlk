@@ -1469,12 +1469,12 @@ namespace WowPsParty
         Item* const ranged = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
         if (!ranged) return false;
         uint32 shootSpell = 0;
-        bool   autoRepeat = false;
+        bool   needsAmmo  = false;
         switch (ranged->GetTemplate()->SubClass)
         {
             case ITEM_SUBCLASS_WEAPON_BOW:
             case ITEM_SUBCLASS_WEAPON_GUN:
-            case ITEM_SUBCLASS_WEAPON_CROSSBOW: shootSpell = 3018; autoRepeat = true; break;
+            case ITEM_SUBCLASS_WEAPON_CROSSBOW: shootSpell = 3018; needsAmmo = true; break;
             case ITEM_SUBCLASS_WEAPON_THROWN:   shootSpell = 2764; break;
             default: return false;   // wand (use the `wand` verb) or nothing
         }
@@ -1482,17 +1482,26 @@ namespace WowPsParty
         // hunter Auto Shot helper) so a no-ammo tank falls back to its ability
         // instead of attempting — and failing — the shot every tick. Thrown
         // weapons are their own ammo, so they skip this.
-        if (autoRepeat && bot->GetUInt32Value(PLAYER_AMMO_ID) == 0) return false;
+        if (needsAmmo && bot->GetUInt32Value(PLAYER_AMMO_ID) == 0) return false;
         if (bot->GetDistance(target) > 30.0f) return false;
         if (!bot->IsWithinLOSInMap(target)) return false;
-        if (autoRepeat)
-            if (Spell* repeat = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
-            {
-                if (repeat->m_targets.GetUnitTarget() == target)
-                    return true;                          // already shooting this mob
-                bot->InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
-                return false;                             // wrong target — restart next tick
-            }
+        // Already mid-shot? DON'T re-cast — re-issuing the shot every tick restarts
+        // its wind-up/swing timer so it never lands ("interrupts itself forever,
+        // animation restarts very fast"). Shoot (3018) and Throw (2764) live in the
+        // CURRENT_AUTOREPEAT_SPELL slot once the auto-attack is established, but the
+        // FIRST cast spends its wind-up in CURRENT_GENERIC_SPELL — which the old
+        // autorepeat-only guard missed, so it kept re-casting the wind-up forever.
+        // Check BOTH slots: if our shot is already in flight at this target, leave
+        // it alone; if it's aimed at the wrong target, stop so next tick re-acquires.
+        for (CurrentSpellTypes slot : { CURRENT_AUTOREPEAT_SPELL, CURRENT_GENERIC_SPELL })
+            if (Spell* cur = bot->GetCurrentSpell(slot))
+                if (cur->GetSpellInfo() && cur->GetSpellInfo()->Id == shootSpell)
+                {
+                    if (cur->m_targets.GetUnitTarget() == target)
+                        return true;                      // already shooting this mob
+                    bot->InterruptSpell(slot);
+                    return false;                         // wrong target — restart next tick
+                }
         bot->SetFacingToObject(target);   // ranged attack fails NOT_INFRONT otherwise
         return bot->CastSpell(target, shootSpell, false) == SPELL_CAST_OK;
     }
