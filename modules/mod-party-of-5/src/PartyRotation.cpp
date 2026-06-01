@@ -2729,13 +2729,23 @@ namespace WowPsParty
         // tick. (Resurrect-accept is handled separately in ApplyDirective.)
         if (!bot->IsAlive()) return false;
 
-        // Mounted (traveling with the leader): do NOTHING. An out_of_combat rule —
-        // a rogue's Stealth, a hunter's Call Pet, a self-buff, eat/drink — would
-        // cast and DISMOUNT the bot, which the follow ticker's mount-sync then
-        // re-mounts, and the rule re-fires: an endless mount/cast flicker. Combat
-        // auto-dismounts, so this only skips idle mounted travel; the rotation
-        // (and pet/ammo upkeep) resumes the moment the bot is off its mount.
-        if (bot->IsMounted()) return false;
+        // Mounted while traveling with the leader: do NOTHING out of combat. An
+        // out_of_combat rule — a rogue's Stealth, a hunter's Call Pet, a self-buff,
+        // eat/drink — would cast and DISMOUNT the bot, which the follow ticker's
+        // mount-sync then re-mounts, and the rule re-fires: an endless mount/cast
+        // flicker. So out of combat we just skip and stay mounted.
+        //
+        // IN COMBAT, force the dismount. Damage normally auto-dismounts, but a bot
+        // that entered combat mounted and never got HIT (its target can't reach it
+        // because a mounted unit can't attack) stays stuck mounted forever, spamming
+        // failed ENGAGEs — and the follow ticker's dismount-sync yields in combat so
+        // nothing frees it. Dismounting here lets it actually fight; no re-mount
+        // flicker because the mount-sync only re-mounts out of combat.
+        if (bot->IsMounted())
+        {
+            if (!bot->IsInCombat()) return false;   // idle travel — stay mounted
+            bot->Dismount();                         // in a fight — get off and engage
+        }
 
         // Keep ammo/poisons topped up (self-throttled). Runs before the rotation
         // so a freshly-spawned hunter has arrows on its first idle tick and a
