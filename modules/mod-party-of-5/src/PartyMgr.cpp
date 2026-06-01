@@ -305,11 +305,19 @@ namespace WowPsParty
             case 1: // Warrior
                 if (isTank)
                 {
+                    // Survival cooldowns first (both off the GCD in-game). Shield
+                    // Wall = ~40% DR panic; Last Stand = +30% max health to buy the
+                    // healer time. Gated low so they stay dormant until real danger.
+                    add("self_health<20", "buff_self:Shield Wall", 95);
                     add("target_casting&target_interruptible", "cast:Shield Bash", 92);
                     add("enemy_loose_in_range", "cast_loose_enemy:Taunt", 90);
+                    add("self_health<30", "buff_self:Last Stand", 89);
                     add("always", "buff_self:Defensive Stance", 84);
                     add("always", "buff_self:Commanding Shout", 80);
                     add("has_target", "cast:Shield Slam", 74);
+                    // Maintain Shield Block for steady mitigation (skips while the
+                    // block buff is up; refreshes when it lapses and is off CD).
+                    add("has_target", "buff_self:Shield Block", 72);
                     add("enemies_in_melee>2", "cast:Thunder Clap", 70);
                     add("has_target", "cast:Revenge", 66);
                     add("enemies_in_melee>2&target_missing_aura:Demoralizing Shout", "cast:Demoralizing Shout", 58);
@@ -365,31 +373,68 @@ namespace WowPsParty
                 }
                 else if (isTank)
                 {
+                    // Panic full self-heal before anything else (shares Forbearance
+                    // with Divine Protection below, so the <15 gate keeps it as the
+                    // true last resort once the 50% DR can't save us).
+                    add("self_health<15", "cast_self:Lay on Hands", 95);
                     add("enemy_loose_in_range", "cast_loose_enemy:Hand of Reckoning", 92);
+                    // Paladins have no true interrupt in 3.3.5a — stun the caster
+                    // with Hammer of Justice (no-op on stun-immune bosses).
+                    add("target_casting&target_interruptible", "cast:Hammer of Justice", 91);
+                    // 50% damage reduction when in danger (off the GCD in-game; the
+                    // rotation just spends one tick popping it). Forbearance.
+                    add("self_health<40", "buff_self:Divine Protection", 89);
                     add("party_lowest_health<35", "cast_party_lowest:Flash of Light", 86);
                     add("always", "buff_self:Righteous Fury", 82);
                     add("always", "buff_self:Devotion Aura", 80);
                     add("always", "buff_self:Seal of Righteousness", 78);
+                    // Holy Shield: block-chance + holy-damage shield. Core prot
+                    // ability that was missing — both steady mitigation AND threat.
+                    add("has_target", "buff_self:Holy Shield", 76);
                     add("party_has_magic", "cure_party:Cleanse", 74);
                     add("has_target", "cast:Avenger's Shield", 70);
                     add("enemies_in_melee>2", "cast:Consecration", 66);
-                    add("enemies_in_melee>2", "cast:Holy Wrath", 58);
-                    add("has_target", "cast:Hammer of the Righteous", 54);
+                    // Shield of Righteousness (lvl 75): big single-target threat,
+                    // scales with block value — was missing entirely. Falls through
+                    // harmlessly below 75 / with no shield equipped.
+                    add("has_target", "cast:Shield of Righteousness", 63);
+                    add("has_target", "cast:Hammer of the Righteous", 60);
+                    add("enemies_in_melee>2", "cast:Holy Wrath", 56);
                     add("has_target", "cast:Judgement of Light", 48);
                     add("has_target", "cast:Crusader Strike", 40);
                 }
                 else
                 {
+                    add("self_health<15", "cast_self:Lay on Hands", 95);
+                    // Stun-interrupt — paladins have no kick in 3.3.5a.
+                    add("target_casting&target_interruptible", "cast:Hammer of Justice", 90);
                     add("party_lowest_health<35", "cast_party_lowest:Flash of Light", 86);
                     add("target_health<20", "cast:Hammer of Wrath", 84);
-                    add("always", "buff_self:Retribution Aura", 78);
-                    add("always", "buff_self:Seal of Righteousness", 76);
+                    add("always", "buff_self:Retribution Aura", 80);
+                    // +20% damage burst cooldown — popped as soon as it's off CD
+                    // (high prio is free: buff_self falls through while it's active
+                    // or on cooldown, so it only ever wins the tick it actually
+                    // fires). Forbearance, but Ret has no panic that needs it.
+                    add("has_target", "buff_self:Avenging Wrath", 79);
+                    // Seal of Command cleaves up to 3 targets (better on packs);
+                    // fall back to Seal of Righteousness only if SoC isn't known —
+                    // the self_missing gate stops SoR overwriting an active SoC.
+                    add("always", "buff_self:Seal of Command", 78);
+                    add("self_missing_aura:Seal of Command", "buff_self:Seal of Righteousness", 77);
+                    // Refill mana before the rotation stalls out (off the GCD).
+                    add("self_mana<20", "buff_self:Divine Plea", 75);
+                    // The Art of War proc → instant, free Exorcism on ANY target.
+                    // This is the main Ret damage that was being left on the table:
+                    // the old unconditional Exorcism just failed on non-undead.
+                    add("self_has_aura:The Art of War", "cast:Exorcism", 73);
                     add("has_target", "cast:Judgement of Wisdom", 70);
                     add("has_target", "cast:Crusader Strike", 64);
                     add("has_target", "cast:Divine Storm", 60);
                     add("enemies_in_melee>2", "cast:Consecration", 54);
                     add("enemies_in_melee>2", "cast:Holy Wrath", 48);
-                    add("has_target", "cast:Exorcism", 42);
+                    // Without the proc, Exorcism is only castable on undead/demon.
+                    add("target_type_undead", "cast:Exorcism", 43);
+                    add("target_type_demon", "cast:Exorcism", 42);
                 }
                 break;
 
@@ -487,6 +532,11 @@ namespace WowPsParty
                 if (isTank)
                 {
                     add("enemy_loose_in_range", "cast_loose_enemy:Dark Command", 90);
+                    // Icebound Fortitude = damage reduction + stun immunity panic
+                    // (baseline). Vampiric Blood = +max HP & +healing taken (Blood
+                    // talent; falls through if unspecced). Both off the GCD.
+                    add("self_health<35", "buff_self:Icebound Fortitude", 89);
+                    add("self_health<45", "buff_self:Vampiric Blood", 88);
                     add("target_casting&target_interruptible", "cast:Mind Freeze", 86);
                     add("self_health<55", "cast:Death Strike", 80);
                     add("self_health<40", "cast_self:Rune Tap", 78);
@@ -624,6 +674,12 @@ namespace WowPsParty
                 else if (isTank)
                 {
                     add("enemy_loose_in_range", "cast_loose_enemy:Growl", 90);
+                    // Barkskin = 20% DR (any form, off the GCD). Survival Instincts
+                    // = +30% max health (feral talent). Frenzied Regeneration =
+                    // rage->health self-heal (bear). All gated on real danger.
+                    add("self_health<50", "buff_self:Barkskin", 89);
+                    add("self_health<35", "buff_self:Survival Instincts", 88);
+                    add("self_health<35", "buff_self:Frenzied Regeneration", 87);
                     add("always", "buff_self:Bear Form", 84);
                     add("enemies_in_melee>2", "cast:Swipe", 70);
                     add("has_target", "cast:Mangle (Bear)", 68);
