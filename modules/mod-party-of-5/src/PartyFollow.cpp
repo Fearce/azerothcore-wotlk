@@ -813,7 +813,11 @@ namespace WowPsParty
         // and hold off for a few seconds after it drops combat, so the party can
         // loot/regroup/start drinking before the next pack is yanked in.
         {
-            static std::unordered_map<uint32, std::pair<bool, uint32>> combatState;  // gLow -> (wasInCombat, leftCombatMs)
+            // thread_local: TankLeadEngagement runs from the map-update thread pool,
+            // and a bot is always updated by the thread owning its map — so a per-
+            // thread map is race-free without a lock, matching wasAlive/stuckTracker
+            // below. (A plain static would data-race if MapUpdate.Threads > 1.)
+            static thread_local std::unordered_map<uint32, std::pair<bool, uint32>> combatState;  // gLow -> (wasInCombat, leftCombatMs)
             bool const inCombat = bot->IsInCombat();
             auto& cs = combatState[bot->GetGUID().GetCounter()];
             if (cs.first && !inCombat) cs.second = getMSTime();   // just left combat
@@ -1483,7 +1487,8 @@ namespace WowPsParty
             // face the bot the target point moves and the bot chases it forever:
             // the "spazz on the same spot". So: no angle, and DON'T MOVE when
             // already in a safe firing position.
-            //   < 8y          too close -> back straight out to ~18y
+            //   < 8y          too close -> stand & fight if a mob's on us, else
+            //                              back straight out to ~13y to shoot
             //   8..hold +LoS  SAFE      -> stand still and shoot (no movement)
             //   > hold / noLoS          -> close in (plain chase, no angle), once
             // `hold` is per-bot: the shortest-range nuke in its rotation (clamped
@@ -1547,7 +1552,7 @@ namespace WowPsParty
                 if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
                     bot->Attack(desired, false);   // back at range — stop meleeing, resume shots
                 // CRUCIAL: a back-out (POINT motion) carries the bot from the <8y
-                // dead zone out to ~18y, and it passes THROUGH this 8..30y band on
+                // dead zone out to ~13y, and it passes THROUGH this 8..hold band on
                 // the way. Stopping all non-idle motion here cut the back-out at
                 // the 8y edge, stranding the hunter next to the mob — next tick it
                 // was <8y again → back-out → stopped at 8y → "kite out, walk back
