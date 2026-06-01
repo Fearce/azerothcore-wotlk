@@ -281,29 +281,6 @@ namespace WowPsParty
         return std::string();
     }
 
-    // True if the bot's party has a LIVE tank-role member (enrolled alt or
-    // hired henchman) on the same map. Lets a ranged bot decide between kiting
-    // (a tank will peel the mob) and planting to fight (nobody will, so running
-    // just drags the mob around forever). The human leader's own spec is
-    // unknown to us, so a player who tanks personally reads as "no tank" — fine,
-    // since the mob returns to them on threat and the bot only stands its ground
-    // while the mob is actually on it.
-    static bool PartyHasLiveTank(Player* bot)
-    {
-        if (!bot) return false;
-        std::vector<ObjectGuid> party;
-        GetPartyGuidsFor(bot->GetGUID(), party);
-        for (ObjectGuid const& gg : party)
-        {
-            if (RoleForGuid(gg) != "tank") continue;
-            Player* t = ObjectAccessor::FindConnectedPlayer(gg);
-            if (t && t->IsInWorld() && t->IsAlive()
-                && t->GetMapId() == bot->GetMapId())
-                return true;
-        }
-        return false;
-    }
-
     // Pick a LEVEL- and RACE-appropriate mount for the bot, matching the
     // leader's GROUND-vs-FLYING type — instead of copying the leader's exact
     // mount (a level-20 alt riding the player's epic flyer looked absurd).
@@ -1518,13 +1495,18 @@ namespace WowPsParty
 
             if (d < 8.0f)
             {
-                // Forced into melee with no tank to peel: STAND AND FIGHT rather
-                // than kite forever (backing out only drags the mob around the
-                // room). Holding still also buys the pet time to reach the mob
-                // and Growl it off; once the mob leaves us we resume ranged next
-                // tick. Hunters flip on melee swings (their shots are dead-zoned
-                // this close); casters just hold and keep casting point-blank.
-                if (desired->GetVictim() == bot && !PartyHasLiveTank(bot))
+                // A mob is in our face. DON'T kite — backing out drags it away from
+                // the tank and around the room, so the tank can't grab it. STAND
+                // our ground (it's right where it broke off, near the tank), let the
+                // tank pull aggro, and meanwhile the hunter swings in melee (its
+                // shots are dead-zoned this close); casters hold and keep casting.
+                // The instant nothing is on us (tank took it, or it died) we fall
+                // through and back out to firing range. With NO tank nothing ever
+                // takes it, so we just keep fighting — same code, no special case.
+                bool mobOnMe = false;
+                for (Unit* a : bot->getAttackers())
+                    if (a && a->IsAlive()) { mobOnMe = true; break; }
+                if (mobOnMe)
                 {
                     if (mg != IDLE_MOTION_TYPE)
                     {
@@ -1535,17 +1517,15 @@ namespace WowPsParty
                     if (acls == CLASS_HUNTER)
                         bot->Attack(desired, true);   // white melee swings in the dead zone
                     bot->SetFacingToObject(desired);
-                    AssistLog(gLow, "ranged: no tank, standing ground to fight in melee");
+                    AssistLog(gLow, "ranged: mob in melee — stand and fight, let the tank grab it");
                     return;
                 }
-                // A tank will take it (or it's on someone else) — back out just
-                // PAST the dead zone (13y), NOT all the way to 18y. A ranged
-                // special shot's effective min range is ~10y for a normal mob
-                // (spell min + melee range), so 13y is just clear of it: close
-                // enough to stay (less running, safer indoors) yet far enough to
-                // actually fire — 10y left the bot IN the dead zone, only able to
-                // auto-shoot. The rotation's own too-close check nudges it further
-                // for big mobs. Drop any melee.
+                // Nothing on us but we're <8y (walked in, or the mob died / was
+                // taken). Back out just PAST the dead zone (13y) so we can shoot
+                // again — a ranged special shot's effective min range is ~10y for a
+                // normal mob (spell min + melee range), so 13y is just clear of it.
+                // The rotation's own too-close check nudges it further for big mobs.
+                // Drop any melee.
                 if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
                     bot->Attack(desired, false);
                 if (mg != POINT_MOTION_TYPE)

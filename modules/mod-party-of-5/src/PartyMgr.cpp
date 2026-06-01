@@ -686,6 +686,17 @@ namespace WowPsParty
             || cls == 8 || cls == 9 || cls == 11)   // Pala/Hunter/Priest/Shaman/Mage/Warlock/Druid
             add("out_of_combat&self_mana<90", "drink", 14);
 
+        // Swarmed → wand. When >3 mobs are in melee on a DPS caster, cast-time
+        // nukes are useless (constant pushback never lets them land), so revert to
+        // the WAND — instant, free, reliable — instead of spamming a Frostbolt that
+        // never completes. HIGH priority so it beats the single-target cast nukes
+        // while swarmed; the condition keeps it dormant otherwise (interrupts and
+        // self-defense above still win). Pairs with the engine STANDING the caster
+        // its ground (no kiting) so the tank can pull the pack off it. Wand classes
+        // only; shaman/druid use the instant shocks/Moonfire already in their kits.
+        if (!isHealer && (cls == 5 || cls == 8 || cls == 9))   // shadow Priest / Mage / Warlock
+            add("enemies_in_melee>3&has_target", "wand", 55);
+
         // Wand filler for the classes that can equip one (Priest/Mage/Warlock).
         // Lowest combat priority by design: a DPS caster only falls to it when
         // its mana-gated nukes can't fire (i.e. it's out of mana — the cast
