@@ -2721,6 +2721,38 @@ namespace WowPsParty
         }
     }
 
+    // True if the party is ACTUALLY engaging on foot — the leader is off its mount,
+    // or some other member is in combat and dismounted (force-dismounted by damage).
+    // Used to decide whether a mounted bot that's IN COMBAT should drop off to fight:
+    // during a mounted fly-by (everyone still riding, a mob merely chasing and never
+    // landing a hit because mounted is faster) it stays mounted and keeps moving;
+    // only a genuine engagement — the leader stops and dismounts, or a member gets
+    // caught and knocked off — pulls the rest of the party off their mounts too.
+    static bool PartyEngagedDismounted(Player* bot)
+    {
+        if (!bot) return false;
+
+        ObjectGuid const lg = GetLeaderFor(bot->GetGUID());
+        if (!lg.IsEmpty())
+            if (Player* leader = ObjectAccessor::FindConnectedPlayer(lg))
+                if (leader->IsInWorld() && leader->GetMapId() == bot->GetMapId()
+                    && !leader->IsMounted())
+                    return true;   // the leader is on foot
+
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(bot->GetGUID(), party);
+        for (ObjectGuid const& g : party)
+        {
+            if (g == bot->GetGUID()) continue;
+            Player* m = ObjectAccessor::FindConnectedPlayer(g);
+            if (m && m->IsInWorld() && m->IsAlive()
+                && m->GetMapId() == bot->GetMapId()
+                && m->IsInCombat() && !m->IsMounted())
+                return true;   // a member fighting on foot (knocked off by damage)
+        }
+        return false;
+    }
+
     bool TickRotation(Player* bot)
     {
         if (!bot) return false;
@@ -2735,16 +2767,21 @@ namespace WowPsParty
         // mount-sync then re-mounts, and the rule re-fires: an endless mount/cast
         // flicker. So out of combat we just skip and stay mounted.
         //
-        // IN COMBAT, force the dismount. Damage normally auto-dismounts, but a bot
-        // that entered combat mounted and never got HIT (its target can't reach it
-        // because a mounted unit can't attack) stays stuck mounted forever, spamming
-        // failed ENGAGEs — and the follow ticker's dismount-sync yields in combat so
-        // nothing frees it. Dismounting here lets it actually fight; no re-mount
-        // flicker because the mount-sync only re-mounts out of combat.
+        // IN COMBAT, dismount — but ONLY once the party is genuinely engaging, i.e.
+        // the leader has dismounted or a member got knocked off by damage (see
+        // PartyEngagedDismounted). A bot that entered combat mounted and never got
+        // HIT (a mob merely chasing — it can't catch a mounted unit, which also
+        // can't attack back) would otherwise sit stuck mounted, spamming failed
+        // ENGAGEs, with the follow ticker's dismount-sync yielding in combat. But
+        // if EVERYONE is still riding (mounted fly-by, incidental aggro/damage in
+        // transit), stay mounted and keep moving — don't commit the party to a fight
+        // it's trying to ride past. No re-mount flicker: the mount-sync only
+        // re-mounts out of combat.
         if (bot->IsMounted())
         {
-            if (!bot->IsInCombat()) return false;   // idle travel — stay mounted
-            bot->Dismount();                         // in a fight — get off and engage
+            if (!bot->IsInCombat() || !PartyEngagedDismounted(bot))
+                return false;   // idle travel, or a mounted fly-by — stay mounted
+            bot->Dismount();    // the party is fighting on foot — get off and engage
         }
 
         // Keep ammo/poisons topped up (self-throttled). Runs before the rotation
