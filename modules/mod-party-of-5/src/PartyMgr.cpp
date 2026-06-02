@@ -1415,8 +1415,15 @@ namespace WowPsParty
     static std::vector<std::pair<uint8 /*slot*/, uint32 /*guid*/>> FetchPartyRows(uint32 accountId)
     {
         std::vector<std::pair<uint8, uint32>> rows;
+        // JOIN characters so orphan rows (whose char was deleted) are never
+        // treated as party members — they must not count toward the 5-slot cap,
+        // must not be spawn-attempted as bots, and must not be invited to the
+        // group. The OnPlayerDelete hook removes such rows, but this keeps every
+        // consumer self-healing if one ever lingers.
         QueryResult q = CharacterDatabase.Query(
-            "SELECT `slot`, `guid` FROM `account_party` WHERE `account` = {} ORDER BY `slot`", accountId);
+            "SELECT ap.`slot`, ap.`guid` FROM `account_party` ap "
+            "JOIN `characters` c ON c.`guid` = ap.`guid` "
+            "WHERE ap.`account` = {} ORDER BY ap.`slot`", accountId);
         if (!q)
             return rows;
         do
@@ -1455,6 +1462,16 @@ namespace WowPsParty
                 return EnrollResult::AlreadyEnrolled;
             return EnrollResult::TakenByAnotherAccount;
         }
+
+        // Self-heal: drop orphan rows whose character was deleted (e.g. chars
+        // removed before the OnPlayerDelete hook existed). Synchronous so the
+        // slot scan below sees a clean table — otherwise an orphan row at the
+        // chosen slot would collide on the (account, slot) primary key, and
+        // orphans would falsely push the account to "5/5 full".
+        CharacterDatabase.DirectExecute(
+            "DELETE ap FROM `account_party` ap "
+            "LEFT JOIN `characters` c ON c.`guid` = ap.`guid` "
+            "WHERE ap.`account` = {} AND c.`guid` IS NULL", requestorAccount);
 
         // Find next free slot 0..4 in this account.
         auto const rows = FetchPartyRows(requestorAccount);

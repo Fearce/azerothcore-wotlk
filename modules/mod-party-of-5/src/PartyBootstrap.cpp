@@ -96,8 +96,32 @@ public:
     PartyBootstrapPlayerScript() : PlayerScript("PartyBootstrapPlayerScript", {
         PLAYERHOOK_ON_LOGIN,
         PLAYERHOOK_ON_CREATE,
-        PLAYERHOOK_ON_LOGOUT
+        PLAYERHOOK_ON_LOGOUT,
+        PLAYERHOOK_ON_DELETE
     }) { }
+
+    // When a character is deleted, purge its party enrollment + saved loadout so
+    // the slot frees up immediately. Without this the orphan account_party row
+    // keeps counting toward the 5-slot cap (blocking new enrollments), the login
+    // path keeps trying — and failing — to spawn the deleted guid as a bot
+    // ("no PlayerbotMgr"), and the group-build purge can evict the live hero as
+    // a "stale henchman" because the roster no longer matches reality.
+    void OnPlayerDelete(ObjectGuid guid, uint32 accountId) override
+    {
+        if (!WowPsParty::IsEnabled())
+            return;
+
+        uint32 const low = guid.GetCounter();
+
+        CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+        tx->Append("DELETE FROM `account_party` WHERE `guid` = {}", low);
+        tx->Append("DELETE FROM `party_loadout` WHERE `guid` = {}", low);
+        CharacterDatabase.CommitTransaction(tx);
+
+        LOG_INFO("module",
+                 "[WowPsParty] char delete: purged enrollment + loadout for "
+                 "guid={} (account={})", low, accountId);
+    }
 
     // Phase-6 hardening: when the session player logs out while possessing a
     // party member, release the possess first so we don't leave a charm aura

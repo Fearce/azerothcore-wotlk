@@ -144,9 +144,14 @@ namespace WowPsParty
             if (d.account == account && d.henchman) d.leaderGuid = leaderGuid;
         g_formations.erase(account);
 
+        // JOIN characters so a deleted-char orphan row never gets a follow
+        // directive (which would also wrongly inflate followers_installed and
+        // gate UpdateAI for a guid that can't spawn).
         QueryResult q = CharacterDatabase.Query(
-            "SELECT `guid`, `slot`, COALESCE(`role`, 'dps') FROM `account_party` "
-            "WHERE `account` = {}", account);
+            "SELECT ap.`guid`, ap.`slot`, COALESCE(ap.`role`, 'dps') "
+            "FROM `account_party` ap "
+            "JOIN `characters` c ON c.`guid` = ap.`guid` "
+            "WHERE ap.`account` = {}", account);
         if (!q) return;
         uint32 added = 0;
         int firstTankSlot = -1;
