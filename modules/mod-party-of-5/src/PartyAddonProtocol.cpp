@@ -1077,6 +1077,81 @@ static void HandleAhSell(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// PULL_REAGENT\t<itemId>
+//   Consolidate every copy of <itemId> from the OTHER party members' bags into
+//   the requester's (the crafting character's) own bags. The native tradeskill
+//   window counts only the crafter's OWN inventory, so without this the shared
+//   reagents are invisible and "Create" stays greyed at 0/N; sliding them onto
+//   the crafter makes the stock window enable crafting normally. Idempotent — a
+//   re-pull moves nothing once everything is consolidated. Preserve-or-bounce
+//   cross-character move (same as equip/move), so an item is never lost.
+static void HandlePullReagent(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    uint32 const itemId = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+    if (!itemId) return;
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    if (!WowPsParty::GetAccountSettings(account).sharedInventory) return;
+
+    QueryResult q = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {}", account);
+    if (!q) return;
+
+    uint32 moved = 0;
+    do
+    {
+        uint32 const charGuid = q->Fetch()[0].Get<uint32>();
+        if (charGuid == requester->GetGUID().GetCounter()) continue;
+        Player* mate = ObjectAccessor::FindConnectedPlayer(
+            ObjectGuid::Create<HighGuid::Player>(charGuid));
+        if (!mate || mate == requester) continue;
+
+        std::vector<Item*> stacks;
+        auto consider = [&](Item* it) {
+            if (it && !it->IsEquipped() && !it->IsNotEmptyBag() && it->GetEntry() == itemId)
+                stacks.push_back(it);
+        };
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            consider(mate->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = mate->GetBagByPos(b))
+                for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                    consider(bag->GetItemByPos(j));
+
+        for (Item* it : stacks)
+        {
+            mate->MoveItemFromInventory(it->GetBagSlot(), it->GetSlot(), true);
+            it->SetOwnerGUID(requester->GetGUID());
+            it->FSetState(ITEM_CHANGED);
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            it->SaveToDB(tx);
+            CharacterDatabase.CommitTransaction(tx);
+
+            ItemPosCountVec dest;
+            if (requester->CanStoreItem(NULL_BAG, NULL_SLOT, dest, it, false) == EQUIP_ERR_OK)
+            {
+                requester->MoveItemToInventory(dest, it, true);
+                ++moved;
+            }
+            else
+            {
+                // Crafter's bags are full — hand it straight back so it never strands.
+                it->SetOwnerGUID(mate->GetGUID());
+                it->FSetState(ITEM_CHANGED);
+                ItemPosCountVec back;
+                if (mate->CanStoreItem(NULL_BAG, NULL_SLOT, back, it, false) == EQUIP_ERR_OK)
+                    mate->MoveItemToInventory(back, it, true);
+                CharacterDatabaseTransaction tx2 = CharacterDatabase.BeginTransaction();
+                it->SaveToDB(tx2);
+                CharacterDatabase.CommitTransaction(tx2);
+            }
+        }
+    } while (q->NextRow());
+
+    if (moved) WowPsParty::SendInventoryTo(requester);
+}
+
 // DESTROY\t<srcPartySlot>\t<srcItemGuidLow>
 // Permanently destroys an item from a party member's bags. The addon shows a
 // confirmation popup first (Ctrl+Right-Click). Refuses equipped items and
@@ -1915,6 +1990,10 @@ public:
         else if (command == "AH_SELL")
         {
             HandleAhSell(player, payload);
+        }
+        else if (command == "PULL_REAGENT")
+        {
+            HandlePullReagent(player, payload);
         }
         else if (command == "DESTROY")
         {
