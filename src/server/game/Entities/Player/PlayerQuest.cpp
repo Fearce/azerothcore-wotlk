@@ -667,6 +667,11 @@ void Player::IncompleteQuest(uint32 quest_id)
     }
 }
 
+// [WowPsParty PATCH] trampoline so the mod-party-of-5 module can mirror quest
+// TURN-INS to all 5 party members, each hero picking a different reward when the
+// quest offers a choice. Defined in modules/mod-party-of-5/src/PartyHooks.cpp.
+extern void WowPsParty_OnQuestRewarded_Trampoline(Player* who, Quest const* quest, uint32 rewardChoice);
+
 void Player::RewardQuest(Quest const* quest, uint32 reward, Object* questGiver, bool announce, bool isLFGReward)
 {
     //this THING should be here to protect code from quest, which cast on player far teleport as a reward
@@ -886,6 +891,12 @@ void Player::RewardQuest(Quest const* quest, uint32 reward, Object* questGiver, 
     UpdateAreaDependentAuras(GetAreaId());
 
     sScriptMgr->OnPlayerCompleteQuest(this, quest);
+
+    // Fire the WowPsParty mirror hook so party heroes turn the quest in too,
+    // spreading the choice rewards across them. Short-circuits internally via a
+    // thread_local re-entrance guard, so the heroes' own RewardQuest calls below
+    // don't recurse. `reward` is the choice index the turning-in player picked.
+    WowPsParty_OnQuestRewarded_Trampoline(this, quest, reward);
 }
 
 void Player::SetRewardedQuest(uint32 quest_id)

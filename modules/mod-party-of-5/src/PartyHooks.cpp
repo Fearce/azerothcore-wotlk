@@ -43,6 +43,13 @@ namespace WowPsParty
     static thread_local bool g_propagatingMoney = false;
     static thread_local bool g_propagatingQuest = false;
     static thread_local bool g_propagatingLoot  = false;
+    // Set while a HERO is turning in a mirrored quest. The leader's quest XP /
+    // money / rep were already mirrored to every hero by the leader's own
+    // turn-in, so a hero's RewardQuest must NOT grant them again (it would double
+    // the gain and the party would out-level itself). We keep the hero's reward
+    // ITEMS (the whole point — each hero picks a different choice) but ZERO the
+    // XP/money/rep in those hooks while this is set.
+    static thread_local bool g_heroQuestTurnin  = false;
 
     bool IsEnabled();     // from PartyBootstrap.cpp
     bool IsLogVerbose();
@@ -354,6 +361,13 @@ public:
     // and loot both go through Player::ModifyMoney → fires this hook.
     void OnPlayerMoneyChanged(Player* player, int32& amount) override
     {
+        // Hero turning in a mirrored quest: the quest gold already came from the
+        // leader's mirrored turn-in, so zero this hero's copy (don't double it).
+        if (WowPsParty::g_heroQuestTurnin)
+        {
+            amount = 0;
+            return;
+        }
         if (WowPsParty::g_propagatingMoney)
             return;
         if (!WowPsParty::IsEnabled() || !player || !player->GetSession() || amount == 0)
@@ -387,6 +401,13 @@ public:
             amount = 0;
             return;
         }
+        // A hero turning in a mirrored quest already received this quest's XP from
+        // the leader's turn-in (mirrored below). Zero it so it isn't counted twice.
+        if (WowPsParty::g_heroQuestTurnin)
+        {
+            amount = 0;
+            return;
+        }
         if (WowPsParty::g_propagatingXP)
             return;
         if (!WowPsParty::IsEnabled() || !player || !player->GetSession() || amount == 0)
@@ -414,6 +435,13 @@ public:
     // Mirror reputation gains so all 5 stay at the same standing with each faction.
     void OnPlayerGiveReputation(Player* player, int32 factionID, float& amount, ReputationSource repSource) override
     {
+        // Hero turning in a mirrored quest: the rep already came from the leader's
+        // mirrored turn-in, so zero this hero's copy (don't double it).
+        if (WowPsParty::g_heroQuestTurnin)
+        {
+            amount = 0.0f;
+            return;
+        }
         if (WowPsParty::g_propagatingRep)
             return;
         if (!WowPsParty::IsEnabled() || !player || !player->GetSession() || amount == 0.0f || factionID <= 0)
@@ -509,5 +537,50 @@ void WowPsParty_OnQuestAccepted_Trampoline(Player* who, Quest const* quest)
         if (p->GetQuestStatus(quest->GetQuestId()) != QUEST_STATUS_NONE) continue;
         p->AddQuestAndCheckCompletion(quest, nullptr);
     }
+    WowPsParty::g_propagatingQuest = false;
+}
+
+// Trampoline called from the [WowPsParty PATCH] in PlayerQuest.cpp::RewardQuest.
+// Mirrors the quest TURN-IN to every party hero that has it ready, and — when the
+// quest offers a CHOICE of rewards — spreads those choices across the heroes so
+// the account collects a variety instead of five copies of the same item. The
+// heroes don't need to be at the quest giver; RewardQuest just grants the rewards.
+void WowPsParty_OnQuestRewarded_Trampoline(Player* who, Quest const* quest, uint32 rewardChoice)
+{
+    if (WowPsParty::g_propagatingQuest) return;
+    if (!WowPsParty::IsEnabled() || !who || !who->GetSession() || !quest) return;
+    if (!WowPsParty::ProgressionShared(who)) return;   // solo: nothing to mirror
+
+    std::vector<Player*> const peers =
+        LoadedPartyPeers(who->GetSession()->GetAccountId(), who);
+    if (peers.empty()) return;
+
+    uint32 const questId     = quest->GetQuestId();
+    uint32 const choiceCount = quest->GetRewChoiceItemsCount();
+
+    // g_propagatingQuest: stop the accept/reward trampolines re-entering on the
+    // heroes' own RewardQuest. g_heroQuestTurnin: zero the heroes' quest XP/money/
+    // rep (already mirrored from the leader) while keeping their reward items.
+    WowPsParty::g_propagatingQuest = true;
+    WowPsParty::g_heroQuestTurnin  = true;
+    uint32 rewarded = 0;   // counts heroes actually turned in, to keep choices distinct
+    for (Player* p : peers)
+    {
+        // Only a hero that has the quest READY to hand in (objectives done).
+        if (p->GetQuestStatus(questId) != QUEST_STATUS_COMPLETE) continue;
+
+        // Spread the choice rewards: each hero takes a DIFFERENT index, starting
+        // just past the leader's pick and wrapping when there are more heroes than
+        // choices. A quest with 0/1 choice items always uses index 0.
+        uint32 const choice = (choiceCount > 1)
+            ? (rewardChoice + 1 + rewarded) % choiceCount
+            : 0u;
+
+        // Verifies completion AND that the chosen reward fits the hero's bags.
+        if (!p->CanRewardQuest(quest, choice, false)) continue;
+        p->RewardQuest(quest, choice, nullptr, false);
+        ++rewarded;
+    }
+    WowPsParty::g_heroQuestTurnin  = false;
     WowPsParty::g_propagatingQuest = false;
 }
