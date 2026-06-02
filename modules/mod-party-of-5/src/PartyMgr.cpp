@@ -73,7 +73,29 @@ namespace WowPsParty
             "`spawn_companions` TINYINT NOT NULL DEFAULT 1, "
             "`shared_inventory` TINYINT NOT NULL DEFAULT 1, "
             "`shared_gear` TINYINT NOT NULL DEFAULT 1, "
-            "`shared_progression` TINYINT NOT NULL DEFAULT 1)");
+            "`shared_progression` TINYINT NOT NULL DEFAULT 1, "
+            "`quest_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 100, "
+            "`kill_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 100)");
+        // Migrate installs that predate the XP-rate columns. The DB server is
+        // MySQL, which — unlike MariaDB — has no `ADD COLUMN IF NOT EXISTS`; that
+        // syntax errors 1064 and AC aborts the worldserver on any SQL error. So
+        // probe information_schema and add each column only when it's missing.
+        auto columnMissing = [](char const* col) -> bool
+        {
+            return !CharacterDatabase.Query(
+                "SELECT 1 FROM `information_schema`.`COLUMNS` "
+                "WHERE `TABLE_SCHEMA` = DATABASE() "
+                "AND `TABLE_NAME` = 'party_account_settings' "
+                "AND `COLUMN_NAME` = '{}'", col);
+        };
+        if (columnMissing("quest_xp_rate"))
+            CharacterDatabase.DirectExecute(
+                "ALTER TABLE `party_account_settings` "
+                "ADD COLUMN `quest_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 100");
+        if (columnMissing("kill_xp_rate"))
+            CharacterDatabase.DirectExecute(
+                "ALTER TABLE `party_account_settings` "
+                "ADD COLUMN `kill_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 100");
     }
 
     void AccountSettingsRefreshFromDB(uint32 account)
@@ -81,7 +103,8 @@ namespace WowPsParty
         PartySettings s;  // all-ON default
         QueryResult q = CharacterDatabase.Query(
             "SELECT `spawn_companions`,`shared_inventory`,`shared_gear`,"
-            "`shared_progression` FROM `party_account_settings` WHERE `account` = {}",
+            "`shared_progression`,`quest_xp_rate`,`kill_xp_rate` "
+            "FROM `party_account_settings` WHERE `account` = {}",
             account);
         if (q)
         {
@@ -90,6 +113,8 @@ namespace WowPsParty
             s.sharedInventory   = f[1].Get<uint8>() != 0;
             s.sharedGear        = f[2].Get<uint8>() != 0;
             s.sharedProgression = f[3].Get<uint8>() != 0;
+            s.questXpRate       = std::clamp<uint32>(f[4].Get<uint16>(), XP_RATE_MIN, XP_RATE_MAX);
+            s.killXpRate        = std::clamp<uint32>(f[5].Get<uint16>(), XP_RATE_MIN, XP_RATE_MAX);
         }
         std::lock_guard<std::mutex> lock(g_settingsMutex);
         g_accountSettings[account] = s;
@@ -127,6 +152,24 @@ namespace WowPsParty
         else if (key == "shared_inventory")   s.sharedInventory   = value;
         else if (key == "shared_gear")        s.sharedGear        = value;
         else if (key == "shared_progression") s.sharedProgression = value;
+    }
+
+    void SetAccountXpRate(uint32 account, bool quest, uint32 rate)
+    {
+        rate = std::clamp<uint32>(rate, XP_RATE_MIN, XP_RATE_MAX);
+        char const* const col = quest ? "quest_xp_rate" : "kill_xp_rate";
+        // Upsert the single column; other columns keep their defaults on insert.
+        CharacterDatabase.Execute(
+            "INSERT INTO `party_account_settings` (`account`, `{}`) VALUES ({}, {}) "
+            "ON DUPLICATE KEY UPDATE `{}` = {}",
+            col, account, rate, col, rate);
+        // Populate the cache from DB first (on a miss) so the other fields aren't
+        // clobbered with defaults, then update just this one.
+        GetAccountSettings(account);
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        PartySettings& s = g_accountSettings[account];
+        if (quest) s.questXpRate = rate;
+        else       s.killXpRate  = rate;
     }
 
     // ----- Henchmen ----------------------------------------------------------

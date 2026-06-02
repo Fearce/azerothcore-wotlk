@@ -461,7 +461,27 @@ public:
             return;
         if (!WowPsParty::IsEnabled() || !player || !player->GetSession() || amount == 0)
             return;
-        if (!WowPsParty::ProgressionShared(player)) return;  // solo: own XP
+
+        // Apply this account's per-source XP rate (set via .party xp, default
+        // 100%). Scaling the ORIGINAL gain means the originator AND every peer
+        // get the boosted amount: the mirror loop below passes this already-
+        // scaled value to GiveXP, which doesn't re-fire OnPlayerGiveXP, so the
+        // rate lands exactly once. Runs in solo mode too (the rate is account-
+        // wide), so it sits before the shared-progression gate. Only kill and
+        // quest XP are configurable — explore / BG stay at 100%.
+        {
+            WowPsParty::PartySettings const s =
+                WowPsParty::GetAccountSettings(player->GetSession()->GetAccountId());
+            uint32 rate = 100;
+            if (xpSource == XPSOURCE_KILL)
+                rate = s.killXpRate;
+            else if (xpSource == XPSOURCE_QUEST || xpSource == XPSOURCE_QUEST_DF)
+                rate = s.questXpRate;
+            if (rate != 100)
+                amount = static_cast<uint32>(uint64(amount) * rate / 100);
+        }
+
+        if (!WowPsParty::ProgressionShared(player)) return;  // solo: own XP (already scaled)
 
         std::vector<Player*> const peers =
             LoadedPartyPeers(player->GetSession()->GetAccountId(), player);
@@ -475,7 +495,6 @@ public:
             // group_rate=1.0 means no party-share dilution (we already share
             // the full per-kill amount; AC's GiveXP applies its own rest/racial
             // modifiers per peer).
-            (void)xpSource;
             p->GiveXP(amount, victim, /*group_rate=*/1.0f);
         }
         WowPsParty::g_propagatingXP = false;

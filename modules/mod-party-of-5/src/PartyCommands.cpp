@@ -93,6 +93,7 @@ public:
             { "hearth",       HandleHearthCommand,       SEC_PLAYER, Console::Yes },
             { "status",       HandleStatusCommand,       SEC_PLAYER, Console::Yes },
             { "reset",        HandleResetCommand,        SEC_PLAYER, Console::Yes },
+            { "xp",           HandleXpRateCommand,       SEC_PLAYER, Console::Yes },
         };
         // Admin/test commands. Console::Yes lets them be driven from the
         // worldserver console or SOAP without a player session. SEC_CONSOLE
@@ -256,6 +257,66 @@ public:
         return q ? q->Fetch()[0].Get<uint32>() : 0;
     }
 
+    // .party xp [<quest|kill|all> <100-500>]
+    // No args: show this account's current XP rates. With args: set the quest
+    // and/or kill XP multiplier. Account-wide; takes effect immediately for
+    // every character (the OnPlayerGiveXP hook reads the cached rate live).
+    static bool HandleXpRateCommand(ChatHandler* handler, Optional<std::string> whichArg, Optional<uint32> rateArg)
+    {
+        WorldSession* session = handler->GetSession();
+        if (!session) return false;
+        uint32 const account = session->GetAccountId();
+
+        if (!whichArg)
+        {
+            WowPsParty::PartySettings const s = WowPsParty::GetAccountSettings(account);
+            handler->PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r XP rates: quest |cffffff00{}%|r, kill |cffffff00{}%|r. "
+                "Change with |cffffff00.party xp <quest|kill|all> <100-500>|r.",
+                s.questXpRate, s.killXpRate);
+            return true;
+        }
+
+        std::string which{ *whichArg };
+        std::transform(which.begin(), which.end(), which.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        if (which != "quest" && which != "kill" && which != "all")
+        {
+            handler->PSendSysMessage(
+                "|cffff5555[WowPsParty]|r Usage: |cffffff00.party xp <quest|kill|all> <100-500>|r");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        if (!rateArg)
+        {
+            handler->PSendSysMessage(
+                "|cffff5555[WowPsParty]|r Give a rate {}-{}, e.g. |cffffff00.party xp {} 200|r.",
+                WowPsParty::XP_RATE_MIN, WowPsParty::XP_RATE_MAX, which);
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+        if (*rateArg < WowPsParty::XP_RATE_MIN || *rateArg > WowPsParty::XP_RATE_MAX)
+        {
+            handler->PSendSysMessage(
+                "|cffff5555[WowPsParty]|r Rate must be {}-{} (got {}).",
+                WowPsParty::XP_RATE_MIN, WowPsParty::XP_RATE_MAX, *rateArg);
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        if (which == "quest" || which == "all")
+            WowPsParty::SetAccountXpRate(account, /*quest=*/true, *rateArg);
+        if (which == "kill" || which == "all")
+            WowPsParty::SetAccountXpRate(account, /*quest=*/false, *rateArg);
+
+        WowPsParty::PartySettings const s = WowPsParty::GetAccountSettings(account);
+        handler->PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r XP rates set: quest |cffffff00{}%|r, kill |cffffff00{}%|r "
+            "(effective immediately for all characters on your account).",
+            s.questXpRate, s.killXpRate);
+        return true;
+    }
+
     // .party help
     static bool HandleHelpCommand(ChatHandler* handler, Optional<std::string> /*unused*/)
     {
@@ -264,6 +325,7 @@ public:
         handler->PSendSysMessage(".party list            |cff888888- show roster|r");
         handler->PSendSysMessage(".party leave           |cff888888- remove this char|r");
         handler->PSendSysMessage(".party slot <0-4>      |cff888888- mark active-on-login|r");
+        handler->PSendSysMessage(".party xp [quest|kill|all <100-500>] |cff888888- view/set XP rates|r");
         handler->PSendSysMessage(".party rez [slot]      |cff888888- revive dead member(s)|r");
         handler->PSendSysMessage(".party learnall        |cff888888- train all class spells for level|r");
         handler->PSendSysMessage(".party preset <slot> <class>  |cff888888- apply default rotation|r");

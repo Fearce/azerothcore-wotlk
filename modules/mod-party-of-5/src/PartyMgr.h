@@ -66,13 +66,22 @@ namespace WowPsParty
         bool sharedInventory   = true;  // CLIENT: B opens the merged party grid
         bool sharedGear        = true;  // CLIENT: C opens the party gear panel
         bool sharedProgression = true;  // SERVER: mirror XP / gold / loot / quests
+        uint32 questXpRate     = 100;   // % XP from quest turn-ins (clamped 100-500)
+        uint32 killXpRate      = 100;   // % XP from kills           (clamped 100-500)
     };
+
+    // Allowed bounds for the per-account XP multipliers (percent).
+    static constexpr uint32 XP_RATE_MIN = 100;
+    static constexpr uint32 XP_RATE_MAX = 500;
 
     // Cached read; all-ON default for an account with no row yet.
     PartySettings GetAccountSettings(uint32 account);
     // Persist one toggle. key ∈ {spawn_companions, shared_inventory,
     // shared_gear, shared_progression}. Updates the DB and the cache.
     void SetAccountSetting(uint32 account, std::string const& key, bool value);
+    // Persist a per-account XP rate (percent, clamped to [XP_RATE_MIN, XP_RATE_MAX]).
+    // quest=true sets the quest-turn-in rate, false the kill rate. DB + cache.
+    void SetAccountXpRate(uint32 account, bool quest, uint32 rate);
     void AccountSettingsRefreshFromDB(uint32 account);
     void EnsureSettingsTable();   // CREATE TABLE IF NOT EXISTS — call on startup
 
