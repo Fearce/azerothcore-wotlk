@@ -126,8 +126,57 @@ public:
         PLAYERHOOK_ON_MONEY_CHANGED,
         PLAYERHOOK_ON_CREATURE_KILL,
         PLAYERHOOK_ON_STORE_NEW_ITEM,
-        PLAYERHOOK_ON_LEVEL_CHANGED
+        PLAYERHOOK_ON_LEVEL_CHANGED,
+        PLAYERHOOK_ON_QUEST_ABANDON
     }) { }
+
+    // Mirror a quest ABANDON across the party: when one party character drops a
+    // quest, every other LOADED hero that still has it in their log drops it too
+    // (the counterpart to the accept/turn-in mirrors). Heroes without the quest
+    // are left alone. Fires from sScriptMgr->OnPlayerQuestAbandon in the engine's
+    // abandon handler, so it only triggers on a real player-initiated abandon —
+    // not on turn-in or auto-removal.
+    void OnPlayerQuestAbandon(Player* player, uint32 questId) override
+    {
+        using namespace WowPsParty;
+        if (g_propagatingQuest) return;
+        if (!IsEnabled() || !player || !player->GetSession() || !questId) return;
+        if (!ProgressionShared(player)) return;   // solo: don't mirror quests
+        if (!sPartyMgr.GetSlotForGuid(player->GetGUID().GetCounter()))
+            return;  // abandoner isn't one of this account's party characters
+
+        std::vector<Player*> const peers =
+            LoadedPartyPeers(player->GetSession()->GetAccountId(), player);
+        if (peers.empty()) return;
+
+        // g_propagatingQuest guards the accept/reward trampolines from re-entering;
+        // the engine doesn't re-fire OnPlayerQuestAbandon for these RemoveActiveQuest
+        // calls, but set it anyway for parity and belt-and-braces.
+        g_propagatingQuest = true;
+        uint32 dropped = 0;
+        for (Player* p : peers)
+        {
+            uint16 const slot = p->FindQuestSlot(questId);
+            if (slot >= MAX_QUEST_LOG_SIZE) continue;   // hero doesn't have it
+
+            // Mirror the engine's abandon sequence (QuestHandler.cpp). The first
+            // step is its gate: if the provided source item can't be returned
+            // (e.g. an equipped non-empty quest bag), the engine refuses the
+            // abandon — so skip this hero too rather than half-removing it.
+            if (!p->TakeQuestSourceItem(questId, true)) continue;
+            p->RemoveTimedQuest(questId);
+            p->AbandonQuest(questId);           // destroy quest-received items
+            p->RemoveActiveQuest(questId);      // drop the active status (+ DB)
+            p->SetQuestSlot(slot, 0);           // clear the visible log slot
+            ++dropped;
+        }
+        g_propagatingQuest = false;
+
+        if (dropped)
+            LOG_INFO("module",
+                "[WowPsParty] {} abandoned quest {} — mirrored to {} hero(es).",
+                player->GetName(), questId, dropped);
+    }
 
     // Auto-learn on ding: when a party member levels up, immediately teach
     // every class spell now available — so a 5-char party never has to trek
