@@ -439,7 +439,13 @@ public:
         WowPsParty::g_propagatingMoney = false;
     }
 
-    // Mirror kill/quest XP to every party member so the 5 level together.
+    // Mirror QUEST turn-in XP to every party member. Kill / explore / BG XP is
+    // deliberately NOT mirrored: the party-of-5 is a real group, so the engine
+    // already splits those across all members the normal way (each gets its
+    // ~1/5 share once). Mirroring them stacked all five shares onto everyone —
+    // the ~5x over-leveling bug. Quest XP is the exception, because the heroes
+    // never visit the quest giver, so the leader's turn-in is the only GiveXP
+    // that fires and the mirror is the only way they get quest XP at all.
     void OnPlayerGiveXP(Player* player, uint32& amount, Unit* victim, uint8 xpSource) override
     {
         // Henchmen are fixed at their hire level — they never level up, so they
@@ -481,22 +487,27 @@ public:
                 amount = static_cast<uint32>(uint64(amount) * rate / 100);
         }
 
-        if (!WowPsParty::ProgressionShared(player)) return;  // solo: own XP (already scaled)
+        // Only QUEST turn-in XP is mirrored. Kill / explore / BG XP is already
+        // handed to each group member by the engine's normal party-XP split, so
+        // mirroring it stacked 5 shares onto everyone (~5x). This member still
+        // keeps its own scaled gain above — we just don't copy it to the peers.
+        if (xpSource != XPSOURCE_QUEST && xpSource != XPSOURCE_QUEST_DF)
+            return;
+
+        if (!WowPsParty::ProgressionShared(player)) return;  // solo: own quest XP, no mirror
 
         std::vector<Player*> const peers =
             LoadedPartyPeers(player->GetSession()->GetAccountId(), player);
         if (peers.empty())
             return;
 
+        // Quest XP isn't group-split by the engine (turn-in is a personal
+        // reward), and the heroes can't turn the quest in themselves, so mirror
+        // the leader's full (scaled) quest XP to each of them — like five solo
+        // players each handing the quest in.
         WowPsParty::g_propagatingXP = true;
         for (Player* p : peers)
-        {
-            // GiveXP(uint32 xp, Unit* victim, float group_rate, bool isLFGReward).
-            // group_rate=1.0 means no party-share dilution (we already share
-            // the full per-kill amount; AC's GiveXP applies its own rest/racial
-            // modifiers per peer).
             p->GiveXP(amount, victim, /*group_rate=*/1.0f);
-        }
         WowPsParty::g_propagatingXP = false;
     }
 
