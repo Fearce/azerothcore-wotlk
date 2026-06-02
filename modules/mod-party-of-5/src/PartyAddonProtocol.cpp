@@ -1010,6 +1010,10 @@ static void HandleAhSell(Player* requester, std::string_view payload)
     if (srcItem->IsEquipped())          { err("|cffff5555[WowPsParty]|r Unequip the item before auctioning it."); return; }
     if (srcItem->IsNotEmptyBag())       { err("|cffff5555[WowPsParty]|r Empty the bag before auctioning it."); return; }
     if (!srcItem->CanBeTraded())        { err(Acore::StringFormat("|cffff5555[WowPsParty]|r |cffffffff{}|r is soulbound — can't be auctioned.", tmpl->Name1)); return; }
+    // Same extra gates the real AH applies (AuctionHouseHandler.cpp): conjured
+    // items (mage food/water) and time-limited items don't survive AH escrow.
+    if (tmpl->HasFlag(ITEM_FLAG_CONJURED) || srcItem->GetUInt32Value(ITEM_FIELD_DURATION))
+                                        { err(Acore::StringFormat("|cffff5555[WowPsParty]|r |cffffffff{}|r can't be auctioned.", tmpl->Name1)); return; }
     if (sAuctionMgr->GetAItem(srcItem->GetGUID())) return;  // already in an auction
 
     AuctionHouseEntry const* ahEntry =
@@ -1038,7 +1042,11 @@ static void HandleAhSell(Player* requester, std::string_view payload)
     AH->item_guid       = srcItem->GetGUID();
     AH->item_template   = srcItem->GetEntry();
     AH->itemCount       = srcItem->GetCount();
-    AH->owner           = srcChar->GetGUID();
+    // Owner = the human requester, NOT srcChar: the item can sit in a bot hero's
+    // bags, and bots don't reliably collect mail — so proceeds (and the unsold-
+    // item return) would get stuck. The human owns it, sees it in their Auctions
+    // tab, and collecting that mail re-mirrors the gold across the shared pool.
+    AH->owner           = requester->GetGUID();
     AH->startbid        = copper;
     AH->bidder          = ObjectGuid::Empty;
     AH->bid             = 0;
