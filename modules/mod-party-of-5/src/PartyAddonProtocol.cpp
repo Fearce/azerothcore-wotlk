@@ -618,6 +618,33 @@ static void HandleUnequip(Player* requester, std::string_view payload)
 // EQUIP\t<srcPartySlot>\t<srcItemGuidLow>   (always equips to the currently-
 // controlled body — destination slot is derived from the item template's class
 // & subclass so the user doesn't have to pick a slot.)
+// Player::CanUseItem(Item*, true) minus the soulbind-ownership guard
+// (IsBindedNotWith). The shared-party gear feature deliberately equips one of
+// the player's alts with another alt's Bind-on-Pickup gear — the equip re-owns
+// the item to the destination, so "soulbound to a different character" must not
+// block it (that was Kevin's "leather pants on my paladin: target can't use
+// this item" report). We still enforce everything that genuinely matters:
+// class / race / level / required-skill / required-spell (the ItemTemplate
+// overload) PLUS the armor & weapon proficiency that overload omits.
+static InventoryResult CanUseItemIgnoringBind(Player* dest, Item* item)
+{
+    ItemTemplate const* proto = item->GetTemplate();
+    if (!proto) return EQUIP_ERR_ITEM_NOT_FOUND;
+
+    InventoryResult const res = dest->CanUseItem(proto);
+    if (res != EQUIP_ERR_OK) return res;
+
+    // Heirlooms "morph" their armor type down for a class that hasn't learned
+    // the higher proficiency yet, so don't proficiency-gate them (mirrors the
+    // engine's heirloom branch in CanUseItem(Item*)).
+    uint32 const itemSkill = item->GetSkill();
+    if (itemSkill != 0 && proto->Quality != ITEM_QUALITY_HEIRLOOM
+        && dest->GetSkillValue(itemSkill) == 0)
+        return EQUIP_ERR_NO_REQUIRED_PROFICIENCY;
+
+    return EQUIP_ERR_OK;
+}
+
 static void HandleEquip(Player* requester, std::string_view payload)
 {
     // Payload formats supported:
@@ -720,11 +747,11 @@ static void HandleEquip(Player* requester, std::string_view payload)
         return;
     }
 
-    // Validate dest can use the item. The Item* overload checks armor
-    // proficiency (Cloth/Leather/Mail/Plate skill) via Item::GetSkill();
-    // the ItemTemplate* overload doesn't, so a level-20 hunter would
-    // "pass" the check on mail bracers and end up equipping them.
-    InventoryResult const reason = dest->CanUseItem(srcItem, /*not_loading=*/true);
+    // Validate dest can USE the item (class / race / level / proficiency),
+    // ignoring soulbind ownership — moving a member's BoP gear onto another of
+    // the player's own alts is the whole point here, and the cross-char branch
+    // re-owns the item to dest anyway. (See CanUseItemIgnoringBind.)
+    InventoryResult const reason = CanUseItemIgnoringBind(dest, srcItem);
     if (reason != EQUIP_ERR_OK)
     {
         ChatHandler(requester->GetSession()).PSendSysMessage(
@@ -733,86 +760,109 @@ static void HandleEquip(Player* requester, std::string_view payload)
         return;
     }
 
-    // Find a suitable equip slot. swap=true so an item already in the slot
-    // gets unequipped into a bag automatically (otherwise CanEquipItem
-    // returns NOT_EQUIPPABLE when the slot is occupied -- user had to
-    // manually unequip first, per Kevin's report).
-    uint16 eqDest;
-    InventoryResult result = dest->CanEquipItem(NULL_SLOT, eqDest, srcItem, /*swap=*/true, /*not_loading=*/true);
-    if (result != EQUIP_ERR_OK)
-    {
-        ChatHandler(requester->GetSession()).PSendSysMessage(
-            "|cffff5555[WowPsParty]|r Equip rejected ({}). Check requirements.", uint32(result));
-        return;
-    }
-
     if (srcChar == dest)
     {
-        // SwapItem is the canonical equip-into-(possibly-occupied)-slot
-        // path. It atomically unequips the current occupant back into the
-        // source bag slot and equips the new item. The previous
-        // RemoveItem + EquipItem sequence VANISHED items when the dest
-        // slot was occupied (hunter replacing a bow with another bow):
-        // RemoveItem detached the new bow from its bag slot, EquipItem
-        // then refused to clobber the equipped bow, and the new item
-        // leaked — still owned by the player in DB but gone from UI.
+        // Same character: the item is already owned by dest, so CanEquipItem's
+        // bind check passes. swap=true auto-unequips the current occupant back
+        // into the source bag slot (otherwise CanEquipItem returns NOT_EQUIPPABLE
+        // when the slot is occupied). SwapItem is the canonical equip-into-
+        // (possibly-occupied)-slot path; a manual RemoveItem + EquipItem used to
+        // VANISH the item when the dest slot was full.
+        uint16 eqDest;
+        InventoryResult const result =
+            dest->CanEquipItem(NULL_SLOT, eqDest, srcItem, /*swap=*/true, /*not_loading=*/true);
+        if (result != EQUIP_ERR_OK)
+        {
+            ChatHandler(requester->GetSession()).PSendSysMessage(
+                "|cffff5555[WowPsParty]|r Equip rejected ({}). Check requirements.", uint32(result));
+            return;
+        }
         uint16 const srcPos = srcItem->GetPos();
         LOG_INFO("module",
             "[WowPsParty Equip] same-char swap: char={} item={} ({}) srcPos={:#x} eqDest={:#x}",
-            dest->GetName(), srcItem->GetEntry(), srcItem->GetTemplate()->Name1,
-            srcPos, eqDest);
+            dest->GetName(), srcItem->GetEntry(), srcItem->GetTemplate()->Name1, srcPos, eqDest);
         dest->SwapItem(srcPos, eqDest);
     }
     else
     {
-        // Cross-character transfer that PRESERVES the Item object (and thus
-        // its enchants, gems, durability, charges, random properties, soulbind
-        // state). MoveItemFromInventory detaches the Item from srcChar without
-        // destroying it; we re-parent via SetOwnerGUID + persist via
-        // SaveInventoryAndGoldToDB; MoveItemToInventory threads it into dest's
-        // bag at the position CanStoreItem found.
+        // Cross-character transfer that PRESERVES the Item object (enchants,
+        // gems, durability, charges, random props, soulbind state). Re-own it to
+        // dest BEFORE the equip checks: CanEquipItem (and the CanUseItem it calls
+        // internally) reject anything soulbound to another character, and that
+        // guard only clears once owner == dest. On any failure we bounce the item
+        // back to src so it never strands or vanishes.
         srcChar->MoveItemFromInventory(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
         srcItem->SetOwnerGUID(dest->GetGUID());
-        // Persist the ownership change immediately so a worldserver crash
-        // doesn't leave the item half-orphaned (rows in characters_inventory
-        // would otherwise still point at srcChar).
+        // Flush the item row now so item_instance.owner_guid tracks the new owner
+        // (SetOwnerGUID leaves the item UNCHANGED, so SaveToDB would no-op without
+        // marking it dirty first). MoveItemToInventory below writes the final bag
+        // placement on the normal inventory save.
+        srcItem->FSetState(ITEM_CHANGED);
         CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
         srcItem->SaveToDB(tx);
         CharacterDatabase.CommitTransaction(tx);
 
-        ItemPosCountVec destPos;
-        if (dest->CanStoreItem(NULL_BAG, NULL_SLOT, destPos, srcItem, false) == EQUIP_ERR_OK)
+        auto bounceBackToSrc = [&]()
         {
-            dest->MoveItemToInventory(destPos, srcItem, true);
-            uint16 dest2;
-            // swap=true (same reason as the same-character branch above)
-            if (dest->CanEquipItem(NULL_SLOT, dest2, srcItem, true, true) == EQUIP_ERR_OK)
-            {
-                // Use SwapItem here too: the new item is now sitting in
-                // dest's bag, dest's old equipped item (if any) needs to
-                // travel back into that bag slot atomically. Manual
-                // RemoveItem + EquipItem had the same vanish-bug as the
-                // same-char branch.
-                uint16 const bagPos = srcItem->GetPos();
-                LOG_INFO("module",
-                    "[WowPsParty Equip] x-char swap: from={} to={} item={} ({}) bagPos={:#x} eqDest={:#x}",
-                    srcChar->GetName(), dest->GetName(),
-                    srcItem->GetEntry(), srcItem->GetTemplate()->Name1,
-                    bagPos, dest2);
-                dest->SwapItem(bagPos, dest2);
-            }
-        }
-        else
-        {
-            // dest's bags are full — give it back to src so the item doesn't
-            // vanish. (Edge case; the UI should have warned earlier.)
             srcItem->SetOwnerGUID(srcChar->GetGUID());
             ItemPosCountVec backPos;
             if (srcChar->CanStoreItem(NULL_BAG, NULL_SLOT, backPos, srcItem, false) == EQUIP_ERR_OK)
                 srcChar->MoveItemToInventory(backPos, srcItem, true);
-            CharacterDatabaseTransaction tx2 = CharacterDatabase.BeginTransaction();
-            srcItem->SaveToDB(tx2);
-            CharacterDatabase.CommitTransaction(tx2);
+            srcItem->FSetState(ITEM_CHANGED);
+            CharacterDatabaseTransaction txb = CharacterDatabase.BeginTransaction();
+            srcItem->SaveToDB(txb);
+            CharacterDatabase.CommitTransaction(txb);
+        };
+
+        ItemPosCountVec destPos;
+        if (dest->CanStoreItem(NULL_BAG, NULL_SLOT, destPos, srcItem, false) != EQUIP_ERR_OK)
+        {
+            // dest's bags are full — give it back so the item doesn't vanish.
+            bounceBackToSrc();
+            ChatHandler(requester->GetSession()).PSendSysMessage(
+                "|cffff5555[WowPsParty]|r {}'s bags are full — can't take the item.", dest->GetName());
+            WowPsParty::SendInventoryTo(requester);
+            return;
+        }
+        dest->MoveItemToInventory(destPos, srcItem, true);
+
+        // Now owner == dest, so the bind guard passes. swap=true so an occupied
+        // slot's current item travels back into the bag slot atomically.
+        uint16 eqDest;
+        InventoryResult const result =
+            dest->CanEquipItem(NULL_SLOT, eqDest, srcItem, /*swap=*/true, /*not_loading=*/true);
+        if (result != EQUIP_ERR_OK)
+        {
+            // Couldn't equip after the move (e.g. combat, unique-equipped) —
+            // detach from dest and send it home so it isn't silently relocated.
+            dest->MoveItemFromInventory(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+            bounceBackToSrc();
+            ChatHandler(requester->GetSession()).PSendSysMessage(
+                "|cffff5555[WowPsParty]|r Equip rejected ({}). Check requirements.", uint32(result));
+            WowPsParty::SendInventoryTo(requester);
+            return;
+        }
+
+        uint16 const bagPos = srcItem->GetPos();
+        LOG_INFO("module",
+            "[WowPsParty Equip] x-char swap: from={} to={} item={} ({}) bagPos={:#x} eqDest={:#x}",
+            srcChar->GetName(), dest->GetName(),
+            srcItem->GetEntry(), srcItem->GetTemplate()->Name1, bagPos, eqDest);
+        dest->SwapItem(bagPos, eqDest);
+
+        // SwapItem re-validates internally (CanUnequipItem on the slot's current
+        // occupant, the reverse store) beyond what CanEquipItem covered. If that
+        // failed it left the item in dest's bags and sent the equip error to
+        // dest's session (a bot), invisible to us — detect the strand and send
+        // the item home with feedback rather than silently relocating it.
+        if (!srcItem->IsEquipped())
+        {
+            dest->MoveItemFromInventory(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+            bounceBackToSrc();
+            ChatHandler(requester->GetSession()).PSendSysMessage(
+                "|cffff5555[WowPsParty]|r Equip rejected — couldn't swap into that slot.");
+            WowPsParty::SendInventoryTo(requester);
+            return;
         }
     }
 
