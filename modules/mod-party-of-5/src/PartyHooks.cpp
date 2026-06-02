@@ -13,6 +13,7 @@
 #include "Creature.h"
 #include "Group.h"
 #include "GroupMgr.h"
+#include "Bag.h"
 #include "Item.h"
 #include "ItemTemplate.h"
 #include "Log.h"
@@ -31,6 +32,7 @@
 #include "Trainer.h"
 #include "WorldSession.h"
 
+#include <algorithm>
 #include <unordered_set>
 
 namespace WowPsParty
@@ -60,6 +62,14 @@ namespace WowPsParty
     {
         if (!p || !p->GetSession()) return false;
         return GetAccountSettings(p->GetSession()->GetAccountId()).sharedProgression;
+    }
+
+    // Shared-inventory toggle (the merged party bag grid, B key). Off = each
+    // char's bags are their own. Gates cross-member crafting reagents. ON default.
+    static bool InventoryShared(Player* p)
+    {
+        if (!p || !p->GetSession()) return false;
+        return GetAccountSettings(p->GetSession()->GetAccountId()).sharedInventory;
     }
 
     // Teach every class-trainer spell `p` qualifies for at its level. Shared by
@@ -114,6 +124,33 @@ namespace
             peers.push_back(p);
         }
         return peers;
+    }
+
+    // Count of reagent `itemId` a member can actually contribute to a craft:
+    // backpack + equipped + keyring + bags, EXCLUDING items locked in an open
+    // trade window. Deliberately mirrors Player::HasItemCount's predicate (and
+    // excludes bank, like the vanilla reagent check) so this count and the
+    // Player::DestroyItemCount used to consume — which also skips IsInTrade()
+    // items — stay symmetric: never count a copy we then can't destroy.
+    static uint32 UsableReagentCount(Player* p, uint32 itemId)
+    {
+        if (!p) return 0;
+        uint32 count = 0;
+        for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            if (Item* it = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                if (it->GetEntry() == itemId && !it->IsInTrade())
+                    count += it->GetCount();
+        for (uint8 i = KEYRING_SLOT_START; i < CURRENCYTOKEN_SLOT_END; ++i)
+            if (Item* it = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                if (it->GetEntry() == itemId && !it->IsInTrade())
+                    count += it->GetCount();
+        for (uint8 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_END; ++i)
+            if (Bag* bag = p->GetBagByPos(i))
+                for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                    if (Item* it = bag->GetItemByPos(j))
+                        if (it->GetEntry() == itemId && !it->IsInTrade())
+                            count += it->GetCount();
+        return count;
     }
 }
 
@@ -678,4 +715,51 @@ void WowPsParty_OnQuestRewarded_Trampoline(Player* who, Quest const* quest, uint
     }
     WowPsParty::g_heroQuestTurnin  = false;
     WowPsParty::g_propagatingQuest = false;
+}
+
+// Trampoline called from the [WowPsParty PATCH] in Spell.cpp::CheckItems.
+// Total count of crafting reagent `itemId` available to the crafter across the
+// WHOLE shared party — the crafter's own bags plus every loaded party member's.
+// Lets you craft (tailoring, etc.) using reagents sitting in a partner's bags
+// shown in the merged Party Inventory. For a solo / shared-inventory-off caster
+// this is just the crafter's own count, so vanilla behaviour is preserved.
+uint32 WowPsParty_PartyReagentCount(Player* crafter, uint32 itemId)
+{
+    if (!crafter) return 0;
+    uint32 total = UsableReagentCount(crafter, itemId);
+    if (!WowPsParty::IsEnabled() || !WowPsParty::InventoryShared(crafter))
+        return total;   // solo: own bags only == vanilla HasItemCount predicate
+    for (Player* p : LoadedPartyPeers(crafter->GetSession()->GetAccountId(), crafter))
+        total += UsableReagentCount(p, itemId);
+    return total;
+}
+
+// Trampoline called from the [WowPsParty PATCH] in Spell.cpp::TakeReagents.
+// Consume `count` of reagent `itemId`: the crafter's own bags first, then loaded
+// party members for the shortfall (the counterpart to the count above). For a
+// solo / shared-inventory-off caster this destroys only from the crafter — i.e.
+// exactly what the vanilla DestroyItemCount it replaces did.
+void WowPsParty_TakeReagent(Player* crafter, uint32 itemId, uint32 count)
+{
+    if (!crafter || count == 0) return;
+
+    uint32 const own = UsableReagentCount(crafter, itemId);
+    uint32 const fromCrafter = std::min(own, count);
+    if (fromCrafter)
+        crafter->DestroyItemCount(itemId, fromCrafter, true);
+
+    uint32 remaining = count - fromCrafter;
+    if (remaining == 0) return;
+    if (!WowPsParty::IsEnabled() || !WowPsParty::InventoryShared(crafter)) return;
+
+    for (Player* p : LoadedPartyPeers(crafter->GetSession()->GetAccountId(), crafter))
+    {
+        if (remaining == 0) break;
+        uint32 const take = std::min(UsableReagentCount(p, itemId), remaining);
+        if (take)
+        {
+            p->DestroyItemCount(itemId, take, true);
+            remaining -= take;
+        }
+    }
 }

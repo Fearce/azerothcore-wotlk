@@ -370,6 +370,19 @@ bool StoreLootAction::Execute(Event event)
 
     bot->SetLootGUID(guid);
 
+    // [WowPsParty] A skinnable beast can only be skinned by a third party once
+    // its NORMAL loot is fully removed: Spell.cpp's SPELL_EFFECT_SKINNING gate
+    // needs loot.isLooted() AND UNIT_FLAG_SKINNABLE, and the engine only sets
+    // that flag in Creature::AllLootRemovedFromCorpse (fired when the loot is
+    // emptied). The bot normally leaves loot-strategy-filtered / over-cap items
+    // on the corpse, so it never empties and the human party member gets
+    // "target not looted". On a skinnable corpse, loot EVERYTHING into the shared
+    // party bags so it empties and turns skinnable (the surplus feeds Sell Trash
+    // rather than being destroyed).
+    Creature* lootCreature = botAI->GetCreature(guid);
+    bool const emptySkinnable = lootCreature && loot_type != LOOT_SKINNING &&
+        lootCreature->GetCreatureTemplate()->SkinLootId != 0;
+
     if (gold > 0)
     {
         WorldPacket* packet = new WorldPacket(CMSG_LOOT_MONEY, 0);
@@ -395,14 +408,14 @@ bool StoreLootAction::Execute(Event event)
         if (lootslot_type != LOOT_SLOT_TYPE_ALLOW_LOOT && lootslot_type != LOOT_SLOT_TYPE_OWNER)
             continue;
 
-        if (loot_type != LOOT_SKINNING && !IsLootAllowed(itemid, botAI))
+        if (!emptySkinnable && loot_type != LOOT_SKINNING && !IsLootAllowed(itemid, botAI))
             continue;
 
         ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemid);
         if (!proto)
             continue;
 
-        if (!botAI->HasActivePlayerMaster() && AI_VALUE(uint8, "bag space") > 80)
+        if (!emptySkinnable && !botAI->HasActivePlayerMaster() && AI_VALUE(uint8, "bag space") > 80)
         {
             uint32 maxStack = proto->GetMaxStackSize();
             if (maxStack == 1)

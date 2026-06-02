@@ -5524,7 +5524,12 @@ void Spell::TakeReagents()
         if (m_targets.GetItemTargetEntry() == itemid)
             m_targets.SetItemTarget(nullptr);
 
-        p_caster->DestroyItemCount(itemid, itemcount, true);
+        // [WowPsParty PATCH] Consume reagents from the shared Party Inventory —
+        // the crafter's own bags first, then loaded party members for the
+        // shortfall. For a solo / shared-off caster this is identical to the
+        // vanilla DestroyItemCount it replaces (crafter only).
+        extern void WowPsParty_TakeReagent(Player*, uint32, uint32);
+        WowPsParty_TakeReagent(p_caster, itemid, itemcount);
     }
 }
 
@@ -7304,7 +7309,14 @@ SpellCastResult Spell::CheckItems(uint32* param1, uint32* param2)
                     }
                 }
                 if (!player->HasItemCount(itemid, itemcount))
-                    return SPELL_FAILED_REAGENTS;
+                {
+                    // [WowPsParty PATCH] Craft from the shared Party Inventory:
+                    // count the reagent across every loaded party member, not
+                    // just the crafter, so reagents in a partner's bags count.
+                    extern uint32 WowPsParty_PartyReagentCount(Player*, uint32);
+                    if (WowPsParty_PartyReagentCount(player, itemid) < itemcount)
+                        return SPELL_FAILED_REAGENTS;
+                }
             }
         }
 
