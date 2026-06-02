@@ -43,6 +43,7 @@
 #include "SpellInfo.h"   // SpellInfo::Effects[] for the leader's mount-type check
 
 // Gathering (mining / herbalism) for follower bots.
+#include "Bag.h"
 #include "Cell.h"
 #include "CellImpl.h"
 #include "Chat.h"
@@ -962,6 +963,7 @@ namespace WowPsParty
         uint32     commitMs   = 0;  // when we committed (stuck timeout)
         ObjectGuid avoid;           // a node we abandoned as unreachable
         uint32     avoidUntil = 0;
+        uint32     lastOffloadMs = 0; // last full-bags offload attempt (throttle)
     };
     static std::unordered_map<uint32, GatherState> g_gather;  // botLow -> state
     static std::mutex g_gatherMutex;
@@ -1024,6 +1026,87 @@ namespace WowPsParty
             if (d < bestDist) { bestDist = d; best = go; }
         }
         return best;
+    }
+
+    static constexpr uint32 GATHER_OFFLOAD_THROTTLE_MS = 4000;
+
+    // A gathering bot's own 16-slot backpack fills with mats and stops it
+    // harvesting (TickGathering won't deplete a node it can't store). But the
+    // party inventory is SHARED — which bot physically carries a stack is
+    // invisible to the player — so slide gathered trade goods (ore / herbs /
+    // cloth / leather / stone) over to a bot party-mate that has room and keep
+    // gathering on the party's COLLECTIVE space. Only ITEM_CLASS_TRADE_GOODS
+    // moves: never tools (the mining pick / skinning knife stay), gear, bags,
+    // quest or soulbound items. Uses the same preserve-or-bounce cross-character
+    // move the equip/move handlers use, so an item is never lost or duplicated.
+    // Returns the number of slots freed on `bot`.
+    static uint32 OffloadTradeGoodsToPeers(Player* bot)
+    {
+        std::vector<Player*> peers;
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(bot->GetGUID(), party);
+        for (ObjectGuid const& g : party)
+        {
+            if (g == bot->GetGUID()) continue;
+            Player* p = ObjectAccessor::FindConnectedPlayer(g);
+            // Bot party-mates only — never push mats into the human's own bags.
+            if (p && p->IsInWorld() && sPlayerbotsMgr.GetPlayerbotAI(p) &&
+                !p->HasUnitFlag(UNIT_FLAG_POSSESSED) && p->GetFreeInventorySpace() > 0)
+                peers.push_back(p);
+        }
+        if (peers.empty()) return 0;
+
+        std::vector<Item*> movable;
+        auto consider = [&](Item* it)
+        {
+            if (!it || it->IsEquipped() || it->IsNotEmptyBag()) return;
+            ItemTemplate const* t = it->GetTemplate();
+            if (t && t->Class == ITEM_CLASS_TRADE_GOODS)
+                movable.push_back(it);
+        };
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            consider(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = bot->GetBagByPos(b))
+                for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                    consider(bag->GetItemByPos(j));
+
+        uint32 freed = 0;
+        size_t pi = 0;
+        for (Item* it : movable)
+        {
+            while (pi < peers.size() && peers[pi]->GetFreeInventorySpace() == 0) ++pi;
+            if (pi >= peers.size()) break;
+            Player* peer = peers[pi];
+
+            bot->MoveItemFromInventory(it->GetBagSlot(), it->GetSlot(), true);
+            it->SetOwnerGUID(peer->GetGUID());
+            it->FSetState(ITEM_CHANGED);
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            it->SaveToDB(tx);
+            CharacterDatabase.CommitTransaction(tx);
+
+            ItemPosCountVec dest;
+            if (peer->CanStoreItem(NULL_BAG, NULL_SLOT, dest, it, false) == EQUIP_ERR_OK)
+            {
+                peer->MoveItemToInventory(dest, it, true);
+                ++freed;
+            }
+            else
+            {
+                // Couldn't store (raced full) — give it straight back so it never strands.
+                it->SetOwnerGUID(bot->GetGUID());
+                it->FSetState(ITEM_CHANGED);
+                ItemPosCountVec back;
+                if (bot->CanStoreItem(NULL_BAG, NULL_SLOT, back, it, false) == EQUIP_ERR_OK)
+                    bot->MoveItemToInventory(back, it, true);
+                CharacterDatabaseTransaction tx2 = CharacterDatabase.BeginTransaction();
+                it->SaveToDB(tx2);
+                CharacterDatabase.CommitTransaction(tx2);
+            }
+            if (freed >= 8) break;   // a handful of slots is plenty to keep gathering
+        }
+        return freed;
     }
 
     // ----- "Train me soon" reminders ---------------------------------------
@@ -1259,7 +1342,24 @@ namespace WowPsParty
         // Nowhere to put the mats — don't harvest (AutoStoreLoot silently drops
         // items that don't fit, which would deplete the node for nothing) and
         // don't even approach. Resumes once a bag slot frees up.
-        if (bot->GetFreeInventorySpace() == 0) { GatherLog(gLow, "skip: bags full"); return; }
+        if (bot->GetFreeInventorySpace() == 0)
+        {
+            // Shared party inventory: try to slide gathered mats to a bot
+            // party-mate with room so one full backpack doesn't stall the party.
+            // Throttled, and only re-attempted if it actually frees space.
+            bool throttled = false;
+            {
+                std::lock_guard<std::mutex> lock(g_gatherMutex);
+                auto& st = g_gather[gLow];
+                if (now - st.lastOffloadMs < GATHER_OFFLOAD_THROTTLE_MS) throttled = true;
+                else st.lastOffloadMs = now;
+            }
+            if (throttled) { GatherLog(gLow, "skip: bags full"); return; }
+            uint32 const freed = OffloadTradeGoodsToPeers(bot);
+            if (freed == 0 || bot->GetFreeInventorySpace() == 0)
+            { GatherLog(gLow, "skip: bags full (party also full)"); return; }
+            GatherLog(gLow, "offloaded mats to a party-mate to keep gathering");
+        }
 
         ObjectGuid const leaderGuid = GetLeaderFor(bot->GetGUID());
         if (!leaderGuid) { GatherLog(gLow, "skip: no leader directive"); return; }
