@@ -74,8 +74,8 @@ namespace WowPsParty
             "`shared_inventory` TINYINT NOT NULL DEFAULT 1, "
             "`shared_gear` TINYINT NOT NULL DEFAULT 1, "
             "`shared_progression` TINYINT NOT NULL DEFAULT 1, "
-            "`quest_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 100, "
-            "`kill_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 100)");
+            "`quest_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 200, "
+            "`kill_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 200)");
         // Migrate installs that predate the XP-rate columns. The DB server is
         // MySQL, which — unlike MariaDB — has no `ADD COLUMN IF NOT EXISTS`; that
         // syntax errors 1064 and AC aborts the worldserver on any SQL error. So
@@ -91,11 +91,27 @@ namespace WowPsParty
         if (columnMissing("quest_xp_rate"))
             CharacterDatabase.DirectExecute(
                 "ALTER TABLE `party_account_settings` "
-                "ADD COLUMN `quest_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 100");
+                "ADD COLUMN `quest_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 200");
         if (columnMissing("kill_xp_rate"))
             CharacterDatabase.DirectExecute(
                 "ALTER TABLE `party_account_settings` "
-                "ADD COLUMN `kill_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 100");
+                "ADD COLUMN `kill_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 200");
+        // New accounts default to x2 XP. Installs whose columns were first added
+        // with the old DEFAULT 100 get their new-row default switched to 200.
+        // Only ALTER when a default actually isn't 200 yet, so we're not running
+        // unconditional DDL on every startup (existing rows are untouched).
+        auto defaultNot200 = [](char const* col) -> bool
+        {
+            return CharacterDatabase.Query(
+                "SELECT 1 FROM `information_schema`.`COLUMNS` "
+                "WHERE `TABLE_SCHEMA` = DATABASE() "
+                "AND `TABLE_NAME` = 'party_account_settings' "
+                "AND `COLUMN_NAME` = '{}' AND `COLUMN_DEFAULT` <> '200'", col) != nullptr;
+        };
+        if (defaultNot200("quest_xp_rate") || defaultNot200("kill_xp_rate"))
+            CharacterDatabase.DirectExecute(
+                "ALTER TABLE `party_account_settings` "
+                "ALTER `quest_xp_rate` SET DEFAULT 200, ALTER `kill_xp_rate` SET DEFAULT 200");
     }
 
     void AccountSettingsRefreshFromDB(uint32 account)

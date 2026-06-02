@@ -127,7 +127,9 @@ namespace WowPsParty
         out << "SETTINGS\t" << (s.spawnCompanions ? 1 : 0)
             << '\t' << (s.sharedInventory ? 1 : 0)
             << '\t' << (s.sharedGear ? 1 : 0)
-            << '\t' << (s.sharedProgression ? 1 : 0);
+            << '\t' << (s.sharedProgression ? 1 : 0)
+            << '\t' << s.questXpRate
+            << '\t' << s.killXpRate;
         SendWPSP(player, out.str());
     }
 
@@ -1593,6 +1595,24 @@ public:
             LOG_INFO("module",
                 "[WowPsParty] SET_SETTING account={} {}={}", account, key, val ? 1 : 0);
             WowPsParty::SendSettingsTo(player);   // echo back the full set
+        }
+        else if (command == "SET_XPRATE")
+        {
+            // SET_XPRATE\t<quest|kill>\t<rate>   rate = percent (100-500, server clamps)
+            std::string s(payload);
+            auto t = s.find('\t');
+            if (t == std::string::npos) return;
+            std::string const which = s.substr(0, t);
+            if (which != "quest" && which != "kill") return;
+            // rate is unvalidated here on purpose — SetAccountXpRate clamps it to
+            // [XP_RATE_MIN, XP_RATE_MAX], so any out-of-range / garbage value is
+            // bounded before it touches the DB.
+            uint32 const rate = std::strtoul(s.substr(t + 1).c_str(), nullptr, 10);
+            uint32 const account = player->GetSession()->GetAccountId();
+            WowPsParty::SetAccountXpRate(account, which == "quest", rate);
+            LOG_INFO("module",
+                "[WowPsParty] SET_XPRATE account={} {}={}", account, which, rate);
+            WowPsParty::SendSettingsTo(player);   // echo back the clamped value
         }
         else if (command == "REQ_HENCHMEN")
         {

@@ -66,8 +66,8 @@ namespace WowPsParty
         bool sharedInventory   = true;  // CLIENT: B opens the merged party grid
         bool sharedGear        = true;  // CLIENT: C opens the party gear panel
         bool sharedProgression = true;  // SERVER: mirror XP / gold / loot / quests
-        uint32 questXpRate     = 100;   // % XP from quest turn-ins (clamped 100-500)
-        uint32 killXpRate      = 100;   // % XP from kills           (clamped 100-500)
+        uint32 questXpRate     = 200;   // % XP from quest turn-ins (clamped 100-500, default x2)
+        uint32 killXpRate      = 200;   // % XP from kills           (clamped 100-500, default x2)
     };
 
     // Allowed bounds for the per-account XP multipliers (percent).
