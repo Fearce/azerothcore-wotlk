@@ -403,6 +403,22 @@ void Item::SaveToDB(CharacterDatabaseTransaction trans)
                 if (!isInTransaction)
                     CharacterDatabase.CommitTransaction(trans);
 
+                // [WowPs guard] An upstream path can leave an item flagged
+                // ITEM_REMOVED while it's still in the world (m_inWorld true),
+                // which makes ~Object ABORT the entire worldserver on this delete
+                // (and likewise if it's still in the object-update list). Finish
+                // the teardown here — exactly what the normal removal path does —
+                // so the server stays up, and log the offender (entry/guid/owner/
+                // slot) so the corruption can be traced to its source and fixed.
+                if (IsInWorld())
+                {
+                    LOG_ERROR("entities.item",
+                        "[WowPs guard] item entry={} guid={} owner={} bag={} slot={} was ITEM_REMOVED but still IN WORLD on save — removing from world to avoid worldserver abort.",
+                        GetEntry(), GetGUID().GetCounter(), GetOwnerGUID().GetCounter(),
+                        uint32(GetBagSlot()), uint32(GetSlot()));
+                    RemoveFromWorld();
+                }
+
                 delete this;
                 return;
             }
