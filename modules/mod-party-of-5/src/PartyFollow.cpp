@@ -45,6 +45,7 @@
 // Gathering (mining / herbalism) for follower bots.
 #include "Cell.h"
 #include "CellImpl.h"
+#include "Creature.h"
 #include "DBCStores.h"
 #include "GameObject.h"
 #include "GridNotifiers.h"
@@ -83,6 +84,22 @@ namespace WowPsParty
                 : _src(src), _range(range) {}
             bool operator()(GameObject* go) const
             { return go && go->isSpawned() && _src->IsWithinDist(go, _range, false); }
+            WorldObject const* _src;
+            float _range;
+        };
+
+        // Predicate for the grid searcher: any dead, currently-skinnable corpse
+        // within range. The per-bot skill/level gate happens in the caller.
+        struct NearbySkinnableCheck
+        {
+            NearbySkinnableCheck(WorldObject const* src, float range)
+                : _src(src), _range(range) {}
+            bool operator()(Creature* c) const
+            {
+                return c && !c->IsAlive()
+                    && c->HasUnitFlag(UNIT_FLAG_SKINNABLE)
+                    && _src->IsWithinDist(c, _range, false);
+            }
             WorldObject const* _src;
             float _range;
         };
@@ -920,13 +937,14 @@ namespace WowPsParty
                  nearest->GetGUID().GetCounter(), nearest->GetEntry(), dist, ok);
     }
 
-    // ===== Gathering (mining / herbalism) ==================================
+    // ===== Gathering (mining / herbalism / skinning) =======================
     //
-    // A follower bot that the player trained in Mining or Herbalism will, while
-    // OUT OF COMBAT and travelling with the party, peel off to harvest a nearby
-    // node (within 30y) that's within its skill, then resume following. Only the
-    // player's own alts gather — henchmen are temporary combat companions and
-    // are skipped. There's no toggle: training the profession IS the opt-in.
+    // A follower bot that the player trained in Mining, Herbalism or Skinning
+    // will, while OUT OF COMBAT and travelling with the party, peel off to
+    // harvest a nearby node OR skinnable corpse (within 30y) that's within its
+    // skill, then resume following. Only the player's own alts gather —
+    // henchmen are temporary combat companions and are skipped. There's no
+    // toggle: training the profession IS the opt-in.
 
     static constexpr float GATHER_SCAN_RANGE = 30.0f;  // node search radius
     static constexpr float GATHER_REACH      = 5.0f;   // interaction distance
@@ -1036,6 +1054,129 @@ namespace WowPsParty
             bot->GetName(), go->GetEntry(), skillId, req);
     }
 
+    // ----- Skinning (corpse harvesting) ------------------------------------
+    // A bot trained in Skinning peels nearby skinnable corpses exactly like a
+    // mining/herb node: walk over, harvest straight into bags, skill up. The
+    // engine only sets UNIT_FLAG_SKINNABLE once a corpse's normal loot has been
+    // removed (Creature::AllLootRemovedFromCorpse), so this naturally waits for
+    // the kill to be looted first. A corpse's required skill is usually Skinning
+    // (leather); a few special mobs want Herbalism/Mining/Engineering instead,
+    // and IsSkinnableBy verifies the bot actually has whatever the corpse asks
+    // for — so a skinner never harvests one it isn't qualified to.
+
+    // Skill-up red-level for a harvested corpse, mirroring Spell::EffectSkinning.
+    // (The can-I-skin gate uses a different, skill-based formula — see below.)
+    static int32 CorpseSkinReq(int32 level)
+    {
+        return level < 10 ? 0 : level < 20 ? (level - 10) * 10 : level * 5;
+    }
+
+    static bool IsSkinnableBy(Player* bot, Creature* c)
+    {
+        if (!c || c->IsAlive()) return false;
+        if (!c->HasUnitFlag(UNIT_FLAG_SKINNABLE)) return false;
+        uint32 const skill = c->GetCreatureTemplate()->GetRequiredLootSkill();
+        if (!bot->HasSkill(skill)) return false;
+        // Engine cast gate (Spell::CheckCast, skinning): the required value keys
+        // off the bot's CURRENT skill, not the corpse-level bands above.
+        int32 const skillValue = bot->GetSkillValue(skill);
+        int32 const level      = c->GetLevel();
+        int32 const reqValue   = (skillValue < 100) ? (level - 10) * 10 : level * 5;
+        if (reqValue > skillValue) return false;
+        return true;
+    }
+
+    static Creature* FindNearestSkinnable(Player* bot, float range, ObjectGuid avoid)
+    {
+        std::list<Creature*> crs;
+        NearbySkinnableCheck check(bot, range);
+        Acore::CreatureListSearcher<NearbySkinnableCheck> searcher(bot, crs, check);
+        Cell::VisitObjects(bot, searcher, range);
+
+        Creature* best = nullptr;
+        float bestDist = range + 1.0f;
+        for (Creature* c : crs)
+        {
+            if (avoid && c->GetGUID() == avoid) continue;
+            if (!IsSkinnableBy(bot, c)) continue;
+            float const d = bot->GetDistance(c);
+            if (d < bestDist) { bestDist = d; best = c; }
+        }
+        return best;
+    }
+
+    // Harvest a skinnable corpse straight into the bot's bags. Mirrors
+    // Spell::EffectSkinning (clear the flag, skill up with elite x2) but stores
+    // the skin loot directly instead of opening a loot window — our party bots
+    // hard-return from UpdateAI, so the default loot AI never runs for them.
+    static void SkinCorpse(Player* bot, Creature* c)
+    {
+        uint32 const skill = c->GetCreatureTemplate()->GetRequiredLootSkill();
+        int32 const reqValue = CorpseSkinReq(c->GetLevel());
+
+        bot->SetFacingToObject(c);
+        c->RemoveUnitFlag(UNIT_FLAG_SKINNABLE);
+
+        if (uint32 const skinLootId = c->GetCreatureTemplate()->SkinLootId)
+            bot->AutoStoreLoot(skinLootId, LootTemplates_Skinning, true);
+
+        // Tag the corpse as skinned. Without this, Creature::AllLootRemovedFrom-
+        // Corpse re-sets UNIT_FLAG_SKINNABLE (it only skips when loot_type is
+        // LOOT_SKINNING) and the bot could skin it twice → leather dupe; the tag
+        // also makes the corpse despawn next update like a real skinned one.
+        // clear() resets loot_type to LOOT_NONE, so set the tag afterwards.
+        c->loot.clear();
+        c->loot.loot_type = LOOT_SKINNING;
+
+        if (uint32 const pure = bot->GetPureSkillValue(skill))
+            bot->UpdateGatherSkill(skill, pure, uint32(reqValue), c->isElite() ? 2 : 1);
+
+        LOG_INFO("module",
+            "[WowPsParty Gather] {} skinned creature entry={} skill={} req={}",
+            bot->GetName(), c->GetEntry(), skill, reqValue);
+    }
+
+    // ----- Unified harvest target (node OR corpse) -------------------------
+    // The tick state machine commits to one target guid and walks to it; these
+    // resolve / validate / harvest it regardless of whether it's a GameObject
+    // node or a creature corpse, so mining/herb and skinning share one approach
+    // loop (commit, stuck-timeout, avoid) instead of duplicating it.
+    static WorldObject* ResolveHarvest(Player* bot, ObjectGuid guid)
+    {
+        if (!guid) return nullptr;
+        if (WorldObject* go = ObjectAccessor::GetGameObject(*bot, guid)) return go;
+        return ObjectAccessor::GetCreature(*bot, guid);
+    }
+
+    static bool IsHarvestableBy(Player* bot, WorldObject* obj)
+    {
+        if (!obj) return false;
+        if (GameObject* go = obj->ToGameObject()) return IsGatherableBy(bot, go);
+        if (Creature* c = obj->ToCreature())      return IsSkinnableBy(bot, c);
+        return false;
+    }
+
+    static void HarvestTarget(Player* bot, WorldObject* obj)
+    {
+        if (GameObject* go = obj->ToGameObject()) { GatherNode(bot, go); return; }
+        if (Creature* c = obj->ToCreature())      SkinCorpse(bot, c);
+    }
+
+    // Nearest harvestable of EITHER kind the bot is trained for, within range.
+    static WorldObject* FindNearestHarvest(Player* bot, float range, ObjectGuid avoid,
+                                           bool wantNodes, bool wantSkin)
+    {
+        WorldObject* best = nullptr;
+        float bestDist = range + 1.0f;
+        if (wantNodes)
+            if (GameObject* go = FindNearestGatherNode(bot, range, avoid))
+            { best = go; bestDist = bot->GetDistance(go); }
+        if (wantSkin)
+            if (Creature* c = FindNearestSkinnable(bot, range, avoid))
+                if (bot->GetDistance(c) < bestDist) best = c;
+        return best;
+    }
+
     void TickGathering(Player* bot)
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld() || !bot->GetSession()) return;
@@ -1045,10 +1186,10 @@ namespace WowPsParty
         if (IsHenchman(bot->GetGUID())) return;            // only the player's alts
         if (IsTankLeading(bot->GetGUID())) return;         // busy leading a dungeon
 
-        // Fast skill gate — most bots have neither profession, exit immediately.
-        bool const canMine = bot->HasSkill(SKILL_MINING);
-        bool const canHerb = bot->HasSkill(SKILL_HERBALISM);
-        if (!canMine && !canHerb) return;
+        // Fast skill gate — most bots have no gather profession, exit at once.
+        bool const canNode = bot->HasSkill(SKILL_MINING) || bot->HasSkill(SKILL_HERBALISM);
+        bool const canSkin = bot->HasSkill(SKILL_SKINNING);
+        if (!canNode && !canSkin) return;
 
         uint32 const gLow = bot->GetGUID().GetCounter();
         uint32 const now  = getMSTime();
@@ -1079,38 +1220,38 @@ namespace WowPsParty
             avoidUntil = st.avoidUntil;
         }
 
-        GameObject* node = committed
-            ? ObjectAccessor::GetGameObject(*bot, committed) : nullptr;
+        WorldObject* target = ResolveHarvest(bot, committed);
 
-        if (!IsGatherableBy(bot, node))
+        if (!IsHarvestableBy(bot, target))
         {
-            // Lost/invalid committed node — pick the nearest valid one, skipping
-            // any node we recently gave up reaching.
-            node = FindNearestGatherNode(bot, GATHER_SCAN_RANGE,
-                                         (now < avoidUntil) ? avoid : ObjectGuid::Empty);
+            // Lost/invalid committed target — pick the nearest valid node or
+            // corpse, skipping any we recently gave up reaching.
+            target = FindNearestHarvest(bot, GATHER_SCAN_RANGE,
+                                        (now < avoidUntil) ? avoid : ObjectGuid::Empty,
+                                        canNode, canSkin);
             std::lock_guard<std::mutex> lock(g_gatherMutex);
             auto& st = g_gather[gLow];
-            st.node     = node ? node->GetGUID() : ObjectGuid::Empty;
-            st.commitMs = node ? now : 0;
+            st.node     = target ? target->GetGUID() : ObjectGuid::Empty;
+            st.commitMs = target ? now : 0;
         }
         else if (commitMs && (now - commitMs) > GATHER_APPROACH_TIMEOUT_MS &&
-                 !bot->IsWithinDistInMap(node, GATHER_REACH))
+                 !bot->IsWithinDistInMap(target, GATHER_REACH))
         {
             // Committed but can't reach it (wedged on geometry). Abandon it and
             // avoid re-picking it for a while; next tick re-scans for another.
             std::lock_guard<std::mutex> lock(g_gatherMutex);
             auto& st = g_gather[gLow];
-            st.avoid      = node->GetGUID();
+            st.avoid      = target->GetGUID();
             st.avoidUntil = now + GATHER_AVOID_MS;
             st.node       = ObjectGuid::Empty;
             st.commitMs   = 0;
             return;
         }
-        if (!node) return;
+        if (!target) return;
 
-        if (bot->IsWithinDistInMap(node, GATHER_REACH))
+        if (bot->IsWithinDistInMap(target, GATHER_REACH))
         {
-            GatherNode(bot, node);
+            HarvestTarget(bot, target);
             std::lock_guard<std::mutex> lock(g_gatherMutex);
             auto& st = g_gather[gLow];
             st.node = ObjectGuid::Empty;
@@ -1118,13 +1259,13 @@ namespace WowPsParty
         }
         else
         {
-            // Walk to the node and keep the 1Hz follow re-asserter off us so it
-            // doesn't yank us back to the leader mid-approach. MovePoint paths
-            // around geometry (generatePath defaults true).
+            // Walk to the target and keep the 1Hz follow re-asserter off us so
+            // it doesn't yank us back to the leader mid-approach. MovePoint
+            // paths around geometry (generatePath defaults true).
             HoldFollower(bot->GetGUID(), 2500);
-            bot->SetFacingToObject(node);
+            bot->SetFacingToObject(target);
             bot->GetMotionMaster()->MovePoint(0xA17,
-                node->GetPositionX(), node->GetPositionY(), node->GetPositionZ());
+                target->GetPositionX(), target->GetPositionY(), target->GetPositionZ());
         }
     }
 
@@ -2364,7 +2505,7 @@ void WowPsParty_TankFollowPath_Trampoline(Player* bot)
     WowPsParty::TankFollowPath(bot);
 }
 
-// Gathering trampoline — out-of-combat mining/herbalism for the player's alts.
+// Gathering trampoline — out-of-combat mining/herbalism/skinning for the player's alts.
 void WowPsParty_TickGathering_Trampoline(Player* bot)
 {
     WowPsParty::TickGathering(bot);
