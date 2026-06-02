@@ -296,7 +296,18 @@ bool LootObject::IsLootPossible(Player* bot)
     if (creature && creature->getDeathState() == DeathState::Corpse)
     {
         if (!bot->isAllowedToLoot(creature) && skillId != SKILL_SKINNING)
+        {
+            static thread_local uint32 _wpsLastLog = 0;
+            uint32 const _now = getMSTime();
+            if (_now - _wpsLastLog > 3000)
+            {
+                _wpsLastLog = _now;
+                LOG_INFO("module",
+                    "[WowPsLoot] {} NOT allowed to loot corpse entry={} guid={} (loot rights — bot didn't tap it?)",
+                    bot->GetName(), creature->GetEntry(), guid.GetCounter());
+            }
             return false;
+        }
     }
 
     // Prevent bot from running to chests that are unlootable (e.g. Gunship Armory before completing the event) or on

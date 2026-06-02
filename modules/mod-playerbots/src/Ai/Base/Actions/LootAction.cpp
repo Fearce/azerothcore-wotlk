@@ -370,6 +370,10 @@ bool StoreLootAction::Execute(Event event)
 
     bot->SetLootGUID(guid);
 
+    LOG_INFO("module", "[WowPsLoot] {} StoreLoot guid={} type={} gold={} items={} bagPct={} master={}",
+        bot->GetName(), guid.GetCounter(), uint32(loot_type), gold, uint32(items),
+        uint32(AI_VALUE(uint8, "bag space")), botAI->HasActivePlayerMaster() ? 1 : 0);
+
     if (gold > 0)
     {
         WorldPacket* packet = new WorldPacket(CMSG_LOOT_MONEY, 0);
