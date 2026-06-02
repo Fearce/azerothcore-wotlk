@@ -38,7 +38,9 @@
 #include "PlayerbotMgr.h"
 #include "AiObjectContext.h"
 #include "Value.h"
+#include "AuctionHouseMgr.h"
 #include "DatabaseEnv.h"
+#include "GameTime.h"
 #include "Item.h"
 #include "ItemTemplate.h"
 #include "Log.h"
@@ -958,6 +960,112 @@ static void HandleSell(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// AH_SELL\t<srcPartySlot>\t<srcItemGuidLow>\t<copperBuyout>
+//   Lists an item out of any party member's bag on the owner's faction Auction
+//   House — no auctioneer required (same auctioneer-less posting the AH bot uses).
+//   24h listing, start bid == buyout == the requested copper price. The deposit
+//   is charged to the item's owner; the shared-gold hook (OnPlayerMoneyChanged)
+//   mirrors that delta across the pool. When the auction sells (or expires) the
+//   AH mails proceeds / the item back to the owner char by the normal settlement
+//   path, and collecting that mail re-mirrors the gold. Item must be tradeable
+//   (not soulbound), unequipped and an empty bag — the same gates the real AH
+//   applies, surfaced as chat errors so the click isn't silently dropped.
+static void HandleAhSell(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+
+    auto t1 = payload.find('\t');
+    if (t1 == std::string_view::npos) return;
+    auto t2 = payload.find('\t', t1 + 1);
+    if (t2 == std::string_view::npos) return;
+
+    uint32 const srcSlot = std::strtoul(std::string(payload.substr(0, t1)).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(t1 + 1, t2 - t1 - 1)).c_str(), nullptr, 10);
+    uint32 const copper = std::strtoul(std::string(payload.substr(t2 + 1)).c_str(), nullptr, 10);
+    if (!srcItemGuidLow || copper == 0) return;
+
+    auto err = [&](std::string const& msg)
+    { ChatHandler(requester->GetSession()).SendSysMessage(msg.c_str()); };
+
+    if (copper > MAX_MONEY_AMOUNT)
+    {
+        err("|cffff5555[WowPsParty]|r That price is too high.");
+        return;
+    }
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    QueryResult q = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, srcSlot);
+    if (!q) return;
+    uint32 const srcCharGuid = q->Fetch()[0].Get<uint32>();
+    Player* srcChar = ObjectAccessor::FindConnectedPlayer(
+        ObjectGuid::Create<HighGuid::Player>(srcCharGuid));
+    if (!srcChar) return;
+
+    Item* srcItem = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!srcItem) return;
+    ItemTemplate const* tmpl = srcItem->GetTemplate();
+    if (!tmpl) return;
+
+    if (srcItem->IsEquipped())          { err("|cffff5555[WowPsParty]|r Unequip the item before auctioning it."); return; }
+    if (srcItem->IsNotEmptyBag())       { err("|cffff5555[WowPsParty]|r Empty the bag before auctioning it."); return; }
+    if (!srcItem->CanBeTraded())        { err(Acore::StringFormat("|cffff5555[WowPsParty]|r |cffffffff{}|r is soulbound — can't be auctioned.", tmpl->Name1)); return; }
+    if (sAuctionMgr->GetAItem(srcItem->GetGUID())) return;  // already in an auction
+
+    AuctionHouseEntry const* ahEntry =
+        sAuctionMgr->GetAuctionHouseEntryFromFactionTemplate(srcChar->GetFaction());
+    AuctionHouseObject* auctionHouse = sAuctionMgr->GetAuctionsMap(srcChar->GetFaction());
+    if (!ahEntry || !auctionHouse)
+    {
+        err("|cffff5555[WowPsParty]|r No auction house is reachable for that character.");
+        return;
+    }
+
+    uint32 const etime   = 2 * MIN_AUCTION_TIME;   // 24h, in seconds
+    uint32 const count   = srcItem->GetCount();
+    uint32 const deposit = sAuctionMgr->GetAuctionDeposit(ahEntry, etime, srcItem, count);
+    if (!srcChar->HasEnoughMoney(deposit))
+    {
+        err(Acore::StringFormat("|cffff5555[WowPsParty]|r Not enough gold for the |cffffd100{}.{}.{}|r deposit.",
+            deposit / 10000, (deposit / 100) % 100, deposit % 100));
+        return;
+    }
+    srcChar->ModifyMoney(-int32(deposit));
+
+    AuctionEntry* AH = new AuctionEntry();
+    AH->Id              = sObjectMgr->GenerateAuctionID();
+    AH->houseId         = AuctionHouseId(ahEntry->houseId);
+    AH->item_guid       = srcItem->GetGUID();
+    AH->item_template   = srcItem->GetEntry();
+    AH->itemCount       = srcItem->GetCount();
+    AH->owner           = srcChar->GetGUID();
+    AH->startbid        = copper;
+    AH->bidder          = ObjectGuid::Empty;
+    AH->bid             = 0;
+    AH->buyout          = copper;
+    AH->expire_time     = GameTime::GetGameTime().count() + etime;
+    AH->deposit         = deposit;
+    AH->auctionHouseEntry = ahEntry;
+
+    sAuctionMgr->AddAItem(srcItem);
+    auctionHouse->AddAuction(AH);
+
+    srcChar->MoveItemFromInventory(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+    srcItem->DeleteFromInventoryDB(trans);
+    srcItem->SaveToDB(trans);
+    AH->SaveToDB(trans);
+    srcChar->SaveInventoryAndGoldToDB(trans);
+    CharacterDatabase.CommitTransaction(trans);
+
+    ChatHandler(requester->GetSession()).PSendSysMessage(
+        "|cff66ccff[WowPsParty]|r Auctioned |cffffffff{}|r for |cffffd100{}.{}.{}|r buyout (24h).",
+        tmpl->Name1, copper / 10000, (copper / 100) % 100, copper % 100);
+
+    WowPsParty::SendInventoryTo(requester);
+}
+
 // DESTROY\t<srcPartySlot>\t<srcItemGuidLow>
 // Permanently destroys an item from a party member's bags. The addon shows a
 // confirmation popup first (Ctrl+Right-Click). Refuses equipped items and
@@ -1792,6 +1900,10 @@ public:
         else if (command == "SELL")
         {
             HandleSell(player, payload);
+        }
+        else if (command == "AH_SELL")
+        {
+            HandleAhSell(player, payload);
         }
         else if (command == "DESTROY")
         {
