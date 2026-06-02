@@ -1733,14 +1733,22 @@ namespace WowPsParty
             {
                 std::vector<ObjectGuid> toRemove;
                 for (auto const& slot : existing->GetMemberSlots())
-                    if (slot.guid != leader->GetGUID() &&
-                        !enrolled.count(slot.guid.GetCounter()))
-                        toRemove.push_back(slot.guid);
+                {
+                    if (slot.guid == leader->GetGUID()) continue;
+                    if (enrolled.count(slot.guid.GetCounter())) continue;  // our own alt
+                    // Only purge OFFLINE stragglers — a stale henchman from a past
+                    // session that the saved group still lists. A CONNECTED non-
+                    // enrolled member is either a henchman hired this session or a
+                    // real player who grouped up with us (a friend on another
+                    // account); never kick those, or co-op play breaks.
+                    if (ObjectAccessor::FindConnectedPlayer(slot.guid)) continue;
+                    toRemove.push_back(slot.guid);
+                }
                 for (ObjectGuid const& g : toRemove)
                 {
                     existing->RemoveMember(g);  // may delete the group object
                     LOG_INFO("module",
-                        "[WowPsParty] login purge: removed stale henchman guid={} "
+                        "[WowPsParty] login purge: removed stale offline member guid={} "
                         "from party group", g.GetCounter());
                 }
             }
