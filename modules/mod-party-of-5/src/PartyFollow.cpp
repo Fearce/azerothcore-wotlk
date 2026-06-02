@@ -45,6 +45,7 @@
 // Gathering (mining / herbalism) for follower bots.
 #include "Cell.h"
 #include "CellImpl.h"
+#include "Chat.h"
 #include "Creature.h"
 #include "DBCStores.h"
 #include "GameObject.h"
@@ -1025,6 +1026,65 @@ namespace WowPsParty
         return best;
     }
 
+    // ----- "Train me soon" reminders ---------------------------------------
+    // As a gathering skill climbs into its final 5 points before the CURRENT
+    // cap (e.g. 70..75 while the cap is 75), the bot calls out each new point in
+    // party chat so Kevin remembers to train the next rank. Every value is
+    // announced at most once — including the cap itself — so a bot parked at the
+    // cap (nothing left to gain until the next rank is trained) never re-spams.
+    static std::unordered_map<uint64, uint16> g_skillAnnounce;  // (guidLow<<16|skill) -> last announced value
+    static std::mutex g_skillAnnounceMutex;
+
+    static char const* GatherSkillName(uint32 skill)
+    {
+        switch (skill)
+        {
+            case SKILL_MINING:    return "Mining";
+            case SKILL_HERBALISM: return "Herbalism";
+            case SKILL_SKINNING:  return "Skinning";
+            default:              return "Gathering";
+        }
+    }
+
+    // Call right after a SUCCESSFUL UpdateGatherSkill (the skill actually went
+    // up). Announces only the three gathering professions, only within the last
+    // 5 points before the cap, and only once per value reached.
+    static void AnnounceGatherSkillProgress(Player* bot, uint32 skill)
+    {
+        if (skill != SKILL_MINING && skill != SKILL_HERBALISM && skill != SKILL_SKINNING)
+            return;
+
+        int32 const value = bot->GetPureSkillValue(skill);
+        int32 const cap   = bot->GetPureMaxSkillValue(skill);
+        if (cap <= 0 || value < cap - 5) return;   // not yet in the final-5 band
+
+        // One announcement per value: skip anything we've already reported for
+        // this bot+skill. Skill is monotonic, so the cap fires exactly once.
+        // Assumes SkillGain.Gathering = 1 (the realm default) — at a higher step
+        // intermediate values are skipped, never duplicated, by this same guard.
+        uint64 const key = (uint64(bot->GetGUID().GetCounter()) << 16) | uint16(skill);
+        {
+            std::lock_guard<std::mutex> lock(g_skillAnnounceMutex);
+            uint16& last = g_skillAnnounce[key];
+            if (value <= int32(last)) return;
+            last = uint16(value);
+        }
+
+        Group* g = bot->GetGroup();
+        if (!g) return;
+
+        std::string const msg = (value >= cap)
+            ? Acore::StringFormat("{} {}/{} — capped! Train my next rank so I can keep gathering.",
+                                  GatherSkillName(skill), value, cap)
+            : Acore::StringFormat("{} {}/{} — almost capped, train me soon!",
+                                  GatherSkillName(skill), value, cap);
+
+        WorldPacket data;
+        ChatMsg const type = g->isRaidGroup() ? CHAT_MSG_RAID : CHAT_MSG_PARTY;
+        ChatHandler::BuildChatPacket(data, type, LANG_UNIVERSAL, bot, nullptr, msg.c_str());
+        g->BroadcastPacket(&data, true, -1, bot->GetGUID());
+    }
+
     // Harvest the node directly into the bot's bags. Mirrors the essence of
     // Spell::EffectOpenLock (skill-up guarded by the per-GO skillup list, then
     // loot) but without a loot window — our party bots hard-return from
@@ -1040,7 +1100,8 @@ namespace WowPsParty
         {
             go->AddToSkillupList(bot->GetGUID());
             if (uint32 pure = bot->GetPureSkillValue(skillId))
-                bot->UpdateGatherSkill(skillId, pure, req);
+                if (bot->UpdateGatherSkill(skillId, pure, req))
+                    AnnounceGatherSkillProgress(bot, skillId);
         }
 
         if (uint32 const lootId = go->GetGOInfo()->GetLootId())
@@ -1129,7 +1190,8 @@ namespace WowPsParty
         c->loot.loot_type = LOOT_SKINNING;
 
         if (uint32 const pure = bot->GetPureSkillValue(skill))
-            bot->UpdateGatherSkill(skill, pure, uint32(reqValue), c->isElite() ? 2 : 1);
+            if (bot->UpdateGatherSkill(skill, pure, uint32(reqValue), c->isElite() ? 2 : 1))
+                AnnounceGatherSkillProgress(bot, skill);
 
         LOG_INFO("module",
             "[WowPsParty Gather] {} skinned creature entry={} skill={} req={}",
