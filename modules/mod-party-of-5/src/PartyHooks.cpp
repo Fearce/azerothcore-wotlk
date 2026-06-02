@@ -620,10 +620,12 @@ void WowPsParty_OnQuestAccepted_Trampoline(Player* who, Quest const* quest)
 }
 
 // Trampoline called from the [WowPsParty PATCH] in PlayerQuest.cpp::RewardQuest.
-// Mirrors the quest TURN-IN to every party hero that has it ready, and — when the
-// quest offers a CHOICE of rewards — spreads those choices across the heroes so
-// the account collects a variety instead of five copies of the same item. The
-// heroes don't need to be at the quest giver; RewardQuest just grants the rewards.
+// Mirrors the quest TURN-IN to every party hero that has the quest, force-
+// completing it first so they stay in lockstep on quest CHAINS (RewardQuest
+// marks the quest rewarded, which satisfies the next quest's prerequisite). When
+// the quest offers a CHOICE of rewards the heroes spread those choices so the
+// account collects a variety instead of five copies of the same item. The heroes
+// don't need to be at the quest giver — this is a full turn-in, not just loot.
 void WowPsParty_OnQuestRewarded_Trampoline(Player* who, Quest const* quest, uint32 rewardChoice)
 {
     if (WowPsParty::g_propagatingQuest) return;
@@ -645,8 +647,20 @@ void WowPsParty_OnQuestRewarded_Trampoline(Player* who, Quest const* quest, uint
     uint32 rewarded = 0;   // counts heroes actually turned in, to keep choices distinct
     for (Player* p : peers)
     {
-        // Only a hero that has the quest READY to hand in (objectives done).
-        if (p->GetQuestStatus(questId) != QUEST_STATUS_COMPLETE) continue;
+        QuestStatus const st = p->GetQuestStatus(questId);
+        // Hero never had this quest, or already turned it in — nothing to do.
+        if (st == QUEST_STATUS_NONE || st == QUEST_STATUS_REWARDED) continue;
+
+        // The heroes are bots shadowing the leader's questing, and the leader
+        // (which just handed this in) is the source of truth. Force the hero's
+        // objectives complete if they aren't already, so it turns in alongside
+        // the leader and stays in lockstep on the quest CHAIN — including
+        // objective types we can't mirror (explore / escort / use-object /
+        // talk-to-NPC). Without this, such a hero never reaches COMPLETE, is
+        // skipped, is never marked rewarded, and then fails the prerequisite for
+        // the next quest in the chain — a desync that never self-heals.
+        if (st != QUEST_STATUS_COMPLETE)
+            p->CompleteQuest(questId);
 
         // Spread the choice rewards: each hero takes a DIFFERENT index, starting
         // just past the leader's pick and wrapping when there are more heroes than
@@ -655,7 +669,9 @@ void WowPsParty_OnQuestRewarded_Trampoline(Player* who, Quest const* quest, uint
             ? (rewardChoice + 1 + rewarded) % choiceCount
             : 0u;
 
-        // Verifies completion AND that the chosen reward fits the hero's bags.
+        // Verifies the (now-complete) quest is rewardable and the chosen reward
+        // fits the hero's bags. For a rare auto-reward tracking quest CompleteQuest
+        // already rewarded it, so this returns false and we don't double-reward.
         if (!p->CanRewardQuest(quest, choice, false)) continue;
         p->RewardQuest(quest, choice, nullptr, false);
         ++rewarded;
