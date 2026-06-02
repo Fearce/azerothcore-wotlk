@@ -859,7 +859,10 @@ static void HandleEquip(Player* requester, std::string_view payload)
         // failed it left the item in dest's bags and sent the equip error to
         // dest's session (a bot), invisible to us — detect the strand and send
         // the item home with feedback rather than silently relocating it.
-        if (!srcItem->IsEquipped())
+        // Check the item actually reached eqDest, NOT Item::IsEquipped(): that is
+        // `slot < EQUIPMENT_SLOT_END`, which is FALSE for a bag correctly placed in
+        // a bag slot (19-22) — using it stranded every bag-equip (Kevin's report).
+        if (srcItem->GetPos() != eqDest)
         {
             dest->MoveItemFromInventory(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
             bounceBackToSrc();
