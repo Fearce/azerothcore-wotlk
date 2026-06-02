@@ -785,15 +785,36 @@ bool WowPsParty_ForceSkinReady(Player* skinner, Creature* creature)
     CreatureTemplate const* tmpl = creature->GetCreatureTemplate();
     if (!tmpl || tmpl->SkinLootId == 0) return false;
 
-    // Only the corpse's OWN killers may force it — never clear a stranger's loot.
     Player* recipient = creature->GetLootRecipient();
     Group*  rgroup    = creature->GetLootRecipientGroup();
-    bool const ownKill = (recipient && recipient == skinner) ||
-                         (rgroup && skinner->GetGroup() == rgroup);
-    if (!ownKill) return false;
+
+    // Diagnostic: shows exactly why a skin attempt is/ isn't allowed and the
+    // corpse state, so a still-failing case can be read straight from the log.
+    LOG_INFO("module",
+        "[WowPsParty Skin] {} skins entry={} guid={}: recip={} rgroup={} skinnerGroup={} skinnableFlag={} isLooted={} skinLootId={}",
+        skinner->GetName(), creature->GetEntry(), creature->GetGUID().GetCounter(),
+        recipient ? recipient->GetName() : "<none>",
+        rgroup ? "set" : "null",
+        skinner->GetGroup() ? "set" : "null",
+        creature->HasUnitFlag(UNIT_FLAG_SKINNABLE) ? 1 : 0,
+        creature->loot.isLooted() ? 1 : 0,
+        tmpl->SkinLootId);
+
+    // Co-op private server: any party member may finish a corpse's leftover loot
+    // to skin it. We require only that SOMEONE tapped it (a real kill, so there's
+    // a recipient for AllLootRemovedFromCorpse) — the leftover is FORFEITED, not
+    // stolen, so there's nothing to grief. The earlier strict "skinner shares the
+    // recipient's WoW group" gate failed because the human isn't necessarily in
+    // the same Group object as the bot that tapped the kill.
+    if (!recipient && !rgroup) return false;
 
     creature->loot.clear();                              // empty the normal loot
     creature->RemoveDynamicFlag(UNIT_DYNFLAG_LOOTABLE);  // clear the sparkle/lootable state
-    creature->AllLootRemovedFromCorpse();                // sets UNIT_FLAG_SKINNABLE
+    creature->AllLootRemovedFromCorpse();                // sets UNIT_FLAG_SKINNABLE (needs a recipient)
+    // Belt-and-braces: if AllLootRemovedFromCorpse's internal guards didn't fire
+    // (e.g. recipient cleared), set the flag directly — the SkinLootId check above
+    // already confirmed this creature is genuinely skinnable.
+    if (!creature->HasUnitFlag(UNIT_FLAG_SKINNABLE))
+        creature->SetUnitFlag(UNIT_FLAG_SKINNABLE);
     return true;
 }
