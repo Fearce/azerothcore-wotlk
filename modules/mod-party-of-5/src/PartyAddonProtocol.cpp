@@ -1092,7 +1092,10 @@ static void HandlePullReagent(Player* requester, std::string_view payload)
     if (!itemId) return;
 
     uint32 const account = requester->GetSession()->GetAccountId();
-    if (!WowPsParty::GetAccountSettings(account).sharedInventory) return;
+    bool const sharedInv = WowPsParty::GetAccountSettings(account).sharedInventory;
+    LOG_INFO("module", "[WowPsParty PullReagent] {} (acct {}) requested itemId={} sharedInv={}",
+        requester->GetName(), account, itemId, sharedInv ? 1 : 0);
+    if (!sharedInv) return;
 
     QueryResult q = CharacterDatabase.Query(
         "SELECT `guid` FROM `account_party` WHERE `account` = {}", account);
@@ -1149,6 +1152,8 @@ static void HandlePullReagent(Player* requester, std::string_view payload)
         }
     } while (q->NextRow());
 
+    LOG_INFO("module", "[WowPsParty PullReagent] itemId={} -> moved {} stack(s) onto {}",
+        itemId, moved, requester->GetName());
     if (moved) WowPsParty::SendInventoryTo(requester);
 }
 
