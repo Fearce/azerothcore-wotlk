@@ -6234,12 +6234,29 @@ SpellCastResult Spell::CheckCast(bool strict, uint32* /*param1*/, uint32* /*para
                     if (!m_caster->IsPlayer() || !m_targets.GetUnitTarget() || !m_targets.GetUnitTarget()->IsCreature())
                         return SPELL_FAILED_BAD_TARGETS;
 
-                    if (!(m_targets.GetUnitTarget()->GetUnitFlags() & UNIT_FLAG_SKINNABLE))
-                        return SPELL_FAILED_TARGET_UNSKINNABLE;
-
                     Creature* creature = m_targets.GetUnitTarget()->ToCreature();
+
+                    // [WowPsParty PATCH] A skinnable beast the party killed can be
+                    // left "unlooted" by the bots (loot-strategy-filtered items, or
+                    // full bags), so it never turns skinnable and nobody in the
+                    // group can skin it. For the skinner's OWN party kill, finish the
+                    // corpse's normal loot so the gates below pass; a no-op for any
+                    // other corpse (returns false → original error preserved).
+                    extern bool WowPsParty_ForceSkinReady(Player*, Creature*);
+
+                    if (!(m_targets.GetUnitTarget()->GetUnitFlags() & UNIT_FLAG_SKINNABLE))
+                    {
+                        if (!creature || !WowPsParty_ForceSkinReady(m_caster->ToPlayer(), creature) ||
+                            !(m_targets.GetUnitTarget()->GetUnitFlags() & UNIT_FLAG_SKINNABLE))
+                            return SPELL_FAILED_TARGET_UNSKINNABLE;
+                    }
+
                     if (!creature->IsCritter() && !creature->loot.isLooted())
-                        return SPELL_FAILED_TARGET_NOT_LOOTED;
+                    {
+                        if (!WowPsParty_ForceSkinReady(m_caster->ToPlayer(), creature) ||
+                            !creature->loot.isLooted())
+                            return SPELL_FAILED_TARGET_NOT_LOOTED;
+                    }
 
                     uint32 skill = creature->GetCreatureTemplate()->GetRequiredLootSkill();
 

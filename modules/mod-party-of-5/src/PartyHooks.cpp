@@ -763,3 +763,37 @@ void WowPsParty_TakeReagent(Player* crafter, uint32 itemId, uint32 count)
         }
     }
 }
+
+// Trampoline called from the [WowPsParty PATCH] in Spell.cpp::CheckCast for
+// SPELL_EFFECT_SKINNING. The engine refuses to skin a beast whose NORMAL loot
+// isn't fully gone (UNIT_FLAG_SKINNABLE unset and/or loot not looted). In a
+// party-of-5 the bots loot only what they want/can and leave the rest — and with
+// full bags they leave everything — so a skinnable corpse can stay "unlooted"
+// forever and nobody in the group can skin it. If THIS skinner shares the
+// corpse's kill (its loot-recipient GROUP — the real 5-man, so both Kevin and
+// Mill qualify for their party's kills), finish the corpse's normal loot and
+// mark it skinnable so the skin proceeds. The bots already pulled what they
+// wanted into the shared inventory; the small remainder is dropped (skinning the
+// corpse directly is choosing the skin over re-looting it). Returns true once
+// the corpse is skinnable.
+bool WowPsParty_ForceSkinReady(Player* skinner, Creature* creature)
+{
+    if (!skinner || !creature) return false;
+    if (!WowPsParty::IsEnabled()) return false;
+
+    // Skinnable beasts only — never disturb a non-skinnable corpse's loot.
+    CreatureTemplate const* tmpl = creature->GetCreatureTemplate();
+    if (!tmpl || tmpl->SkinLootId == 0) return false;
+
+    // Only the corpse's OWN killers may force it — never clear a stranger's loot.
+    Player* recipient = creature->GetLootRecipient();
+    Group*  rgroup    = creature->GetLootRecipientGroup();
+    bool const ownKill = (recipient && recipient == skinner) ||
+                         (rgroup && skinner->GetGroup() == rgroup);
+    if (!ownKill) return false;
+
+    creature->loot.clear();                              // empty the normal loot
+    creature->RemoveDynamicFlag(UNIT_DYNFLAG_LOOTABLE);  // clear the sparkle/lootable state
+    creature->AllLootRemovedFromCorpse();                // sets UNIT_FLAG_SKINNABLE
+    return true;
+}
