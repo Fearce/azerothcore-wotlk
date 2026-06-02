@@ -1065,6 +1065,20 @@ static void HandleSplit(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// A "general" container holds ordinary items. Specialized containers — quivers
+// and ammo pouches (ITEM_CLASS_QUIVER) and profession bags (soul / herb /
+// enchanting / etc., ITEM_CLASS_CONTAINER with a non-zero subclass) — only
+// accept their own item family. The generic bag sort must leave both their
+// slots AND their contents alone: swapping an ordinary item into a quiver slot
+// is exactly what made the client throw "This item doesn't go in that
+// container" when a hunter with a quiver hit Sort.
+static bool IsGeneralContainer(Bag const* bag)
+{
+    ItemTemplate const* t = bag ? bag->GetTemplate() : nullptr;
+    return t && t->Class == ITEM_CLASS_CONTAINER
+             && t->SubClass == ITEM_SUBCLASS_CONTAINER;
+}
+
 // Compact + order one character's bag contents (backpack + equipped bags) the
 // way Bagnon's sort does: quality first, then item class/subclass, then entry.
 // Selection-sort via SwapItem so we never detach/re-store items (which would
@@ -1087,6 +1101,7 @@ static void SortBagsFor(Player* p)
     {
         Bag* bag = p->GetBagByPos(b);
         if (!bag) continue;
+        if (!IsGeneralContainer(bag)) continue;   // skip quivers / profession bags
         for (uint32 j = 0; j < bag->GetBagSize(); ++j)
             addPos(b, uint8(j));
     }
@@ -1157,6 +1172,66 @@ static void HandleSortBags(Player* requester)
             ObjectGuid::Create<HighGuid::Player>(guid));
         if (p) SortBagsFor(p);
     }
+    WowPsParty::SendInventoryTo(requester);
+}
+
+// SELL_TRASH — vendor-sell every grey (poor quality) item across the whole
+// party's bags in one click. Mirrors HandleSell's credit-to-requester (the
+// shared-gold hook then mirrors the gain across the party), but loops over all
+// members and only touches ITEM_QUALITY_POOR items with a sell value. Money is
+// credited once at the end so the shared-pool hook fires a single time.
+static void HandleSellTrash(Player* requester)
+{
+    if (!requester || !requester->GetSession()) return;
+    uint32 const account = requester->GetSession()->GetAccountId();
+
+    uint32 totalMoney = 0;
+    uint32 soldCount  = 0;
+
+    auto trySell = [&](Player* owner, Item* item)
+    {
+        if (!item) return;
+        ItemTemplate const* tmpl = item->GetTemplate();
+        if (!tmpl) return;
+        if (tmpl->Quality != ITEM_QUALITY_POOR) return;
+        if (tmpl->SellPrice == 0) return;
+        if (item->IsEquipped() || item->IsNotEmptyBag()) return;   // greys are neither, but guard
+        totalMoney += tmpl->SellPrice * item->GetCount();
+        soldCount  += 1;
+        owner->DestroyItem(item->GetBagSlot(), item->GetSlot(), true);
+    };
+
+    for (uint8 slot = 0; slot < WowPsParty::PARTY_SIZE; ++slot)
+    {
+        uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+        if (!guid) continue;
+        Player* p = ObjectAccessor::FindConnectedPlayer(
+            ObjectGuid::Create<HighGuid::Player>(guid));
+        if (!p) continue;
+
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            trySell(p, p->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+        {
+            Bag* bag = p->GetBagByPos(b);
+            if (!bag) continue;
+            for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                trySell(p, p->GetItemByPos(b, uint8(j)));
+        }
+    }
+
+    if (soldCount == 0)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r No grey items to sell.");
+        return;
+    }
+
+    requester->ModifyMoney(int32(totalMoney));
+    ChatHandler(requester->GetSession()).PSendSysMessage(
+        "|cff66ccff[WowPsParty]|r Sold |cffffffff{}|r grey item(s) for |cffffd100{}.{}.{}|r.",
+        soldCount, totalMoney / 10000, (totalMoney / 100) % 100, totalMoney % 100);
+
     WowPsParty::SendInventoryTo(requester);
 }
 
@@ -1663,6 +1738,10 @@ public:
         else if (command == "SORT_BAGS")
         {
             HandleSortBags(player);
+        }
+        else if (command == "SELL_TRASH")
+        {
+            HandleSellTrash(player);
         }
         // REQ_TALENTS\t<token>  → TALENTS\t...  (alt slot OR henchman "h<guid>")
         else if (command == "REQ_TALENTS")
