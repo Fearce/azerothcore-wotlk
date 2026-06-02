@@ -804,6 +804,48 @@ namespace WowPsParty
         return best;
     }
 
+    // "lowest" target mode: the LOWEST-current-health enemy the party is already
+    // engaged with, within the bot's range — focus-fire to secure the next kill
+    // instead of spreading damage. Like PickLooseTarget it only considers mobs in
+    // combat (attacking, or being attacked by, the bot / its pet / a group member
+    // or their pets), so it never pulls an idle mob; it just ranks them by health
+    // remaining rather than distance. Returns nullptr if nothing qualifies.
+    static Unit* PickLowestHealthTarget(Player* bot)
+    {
+        constexpr float MAX_RANGE = 40.0f;
+        Unit* best = nullptr;
+        uint32 bestHp = 0;
+        bool   found  = false;
+        auto consider = [&](Unit* a)
+        {
+            if (!a || !a->IsAlive() || !a->IsInCombat()) return;
+            if (!bot->IsValidAttackTarget(a)) return;
+            if (bot->GetDistance(a) > MAX_RANGE) return;
+            uint32 const hp = a->GetHealth();
+            if (!found || hp < bestHp) { bestHp = hp; best = a; found = true; }
+        };
+        auto considerAround = [&](Unit* u)
+        {
+            if (!u) return;
+            for (Unit* a : u->getAttackers()) consider(a);   // mobs attacking u
+            if (Unit* v = u->GetVictim()) consider(v);       // and the mob u is attacking
+        };
+        considerAround(bot);
+        for (Unit* ctrl : bot->m_Controlled) considerAround(ctrl);
+        if (Group* g = bot->GetGroup())
+        {
+            for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
+            {
+                Player* m = itr->GetSource();
+                if (!m || !m->IsInWorld() || m == bot || m->GetMapId() != bot->GetMapId())
+                    continue;
+                considerAround(m);
+                for (Unit* ctrl : m->m_Controlled) considerAround(ctrl);
+            }
+        }
+        return best;
+    }
+
     // The party tank's current victim, for focus-fire ("tank" mode). The tank
     // may be a follower bot (found via the directive registry) or the
     // controlled char itself (then the leader's victim is the tank's victim).
@@ -1710,6 +1752,12 @@ namespace WowPsParty
         if (mode == "nearest")
         {
             desired = bot->SelectNearbyTarget(nullptr, 40.0f);
+            if (!desired) desired = pickPartyDefenseTarget();
+        }
+        else if (mode == "lowest")
+        {
+            // Focus the weakest enemy already engaged with the party.
+            desired = PickLowestHealthTarget(bot);
             if (!desired) desired = pickPartyDefenseTarget();
         }
         else if (mode == "loose")
