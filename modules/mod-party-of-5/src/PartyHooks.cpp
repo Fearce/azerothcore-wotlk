@@ -390,6 +390,18 @@ public:
             loot->gold = 0;
         }
 
+        // Announce every hero pickup to the HUMAN at the keyboard (the party
+        // leader), not to whichever hero bot actually grabbed it — otherwise a
+        // bot-landed kill announced the loot to the BOT's session and the player
+        // never saw it. `killer` is either the human (landed the kill) or a
+        // managed bot whose directive leader IS the human; GetLeaderFor returns
+        // empty for the leader itself, so fall back to `killer`. Only enrolled
+        // heroes are ever takers here (GetParty excludes henchmen), so henchman
+        // pickups are never announced — exactly what we want.
+        ObjectGuid const leaderGuid = WowPsParty::GetLeaderFor(killer->GetGUID());
+        Player* human = leaderGuid ? ObjectAccessor::FindConnectedPlayer(leaderGuid) : killer;
+        if (!human || !human->GetSession()) human = killer;
+
         // Items: iterate, for each non-FFA non-looted item, find a taker
         // with bag space, store it. Announce each pickup in chat so the
         // user sees what the party scooped up.
@@ -426,7 +438,8 @@ public:
                     std::string const lootMsg = Acore::StringFormat(
                         "|cff66ccff[Loot]|r {} picked up |cffffffff|Hitem:{}::::::::1::::|h[{}]|h|r x{}",
                         takerName, itemId, itemName, itemCount);
-                    ChatHandler(killer->GetSession()).SendSysMessage(lootMsg);
+                    if (human && human->GetSession())
+                        ChatHandler(human->GetSession()).SendSysMessage(lootMsg);
                     break;
                 }
             }
