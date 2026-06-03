@@ -2586,19 +2586,21 @@ namespace WowPsParty
             delete pet;   // LoadPetFromDB self-cleans on success; delete only on failure
     }
 
-    // Drive the hunter's pet. mod-playerbots normally runs the pet — sets its
-    // stance, toggles ability autocast, and commands attacks — but that's all
-    // gated out for our bots, so a re-summoned pet just heels passively and
-    // never uses Growl/Claw/Bite/etc. We re-implement the essentials:
-    //   * defensive stance (so it defends the hunter on its own, even when the
-    //     leader hasn't tagged the mob) + autocast on every autocastable ability
-    //     it knows, so it weaves Growl/Claw/Bite/Rake/Swipe itself;
-    //   * while the hunter is fighting: push the pet onto the hunter's victim so
-    //     it focuses the same mob (Growl pulls threat off the bot);
+    // Drive ANY bot's pet — hunter beast, warlock demon (imp/voidwalker/felguard/
+    // …), mage water elemental, DK ghoul. mod-playerbots normally runs the pet
+    // (stance, ability autocast, commanding attacks) but that's gated out for our
+    // bots, so a freshly-summoned pet just sits on PASSIVE and never attacks
+    // (Kevin's "fresh warlock's imp won't attack" report). We re-implement the
+    // essentials for every pet class:
+    //   * DEFENSIVE react state (so it engages on its own when its master or the
+    //     party is attacked, even before the leader tags the mob) + autocast on
+    //     every autocastable ability it knows (imp Firebolt, pet Growl/Claw/Bite,
+    //     Waterbolt, …) MINUS the threat-droppers / utility the AI can't time;
+    //   * while the master is fighting: push the pet onto the master's victim so
+    //     it focuses the same mob;
     //   * out of combat: heel it back so it doesn't body-pull the next pack.
-    static void MaintainHunterPet(Player* bot)
+    static void MaintainBotPet(Player* bot)
     {
-        if (bot->getClass() != CLASS_HUNTER) return;
         Pet* pet = bot->GetPet();
         if (!pet || !pet->IsAlive()) return;
         CharmInfo* charm = pet->GetCharmInfo();
@@ -2833,11 +2835,12 @@ namespace WowPsParty
         WowPsParty::MaintainBotConsumables(bot);
 
         // Keep the hunter's auto-shot running between ability casts, its pet
-        // summoned, and that pet defending + on-target (all bypassed by our
-        // UpdateAI gate).
+        // summoned, and EVERY bot's pet defending + on-target (all bypassed by our
+        // UpdateAI gate). MaintainBotPet covers all pet classes — without it a
+        // freshly-summoned warlock imp / mage elemental sits on passive.
         EnsureRangedAutoAttack(bot);
         EnsureHunterPet(bot);
-        MaintainHunterPet(bot);
+        MaintainBotPet(bot);
 
         std::vector<RotationRule> rules;
         {
