@@ -409,13 +409,15 @@ namespace WowPsParty
     }
 
     // Choose a kite destination at `dist` yards from `enemy` that the bot can
-    // retreat to WITHOUT backing into — or pathing past — other hostile mobs,
-    // so kiting one mob doesn't aggro the whole room. Fans out from the
-    // straight-away direction (enemy -> bot) through progressively wider
-    // angles; the first candidate whose entire retreat LANE stays DANGER yards
-    // clear of every OTHER hostile wins. Returns false when every lane is
-    // crowded, so the caller holds position and keeps casting instead of
-    // pulling the dungeon. (Reachability/lava is still handled by MovePoint's
+    // retreat to WITHOUT backing into — or pathing past — UN-AGGROED hostile
+    // mobs, so kiting doesn't pull a fresh pack. Mobs already in combat are
+    // fine to walk past (they add no new pull), so only out-of-combat hostiles
+    // block a lane — otherwise the kiter gets boxed in by the very pack it's
+    // fighting. Fans out from the straight-away direction (enemy -> bot)
+    // through progressively wider angles; the first candidate whose retreat
+    // LANE stays DANGER yards clear of every un-aggroed hostile wins. Returns
+    // false when every lane is crowded, so the caller skips the kite and casts
+    // in place. (Reachability/lava is still handled by MovePoint's
     // forceDestination=false at the call site.)
     static bool PickSafeKitePoint(Player* bot, Unit* enemy, float dist,
                                   float& ox, float& oy, float& oz)
@@ -443,8 +445,12 @@ namespace WowPsParty
             for (Unit* h : hostiles)
             {
                 if (!h || h == enemy || !h->IsAlive()) continue;
-                // Reject if any other mob is near the retreat lane (bot -> spot),
-                // which subsumes the endpoint test (the spot is the lane's end).
+                // Only UN-AGGROED mobs are a danger — walking past something
+                // already fighting the party pulls nothing new, and treating it
+                // as a wall is what corners the kiter. Skip in-combat hostiles.
+                if (h->IsInCombat()) continue;
+                // Reject if an un-aggroed mob is near the retreat lane (bot ->
+                // spot); this subsumes the endpoint test (spot = lane's end).
                 if (DistPointToSeg2D(h->GetPositionX(), h->GetPositionY(),
                                      bx, by, x, y) < DANGER)
                 {
