@@ -852,6 +852,11 @@ static void HandleEquip(Player* requester, std::string_view payload)
         ? uint8(INVENTORY_SLOT_BAG_START + bagIdx)
         : uint8(NULL_SLOT);
 
+    LOG_INFO("module",
+        "[WowPsParty Equip] parse: srcSlot={} destSlot={} bagIdx={} class={} -> targetEqSlot={}",
+        srcSlot, destSlot, bagIdx, uint32(srcItem->GetTemplate()->Class),
+        uint32(targetEqSlot));
+
     if (srcChar == dest)
     {
         // Same character: the item is already owned by dest, so CanEquipItem's
