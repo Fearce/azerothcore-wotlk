@@ -2516,7 +2516,15 @@ namespace WowPsParty
             {
                 float x, y, z;
                 enemy->GetNearPoint(bot, x, y, z, 0.0f, want + 4.0f, enemy->GetAngle(bot));
-                bot->GetMotionMaster()->MovePoint(0, x, y, z);
+                // forceDestination=false: only move to a point the navmesh can
+                // actually REACH. Without it MovePoint forces the bot straight to
+                // the computed spot even when it's through a wall or over lava —
+                // a kite point away from a mob landed a mage in Ragefire's lava and
+                // dragged the party in. Now an unreachable kite point just stops the
+                // bot on valid ground (it stands and casts) instead of diving in.
+                bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                                                  0.0f, 0.0f, /*generatePath=*/true,
+                                                  /*forceDestination=*/false);
             }
             return true;
         }
@@ -2537,7 +2545,15 @@ namespace WowPsParty
                 float x, y, z;
                 healer->GetNearPoint(bot, x, y, z, 0.0f, std::max(want - 2.0f, 3.0f),
                                      healer->GetAngle(bot));
-                bot->GetMotionMaster()->MovePoint(0, x, y, z);
+                // forceDestination=false: only move to a point the navmesh can
+                // actually REACH. Without it MovePoint forces the bot straight to
+                // the computed spot even when it's through a wall or over lava —
+                // a kite point away from a mob landed a mage in Ragefire's lava and
+                // dragged the party in. Now an unreachable kite point just stops the
+                // bot on valid ground (it stands and casts) instead of diving in.
+                bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                                                  0.0f, 0.0f, /*generatePath=*/true,
+                                                  /*forceDestination=*/false);
             }
             return true;
         }
@@ -2564,7 +2580,15 @@ namespace WowPsParty
                 float x, y, z;
                 enemy->GetNearPoint(bot, x, y, z, 0.0f, std::max(want - 2.0f, 3.0f),
                                     enemy->GetAngle(bot));
-                bot->GetMotionMaster()->MovePoint(0, x, y, z);
+                // forceDestination=false: only move to a point the navmesh can
+                // actually REACH. Without it MovePoint forces the bot straight to
+                // the computed spot even when it's through a wall or over lava —
+                // a kite point away from a mob landed a mage in Ragefire's lava and
+                // dragged the party in. Now an unreachable kite point just stops the
+                // bot on valid ground (it stands and casts) instead of diving in.
+                bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                                                  0.0f, 0.0f, /*generatePath=*/true,
+                                                  /*forceDestination=*/false);
             }
             return true;
         }
