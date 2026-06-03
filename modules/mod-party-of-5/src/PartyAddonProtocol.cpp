@@ -324,20 +324,16 @@ namespace WowPsParty
         if (!requester || !requester->GetSession()) return;
         uint32 const account = requester->GetSession()->GetAccountId();
 
-        std::ostringstream out;
-        out << "INVENTORY\t";
-        bool first = true;
-        uint32 totalSlots = 0;   // party-wide bag capacity (for empty-cell count)
+        std::vector<std::string> records;   // every ';'-record, streamed in chunks
+        uint32 totalSlots = 0;              // party-wide bag capacity (empty cells)
 
-        // Separator helper for non-item trailing records (BAG/CAP/POOL).
-        auto sep = [&]() { if (!first) out << ';'; first = false; };
-
-        auto emit = [&](uint32 partySlot, uint32 bag, uint32 pos, Item* item)
+        auto emitItem = [&](uint32 partySlot, uint32 bag, uint32 pos, Item* item)
         {
-            sep();
-            out << partySlot << ':' << bag << ':' << pos << ':'
-                << item->GetEntry() << ':' << item->GetCount() << ':'
-                << item->GetGUID().GetCounter();
+            std::ostringstream r;
+            r << partySlot << ':' << bag << ':' << pos << ':'
+              << item->GetEntry() << ':' << item->GetCount() << ':'
+              << item->GetGUID().GetCounter();
+            records.push_back(r.str());
         };
 
         for (uint8 partySlot = 0; partySlot < PARTY_SIZE; ++partySlot)
@@ -345,69 +341,68 @@ namespace WowPsParty
             uint32 const guid = GuidForAccountSlot(account, partySlot);
             if (!guid) continue;
             ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
+            // Connected-player lookup first; fall back to the in-world lookup so a
+            // member it misses (e.g. an odd session state after an LFG dungeon)
+            // is still read instead of silently dropped.
             Player* p = ObjectAccessor::FindConnectedPlayer(og);
-            // Diagnostic: a party member's items vanish from the shared inventory
-            // after an LFG dungeon. Log which lookup finds them so we can see why
-            // a live, ticking bot is skipped — and fall back to the in-world
-            // lookup if the connected-player lookup misses it.
-            if (!p)
-            {
-                Player* wp = ObjectAccessor::FindPlayer(og);
-                if (wp) p = wp;
-                LOG_INFO("module",
-                    "[WowPsParty Inv] slot={} guid={} connected=NULL findPlayer={}",
-                    partySlot, guid, wp ? "FOUND" : "null");
-            }
-            else
-            {
-                LOG_INFO("module",
-                    "[WowPsParty Inv] slot={} guid={} {} map={} beingTP={}",
-                    partySlot, guid, p->GetName(), p->GetMapId(),
-                    p->IsBeingTeleported() ? 1 : 0);
-            }
+            if (!p) p = ObjectAccessor::FindPlayer(og);
             if (!p) continue;
 
             // Main backpack (16 slots): bag=255 (INVENTORY_SLOT_BAG_0), pos=23..38
             totalSlots += INVENTORY_SLOT_ITEM_END - INVENTORY_SLOT_ITEM_START;
             for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
-            {
-                Item* item = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
-                if (item)
-                    emit(partySlot, INVENTORY_SLOT_BAG_0, i, item);
-            }
-            // The 4 equippable bag slots (19..22). Emit one BAG record per
-            // slot — including empties (bagItemId 0) — so the addon can show
-            // them in the bag strip and let the user equip a found bag. Then
-            // emit the items inside any equipped bag.
+                if (Item* item = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                    emitItem(partySlot, INVENTORY_SLOT_BAG_0, i, item);
+
+            // The 4 equippable bag slots (19..22). Emit one BAG record per slot —
+            // including empties (bagItemId 0) — so the addon shows the bag strip
+            // and lets the user equip a found bag. Then the items inside each.
             for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
             {
                 uint32 const bagIdx = b - INVENTORY_SLOT_BAG_START;  // 0..3
                 Bag* bag = p->GetBagByPos(b);
-                sep();
-                out << "BAG:" << uint32(partySlot) << ':' << bagIdx << ':'
-                    << (bag ? bag->GetEntry() : 0);
+                {
+                    std::ostringstream r;
+                    r << "BAG:" << uint32(partySlot) << ':' << bagIdx << ':'
+                      << (bag ? bag->GetEntry() : 0);
+                    records.push_back(r.str());
+                }
                 if (!bag) continue;
                 totalSlots += bag->GetBagSize();
                 for (uint32 j = 0; j < bag->GetBagSize(); ++j)
-                {
-                    Item* item = p->GetItemByPos(b, j);
-                    if (item)
-                        emit(partySlot, b, j, item);
-                }
+                    if (Item* item = p->GetItemByPos(b, j))
+                        emitItem(partySlot, b, j, item);
             }
         }
-        // Total party bag capacity, so the addon can render empty cells up to
-        // the real free space rather than a fixed minimum.
-        sep();
-        out << "CAP:" << totalSlots;
-        // Shared gold pool. PartyHooks mirrors every money delta across the
-        // party, so the requester's GetMoney() is the pool value. "POOL:" /
-        // "CAP:" / "BAG:" all carry fewer than the 6 colons the item parser
-        // needs, so the items loop ignores them and the dedicated parsers
-        // pick them up.
-        sep();
-        out << "POOL:" << requester->GetMoney();
-        SendWPSP(requester, out.str());
+        // Party-wide capacity + shared gold pool (requester's money is the pool;
+        // PartyHooks mirrors every delta). "BAG:"/"CAP:"/"POOL:" carry fewer than
+        // the 6 colons the item parser needs, so the items loop ignores them.
+        { std::ostringstream r; r << "CAP:"  << totalSlots;             records.push_back(r.str()); }
+        { std::ostringstream r; r << "POOL:" << requester->GetMoney();  records.push_back(r.str()); }
+
+        // CHUNKED send. One INVENTORY message holding the whole party's items is
+        // far over the addon-message size the 3.3.5a client accepts — it silently
+        // drops the oversized packet and the panel shows nothing (the bug that
+        // appeared once every member loaded with a full bag). Stream it:
+        //   INV_BEGIN            -> client resets
+        //   INVENTORY <chunk> *N -> client APPENDS each (records never split)
+        //   INV_END              -> client sorts + renders
+        SendWPSP(requester, "INV_BEGIN");
+        constexpr size_t MAX_PAYLOAD = 220;   // record bytes per INVENTORY message
+        std::string chunk;
+        auto flush = [&]()
+        {
+            if (!chunk.empty()) { SendWPSP(requester, "INVENTORY\t" + chunk); chunk.clear(); }
+        };
+        for (std::string const& rec : records)
+        {
+            if (!chunk.empty() && chunk.size() + 1 + rec.size() > MAX_PAYLOAD)
+                flush();
+            if (!chunk.empty()) chunk += ';';
+            chunk += rec;
+        }
+        flush();
+        SendWPSP(requester, "INV_END");
     }
 
     // TALENTS\t<slot>\t<freePoints>\t<classId>\t<rec>;<rec>;...
