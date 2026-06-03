@@ -623,6 +623,14 @@ namespace lfg
         uint32 rDungeonId = 0;
         bool isContinue = grp && grp->isLFGGroup() && GetState(gguid) != LFG_STATE_FINISHED_DUNGEON;
 
+        // [WowPsParty] Diagnostic: the whole join context up front, so a silent
+        // "do not meet requirements" can be traced to the exact gate.
+        LOG_INFO("module",
+            "[WowPsParty LFG] Join: leader={} members={} isLFGGroup={} state={} isContinue={} dungeonsReq={}",
+            player->GetName(), grp ? grp->GetMembersCount() : 1,
+            grp ? grp->isLFGGroup() : false, uint32(GetState(gguid)), isContinue,
+            uint32(dungeons.size()));
+
         if (grp && (grp->isBGGroup() || grp->isBFGroup()))
             return;
 
@@ -830,6 +838,9 @@ namespace lfg
             dungeons.clear();
             dungeons.insert(GetDungeon(gguid));
             joinData.result = LFG_JOIN_PARTY_NOT_MEET_REQS;
+            LOG_INFO("module",
+                "[WowPsParty LFG] join blocked: stale isContinue path (group flagged LFG, 5 members) — currentDungeon={}",
+                GetDungeon(gguid));
         }
 
         // Can't join. Send result
