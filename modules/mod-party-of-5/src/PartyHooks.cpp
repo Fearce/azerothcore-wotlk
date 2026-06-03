@@ -225,6 +225,12 @@ public:
         if (!IsEnabled() || !player || !player->GetSession()) return;
         if (!sPartyMgr.GetSlotForGuid(player->GetGUID().GetCounter()))
             return;  // not one of this account's party characters
+        // SOLO MODE: auto-learning the whole class kit on ding and nudging the
+        // player to "open the rotation editor" are party-of-5 conveniences (so
+        // the bots have their full kit + a rotation). With companions disabled
+        // there are no bots — the player trains normally and gets no reminder.
+        if (!GetAccountSettings(player->GetSession()->GetAccountId()).spawnCompanions)
+            return;
 
         // Snapshot the spell-chains already known so we can report only the
         // genuinely NEW abilities (not higher ranks of spells already in use —

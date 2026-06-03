@@ -173,28 +173,39 @@ public:
 
         uint32 const accountId = player->GetSession()->GetAccountId();
 
+        // SOLO MODE: companions disabled means no party spawns (OnActiveLogin
+        // below no-ops on the same flag), so suppress EVERY party-of-5 login
+        // message — the "your party will spawn shortly" line and the rotation
+        // reminder. The account just plays as a normal solo character.
+        bool const partyActive = WowPsParty::GetAccountSettings(accountId).spawnCompanions;
+
         // Unenrolled active player is fine — they just play as the "leader"
         // and the enrolled chars spawn as their party (up to 4 of them).
         // Tell the player what's happening so it's not mysterious.
-        if (slot)
+        if (partyActive)
         {
-            ChatHandler(player->GetSession()).PSendSysMessage(
-                "|cff66ccff[WowPsParty]|r Welcome back. You are slot {} of your account's party. "
-                "Your other party members will spawn beside you shortly.",
-                uint32(*slot));
-        }
-        else
-        {
-            ChatHandler(player->GetSession()).PSendSysMessage(
-                "|cff66ccff[WowPsParty]|r You aren't enrolled in the party, but your "
-                "enrolled characters will still join you as bots. Press |cffffff00O|r "
-                "(or rebind |cffffff00Open party roster|r) to manage the roster.");
+            if (slot)
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cff66ccff[WowPsParty]|r Welcome back. You are slot {} of your account's party. "
+                    "Your other party members will spawn beside you shortly.",
+                    uint32(*slot));
+            }
+            else
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cff66ccff[WowPsParty]|r You aren't enrolled in the party, but your "
+                    "enrolled characters will still join you as bots. Press |cffffff00O|r "
+                    "(or rebind |cffffff00Open party roster|r) to manage the roster.");
+            }
         }
 
         // Rotation-setup reminder: party members without a configured rotation
         // will ONLY auto-attack what you attack — they will not cast spells on
         // their own. Nudge the player toward the editor so they don't expect
-        // the bots to "just play their class" out of the box.
+        // the bots to "just play their class" out of the box. (Solo: no bots,
+        // so no reminder.)
+        if (partyActive)
         {
             QueryResult q = CharacterDatabase.Query(
                 "SELECT ap.guid, COALESCE(pl.priority_actions_json, '') "
