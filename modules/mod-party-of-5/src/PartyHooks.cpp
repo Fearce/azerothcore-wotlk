@@ -225,12 +225,6 @@ public:
         if (!IsEnabled() || !player || !player->GetSession()) return;
         if (!sPartyMgr.GetSlotForGuid(player->GetGUID().GetCounter()))
             return;  // not one of this account's party characters
-        // SOLO MODE: auto-learning the whole class kit on ding and nudging the
-        // player to "open the rotation editor" are party-of-5 conveniences (so
-        // the bots have their full kit + a rotation). With companions disabled
-        // there are no bots — the player trains normally and gets no reminder.
-        if (!GetAccountSettings(player->GetSession()->GetAccountId()).spawnCompanions)
-            return;
 
         // Snapshot the spell-chains already known so we can report only the
         // genuinely NEW abilities (not higher ranks of spells already in use —
@@ -269,6 +263,13 @@ public:
             "[WowPsParty] {} reached level {} — auto-learned {} spell(s), {} new",
             player->GetName(), uint32(player->GetLevel()), n, uint32(newNames.size()));
         if (newNames.empty()) return;
+
+        // Auto-learn above ALWAYS runs (every player levels their full kit). The
+        // chat reminder below, though, is a party-of-5 nudge to configure the
+        // bots' rotation — skip it in SOLO mode (companions disabled): there are
+        // no bots to slot the new spells into.
+        if (!GetAccountSettings(player->GetSession()->GetAccountId()).spawnCompanions)
+            return;
 
         std::string list;
         uint32 shown = 0;
