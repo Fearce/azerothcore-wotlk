@@ -248,6 +248,11 @@ public:
     uint8 GetMemberGroup(ObjectGuid guid) const;
 
     void ConvertToLFG(bool restricted = true);
+    // Clear the LFG group flags (the inverse of ConvertToLFG). The core only
+    // ever SETS GROUPTYPE_LFG; a persistent custom party (mod-party-of-5) that
+    // ran one dungeon stays flagged forever, which makes the dungeon finder
+    // treat it as "already in a dungeon" and reject every later queue.
+    void RemoveLFGFlag();
     bool CheckLevelForRaid();
     void ConvertToRaid();
 

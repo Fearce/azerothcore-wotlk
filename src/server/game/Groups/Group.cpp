@@ -279,6 +279,21 @@ void Group::ConvertToLFG(bool restricted /*= true*/)
     SendUpdate();
 }
 
+void Group::RemoveLFGFlag()
+{
+    m_groupType = GroupType(m_groupType & ~(GROUPTYPE_LFG | GROUPTYPE_LFG_RESTRICTED));
+
+    if (!isBGGroup() && !isBFGroup())
+    {
+        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_GROUP_TYPE);
+        stmt->SetData(0, uint8(m_groupType));
+        stmt->SetData(1, GetGUID().GetCounter());
+        CharacterDatabase.Execute(stmt);
+    }
+
+    SendUpdate();
+}
+
 bool Group::CheckLevelForRaid()
 {
     for (member_citerator citr = m_memberSlots.begin(); citr != m_memberSlots.end(); ++citr)

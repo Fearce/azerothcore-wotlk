@@ -621,15 +621,23 @@ namespace lfg
         LfgJoinResultData joinData;
         LfgGuidSet players;
         uint32 rDungeonId = 0;
-        bool isContinue = grp && grp->isLFGGroup() && GetState(gguid) != LFG_STATE_FINISHED_DUNGEON;
+        // [WowPsParty] A persistent custom party (mod-party-of-5) that ran one
+        // LFG dungeon keeps GROUPTYPE_LFG set forever — the core never clears it.
+        // That makes isContinue below true and the finder rejects every later
+        // queue as "already in a dungeon" (LFG_JOIN_PARTY_NOT_MEET_REQS). If the
+        // group is flagged LFG but is NOT actually queued or in a dungeon (state
+        // NONE and no current dungeon), the flag is stale — clear it so the
+        // queue proceeds as a normal party.
+        if (grp && grp->isLFGGroup()
+            && GetState(gguid) == LFG_STATE_NONE && GetDungeon(gguid) == 0)
+        {
+            grp->RemoveLFGFlag();
+            LOG_INFO("module",
+                "[WowPsParty LFG] cleared stale LFG flag on {}'s party so it can queue",
+                player->GetName());
+        }
 
-        // [WowPsParty] Diagnostic: the whole join context up front, so a silent
-        // "do not meet requirements" can be traced to the exact gate.
-        LOG_INFO("module",
-            "[WowPsParty LFG] Join: leader={} members={} isLFGGroup={} state={} isContinue={} dungeonsReq={}",
-            player->GetName(), grp ? grp->GetMembersCount() : 1,
-            grp ? grp->isLFGGroup() : false, uint32(GetState(gguid)), isContinue,
-            uint32(dungeons.size()));
+        bool isContinue = grp && grp->isLFGGroup() && GetState(gguid) != LFG_STATE_FINISHED_DUNGEON;
 
         if (grp && (grp->isBGGroup() || grp->isBFGroup()))
             return;
