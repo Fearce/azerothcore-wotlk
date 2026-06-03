@@ -2245,7 +2245,12 @@ public:
             tx->Append(
                 "UPDATE `account_party` SET `role` = '{}' WHERE `account` = {} AND `slot` = {}",
                 role, accountId, slot);
-            CharacterDatabase.CommitTransaction(tx);
+            // SYNCHRONOUS commit: SetActiveFollowers below re-queries
+            // account_party.role to rebuild the directives. An async commit isn't
+            // visible to that synchronous read yet, so the directive (and thus
+            // RoleForGuid / the LFG role check) kept the OLD role — a priest set
+            // to Healer still answered the dungeon role check as DPS.
+            CharacterDatabase.DirectCommitTransaction(tx);
 
             // Re-install follow directives so the new role takes effect this tick.
             WowPsParty::ClearFollowersForAccount(accountId);

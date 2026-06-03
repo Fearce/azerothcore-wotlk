@@ -2867,7 +2867,16 @@ void WowPsParty_SetPartyBotLfgRoles_Trampoline(ObjectGuid groupGuid)
         if (!WowPsParty::BotHasActiveFollowDirective(g))
             continue;
 
-        std::string const role = WowPsParty::RoleForGuid(g);
+        // The role check must reflect the CURRENT roster, so read the
+        // authoritative account_party.role straight from the DB for enrolled
+        // alts (the in-memory directive can lag a just-made roster change). A
+        // henchman has no account_party row — fall back to its directive role.
+        std::string role;
+        if (QueryResult q = CharacterDatabase.Query(
+                "SELECT `role` FROM `account_party` WHERE `guid` = {}", g.GetCounter()))
+            role = q->Fetch()[0].Get<std::string>();
+        if (role.empty())
+            role = WowPsParty::RoleForGuid(g);
         uint8 lfgRole = lfg::PLAYER_ROLE_DAMAGE;
         if (role == "tank")
             lfgRole = lfg::PLAYER_ROLE_TANK;
