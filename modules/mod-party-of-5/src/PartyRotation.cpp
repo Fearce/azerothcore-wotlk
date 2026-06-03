@@ -454,10 +454,16 @@ namespace WowPsParty
             }
             if (crowded) continue;
 
+            // Must still be able to SEE the target from the kite spot, or the
+            // caster kites around a corner and stands there unable to cast
+            // (Flamestrike/Fireball both need line of sight). Reject blind spots.
+            if (!enemy->IsWithinLOS(x, y, z))
+                continue;
+
             ox = x; oy = y; oz = z;
             return true;
         }
-        return false;   // nowhere safe — hold and keep casting
+        return false;   // no safe + in-LoS spot — caller skips the kite
     }
 
     // Size of the densest cluster of hostiles that are all within `radius` of
@@ -2582,25 +2588,49 @@ namespace WowPsParty
             if (bot->IsNonMeleeSpellCast(false, false, true)) return false;
             float const want = float(std::atof(arg.c_str()));
             if (want <= 0.0f) return false;
-            if (bot->GetDistance(enemy) >= want) return false;   // far enough — stand & cast
+
+            bool const inLoS = bot->IsWithinLOSInMap(enemy);
+            float const dist = bot->GetDistance(enemy);
+
+            // Kited around a corner: no line of sight to the target, so every
+            // cast fails and the bot just stares at the wall. Regaining LoS
+            // beats keeping distance — step back TOWARD the enemy (navmesh path
+            // rounds the corner into the room) until we can see it again. This
+            // is the "never stuck" guarantee: a blind kiter walks back into LoS
+            // instead of freezing.
+            if (!inLoS)
+            {
+                if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+                {
+                    float x, y, z;
+                    enemy->GetNearPoint(bot, x, y, z, 0.0f,
+                                        std::max(want - 4.0f, 5.0f),
+                                        enemy->GetAngle(bot));
+                    bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                                                      0.0f, 0.0f, true, false);
+                }
+                return true;
+            }
+
+            if (dist >= want) return false;   // far enough AND in LoS — stand & cast
+
+            // Too close: kite only to a spot that's clear of other mobs AND keeps
+            // line of sight (PickSafeKitePoint enforces both). If there is NO such
+            // spot — boxed in, mobs on both sides, every lane a corner — SKIP the
+            // kite entirely (return false) so the bot casts from where it stands
+            // instead of freezing. Kevin's rule: a kite that yields nothing must
+            // not reserve the tick.
             if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
             {
                 float x, y, z;
-                // Only kite to a spot clear of OTHER mobs — backing into a fresh
-                // pack pulls the whole room. If no retreat lane is safe, hold
-                // position and keep casting (don't move) rather than aggro more.
-                if (PickSafeKitePoint(bot, enemy, want + 4.0f, x, y, z))
-                {
-                    // forceDestination=false: only move to a point the navmesh can
-                    // actually REACH. Without it MovePoint forces the bot straight to
-                    // the computed spot even when it's through a wall or over lava —
-                    // a kite point away from a mob landed a mage in Ragefire's lava and
-                    // dragged the party in. Now an unreachable kite point just stops the
-                    // bot on valid ground (it stands and casts) instead of diving in.
-                    bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
-                                                      0.0f, 0.0f, /*generatePath=*/true,
-                                                      /*forceDestination=*/false);
-                }
+                if (!PickSafeKitePoint(bot, enemy, want + 4.0f, x, y, z))
+                    return false;             // no meaningful kite — stand & cast
+                // forceDestination=false: only move to a point the navmesh can
+                // actually REACH, so an unreachable spot (through a wall / over
+                // lava) just isn't taken instead of forcing a straight-line dive.
+                bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                                                  0.0f, 0.0f, /*generatePath=*/true,
+                                                  /*forceDestination=*/false);
             }
             return true;
         }
