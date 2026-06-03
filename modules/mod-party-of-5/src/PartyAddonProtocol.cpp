@@ -1957,6 +1957,28 @@ public:
             out << "LEADDUNGEON\t" << token << '\t' << (on ? 1 : 0);
             SendWPSP(player, out.str());
         }
+        // REQ_ROTATION\t<token>  →  ROTATION\t<token>\t<dsl>
+        // The editor pulls the SAVED rotation from party_loadout (guid-keyed,
+        // authoritative) so a reshuffled party slot never shows the previous
+        // occupant's rotation out of the slot-keyed client cache. '|' field sep
+        // → '~' for the editor's import parser (which avoids '|', a WoW escape).
+        else if (command == "REQ_ROTATION")
+        {
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            std::string dsl;
+            if (guid)
+            {
+                QueryResult q = CharacterDatabase.Query(
+                    "SELECT `priority_actions_json` FROM `party_loadout` "
+                    "WHERE `guid` = {}", guid);
+                if (q) dsl = q->Fetch()[0].Get<std::string>();
+            }
+            std::replace(dsl.begin(), dsl.end(), '|', '~');
+            std::ostringstream out;
+            out << "ROTATION\t" << token << '\t' << dsl;
+            SendWPSP(player, out.str());
+        }
         // SET_LEADDUNGEON\t<token>\t<0|1>
         else if (command == "SET_LEADDUNGEON")
         {
