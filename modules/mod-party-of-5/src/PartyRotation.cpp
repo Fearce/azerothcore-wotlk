@@ -345,10 +345,24 @@ namespace WowPsParty
         return int((float(p->GetHealth()) / maxHp) * 100.0f);
     }
 
-    // True if target has any aura cast by anyone from spell `spellId`.
+    // Defined further down; forward-declared so the rank-insensitive buff check
+    // below (matched by spell name) can reuse it.
+    static Aura const* FindNamedAura(Unit* unit, std::string const& name);
+
+    // True if target already has the buff `spellId` represents — matched by NAME
+    // (any RANK counts), not the exact rank's id. Rank-sensitive matching caused
+    // the "two mages spam Arcane Intellect on one member forever" bug: mage A
+    // (rank 5) and mage B (rank 6) each saw the OTHER's rank as "missing mine" and
+    // re-cast, overwriting each other every GCD. All callers are group-buff / HoT
+    // presence checks ("skip if they already have it"), so any rank should count.
+    // Falls back to the exact-id check if the spell or its name can't be resolved.
     static bool HasAuraFromSpell(Unit* target, uint32 spellId)
     {
         if (!target || !spellId) return false;
+        if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
+            if (char const* nm = si->SpellName[0])
+                if (*nm)
+                    return FindNamedAura(target, nm) != nullptr;
         return target->HasAura(spellId);
     }
 
