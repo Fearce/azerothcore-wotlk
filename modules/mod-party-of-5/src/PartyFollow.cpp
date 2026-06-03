@@ -2351,6 +2351,32 @@ namespace WowPsParty
                 return true;
             }
 
+            // Party-wipe regroup: no healer offered a res (the whole party can be
+            // dead, including the healer), so a dead follower would lie there
+            // forever. Once the LEADER is alive and OUT OF COMBAT — the fight is
+            // over — revive the follower at full health beside the leader. Gated on
+            // leader-not-in-combat so we never battle-rez mid-pull (which would
+            // just feed the same fight); the player kills what's on them, then the
+            // party stands back up and reforms.
+            if (!follower->IsAlive() && !follower->isResurrectRequested()
+                && leader->IsAlive() && !leader->IsInCombat()
+                && leader->GetMapId() == follower->GetMapId())
+            {
+                follower->ResurrectPlayer(1.0f, false);   // full HP/mana, no sickness
+                follower->SpawnCorpseBones();
+                follower->TeleportTo(leader->GetMapId(),
+                    leader->GetPositionX(), leader->GetPositionY(),
+                    leader->GetPositionZ(), leader->GetOrientation());
+                ForceMovableState(follower);
+                follower->GetMotionMaster()->Clear();
+                follower->GetMotionMaster()->MoveIdle();
+                follower->StopMoving();
+                LOG_INFO("module",
+                    "[WowPsParty Follow] {} auto-revived at leader (party regroup)",
+                    follower->GetName());
+                return true;
+            }
+
             // Universal dead->alive scrub. ResurrectPlayer / ResurectUsingRequestData
             // leave stale death-state motion on the MotionMaster; without a clean
             // slate MoveFollow can't drive the revived bot and the catch-up-teleport
