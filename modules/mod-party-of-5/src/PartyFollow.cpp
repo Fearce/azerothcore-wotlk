@@ -1527,8 +1527,37 @@ namespace WowPsParty
         if (!bot) return nullptr;
         std::vector<ObjectGuid> party;
         GetPartyGuidsFor(bot->GetGUID(), party);
+
+        // Resolve live, same-map party members once for the in-combat test.
+        std::vector<Player*> members;
+        for (ObjectGuid const& g : party)
+        {
+            Player* m = ObjectAccessor::FindConnectedPlayer(g);
+            if (m && m->IsInWorld() && m->IsAlive() && m->GetMapId() == bot->GetMapId())
+                members.push_back(m);
+        }
+
+        // Is `u` part of OUR fight? True if it's attacking, or simply in combat
+        // with, any party member or their (non-totem) pet. IsInCombatWith is the
+        // KEY: it catches a RANGED attacker (a dagger-throwing scout/smuggler on
+        // the healer) that getAttackers() — melee attackers only — never lists,
+        // which is why those mobs were invisible and the casters just stood there.
+        auto engagedWithParty = [&](Unit* u) -> bool
+        {
+            if (!u) return false;
+            Unit* const v = u->GetVictim();
+            for (Player* m : members)
+            {
+                if (v == m || u->IsInCombatWith(m)) return true;
+                for (Unit* ctrl : m->m_Controlled)
+                    if (ctrl && !ctrl->IsTotem() && (v == ctrl || u->IsInCombatWith(ctrl)))
+                        return true;
+            }
+            return false;
+        };
+
         Unit*  tankTgt  = nullptr;   // the tank's victim — the party's main fight
-        Unit*  nearest  = nullptr;   // nearest enemy ENGAGED with the party
+        Unit*  nearest  = nullptr;   // nearest enemy engaged with the party
         float  bestDist = 1e9f;
         auto consider = [&](Unit* u, bool fromTank)
         {
@@ -1538,23 +1567,28 @@ namespace WowPsParty
             float const d = bot->GetDistance(u);
             if (d < bestDist) { bestDist = d; nearest = u; }
         };
+
+        // Prefer the tank's victim (focus fire the party's main kill).
         for (ObjectGuid const& g : party)
         {
-            if (g == bot->GetGUID()) continue;
-            Player* m = ObjectAccessor::FindConnectedPlayer(g);
-            if (!m || !m->IsInWorld() || !m->IsAlive() || m->GetMapId() != bot->GetMapId())
-                continue;
-            bool const isTank = (RoleForGuid(g) == "tank");
-            // Who this member is attacking AND — crucially — who is attacking
-            // THEM. A ranged add throwing daggers at the healer is nobody's
-            // victim yet, so without the attacker scan an idle caster never
-            // engages it and just stands there out of spell range. The chase
-            // bands below close it to firing range; the >50y party leash still
-            // caps how far it'll wander from the leader.
-            consider(m->GetVictim(), isTank);
-            for (Unit* a : m->getAttackers()) consider(a, isTank);
+            if (RoleForGuid(g) != "tank") continue;
+            if (Player* m = ObjectAccessor::FindConnectedPlayer(g))
+                if (m->IsInWorld() && m->IsAlive() && m->GetMapId() == bot->GetMapId())
+                    consider(m->GetVictim(), true);
         }
-        for (Unit* a : bot->getAttackers()) consider(a, false);  // and anything on us
+
+        // Grid search: every nearby enemy actually engaged with the party —
+        // melee OR ranged. Bounded to 45y so we don't grab a fight across the
+        // zone; the >50y party leash above caps the wander further.
+        std::list<Unit*> units;
+        Acore::AnyUnfriendlyUnitInObjectRangeCheck check(bot, bot, 45.0f);
+        Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck>
+            searcher(bot, units, check);
+        Cell::VisitObjects(bot, searcher, 45.0f);
+        for (Unit* u : units)
+            if (engagedWithParty(u))
+                consider(u, false);
+
         return tankTgt ? tankTgt : nearest;   // focus the tank's kill, else nearest threat
     }
 
