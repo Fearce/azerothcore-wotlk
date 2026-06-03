@@ -346,6 +346,25 @@ namespace WowPsParty
             if (!guid) continue;
             ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
             Player* p = ObjectAccessor::FindConnectedPlayer(og);
+            // Diagnostic: a party member's items vanish from the shared inventory
+            // after an LFG dungeon. Log which lookup finds them so we can see why
+            // a live, ticking bot is skipped — and fall back to the in-world
+            // lookup if the connected-player lookup misses it.
+            if (!p)
+            {
+                Player* wp = ObjectAccessor::FindPlayer(og);
+                if (wp) p = wp;
+                LOG_INFO("module",
+                    "[WowPsParty Inv] slot={} guid={} connected=NULL findPlayer={}",
+                    partySlot, guid, wp ? "FOUND" : "null");
+            }
+            else
+            {
+                LOG_INFO("module",
+                    "[WowPsParty Inv] slot={} guid={} {} map={} beingTP={}",
+                    partySlot, guid, p->GetName(), p->GetMapId(),
+                    p->IsBeingTeleported() ? 1 : 0);
+            }
             if (!p) continue;
 
             // Main backpack (16 slots): bag=255 (INVENTORY_SLOT_BAG_0), pos=23..38
