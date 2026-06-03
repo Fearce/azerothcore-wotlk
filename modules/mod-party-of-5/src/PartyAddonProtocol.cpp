@@ -663,6 +663,60 @@ static InventoryResult CanUseItemIgnoringBind(Player* dest, Item* item)
     return EQUIP_ERR_OK;
 }
 
+// Move ONE loose, non-container item out of `from`'s inventory onto any OTHER
+// party member that has room. Used to free a single slot so a bigger bag can be
+// staged in a regular slot and then swapped into a bag slot on a member whose
+// bags are otherwise full (the core won't run a bag-into-slot swap without the
+// new bag staged somewhere first). The party inventory is shared, so which member
+// ends up holding the displaced item doesn't matter. Returns true if a slot freed.
+static bool RelocateOneLooseItem(uint32 account, Player* from)
+{
+    if (!from) return false;
+    std::vector<Player*> peers;
+    if (QueryResult q = CharacterDatabase.Query(
+            "SELECT `guid` FROM `account_party` WHERE `account` = {}", account))
+    {
+        do
+        {
+            uint32 const g = q->Fetch()[0].Get<uint32>();
+            ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(g);
+            Player* p = ObjectAccessor::FindConnectedPlayer(og);
+            if (!p) p = ObjectAccessor::FindPlayer(og);
+            if (p && p != from) peers.push_back(p);
+        } while (q->NextRow());
+    }
+    if (peers.empty()) return false;
+
+    auto tryMove = [&](Item* item) -> bool
+    {
+        if (!item) return false;
+        if (item->GetTemplate()->Class == ITEM_CLASS_CONTAINER) return false;  // never displace a bag
+        for (Player* peer : peers)
+        {
+            ItemPosCountVec dpos;
+            if (peer->CanStoreItem(NULL_BAG, NULL_SLOT, dpos, item, false) != EQUIP_ERR_OK)
+                continue;
+            from->MoveItemFromInventory(item->GetBagSlot(), item->GetSlot(), true);
+            item->SetOwnerGUID(peer->GetGUID());
+            item->FSetState(ITEM_CHANGED);
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            item->SaveToDB(tx);
+            CharacterDatabase.CommitTransaction(tx);
+            peer->MoveItemToInventory(dpos, item, true);
+            return true;
+        }
+        return false;
+    };
+
+    for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+        if (tryMove(from->GetItemByPos(INVENTORY_SLOT_BAG_0, i))) return true;
+    for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+        if (Bag* bag = from->GetBagByPos(b))
+            for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                if (tryMove(from->GetItemByPos(b, j))) return true;
+    return false;
+}
+
 static void HandleEquip(Player* requester, std::string_view payload)
 {
     // Payload formats supported:
@@ -833,7 +887,21 @@ static void HandleEquip(Player* requester, std::string_view payload)
         };
 
         ItemPosCountVec destPos;
-        if (dest->CanStoreItem(NULL_BAG, NULL_SLOT, destPos, srcItem, false) != EQUIP_ERR_OK)
+        bool canStore =
+            (dest->CanStoreItem(NULL_BAG, NULL_SLOT, destPos, srcItem, false) == EQUIP_ERR_OK);
+        // A container is equipped into a bag SLOT — a 1-for-1 swap where the old
+        // bag's contents redistribute into the new (bigger) one. The core still
+        // needs the new bag STAGED in a regular slot to run that swap, which a
+        // member with full bags has no room for (Kevin's "can't equip a bigger
+        // bag, bags are full"). Free one slot by shifting a loose item to another
+        // shared-inventory member, then retry the store.
+        if (!canStore && srcItem->GetTemplate()->Class == ITEM_CLASS_CONTAINER)
+        {
+            if (RelocateOneLooseItem(account, dest))
+                canStore = (dest->CanStoreItem(NULL_BAG, NULL_SLOT, destPos, srcItem, false)
+                            == EQUIP_ERR_OK);
+        }
+        if (!canStore)
         {
             // dest's bags are full — give it back so the item doesn't vanish.
             bounceBackToSrc();
