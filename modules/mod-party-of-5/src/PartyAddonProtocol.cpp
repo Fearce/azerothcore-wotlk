@@ -1552,87 +1552,18 @@ static void HandleMove(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
-// GOTO_DELTA\t<dWorldX>\t<dWorldY>   — instant teleport. The addon
-// computes a world-space (X, Y) delta from a right-click on the world map
-// relative to the player's mapped position. We just `TeleportTo` the
-// session player there; PartyFollow's catch-up teleport drags the bots
-// onto the new map/coords within ~1 second on the next tick.
-//
-// The old "scout walks ahead, bots fight along the way" implementation
-// was great for in-zone travel through hostile territory, but Kevin
-// wants this to be a fast-travel tool for recording dungeon paths and
-// hopping between zones — so instant TP is the right answer.
-static void HandleGotoDelta(Player* requester, std::string_view payload)
+// GOTO_DELTA — DISABLED (2026-06-03). The right-click-the-map teleport was
+// removed: the client hook also fired on Blizzard's NORMAL world map, so a
+// stray right-click teleported the whole party by accident. The feature is
+// gone entirely — GMs use `.tele`. This handler is now a no-op so any
+// GOTO_DELTA a stale/un-synced addon copy might still send is ignored instead
+// of teleporting anyone. (Prior teleport implementation is in git history.)
+static void HandleGotoDelta(Player* requester, std::string_view /*payload*/)
 {
-    if (!requester || !requester->GetSession()) return;
-    auto tab = payload.find('\t');
-    if (tab == std::string_view::npos) return;
-    float const dx = std::strtof(std::string(payload.substr(0, tab)).c_str(), nullptr);
-    float const dy = std::strtof(std::string(payload.substr(tab + 1)).c_str(), nullptr);
-
-    float const targetX = requester->GetPositionX() + dx;
-    float const targetY = requester->GetPositionY() + dy;
-    float targetZ = requester->GetMap()->GetHeight(
-        requester->GetPhaseMask(), targetX, targetY, MAX_HEIGHT);
-    if (targetZ <= INVALID_HEIGHT)
-        targetZ = requester->GetPositionZ();
-    requester->UpdateAllowedPositionZ(targetX, targetY, targetZ);
-
+    if (!requester) return;
     LOG_INFO("module",
-        "[WowPsParty] GOTO_DELTA from guid={} TELEPORT -> ({:.1f},{:.1f},{:.1f})",
-        requester->GetGUID().GetCounter(), targetX, targetY, targetZ);
-
-    // NearTeleportTo is the "warp instantly within the same map" path. It
-    // bypasses the pre-checks in TeleportTo (combat, in-flight, recent
-    // death, taxi, transport) that were silently dropping the request.
-    requester->NearTeleportTo(targetX, targetY, targetZ,
-                              requester->GetOrientation());
-
-    // Drag the rest of the party with us. Previously the catch-up
-    // teleport in PartyFollow handled this asynchronously, but it had
-    // a one-tick lag, occasionally lost bots across map boundaries,
-    // and felt janky when the user was zone-hopping. Teleport every
-    // connected party member in this same frame; ring them out by 2.5y
-    // so they don't pile on top of the requester (PartyFollow's next
-    // tick redistributes them into formation anyway).
-    uint32 const account = requester->GetSession()->GetAccountId();
-    QueryResult qP = CharacterDatabase.Query(
-        "SELECT `guid` FROM `account_party` WHERE `account` = {}", account);
-    if (qP)
-    {
-        int formIdx = 0;
-        do
-        {
-            uint32 const g = qP->Fetch()[0].Get<uint32>();
-            if (g == requester->GetGUID().GetCounter()) continue;
-            Player* m = ObjectAccessor::FindConnectedPlayer(
-                ObjectGuid::Create<HighGuid::Player>(g));
-            if (!m) continue;
-
-            float const angle = (2.0f * float(M_PI) / 4.0f) * float(formIdx);
-            float const fx = targetX + std::cos(angle) * 2.5f;
-            float const fy = targetY + std::sin(angle) * 2.5f;
-            float fz = requester->GetMap()->GetHeight(
-                m->GetPhaseMask(), fx, fy, MAX_HEIGHT);
-            if (fz <= INVALID_HEIGHT) fz = targetZ;
-            m->UpdateAllowedPositionZ(fx, fy, fz);
-
-            if (m->GetMapId() == requester->GetMapId())
-                m->NearTeleportTo(fx, fy, fz, requester->GetOrientation());
-            else
-                m->TeleportTo(requester->GetMapId(), fx, fy, fz,
-                              requester->GetOrientation());
-
-            LOG_INFO("module",
-                "[WowPsParty] GOTO_DELTA follower {} -> ({:.1f},{:.1f},{:.1f})",
-                m->GetName(), fx, fy, fz);
-            ++formIdx;
-        } while (qP->NextRow());
-    }
-
-    ChatHandler(requester->GetSession()).PSendSysMessage(
-        "|cff66ccff[WowPsParty]|r Teleported party to ({:.0f}, {:.0f}).",
-        targetX, targetY);
+        "[WowPsParty] GOTO_DELTA ignored (feature disabled) from guid={}",
+        requester->GetGUID().GetCounter());
 }
 
 namespace WowPsParty
