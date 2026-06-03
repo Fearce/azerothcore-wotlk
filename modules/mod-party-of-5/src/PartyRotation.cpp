@@ -1887,6 +1887,21 @@ namespace WowPsParty
             }
             float x, y, z;
             aimAt->GetPosition(x, y, z);
+            // Predictive placement: a mob group charging the casters walks out of a
+            // Flamestrike dropped on its CURRENT spot before the ~2s cast lands. Aim
+            // where the cluster WILL be when the cast ends — `lead` yards ahead along
+            // the anchor's facing (= its move direction), like a real player leading
+            // the throw. Capped so a sudden turn can't fling the AoE across the map;
+            // GetNearPoint settles z onto the ground at the lead point.
+            if (castMs > 0 && aimAt->isMoving())
+            {
+                float lead = aimAt->GetSpeed(MOVE_RUN) * (float(castMs) / 1000.0f);
+                if (lead > 1.0f)
+                {
+                    lead = std::min(lead, 18.0f);
+                    aimAt->GetNearPoint(nullptr, x, y, z, 0.0f, lead, aimAt->GetOrientation());
+                }
+            }
             SpellCastResult const r = bot->CastSpell(x, y, z, spellId, false);
             if (r != SPELL_CAST_OK)
             {
