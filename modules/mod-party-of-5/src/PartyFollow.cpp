@@ -2364,18 +2364,23 @@ namespace WowPsParty
                 ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
 
             // Catch-up speed: every managed follower (an enrolled hero alt OR a
-            // hired henchman — both live in g_directives) runs at 110% ON FOOT,
-            // so it slowly closes any gap to the leader without looking obviously
-            // faster. Only nudge UP from base (rate < 1.1) — never cap a real
-            // speed buff (Aspect of the Pack, etc.) back down, and the guard
-            // means we don't spam a speed packet once it's already 1.1. Skip
-            // while MOUNTED: AC computes MOVE_RUN from the mounted-speed aura
-            // category when mounted, so the party's matched mount already keeps
-            // them at the leader's exact speed — forcing 1.1 here would only
-            // fight that. On dismount the core resets MOVE_RUN to 1.0 and the
-            // next tick restores 1.1.
-            if (!follower->IsMounted() && follower->GetSpeedRate(MOVE_RUN) < 1.1f)
-                follower->SetSpeed(MOVE_RUN, 1.1f, true);
+            // hired henchman — both live in g_directives) runs 3% faster than the
+            // LEADER so it slowly closes any gap without looking obviously faster.
+            // Tracking the leader's rate (never the follower's own, which would
+            // compound every tick) makes one rule cover BOTH states: on foot the
+            // leader is 1.0 -> bot 1.03; mounted, the party's matched mount makes
+            // the leader's run rate the bot's natural mounted speed, so x1.03 is
+            // 103% of that — they keep creeping up even while everyone's riding.
+            // Only act while both share the same mount state, so a mid-transition
+            // mount/dismount can't briefly fling an on-foot bot at mounted speed.
+            // The +/-0.01 guard avoids re-sending a speed packet once it matches.
+            if (follower->IsMounted() == leader->IsMounted())
+            {
+                float const target = leader->GetSpeedRate(MOVE_RUN) * 1.03f;
+                float const cur    = follower->GetSpeedRate(MOVE_RUN);
+                if (cur < target - 0.01f || cur > target + 0.01f)
+                    follower->SetSpeed(MOVE_RUN, target, true);
+            }
 
             // Mount matching — keep the follower's mounted state synced with the
             // leader's so the party doesn't trail on foot during travel. The bot
