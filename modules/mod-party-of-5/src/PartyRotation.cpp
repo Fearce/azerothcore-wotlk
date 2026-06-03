@@ -389,14 +389,34 @@ namespace WowPsParty
         return uint32(targets.size());
     }
 
+    // 2D distance from point (px,py) to the segment (ax,ay)->(bx,by). Used to
+    // test whether a hostile sits near a bot's retreat LANE, not just its
+    // endpoint — clipping past a mob mid-kite pulls it just as surely as
+    // stopping next to one.
+    static float DistPointToSeg2D(float px, float py, float ax, float ay,
+                                  float bx, float by)
+    {
+        float const abx = bx - ax, aby = by - ay;
+        float const len2 = abx * abx + aby * aby;
+        float t = 0.0f;
+        if (len2 > 0.0001f)
+            t = ((px - ax) * abx + (py - ay) * aby) / len2;
+        if (t < 0.0f) t = 0.0f;
+        else if (t > 1.0f) t = 1.0f;
+        float const cx = ax + t * abx, cy = ay + t * aby;
+        float const dx = px - cx, dy = py - cy;
+        return std::sqrt(dx * dx + dy * dy);
+    }
+
     // Choose a kite destination at `dist` yards from `enemy` that the bot can
-    // retreat to WITHOUT backing into other hostile mobs — so kiting one mob
-    // doesn't aggro the whole room. Fans out from the straight-away direction
-    // (enemy -> bot) through progressively wider angles; the first candidate
-    // with no OTHER hostile within DANGER yards wins. Returns false when every
-    // retreat lane is crowded, so the caller holds position and keeps casting
-    // instead of pulling the dungeon. (Reachability/lava is still handled by
-    // MovePoint's forceDestination=false at the call site.)
+    // retreat to WITHOUT backing into — or pathing past — other hostile mobs,
+    // so kiting one mob doesn't aggro the whole room. Fans out from the
+    // straight-away direction (enemy -> bot) through progressively wider
+    // angles; the first candidate whose entire retreat LANE stays DANGER yards
+    // clear of every OTHER hostile wins. Returns false when every lane is
+    // crowded, so the caller holds position and keeps casting instead of
+    // pulling the dungeon. (Reachability/lava is still handled by MovePoint's
+    // forceDestination=false at the call site.)
     static bool PickSafeKitePoint(Player* bot, Unit* enemy, float dist,
                                   float& ox, float& oy, float& oz)
     {
@@ -405,8 +425,10 @@ namespace WowPsParty
         std::list<Unit*> hostiles;
         GatherHostilesAround(bot, 40.0f, hostiles);
 
-        float const DANGER = 12.0f;                 // keep candidate this clear
+        float const DANGER = 12.0f;                 // keep the whole lane this clear
         float const baseAngle = enemy->GetAngle(bot);  // directly away from enemy
+        float const bx = bot->GetPositionX();
+        float const by = bot->GetPositionY();
 
         // Direct retreat first, then symmetric fan-out (~20deg steps each side).
         static float const offsets[] =
@@ -421,10 +443,10 @@ namespace WowPsParty
             for (Unit* h : hostiles)
             {
                 if (!h || h == enemy || !h->IsAlive()) continue;
-                float const dx = h->GetPositionX() - x;
-                float const dy = h->GetPositionY() - y;
-                float const dz = h->GetPositionZ() - z;
-                if (dx * dx + dy * dy + dz * dz < DANGER * DANGER)
+                // Reject if any other mob is near the retreat lane (bot -> spot),
+                // which subsumes the endpoint test (the spot is the lane's end).
+                if (DistPointToSeg2D(h->GetPositionX(), h->GetPositionY(),
+                                     bx, by, x, y) < DANGER)
                 {
                     crowded = true;
                     break;
