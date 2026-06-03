@@ -1558,7 +1558,13 @@ namespace WowPsParty
         tx->Append(
             "UPDATE `characters` SET `party_slot` = {} WHERE `guid` = {}",
             nextSlot, targetGuid);
-        CharacterDatabase.CommitTransaction(tx);
+        // SYNCHRONOUS commit: MGMT_INVITE calls SetActiveFollowers (which
+        // rebuilds follow directives from account_party) immediately after this
+        // returns. An async commit isn't visible to that synchronous re-query
+        // yet, so the just-enrolled member was missing from the directive set —
+        // it then spawned WITHOUT a directive and ran mod-playerbots' default AI
+        // (e.g. a priest self-casting Power Word: Shield) instead of its rotation.
+        CharacterDatabase.DirectCommitTransaction(tx);
 
         LOG_INFO("module",
                  "[WowPsParty] enroll: account={} guid={} name={} slot={}",
@@ -1585,7 +1591,10 @@ namespace WowPsParty
         // Also clear any loadout for this character.
         tx->Append(
             "DELETE FROM `party_loadout` WHERE `guid` = {}", guid);
-        CharacterDatabase.CommitTransaction(tx);
+        // SYNCHRONOUS commit so the SetActiveFollowers rebuild that the kick
+        // handler runs right after sees the row already gone (same async-commit
+        // visibility race the enroll path hit).
+        CharacterDatabase.DirectCommitTransaction(tx);
 
         LOG_INFO("module", "[WowPsParty] leave: account={} guid={}", account, guid);
         return true;
