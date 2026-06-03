@@ -746,6 +746,9 @@ namespace lfg
                             if (!plrg->GetSession()->HasPermission(rbac::RBAC_PERM_JOIN_DUNGEON_FINDER))
                             {
                                 joinData.result = LFG_JOIN_PARTY_NOT_MEET_REQS;
+                                LOG_INFO("module",
+                                    "[WowPsParty LFG] join blocked: member {} lacks RBAC_PERM_JOIN_DUNGEON_FINDER",
+                                    plrg->GetName());
                             }
                             else if (plrg->HasAura(LFG_SPELL_DUNGEON_DESERTER))
                             {
@@ -799,7 +802,21 @@ namespace lfg
             {
                 GetCompatibleDungeons(dungeons, players, joinData.lockmap, rDungeonId);
                 if (dungeons.empty())
+                {
                     joinData.result = grp ? LFG_JOIN_PARTY_NOT_MEET_REQS : LFG_JOIN_NOT_MEET_REQS;
+                    // [WowPsParty] Diagnostic: dump exactly who is locked from what,
+                    // so a "do not meet requirements" failure names the member +
+                    // dungeon + lock-status code instead of being a black box.
+                    for (auto const& pl : joinData.lockmap)
+                    {
+                        Player* lp = ObjectAccessor::FindConnectedPlayer(pl.first);
+                        for (auto const& dl : pl.second)
+                            LOG_INFO("module",
+                                "[WowPsParty LFG] join blocked: member {} locked from dungeon {} (lockStatus={})",
+                                lp ? lp->GetName() : pl.first.ToString(),
+                                (dl.first & 0x00FFFFFF), dl.second);
+                    }
+                }
             }
         }
 
