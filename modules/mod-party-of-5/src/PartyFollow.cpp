@@ -1527,19 +1527,35 @@ namespace WowPsParty
         if (!bot) return nullptr;
         std::vector<ObjectGuid> party;
         GetPartyGuidsFor(bot->GetGUID(), party);
-        Unit* anyVictim = nullptr;
+        Unit*  tankTgt  = nullptr;   // the tank's victim — the party's main fight
+        Unit*  nearest  = nullptr;   // nearest enemy ENGAGED with the party
+        float  bestDist = 1e9f;
+        auto consider = [&](Unit* u, bool fromTank)
+        {
+            if (!u || !u->IsAlive() || !u->IsInCombat()) return;
+            if (!bot->IsValidAttackTarget(u)) return;
+            if (fromTank && !tankTgt) tankTgt = u;
+            float const d = bot->GetDistance(u);
+            if (d < bestDist) { bestDist = d; nearest = u; }
+        };
         for (ObjectGuid const& g : party)
         {
             if (g == bot->GetGUID()) continue;
             Player* m = ObjectAccessor::FindConnectedPlayer(g);
             if (!m || !m->IsInWorld() || !m->IsAlive() || m->GetMapId() != bot->GetMapId())
                 continue;
-            Unit* v = m->GetVictim();
-            if (!v || !v->IsAlive() || !bot->IsValidAttackTarget(v)) continue;
-            if (RoleForGuid(g) == "tank") return v;   // prefer the tank's target
-            if (!anyVictim) anyVictim = v;
+            bool const isTank = (RoleForGuid(g) == "tank");
+            // Who this member is attacking AND — crucially — who is attacking
+            // THEM. A ranged add throwing daggers at the healer is nobody's
+            // victim yet, so without the attacker scan an idle caster never
+            // engages it and just stands there out of spell range. The chase
+            // bands below close it to firing range; the >50y party leash still
+            // caps how far it'll wander from the leader.
+            consider(m->GetVictim(), isTank);
+            for (Unit* a : m->getAttackers()) consider(a, isTank);
         }
-        return anyVictim;
+        for (Unit* a : bot->getAttackers()) consider(a, false);  // and anything on us
+        return tankTgt ? tankTgt : nearest;   // focus the tank's kill, else nearest threat
     }
 
     // The party's lead tank (alive, same map as `bot`), or null. Shared by the
