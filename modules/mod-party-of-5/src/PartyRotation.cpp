@@ -165,6 +165,23 @@ namespace WowPsParty
         return false;
     }
 
+    // True if the bot's rotation has a close_to_enemy rule (advance-to-range).
+    // AssistTarget reads this and FULLY yields target + movement: the rule finds
+    // its own nearest party-engaged enemy and drives its own feet, so the assist
+    // loop's chase bands (which won't close a ranged caster to a far target) must
+    // not fight it.
+    bool BotIsAdvancing(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
+        auto it = g_rotationCache.find(guid.GetCounter());
+        if (it == g_rotationCache.end()) return false;
+        for (RotationRule const& r : it->second)
+            if (r.action.rfind("close_to_enemy", 0) == 0
+                && !CsvContains(Lower(r.flags), "disabled"))
+                return true;
+        return false;
+    }
+
     void RotationCacheRefreshFromDB(uint32 guid)
     {
         QueryResult q = CharacterDatabase.Query(
@@ -739,6 +756,38 @@ namespace WowPsParty
                 return p;
         } while (q->NextRow());
         return nullptr;
+    }
+
+    // Nearest enemy the bot's PARTY is in combat with — either a mob a member is
+    // attacking OR a mob attacking a member (so a ranged add peppering the healer
+    // counts even before anyone has targeted it). In-combat only, so it never
+    // grabs an idle/neutral mob. Used by the close_to_enemy movement action.
+    static Unit* NearestPartyCombatEnemy(Player* bot)
+    {
+        if (!bot) return nullptr;
+        Unit* best = nullptr;
+        float bestD = 1e9f;
+        auto consider = [&](Unit* u)
+        {
+            if (!u || !u->IsAlive() || !u->IsInCombat()) return;
+            if (!bot->IsValidAttackTarget(u)) return;
+            float const d = bot->GetDistance(u);
+            if (d < bestD) { bestD = d; best = u; }
+        };
+        if (Group* grp = bot->GetGroup())
+        {
+            for (GroupReference* it = grp->GetFirstMember(); it; it = it->next())
+            {
+                Player* m = it->GetSource();
+                if (!m || !m->IsInWorld() || !m->IsAlive()
+                    || m->GetMapId() != bot->GetMapId())
+                    continue;
+                consider(m->GetVictim());                       // who this member attacks
+                for (Unit* a : m->getAttackers()) consider(a);  // who attacks this member
+            }
+        }
+        for (Unit* a : bot->getAttackers()) consider(a);        // and anything on us
+        return best;
     }
 
     // ----- condition evaluator ------------------------------------------------
@@ -2521,6 +2570,46 @@ namespace WowPsParty
                 float x, y, z;
                 healer->GetNearPoint(bot, x, y, z, 0.0f, std::max(want - 2.0f, 3.0f),
                                      healer->GetAngle(bot));
+                bot->GetMotionMaster()->MovePoint(0, x, y, z);
+            }
+            return true;
+        }
+
+        // "close_to_enemy:N" — advance to within N yards of the NEAREST enemy the
+        // party is in combat with (a mob a member attacks, OR a mob attacking a
+        // member — so a ranged add throwing daggers at the healer counts even
+        // before anyone targets it), then stand and cast. The inverse of
+        // keep_distance_enemy: it walks IN instead of kiting OUT. The bot OWNS its
+        // feet here — AssistTarget fully yields (BotIsAdvancing matches this verb),
+        // because its chase bands won't close a ranged caster to a far target and
+        // would otherwise leave the mage standing out of range. Make it the LOWEST-
+        // priority rule: the cast rules above fire the instant we're in range.
+        if (verb == "close_to_enemy")
+        {
+            if (bot->IsNonMeleeSpellCast(false, false, true)) return false;
+            float const want = float(std::atof(arg.c_str()));
+            if (want <= 0.0f) return false;
+            Unit* enemy = NearestPartyCombatEnemy(bot);
+            if (!enemy)
+            {
+                // Party isn't fighting anything reachable — drop a stale victim so
+                // the follow ticker can bring us back to the leader.
+                if (bot->GetVictim()) bot->AttackStop();
+                return false;
+            }
+            // Leash: never chase a target way out (mirrors AssistTarget's 50y cap,
+            // which we bypass by owning movement). The enemy is in combat with the
+            // grouped party, so it's normally right next to us anyway.
+            if (bot->GetDistance(enemy) > 50.0f) return false;
+            // Target it so the higher-priority cast rules have something to fire on.
+            if (bot->GetVictim() != enemy)
+                bot->Attack(enemy, false);   // ranged: don't auto-chase into melee
+            if (bot->GetDistance(enemy) <= want) return false;   // in range — let casts run
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+            {
+                float x, y, z;
+                enemy->GetNearPoint(bot, x, y, z, 0.0f, std::max(want - 2.0f, 3.0f),
+                                    enemy->GetAngle(bot));
                 bot->GetMotionMaster()->MovePoint(0, x, y, z);
             }
             return true;

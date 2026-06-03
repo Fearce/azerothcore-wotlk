@@ -149,6 +149,11 @@ namespace WowPsParty
     // stops chasing and lets the rotation own movement.
     bool BotIsKiting(ObjectGuid guid);
 
+    // True when the rotation contains a close_to_enemy rule — the bot advances to
+    // within N yards of the nearest party-engaged enemy. AssistTarget FULLY yields
+    // target + movement to it (the rule finds its own enemy and drives its feet).
+    bool BotIsAdvancing(ObjectGuid guid);
+
     // Returns true if the bot has at least one cached rule (cheap check, called
     // every UpdateAI tick).
     bool HasRotation(uint32 guid);

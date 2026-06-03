@@ -1746,6 +1746,17 @@ namespace WowPsParty
         else
             g_pullAnchor.erase(gLow);   // not pulling → re-capture next pull
 
+        // close_to_enemy rotation rule: the bot advances to the nearest party-
+        // engaged enemy under its OWN control (finds the target, sets the victim,
+        // walks into range). Fully yield here so AssistTarget's target pick + chase
+        // bands — which won't close a ranged caster to a far target — can't fight
+        // it and leave the mage standing out of range.
+        if (WowPsParty::BotIsAdvancing(bot->GetGUID()))
+        {
+            AssistLog(gLow, "close_to_enemy: rotation owns target + movement");
+            return;
+        }
+
         // Target priority:
         //   1. Leader's explicit victim (you click, everyone follows).
         //   2. Whatever's currently swinging at the bot itself.
