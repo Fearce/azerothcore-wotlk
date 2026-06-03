@@ -2363,6 +2363,20 @@ namespace WowPsParty
             if (PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(follower))
                 ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
 
+            // Catch-up speed: every managed follower (an enrolled hero alt OR a
+            // hired henchman — both live in g_directives) runs at 110% ON FOOT,
+            // so it slowly closes any gap to the leader without looking obviously
+            // faster. Only nudge UP from base (rate < 1.1) — never cap a real
+            // speed buff (Aspect of the Pack, etc.) back down, and the guard
+            // means we don't spam a speed packet once it's already 1.1. Skip
+            // while MOUNTED: AC computes MOVE_RUN from the mounted-speed aura
+            // category when mounted, so the party's matched mount already keeps
+            // them at the leader's exact speed — forcing 1.1 here would only
+            // fight that. On dismount the core resets MOVE_RUN to 1.0 and the
+            // next tick restores 1.1.
+            if (!follower->IsMounted() && follower->GetSpeedRate(MOVE_RUN) < 1.1f)
+                follower->SetSpeed(MOVE_RUN, 1.1f, true);
+
             // Mount matching — keep the follower's mounted state synced with the
             // leader's so the party doesn't trail on foot during travel. The bot
             // mounts its OWN level/race-appropriate mount (not a clone of the
