@@ -18,6 +18,7 @@
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "Bag.h"                // henchman inventory clear (GetBagByPos/GetBagSize)
 #include "Unit.h"
 #include "WorldSession.h"
 
@@ -1352,6 +1353,11 @@ namespace WowPsParty
                 }
             }
 
+            // Start the henchman with clean bags (the bot-pool char may carry
+            // junk; Randomize above only refreshes EQUIPPED gear). Keeps ammo /
+            // reagents / shards + equipped gear; henchmen only.
+            ClearHenchmanInventory(hen);
+
             Group* g = lead->GetGroup();
             if (!g)
             {
@@ -1392,11 +1398,63 @@ namespace WowPsParty
         return true;
     }
 
+    // Destroy a HENCHMAN's loose BAG items, keeping only what it needs to keep
+    // functioning. HENCHMEN ONLY — hard-guarded by IsHenchman so it can NEVER run
+    // on the human player or an enrolled alt-bot (those have henchman=false in the
+    // directive). Equipped gear (weapon/armor/wand) and the bag containers
+    // themselves are never touched — we only sweep the GENERAL inventory (backpack
+    // + the slots INSIDE equipped bags), never the equip slots or bag slots. Keeps
+    // henchman bags from filling with bot-pool junk and leaves a clean slate on
+    // dismiss, while a hunter keeps its ammo and a caster its reagents/shards.
+    void ClearHenchmanInventory(Player* hen)
+    {
+        if (!hen) return;
+        if (!WowPsParty::IsHenchman(hen->GetGUID())) return;   // SAFETY: henchmen only
+
+        auto const keep = [](Item* it) -> bool
+        {
+            ItemTemplate const* t = it ? it->GetTemplate() : nullptr;
+            if (!t) return false;
+            if (t->Class == ITEM_CLASS_PROJECTILE) return true;  // arrows / bullets
+            if (t->Class == ITEM_CLASS_REAGENT)    return true;  // spell reagents
+            if (t->ItemId == 6265)                 return true;  // Soul Shard (pet/HS/SS)
+            return false;
+        };
+
+        uint32 destroyed = 0;
+        // Backpack general slots.
+        for (uint8 s = INVENTORY_SLOT_ITEM_START; s < INVENTORY_SLOT_ITEM_END; ++s)
+            if (Item* it = hen->GetItemByPos(INVENTORY_SLOT_BAG_0, s))
+                if (!keep(it)) { hen->DestroyItem(INVENTORY_SLOT_BAG_0, s, true); ++destroyed; }
+        // Slots inside each equipped bag (the bag container itself is left alone).
+        for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+        {
+            Bag* container = hen->GetBagByPos(bag);
+            if (!container) continue;
+            for (uint32 s = 0; s < container->GetBagSize(); ++s)
+                if (Item* it = container->GetItemByPos(uint8(s)))
+                    if (!keep(it)) { hen->DestroyItem(bag, uint8(s), true); ++destroyed; }
+        }
+        if (destroyed)
+        {
+            hen->SaveToDB(false, false);
+            LOG_INFO("module",
+                "[WowPsParty Henchmen] cleared {} bag item(s) from hench_guid={} "
+                "(kept ammo/reagents/shards + equipped gear)",
+                destroyed, hen->GetGUID().GetCounter());
+        }
+    }
+
     void DismissHenchman(Player* requester, uint32 henchGuid)
     {
         if (!requester || !requester->GetSession()) return;
         ObjectGuid const g = ObjectGuid::Create<HighGuid::Player>(henchGuid);
         if (!WowPsParty::IsHenchman(g)) return;   // only dismiss henchmen
+        // Clear its bags (keep ammo/reagents/shards) BEFORE RemoveFollower drops
+        // the directive — ClearHenchmanInventory's own IsHenchman guard reads that
+        // directive, so it must still exist or the clear silently no-ops.
+        if (Player* hen = ObjectAccessor::FindConnectedPlayer(g))
+            ClearHenchmanInventory(hen);
         WowPsParty::RemoveFollower(g);
         WowPsParty::RotationCacheClear(henchGuid);
         WowPsParty::TargetModeCacheSet(henchGuid, "master");   // drop tank "loose"
@@ -1421,6 +1479,11 @@ namespace WowPsParty
     {
         if (!WowPsParty::IsHenchman(henchGuid)) return;
         ObjectGuid const leaderGuid = WowPsParty::GetLeaderFor(henchGuid);
+        // Clear its bags (keep ammo/reagents/shards) BEFORE RemoveFollower drops
+        // the directive — the clear's IsHenchman guard needs it. The clear is pure
+        // bag-item destruction; only the LOGOUT below needs the 200ms defer.
+        if (Player* hen = ObjectAccessor::FindConnectedPlayer(henchGuid))
+            ClearHenchmanInventory(hen);
         WowPsParty::RemoveFollower(henchGuid);
         WowPsParty::RotationCacheClear(henchGuid.GetCounter());
         WowPsParty::TargetModeCacheSet(henchGuid.GetCounter(), "master");
@@ -1440,7 +1503,7 @@ namespace WowPsParty
             // directive is already gone (RemoveFollower above), so this removal's
             // own dismiss hook is a no-op.
             if (Player* hen = ObjectAccessor::FindConnectedPlayer(henchGuid))
-                if (hen->GetGroup()) hen->RemoveFromGroup();
+                if (hen->GetGroup()) hen->RemoveFromGroup();   // bags already cleared above
             if (PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(l))
                 mgr->LogoutPlayerBot(henchGuid);
             UpdateGroupLootForHenchmen(l);

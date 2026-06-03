@@ -2296,24 +2296,26 @@ namespace WowPsParty
             float(M_PI) * 0.9f,     // back-left inner
         };
 
-        // Auto-vote GREED on every pending group-loot roll for this bot. We
-        // hard-return out of mod-playerbots' UpdateAI, suppressing its default
-        // loot-roll action, so without this our party bots (heroes AND hired
-        // henchmen) never respond to a roll and the player has to click greed
-        // for each. Kevin's rule: all party bots greed on everything when the
-        // party is on group loot (which it is whenever a henchman is present).
+        // Auto-vote on every pending group-loot roll for this bot. We hard-return
+        // out of mod-playerbots' UpdateAI, suppressing its default loot-roll
+        // action, so without this our party bots never respond to a roll and the
+        // player has to click for each. Heroes (enrolled alts) GREED so loot stays
+        // in the party; HENCHMEN PASS so they never WIN a roll and accumulate junk
+        // in their bags — henchman bags are kept empty by design (see
+        // ClearHenchmanInventory). Either vote answers the roll so it isn't stuck.
         static void AutoGreedRolls(Player* bot)
         {
             if (!bot) return;
             Group* g = bot->GetGroup();
             if (!g) return;
+            RollVote const vote = IsHenchman(bot->GetGUID()) ? PASS : GREED;
             for (Roll* roll : g->GetRolls())
             {
                 if (!roll) continue;
                 auto it = roll->playerVote.find(bot->GetGUID());
                 if (it == roll->playerVote.end() || it->second != NOT_EMITED_YET)
                     continue;
-                g->CountRollVote(bot->GetGUID(), roll->itemGUID, GREED);
+                g->CountRollVote(bot->GetGUID(), roll->itemGUID, vote);
             }
         }
 

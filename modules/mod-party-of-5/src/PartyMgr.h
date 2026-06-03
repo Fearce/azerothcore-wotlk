@@ -130,6 +130,10 @@ namespace WowPsParty
     void DismissAllHenchmen(Player* requester);
     // Dismiss by guid (group-removal hook → uninvite = despawn).
     void DismissHenchmanByGuid(ObjectGuid henchGuid);
+    // Destroy a HENCHMAN's loose bag items (keeps ammo/reagents/shards + equipped
+    // gear). Henchman-guarded; no-op on the player or an enrolled alt-bot. Called
+    // on hire (start clean) and dismiss (leave clean) so henchman bags never fill.
+    void ClearHenchmanInventory(Player* hen);
 
     class PartyMgr
     {
