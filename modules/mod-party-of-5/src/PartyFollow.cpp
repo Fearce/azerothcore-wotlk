@@ -2364,19 +2364,27 @@ namespace WowPsParty
                 ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
 
             // Catch-up speed: every managed follower (an enrolled hero alt OR a
-            // hired henchman — both live in g_directives) runs 3% faster than the
-            // LEADER so it slowly closes any gap without looking obviously faster.
-            // Tracking the leader's rate (never the follower's own, which would
-            // compound every tick) makes one rule cover BOTH states: on foot the
-            // leader is 1.0 -> bot 1.03; mounted, the party's matched mount makes
-            // the leader's run rate the bot's natural mounted speed, so x1.03 is
-            // 103% of that — they keep creeping up even while everyone's riding.
+            // hired henchman — both live in g_directives) speeds up the FURTHER
+            // behind the leader it falls, so it matches pace when close but
+            // visibly hurries when it lags. Multiplier is applied to the LEADER's
+            // current run rate (never the follower's own, which would compound),
+            // so one rule covers BOTH states: on foot the leader is 1.0; mounted,
+            // the party's matched mount makes the leader's rate the bot's natural
+            // mounted speed, so the tiers mean "% of their mount speed" too.
+            //   <10y: 100% (no overshoot when already on top of the leader)
+            //   10-20y: 103%   20-30y: 105%   >30y: 110%
             // Only act while both share the same mount state, so a mid-transition
             // mount/dismount can't briefly fling an on-foot bot at mounted speed.
-            // The +/-0.01 guard avoids re-sending a speed packet once it matches.
+            // The +/-0.01 guard avoids re-sending a packet until the tier changes.
             if (follower->IsMounted() == leader->IsMounted())
             {
-                float const target = leader->GetSpeedRate(MOVE_RUN) * 1.03f;
+                float const dist = follower->GetDistance(leader);
+                float mult;
+                if      (dist < 10.0f) mult = 1.00f;
+                else if (dist < 20.0f) mult = 1.03f;
+                else if (dist < 30.0f) mult = 1.05f;
+                else                   mult = 1.10f;
+                float const target = leader->GetSpeedRate(MOVE_RUN) * mult;
                 float const cur    = follower->GetSpeedRate(MOVE_RUN);
                 if (cur < target - 0.01f || cur > target + 0.01f)
                     follower->SetSpeed(MOVE_RUN, target, true);
