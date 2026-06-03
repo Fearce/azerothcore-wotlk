@@ -389,6 +389,55 @@ namespace WowPsParty
         return uint32(targets.size());
     }
 
+    // Choose a kite destination at `dist` yards from `enemy` that the bot can
+    // retreat to WITHOUT backing into other hostile mobs — so kiting one mob
+    // doesn't aggro the whole room. Fans out from the straight-away direction
+    // (enemy -> bot) through progressively wider angles; the first candidate
+    // with no OTHER hostile within DANGER yards wins. Returns false when every
+    // retreat lane is crowded, so the caller holds position and keeps casting
+    // instead of pulling the dungeon. (Reachability/lava is still handled by
+    // MovePoint's forceDestination=false at the call site.)
+    static bool PickSafeKitePoint(Player* bot, Unit* enemy, float dist,
+                                  float& ox, float& oy, float& oz)
+    {
+        if (!bot || !enemy) return false;
+
+        std::list<Unit*> hostiles;
+        GatherHostilesAround(bot, 40.0f, hostiles);
+
+        float const DANGER = 12.0f;                 // keep candidate this clear
+        float const baseAngle = enemy->GetAngle(bot);  // directly away from enemy
+
+        // Direct retreat first, then symmetric fan-out (~20deg steps each side).
+        static float const offsets[] =
+            { 0.0f, 0.35f, -0.35f, 0.7f, -0.7f, 1.05f, -1.05f, 1.4f, -1.4f };
+
+        for (float off : offsets)
+        {
+            float x, y, z;
+            enemy->GetNearPoint(bot, x, y, z, 0.0f, dist, baseAngle + off);
+
+            bool crowded = false;
+            for (Unit* h : hostiles)
+            {
+                if (!h || h == enemy || !h->IsAlive()) continue;
+                float const dx = h->GetPositionX() - x;
+                float const dy = h->GetPositionY() - y;
+                float const dz = h->GetPositionZ() - z;
+                if (dx * dx + dy * dy + dz * dz < DANGER * DANGER)
+                {
+                    crowded = true;
+                    break;
+                }
+            }
+            if (crowded) continue;
+
+            ox = x; oy = y; oz = z;
+            return true;
+        }
+        return false;   // nowhere safe — hold and keep casting
+    }
+
     // Size of the densest cluster of hostiles that are all within `radius` of
     // ONE of them — i.e. "how many enemies are within R of each other". This
     // is the metric AoE placement wants (Blizzard / Flamestrike): a high value
@@ -2515,16 +2564,21 @@ namespace WowPsParty
             if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
             {
                 float x, y, z;
-                enemy->GetNearPoint(bot, x, y, z, 0.0f, want + 4.0f, enemy->GetAngle(bot));
-                // forceDestination=false: only move to a point the navmesh can
-                // actually REACH. Without it MovePoint forces the bot straight to
-                // the computed spot even when it's through a wall or over lava —
-                // a kite point away from a mob landed a mage in Ragefire's lava and
-                // dragged the party in. Now an unreachable kite point just stops the
-                // bot on valid ground (it stands and casts) instead of diving in.
-                bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
-                                                  0.0f, 0.0f, /*generatePath=*/true,
-                                                  /*forceDestination=*/false);
+                // Only kite to a spot clear of OTHER mobs — backing into a fresh
+                // pack pulls the whole room. If no retreat lane is safe, hold
+                // position and keep casting (don't move) rather than aggro more.
+                if (PickSafeKitePoint(bot, enemy, want + 4.0f, x, y, z))
+                {
+                    // forceDestination=false: only move to a point the navmesh can
+                    // actually REACH. Without it MovePoint forces the bot straight to
+                    // the computed spot even when it's through a wall or over lava —
+                    // a kite point away from a mob landed a mage in Ragefire's lava and
+                    // dragged the party in. Now an unreachable kite point just stops the
+                    // bot on valid ground (it stands and casts) instead of diving in.
+                    bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                                                      0.0f, 0.0f, /*generatePath=*/true,
+                                                      /*forceDestination=*/false);
+                }
             }
             return true;
         }
