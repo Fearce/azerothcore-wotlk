@@ -846,6 +846,49 @@ namespace WowPsParty
         return best;
     }
 
+    // "nearest" target mode: the NEAREST enemy the party is ALREADY engaged with,
+    // within the bot's range. Like PickLowestHealthTarget it only considers mobs
+    // in combat (attacking, or attacked by, the bot / its pet / a group member or
+    // their pets), so it NEVER walks the bot out to an idle, out-of-combat mob —
+    // the old SelectNearbyTarget grid search did exactly that, marching bots to
+    // their leash to poke a neutral monster. It just ranks the live combatants by
+    // distance. Returns nullptr if nothing qualifies (assist loop then falls back
+    // to party-defense).
+    static Unit* PickNearestEngagedTarget(Player* bot)
+    {
+        constexpr float MAX_RANGE = 40.0f;
+        Unit* best = nullptr;
+        float bestDist = 1e9f;
+        auto consider = [&](Unit* a)
+        {
+            if (!a || !a->IsAlive() || !a->IsInCombat()) return;
+            if (!bot->IsValidAttackTarget(a)) return;
+            float const d = bot->GetDistance(a);
+            if (d > MAX_RANGE) return;
+            if (d < bestDist) { bestDist = d; best = a; }
+        };
+        auto considerAround = [&](Unit* u)
+        {
+            if (!u) return;
+            for (Unit* a : u->getAttackers()) consider(a);   // mobs attacking u
+            if (Unit* v = u->GetVictim()) consider(v);       // and the mob u is attacking
+        };
+        considerAround(bot);
+        for (Unit* ctrl : bot->m_Controlled) considerAround(ctrl);
+        if (Group* g = bot->GetGroup())
+        {
+            for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
+            {
+                Player* m = itr->GetSource();
+                if (!m || !m->IsInWorld() || m == bot || m->GetMapId() != bot->GetMapId())
+                    continue;
+                considerAround(m);
+                for (Unit* ctrl : m->m_Controlled) considerAround(ctrl);
+            }
+        }
+        return best;
+    }
+
     // The party tank's current victim, for focus-fire ("tank" mode). The tank
     // may be a follower bot (found via the directive registry) or the
     // controlled char itself (then the leader's victim is the tank's victim).
@@ -1751,7 +1794,11 @@ namespace WowPsParty
         Unit* desired = nullptr;
         if (mode == "nearest")
         {
-            desired = bot->SelectNearbyTarget(nullptr, 40.0f);
+            // The nearest enemy the party is ALREADY fighting — never an idle,
+            // out-of-combat mob (the old grid search marched bots to their leash
+            // to engage a neutral monster). Falls back to party-defense, which
+            // is itself combat-only, so this can't initiate a pull.
+            desired = PickNearestEngagedTarget(bot);
             if (!desired) desired = pickPartyDefenseTarget();
         }
         else if (mode == "lowest")
