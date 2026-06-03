@@ -730,6 +730,7 @@ static void HandleEquip(Player* requester, std::string_view payload)
     auto secondTab = rest.find('\t');
     uint32 srcItemGuidLow = 0;
     int destSlot = -1;
+    int bagIdx   = -1;   // target bag slot 0..3 for a container; -1 = let core pick
     if (secondTab == std::string_view::npos)
     {
         srcItemGuidLow = std::strtoul(std::string(rest).c_str(), nullptr, 10);
@@ -737,7 +738,17 @@ static void HandleEquip(Player* requester, std::string_view payload)
     else
     {
         srcItemGuidLow = std::strtoul(std::string(rest.substr(0, secondTab)).c_str(), nullptr, 10);
-        destSlot       = std::atoi(std::string(rest.substr(secondTab + 1)).c_str());
+        std::string_view after = rest.substr(secondTab + 1);   // "<destSlot>[\t<bagIdx>]"
+        auto thirdTab = after.find('\t');
+        if (thirdTab == std::string_view::npos)
+        {
+            destSlot = std::atoi(std::string(after).c_str());
+        }
+        else
+        {
+            destSlot = std::atoi(std::string(after.substr(0, thirdTab)).c_str());
+            bagIdx   = std::atoi(std::string(after.substr(thirdTab + 1)).c_str());
+        }
     }
     if (!srcItemGuidLow) return;
 
@@ -832,6 +843,15 @@ static void HandleEquip(Player* requester, std::string_view payload)
         return;
     }
 
+    // If the user dropped a CONTAINER onto a SPECIFIC bag slot, target that slot
+    // (19+bagIdx) so it replaces the bag they aimed at — CanEquipItem(NULL_SLOT)
+    // always routed to the FIRST bag slot regardless of where they dropped.
+    uint8 const targetEqSlot =
+        (bagIdx >= 0 && bagIdx < int(INVENTORY_SLOT_BAG_END - INVENTORY_SLOT_BAG_START)
+         && srcItem->GetTemplate()->Class == ITEM_CLASS_CONTAINER)
+        ? uint8(INVENTORY_SLOT_BAG_START + bagIdx)
+        : uint8(NULL_SLOT);
+
     if (srcChar == dest)
     {
         // Same character: the item is already owned by dest, so CanEquipItem's
@@ -842,7 +862,7 @@ static void HandleEquip(Player* requester, std::string_view payload)
         // VANISH the item when the dest slot was full.
         uint16 eqDest;
         InventoryResult const result =
-            dest->CanEquipItem(NULL_SLOT, eqDest, srcItem, /*swap=*/true, /*not_loading=*/true);
+            dest->CanEquipItem(targetEqSlot, eqDest, srcItem, /*swap=*/true, /*not_loading=*/true);
         if (result != EQUIP_ERR_OK)
         {
             ChatHandler(requester->GetSession()).PSendSysMessage(
@@ -916,7 +936,7 @@ static void HandleEquip(Player* requester, std::string_view payload)
         // slot's current item travels back into the bag slot atomically.
         uint16 eqDest;
         InventoryResult const result =
-            dest->CanEquipItem(NULL_SLOT, eqDest, srcItem, /*swap=*/true, /*not_loading=*/true);
+            dest->CanEquipItem(targetEqSlot, eqDest, srcItem, /*swap=*/true, /*not_loading=*/true);
         if (result != EQUIP_ERR_OK)
         {
             // Couldn't equip after the move (e.g. combat, unique-equipped) —
