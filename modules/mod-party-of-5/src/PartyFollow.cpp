@@ -1944,6 +1944,15 @@ namespace WowPsParty
             return;
         }
 
+        // We have a target to engage — get OFF the floor first. A bot that
+        // finished drinking is left seated (SustainConsume sits it; nothing stands
+        // it back up once topped) and a seated unit can't move or cast, so it sat
+        // far from the fight doing nothing while the party got smacked. We're past
+        // the held-by-rotation guard above, so the bot isn't mid-drink; stand it up
+        // so the positioning below can actually drive it in.
+        if (bot->getStandState() != UNIT_STAND_STATE_STAND)
+            bot->SetStandState(UNIT_STAND_STATE_STAND);
+
         // Kite mode: the rotation has a keep_distance rule, so it OWNS the feet
         // (hops away from the enemy / toward the healer between casts). Lock the
         // victim + facing and yield all movement — installing the chase or the

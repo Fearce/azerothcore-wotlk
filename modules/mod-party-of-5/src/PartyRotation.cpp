@@ -715,6 +715,20 @@ namespace WowPsParty
         return castSpell;
     }
 
+    // True if ANY party member (leader, bots, henchmen) is in combat right now.
+    // A bot must NOT keep sitting and drinking/eating while the rest of the party
+    // is fighting — it has to stand up and join in, even at partial mana. (The
+    // consume hold otherwise re-sits + re-holds it every tick, so it sat far off
+    // doing nothing while the party got smacked.)
+    static bool AnyPartyMemberInCombat(Player* bot)
+    {
+        std::vector<Player*> party;
+        GatherPartyPlayers(bot, party, /*includeDead=*/false);
+        for (Player* m : party)
+            if (m && m->IsInCombat()) return true;
+        return false;
+    }
+
     // Keep a seated bot FAST-restoring HP/mana until topped: (re)apply the food
     // (433) / drink (430) auras whenever they lapse, and add a fraction of the max
     // pool every 1.5 s so recovery to full is ~7.5 s at any level. Shared by the
@@ -3082,7 +3096,14 @@ namespace WowPsParty
         // froze recovery at one slice ("consuming, mana stuck, takes forever").
         // Combat breaks the regen aura anyway, so the !IsInCombat gate hands
         // control straight back when a fight starts.
-        if (!bot->IsInCombat() && BotIsConsuming(bot) && !BotIsTopped(bot))
+        // Hold ONLY while genuinely resting: the bot isn't in combat, the WHOLE
+        // party is out of combat, it's actively consuming, and not yet topped. The
+        // instant ANY party member engages, drop the hold so AssistTarget can stand
+        // the bot up and send it into the fight (AnyPartyMemberInCombat is only
+        // evaluated once the cheap consuming/topped checks pass, so it's not a
+        // per-tick party scan).
+        if (!bot->IsInCombat() && BotIsConsuming(bot) && !BotIsTopped(bot)
+            && !AnyPartyMemberInCombat(bot))
         {
             SustainConsume(bot);
             if (trace)
