@@ -2612,22 +2612,36 @@ namespace WowPsParty
             bool const inLoS = bot->IsWithinLOSInMap(enemy);
             float const dist = bot->GetDistance(enemy);
 
-            // Kited around a corner: no line of sight to the target, so every
-            // cast fails and the bot just stares at the wall. Regaining LoS
-            // beats keeping distance — step back TOWARD the enemy (navmesh path
-            // rounds the corner into the room) until we can see it again. This
-            // is the "never stuck" guarantee: a blind kiter walks back into LoS
-            // instead of freezing.
+            // No line of sight — the target is behind a hill, a corner, or a
+            // doorway, so every cast fails and the bot just stares at the wall
+            // while the party fights without it. Regaining LoS beats keeping
+            // distance: step IN toward the enemy (the navmesh path crests the
+            // rise / rounds the corner) until we can see it again.
+            //
+            // The step MUST be relative to the CURRENT distance. The old code
+            // aimed at a fixed `want-4` from the enemy: the instant the bot
+            // reached that distance it recomputed the SAME spot every tick,
+            // MovePoint saw "already there", and the feet stopped — frozen on the
+            // slope. That is the bug in the report ("even a tiny hill is enough").
+            // Closing by a fixed 10y each arrival keeps real progress until LoS
+            // returns or we're basically on top of the mob (where LoS is a given).
+            // We give up some kite range doing this, but the kite-away branch
+            // below re-extends to a LoS-clear spot once we can see again; if the
+            // terrain offers none, the bot simply casts from here — never frozen.
             if (!inLoS)
             {
                 if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
                 {
+                    float const seekDist = std::max(dist - 10.0f, 5.0f);
                     float x, y, z;
-                    enemy->GetNearPoint(bot, x, y, z, 0.0f,
-                                        std::max(want - 4.0f, 5.0f),
+                    enemy->GetNearPoint(bot, x, y, z, 0.0f, seekDist,
                                         enemy->GetAngle(bot));
                     bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
-                                                      0.0f, 0.0f, true, false);
+                                                      0.0f, 0.0f, /*generatePath=*/true,
+                                                      /*forceDestination=*/false);
+                    LOG_INFO("module",
+                        "[WowPsParty Kite] guid={} no LoS — stepping in dist={} seek={}",
+                        bot->GetGUID().GetCounter(), dist, seekDist);
                 }
                 return true;
             }
