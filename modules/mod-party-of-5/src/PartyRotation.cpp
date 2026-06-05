@@ -1596,7 +1596,7 @@ namespace WowPsParty
         // weapons are their own ammo, so they skip this.
         if (needsAmmo && bot->GetUInt32Value(PLAYER_AMMO_ID) == 0) return false;
         if (bot->GetDistance(target) > 30.0f) return false;
-        if (!bot->IsWithinLOSInMap(target)) return false;
+        if (!bot->IsWithinLOSInMap(target, VMAP::ModelIgnoreFlags::M2)) return false;  // M2: match Spell::CheckCast
         // Already mid-shot? DON'T re-cast — re-issuing the shot every tick restarts
         // its wind-up/swing timer so it never lands ("interrupts itself forever,
         // animation restarts very fast"). Shoot (3018) and Throw (2764) live in the
@@ -1886,7 +1886,7 @@ namespace WowPsParty
                     castBlock = CastBlock::Position;
                     return reject("too close");
                 }
-                if (!bot->IsWithinLOSInMap(target))
+                if (!bot->IsWithinLOSInMap(target, VMAP::ModelIgnoreFlags::M2))  // M2: match Spell::CheckCast (ignore doodad clutter)
                 {
                     castBlock = CastBlock::Position;
                     return reject("no line of sight");
@@ -2580,7 +2580,7 @@ namespace WowPsParty
             if (!ranged || ranged->GetTemplate()->SubClass != ITEM_SUBCLASS_WEAPON_WAND)
                 return false;                                 // no wand equipped
             if (bot->GetDistance(v) > 30.0f) return false;    // wands are 30y
-            return bot->IsWithinLOSInMap(v);
+            return bot->IsWithinLOSInMap(v, VMAP::ModelIgnoreFlags::M2);  // M2: match Spell::CheckCast
         }
 
         // "shoot" — fire the equipped PHYSICAL ranged weapon: a gun/bow/crossbow
@@ -2609,7 +2609,12 @@ namespace WowPsParty
             float const want = float(std::atof(arg.c_str()));
             if (want <= 0.0f) return false;
 
-            bool const inLoS = bot->IsWithinLOSInMap(enemy);
+            // M2 = ignore decorative doodad models (mine carts, rails, lanterns,
+            // clutter rocks), EXACTLY as Spell::CheckCast does. The default check
+            // counts M2, so a bot 3y from a mob with a cart between them read
+            // "no LoS" and repositioned forever (the moonwalk) even though the
+            // spell would land — the AI's LoS MUST agree with the spell engine's.
+            bool const inLoS = bot->IsWithinLOSInMap(enemy, VMAP::ModelIgnoreFlags::M2);
             float const dist = bot->GetDistance(enemy);
 
             // Kited around a corner: no line of sight to the target, so every
@@ -2942,7 +2947,7 @@ namespace WowPsParty
         if (bot->isMoving()) return;                           // can't start a shot mid-move
         if (needAmmo && bot->GetUInt32Value(PLAYER_AMMO_ID) == 0) return;
         if (bot->GetDistance(victim) > maxRange) return;       // out of ranged range
-        if (!bot->IsWithinLOSInMap(victim)) return;
+        if (!bot->IsWithinLOSInMap(victim, VMAP::ModelIgnoreFlags::M2)) return;  // M2: match Spell::CheckCast
         if (autoSpell == 5019) bot->SetFacingToObject(victim); // wand repeat fails NOT_INFRONT otherwise
         SpellCastResult const r = bot->CastSpell(victim, autoSpell, false);
         if (r != SPELL_CAST_OK)

@@ -2175,7 +2175,10 @@ namespace WowPsParty
             // 18..28y) so it positions where its WHOLE kit reaches, not at a flat
             // 30y where only the longest spell is usable.
             float const d   = bot->GetDistance(desired);
-            bool  const los = bot->IsWithinLOSInMap(desired);
+            // M2: ignore doodad clutter, matching Spell::CheckCast — the default
+            // check counts decorative models, so a caster behind a mine cart/rail
+            // read "no LoS" and never settled to fire though the spell would land.
+            bool  const los = bot->IsWithinLOSInMap(desired, VMAP::ModelIgnoreFlags::M2);
             float const hold = WowPsParty::BotRangedCastHold(bot);
 
             // A mob is in melee on us → STAND and fight/heal, NEVER kite, no matter
