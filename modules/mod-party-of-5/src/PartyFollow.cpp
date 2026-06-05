@@ -2169,8 +2169,10 @@ namespace WowPsParty
             // already in a safe firing position.
             //   < 8y          too close -> stand & fight if a mob's on us, else
             //                              back straight out to ~13y to shoot
+            //   any d, noLoS            -> step toward the mob so the navmesh
+            //                              rounds the corner back into LoS
             //   8..hold +LoS  SAFE      -> stand still and shoot (no movement)
-            //   > hold / noLoS          -> close in (plain chase, no angle), once
+            //   > hold +LoS             -> close in (plain chase, no angle), once
             // `hold` is per-bot: the shortest-range nuke in its rotation (clamped
             // 18..28y) so it positions where its WHOLE kit reaches, not at a flat
             // 30y where only the longest spell is usable.
@@ -2231,6 +2233,35 @@ namespace WowPsParty
                 return;
             }
 
+            // NO LINE OF SIGHT — the bot is positioned behind a corner/rock, so
+            // every cast fails SPELL_FAILED_LINE_OF_SIGHT and it freezes staring
+            // at the wall (Nisseiwo in the bug report: in range, full mana, doing
+            // nothing). The MoveChase fallback below does NOT fix this — a chase
+            // only enforces DISTANCE, so while already inside `hold` range it's a
+            // no-op and the feet never move. Must be a dedicated band: step TOWARD
+            // the target so the navmesh path rounds the corner into the room,
+            // restoring LoS; the moment it can see the mob the `los` band below
+            // stops it to cast. Same "walk back into LoS, never freeze" guarantee
+            // the kiter has in PartyRotation's keep_distance_enemy rule. Aim a few
+            // yards INSIDE current distance (and inside `hold`) so the route is
+            // always inward — a point farther out than we already are wouldn't
+            // round the corner. Guard on POINT motion so we don't re-issue (and
+            // reset) the path every tick.
+            if (!los)
+            {
+                if (mg != POINT_MOTION_TYPE)
+                {
+                    float const seekDist = std::max(6.0f, std::min(hold, d) - 5.0f);
+                    float lx, ly, lz;
+                    desired->GetNearPoint(bot, lx, ly, lz, 0.0f, seekDist,
+                                          desired->GetAngle(bot));
+                    bot->GetMotionMaster()->MovePoint(0, lx, ly, lz);
+                    AssistLog(gLow, "ranged: no LoS — moving up to round the corner");
+                }
+                bot->SetFacingToObject(desired);
+                return;
+            }
+
             if (d <= hold && los)
             {
                 // SAFE — the user's "don't move when it can ranged attack". Kill
@@ -2259,8 +2290,9 @@ namespace WowPsParty
                 return;
             }
 
-            // Out of range or no line of sight -> close in. Plain chase (no angle
-            // = no orbit). Install once; a running chase keeps maintaining range.
+            // Out of range (and in LoS — the no-LoS case is handled above) -> close
+            // in. Plain chase (no angle = no orbit). Install once; a running chase
+            // keeps maintaining range.
             // Upper bound = the per-bot hold, so the bot settles INSIDE its kit's
             // reach (not back at 25y where a shorter nuke is still out of range).
             if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
