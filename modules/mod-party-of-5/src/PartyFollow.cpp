@@ -2169,8 +2169,8 @@ namespace WowPsParty
             // already in a safe firing position.
             //   < 8y          too close -> stand & fight if a mob's on us, else
             //                              back straight out to ~13y to shoot
-            //   any d, noLoS            -> step toward the mob so the navmesh
-            //                              rounds the corner back into LoS
+            //   any d, noLoS            -> chase the mob (navmesh routes up stairs
+            //                              / round doorways) until back in LoS
             //   8..hold +LoS  SAFE      -> stand still and shoot (no movement)
             //   > hold +LoS             -> close in (plain chase, no angle), once
             // `hold` is per-bot: the shortest-range nuke in its rotation (clamped
@@ -2233,32 +2233,37 @@ namespace WowPsParty
                 return;
             }
 
-            // NO LINE OF SIGHT — the bot is positioned behind a corner/rock, so
-            // every cast fails SPELL_FAILED_LINE_OF_SIGHT and it freezes staring
-            // at the wall (Nisseiwo in the bug report: in range, full mana, doing
-            // nothing). The MoveChase fallback below does NOT fix this — a chase
-            // only enforces DISTANCE, so while already inside `hold` range it's a
-            // no-op and the feet never move. Must be a dedicated band: step TOWARD
-            // the target so the navmesh path rounds the corner into the room,
-            // restoring LoS; the moment it can see the mob the `los` band below
-            // stops it to cast. Same "walk back into LoS, never freeze" guarantee
-            // the kiter has in PartyRotation's keep_distance_enemy rule. Aim a few
-            // yards INSIDE current distance (and inside `hold`) so the route is
-            // always inward — a point farther out than we already are wouldn't
-            // round the corner. Guard on POINT motion so we don't re-issue (and
-            // reset) the path every tick.
+            // NO LINE OF SIGHT — the target is behind a corner/rock, through a
+            // doorway, or (the common one) up a flight of stairs where the rest of
+            // the party is already fighting. Every cast fails ("You are too far
+            // away!" / SPELL_FAILED_LINE_OF_SIGHT) and the bot freezes staring at
+            // the wall while the party fights without it.
+            //
+            // The fix is a CHASE, not a hand-computed move point. MoveChase routes
+            // the WHOLE path on the navmesh straight to the target, so it climbs the
+            // stairs and rounds the doorway exactly like a melee bot closing in. An
+            // earlier attempt used MovePoint to a spot on the bot->target bearing a
+            // few yards inward — that fails here because the straight bearing is the
+            // BLOCKED line: the point lands on the bot's own side of the wall (Z
+            // projected across a stair transition is garbage too), so the bot shuffled
+            // sideways to the nearest doorway instead of pathing up to the fight.
+            //
+            // Chase to a SHORT range (8y) so the chase always has somewhere to go —
+            // the freeze we're fixing is a chase to `hold` no-op'ing while already
+            // within hold. We rarely reach 8y: LoS clears mid-climb and the `los`
+            // band below stops us at range to cast. Re-issue if we're not already
+            // closing (a stale in-range chase reports "arrived" and stops moving even
+            // with no LoS — exactly the freeze — so guard on isMoving, not just the
+            // generator type).
             if (!los)
             {
-                if (mg != POINT_MOTION_TYPE)
-                {
-                    float const seekDist = std::max(6.0f, std::min(hold, d) - 5.0f);
-                    float lx, ly, lz;
-                    desired->GetNearPoint(bot, lx, ly, lz, 0.0f, seekDist,
-                                          desired->GetAngle(bot));
-                    bot->GetMotionMaster()->MovePoint(0, lx, ly, lz);
-                    AssistLog(gLow, "ranged: no LoS — moving up to round the corner");
-                }
+                if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
+                    bot->Attack(desired, false);
+                bool const closingIn = (mg == CHASE_MOTION_TYPE) && bot->isMoving();
+                if (!closingIn)
+                    bot->GetMotionMaster()->MoveChase(desired, ChaseRange(0.0f, 8.0f));
                 bot->SetFacingToObject(desired);
+                AssistLog(gLow, "ranged: no LoS — chasing up to the fight to regain sight");
                 return;
             }
 
