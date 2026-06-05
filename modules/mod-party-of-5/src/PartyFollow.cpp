@@ -2169,10 +2169,8 @@ namespace WowPsParty
             // already in a safe firing position.
             //   < 8y          too close -> stand & fight if a mob's on us, else
             //                              back straight out to ~13y to shoot
-            //   any d, noLoS            -> chase the mob (navmesh routes up stairs
-            //                              / round doorways) until back in LoS
             //   8..hold +LoS  SAFE      -> stand still and shoot (no movement)
-            //   > hold +LoS             -> close in (plain chase, no angle), once
+            //   > hold / noLoS          -> close in (plain chase, no angle), once
             // `hold` is per-bot: the shortest-range nuke in its rotation (clamped
             // 18..28y) so it positions where its WHOLE kit reaches, not at a flat
             // 30y where only the longest spell is usable.
@@ -2233,40 +2231,6 @@ namespace WowPsParty
                 return;
             }
 
-            // NO LINE OF SIGHT — the target is behind a corner/rock, through a
-            // doorway, or (the common one) up a flight of stairs where the rest of
-            // the party is already fighting. Every cast fails ("You are too far
-            // away!" / SPELL_FAILED_LINE_OF_SIGHT) and the bot freezes staring at
-            // the wall while the party fights without it.
-            //
-            // The fix is a CHASE, not a hand-computed move point. MoveChase routes
-            // the WHOLE path on the navmesh straight to the target, so it climbs the
-            // stairs and rounds the doorway exactly like a melee bot closing in. An
-            // earlier attempt used MovePoint to a spot on the bot->target bearing a
-            // few yards inward — that fails here because the straight bearing is the
-            // BLOCKED line: the point lands on the bot's own side of the wall (Z
-            // projected across a stair transition is garbage too), so the bot shuffled
-            // sideways to the nearest doorway instead of pathing up to the fight.
-            //
-            // Chase to a SHORT range (8y) so the chase always has somewhere to go —
-            // the freeze we're fixing is a chase to `hold` no-op'ing while already
-            // within hold. We rarely reach 8y: LoS clears mid-climb and the `los`
-            // band below stops us at range to cast. Re-issue if we're not already
-            // closing (a stale in-range chase reports "arrived" and stops moving even
-            // with no LoS — exactly the freeze — so guard on isMoving, not just the
-            // generator type).
-            if (!los)
-            {
-                if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
-                    bot->Attack(desired, false);
-                bool const closingIn = (mg == CHASE_MOTION_TYPE) && bot->isMoving();
-                if (!closingIn)
-                    bot->GetMotionMaster()->MoveChase(desired, ChaseRange(0.0f, 8.0f));
-                bot->SetFacingToObject(desired);
-                AssistLog(gLow, "ranged: no LoS — chasing up to the fight to regain sight");
-                return;
-            }
-
             if (d <= hold && los)
             {
                 // SAFE — the user's "don't move when it can ranged attack". Kill
@@ -2295,9 +2259,8 @@ namespace WowPsParty
                 return;
             }
 
-            // Out of range (and in LoS — the no-LoS case is handled above) -> close
-            // in. Plain chase (no angle = no orbit). Install once; a running chase
-            // keeps maintaining range.
+            // Out of range or no line of sight -> close in. Plain chase (no angle
+            // = no orbit). Install once; a running chase keeps maintaining range.
             // Upper bound = the per-bot hold, so the bot settles INSIDE its kit's
             // reach (not back at 25y where a shorter nuke is still out of range).
             if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
