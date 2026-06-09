@@ -2029,6 +2029,10 @@ namespace WowPsParty
         // lower-priority rule.
         auto faceAndCast = [bot, &lastCastResult](Unit* target, uint32 spellId) -> bool
         {
+            // A channel that just got cut short is on a short backoff — skip it so a
+            // channel that can't sustain (still breaking) doesn't spam-re-cast and
+            // drain the whole mana pool; the rotation uses cheaper spells instead.
+            if (ChannelOnBackoff(bot, spellId)) return false;
             // How long to stay planted: cast time, or — for a CHANNELED spell
             // (Arcane Missiles, Mind Flay, Drain Life) whose CalcCastTime is 0 —
             // the channel duration. Movement clears UNIT_STATE_CASTING and breaks
@@ -2053,6 +2057,23 @@ namespace WowPsParty
                 isChannel = info->IsChanneled() && info->GetDuration() > 0;
                 if (isChannel && info->GetDuration() > holdMs)
                     holdMs = info->GetDuration();
+            }
+            // A CHANNEL cancels the instant the caster's position changes — and that
+            // includes the TAIL of a stop-spline. The bot may be mid-MoveChase
+            // (closing to range) or still decelerating from a prior stop when the
+            // rotation picks Mind Flay; casting then starts the channel while it's
+            // technically still moving, so it dies on the next motion update — zero
+            // damage, re-cast, mana drain (the live Mind Flay bug, with HP steady so
+            // it isn't melee pushback). So if we want a channel but we're still
+            // moving, HALT now and DEFER one tick — it fires next tick once truly
+            // planted. Instant/cast-time spells don't need this (an instant doesn't
+            // care, and a cast-time spell's own plant below covers it).
+            if (isChannel && bot->isMoving())
+            {
+                bot->StopMoving();
+                bot->GetMotionMaster()->Clear();
+                WowPsParty::HoldFollower(bot->GetGUID(), 800);
+                return false;
             }
             // Plant ONLY for spells with a stationary window (cast time or
             // channel): a moving Player's motion update clears UNIT_STATE_CASTING
@@ -2156,6 +2177,16 @@ namespace WowPsParty
             // stands at range to cast these, so a hostile within 8y of IT (not the
             // target cluster downrange) means a mob has reached the caster.
             if (isChannel && CountHostilesWithin(bot, 8.0f) > 0) return false;
+            // A channel cancels if the caster moves — including the tail of a stop.
+            // If we're still moving, halt and DEFER one tick so the channel starts
+            // from a truly planted position (else it dies instantly, 0 ticks).
+            if (isChannel && bot->isMoving())
+            {
+                bot->StopMoving();
+                bot->GetMotionMaster()->Clear();
+                WowPsParty::HoldFollower(bot->GetGUID(), 800);
+                return false;
+            }
             if (holdMs > 0)
             {
                 bot->StopMoving();
