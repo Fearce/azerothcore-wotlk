@@ -1672,6 +1672,36 @@ namespace WowPsParty
                                 // stack on index 0; 7+ followers ring out by dist)
     };
 
+    // True when this party is running a dungeon led by a REAL-PLAYER tank — the
+    // case where DPS bots must wait for the human to pull + hold aggro instead of
+    // pre-pulling or piling onto whatever the tank merely auto-attacks/selects.
+    // Scoped exactly to Mill's request: dungeons only, human (not bot) tank only.
+    // A bot-tank party (the human leader is DPS) returns false here and keeps the
+    // existing lead-tank pull coordination (IsTankPulling / IsPartyPullPending).
+    static bool HumanTankLeadActive(Player* bot, Player* leader)
+    {
+        if (!bot || !leader) return false;
+        if (!bot->GetMap() || !bot->GetMap()->IsDungeon()) return false;
+        if (sPlayerbotsMgr.GetPlayerbotAI(leader)) return false;   // leader is a bot, not human
+        return RoleForGuid(leader->GetGUID()) == "tank";
+    }
+
+    // True when `mob` is already fighting THIS bot's party — its current target is
+    // the leader or one of the party bots. Used to gate DPS engagement behind a
+    // human tank's pull: until the mob is actually swinging at a party member (the
+    // tank connected and grabbed it), the DPS bots hold.
+    static bool MobFightingParty(Player* bot, Unit* mob)
+    {
+        if (!mob) return false;
+        Unit* const v = mob->GetVictim();
+        if (!v) return false;
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(bot->GetGUID(), party);
+        for (ObjectGuid const& g : party)
+            if (v->GetGUID() == g) return true;
+        return false;
+    }
+
     void AssistTarget(Player* bot)
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
@@ -1901,6 +1931,28 @@ namespace WowPsParty
         // Final safety: never hand back a dead/invalid target.
         if (desired && (!desired->IsAlive() || !bot->IsValidAttackTarget(desired)))
             desired = nullptr;
+
+        // ---- Wait for a real-player TANK to pull (dungeons only) -------------
+        // In a dungeon led by a human tank, DPS bots must NOT pre-pull or pile
+        // onto a mob the tank is merely auto-attacking / selecting as pull prep —
+        // they wait until the mob is actually fighting the party (the tank
+        // connected and grabbed it), then assist. Mill: "wait for me to make the
+        // pulls and grab aggro before going ham"; and right-clicking an enemy to
+        // start auto-attack is normal tank prep, not a 'go' signal. A bot already
+        // BEING attacked (mob's victim is a party member, incl. itself) is exempt
+        // via MobFightingParty, so it still defends itself. Tanks and healers are
+        // unaffected (healers heal from position; the human tank IS the puller).
+        {
+            std::string const myRole = RoleForGuid(bot->GetGUID());
+            if (desired && myRole != "tank" && myRole != "healer"
+                && HumanTankLeadActive(bot, leader)
+                && !MobFightingParty(bot, desired))
+            {
+                if (bot->GetVictim()) bot->AttackStop();
+                AssistLog(gLow, "human-tank dungeon: holding until the tank pulls + grabs aggro");
+                return;
+            }
+        }
 
         // Retarget throttle. If we're already on a live, valid victim, don't
         // abandon it for a DIFFERENT one more than once per cooldown — that's
