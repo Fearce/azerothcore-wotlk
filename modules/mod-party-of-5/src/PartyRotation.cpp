@@ -956,23 +956,45 @@ namespace WowPsParty
     // stop firing the rotation for the duration, the channel survives and the
     // core slot DOES populate — so after a short grace we trust it to release the
     // lock early if the channel really ended (target died, bot stunned).
-    struct ChannelLock { uint32 untilMs = 0; uint32 graceUntilMs = 0; };
+    struct ChannelLock { uint32 untilMs = 0; uint32 graceUntilMs = 0; uint32 spellId = 0; };
     static std::mutex g_channelLockMutex;
     static std::unordered_map<uint32, ChannelLock> g_channelLocks;
+    // (guidLow<<32 | spellId) -> ms until which the bot must NOT re-cast that
+    // channel. Set when a channel is cut short (see ChannelCommitActive): a mage
+    // being meleed loses ~25% of a channel's duration PER HIT, so an 8s Blizzard
+    // gets pushed off in ~1s and the bot would otherwise re-dump it every GCD,
+    // draining its whole mana pool (Kevin's report). Backing the spell off lets
+    // the rotation fall through to cheaper/instant spells (Frostbolt) and peels
+    // (Frost Nova / kite) instead.
+    static std::unordered_map<uint64, uint32> g_channelBackoff;
 
-    static void MarkChannelCommit(Player* bot, uint32 durationMs)
+    static void MarkChannelCommit(Player* bot, uint32 spellId, uint32 durationMs)
     {
         std::lock_guard<std::mutex> lock(g_channelLockMutex);
         uint32 const now = getMSTime();
         ChannelLock& cl = g_channelLocks[bot->GetGUID().GetCounter()];
         cl.untilMs      = now + durationMs;
         cl.graceUntilMs = now + 1500;   // trust "just cast" until the slot registers
+        cl.spellId      = spellId;
+    }
+
+    // True for `spellId` while the bot is on cut-short backoff for it.
+    static bool ChannelOnBackoff(Player* bot, uint32 spellId)
+    {
+        std::lock_guard<std::mutex> lock(g_channelLockMutex);
+        uint64 const key = (uint64(bot->GetGUID().GetCounter()) << 32) | spellId;
+        auto it = g_channelBackoff.find(key);
+        if (it == g_channelBackoff.end()) return false;
+        if (getMSTime() >= it->second) { g_channelBackoff.erase(it); return false; }
+        return true;
     }
 
     // True while the bot is committed to a channel it just started. Within the
     // grace window we trust the cast; past it we trust the core channel slot
     // (kept alive because we stopped clipping it), with a hard duration cap so a
-    // never-registering channel can't freeze the bot forever.
+    // never-registering channel can't freeze the bot forever. When the channel
+    // ends well before its expected duration, it was cut short (pushback from
+    // melee, an interrupt) — back the spell off so the bot stops re-dumping it.
     static bool ChannelCommitActive(Player* bot)
     {
         std::lock_guard<std::mutex> lock(g_channelLockMutex);
@@ -982,7 +1004,17 @@ namespace WowPsParty
         if (now >= it->second.untilMs) { g_channelLocks.erase(it); return false; }
         if (now < it->second.graceUntilMs) return true;
         if (bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL)) return true;
-        g_channelLocks.erase(it);   // channel ended early — let the bot resume
+        // Channel gone with >1s still expected = cut short. Back it off ~5s.
+        if (it->second.spellId && now + 1000 < it->second.untilMs)
+        {
+            uint64 const key =
+                (uint64(bot->GetGUID().GetCounter()) << 32) | it->second.spellId;
+            g_channelBackoff[key] = now + 5000;
+            LOG_INFO("module",
+                "[WowPsParty Rotation] channel {} on guid={} cut short — backing off 5s",
+                it->second.spellId, bot->GetGUID().GetCounter());
+        }
+        g_channelLocks.erase(it);
         return false;
     }
 
@@ -1990,6 +2022,9 @@ namespace WowPsParty
         // lower-priority rule.
         auto faceAndCast = [bot, &lastCastResult](Unit* target, uint32 spellId) -> bool
         {
+            // A channel that just got cut short (pushback) is on backoff — skip it
+            // so the rotation falls through to cheaper/instant spells.
+            if (ChannelOnBackoff(bot, spellId)) return false;
             // How long to stay planted: cast time, or — for a CHANNELED spell
             // (Arcane Missiles, Mind Flay, Drain Life) whose CalcCastTime is 0 —
             // the channel duration. Movement clears UNIT_STATE_CASTING and breaks
@@ -2044,7 +2079,7 @@ namespace WowPsParty
                 return false;
             }
             // Commit to the channel so the rotation can't re-cast/clip it.
-            if (isChannel) MarkChannelCommit(bot, uint32(holdMs));
+            if (isChannel) MarkChannelCommit(bot, spellId, uint32(holdMs));
             return true;
         };
 
@@ -2054,6 +2089,9 @@ namespace WowPsParty
         // faceAndCast.
         auto faceAndCastAt = [bot](Unit* aimAt, uint32 spellId) -> bool
         {
+            // Skip a ground channel that was just cut short (pushback) — see
+            // ChannelCommitActive. Falls through to the next rule.
+            if (ChannelOnBackoff(bot, spellId)) return false;
             if (aimAt) bot->SetFacingToObject(aimAt);
             // castMs = cast-bar time (drives the predictive lead below — a channel
             // places INSTANTLY so it gets no lead). holdMs = how long to stay
@@ -2122,7 +2160,7 @@ namespace WowPsParty
             }
             if (isChannel)
             {
-                MarkChannelCommit(bot, uint32(holdMs));
+                MarkChannelCommit(bot, spellId, uint32(holdMs));
                 // One-time-per-cast confirmation of how the core sees this channel:
                 // whether the channel slot actually registered. Throttled per
                 // (bot, spell). If channelSlot=0 here, the core isn't tracking the
