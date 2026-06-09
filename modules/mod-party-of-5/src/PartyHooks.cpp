@@ -152,6 +152,54 @@ namespace
                             count += it->GetCount();
         return count;
     }
+
+    // Finish a quest turn-in on a hero WITHOUT granting the reward item: consume
+    // the required/dropped quest items, free the log slot, and mark it rewarded.
+    // Used when the hero's bags are too full for the reward (CanRewardQuest
+    // false) and by the login reconciler. Without it, a full-bagged hero is left
+    // stuck COMPLETE-but-not-rewarded — an orphan "?" turn-in marker, quest items
+    // clogging its bags, and the NEXT turn-in's CanRewardQuest then failing too
+    // (the desync Viv hit). The leader already received the actual reward into
+    // the shared inventory, so the hero only needs lockstep + a clean bag.
+    static void ForceCompleteTurnIn(Player* p, Quest const* quest)
+    {
+        if (!p || !quest) return;
+        uint32 const questId = quest->GetQuestId();
+
+        // Consume required + dropped quest items (mirrors Player::RewardQuest).
+        for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
+        {
+            if (ItemTemplate const* it = sObjectMgr->GetItemTemplate(quest->RequiredItemId[i]))
+            {
+                if (quest->RequiredItemCount[i] > 0 && it->Bonding == BIND_QUEST_ITEM
+                    && !quest->IsRepeatable()
+                    && !p->HasQuestForItem(quest->RequiredItemId[i], questId, true))
+                    p->DestroyItemCount(quest->RequiredItemId[i], 9999, true);
+                else if (quest->RequiredItemCount[i] > 0)
+                    p->DestroyItemCount(quest->RequiredItemId[i], quest->RequiredItemCount[i], true);
+            }
+        }
+        for (uint8 i = 0; i < QUEST_SOURCE_ITEM_IDS_COUNT; ++i)
+        {
+            if (ItemTemplate const* it = sObjectMgr->GetItemTemplate(quest->ItemDrop[i]))
+            {
+                if (quest->ItemDropQuantity[i] > 0 && it->Bonding == BIND_QUEST_ITEM
+                    && !quest->IsRepeatable()
+                    && !p->HasQuestForItem(quest->ItemDrop[i], questId))
+                    p->DestroyItemCount(quest->ItemDrop[i], 9999, true);
+                else if (quest->ItemDropQuantity[i] > 0)
+                    p->DestroyItemCount(quest->ItemDrop[i], quest->ItemDropQuantity[i], true);
+            }
+        }
+        p->TakeQuestSourceItem(questId, false);
+        p->RemoveTimedQuest(questId);
+        uint16 const slot = p->FindQuestSlot(questId);
+        if (slot < MAX_QUEST_LOG_SIZE)
+            p->SetQuestSlot(slot, 0);
+        p->RemoveActiveQuest(questId);
+        p->SetRewardedQuest(questId);          // lockstep on quest chains
+        p->learnQuestRewardedSpells(quest);    // any spell/recipe the turn-in grants
+    }
 }
 
 class PartyHooksPlayerScript : public PlayerScript
@@ -729,12 +777,74 @@ void WowPsParty_OnQuestRewarded_Trampoline(Player* who, Quest const* quest, uint
         // Verifies the (now-complete) quest is rewardable and the chosen reward
         // fits the hero's bags. For a rare auto-reward tracking quest CompleteQuest
         // already rewarded it, so this returns false and we don't double-reward.
-        if (!p->CanRewardQuest(quest, choice, false)) continue;
-        p->RewardQuest(quest, choice, nullptr, false);
-        ++rewarded;
+        if (p->CanRewardQuest(quest, choice, false))
+        {
+            p->RewardQuest(quest, choice, nullptr, false);
+            ++rewarded;
+        }
+        else if (p->GetQuestStatus(questId) != QUEST_STATUS_REWARDED)
+        {
+            // Bags too full (or otherwise un-rewardable) — finish the turn-in
+            // WITHOUT the reward item rather than leaving the quest stuck. See
+            // ForceCompleteTurnIn: this is what stops the orphan-"?" + clogged-bag
+            // desync that snowballs (a full bag fails every later turn-in too).
+            ForceCompleteTurnIn(p, quest);
+        }
     }
     WowPsParty::g_heroQuestTurnin  = false;
     WowPsParty::g_propagatingQuest = false;
+}
+
+// Heal quest desync across a loaded party. If ANY member has rewarded a
+// (non-repeatable) quest but another member still carries it as an active quest,
+// that member is stuck — silently turn it in so its log slot, "?" turn-in marker
+// and quest items clear and it stays in lockstep on the chain. Called from the
+// deferred OnActiveLogin once all party members are in-world. This is what
+// repairs an ALREADY-broken account (Viv's): the next login reconciles it. It
+// also backstops any future case the live turn-in mirror misses.
+void WowPsParty::ReconcilePartyQuests(Player* leader)
+{
+    if (!IsEnabled() || !leader || !leader->GetSession()) return;
+    if (!ProgressionShared(leader)) return;
+
+    std::vector<Player*> members{ leader };
+    for (Player* p : LoadedPartyPeers(leader->GetSession()->GetAccountId(), leader))
+        members.push_back(p);
+    if (members.size() < 2) return;
+
+    // Union of non-repeatable quests anyone in the party has already rewarded.
+    std::unordered_set<uint32> rewardedUnion;
+    for (Player* m : members)
+        for (uint32 qid : m->getRewardedQuests())
+            if (Quest const* q = sObjectMgr->GetQuestTemplate(qid))
+                if (!q->IsRepeatable())
+                    rewardedUnion.insert(qid);
+    if (rewardedUnion.empty()) return;
+
+    // Collect (member, quest) desyncs first, then heal — ForceCompleteTurnIn
+    // clears the log slot we'd be iterating.
+    std::vector<std::pair<Player*, Quest const*>> stuck;
+    for (Player* m : members)
+        for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const qid = m->GetQuestSlotQuestId(slot);
+            if (!qid || !rewardedUnion.count(qid)) continue;
+            if (m->getRewardedQuests().count(qid)) continue;   // already done here
+            if (Quest const* q = sObjectMgr->GetQuestTemplate(qid))
+                stuck.emplace_back(m, q);
+        }
+    if (stuck.empty()) return;
+
+    g_propagatingQuest = true;   // don't re-enter the accept/abandon mirrors
+    g_heroQuestTurnin  = true;
+    for (auto const& [m, q] : stuck)
+        ForceCompleteTurnIn(m, q);
+    g_heroQuestTurnin  = false;
+    g_propagatingQuest = false;
+
+    LOG_INFO("module",
+        "[WowPsParty] quest reconcile: healed {} stuck quest(s) for account {}",
+        stuck.size(), leader->GetSession()->GetAccountId());
 }
 
 // Trampoline called from the [WowPsParty PATCH] in Spell.cpp::CheckItems.

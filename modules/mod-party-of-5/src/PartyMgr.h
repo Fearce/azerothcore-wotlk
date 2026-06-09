@@ -119,6 +119,12 @@ namespace WowPsParty
     // them — this is the replacement.
     void MaintainBotConsumables(Player* bot);
 
+    // Heal quest desync across a loaded party: any quest a peer has rewarded but
+    // this member still carries active gets silently turned in (clears the stuck
+    // "?" marker + quest items). Called from the deferred login once the party is
+    // assembled — repairs an already-broken account and backstops the live mirror.
+    void ReconcilePartyQuests(Player* leader);
+
     // Hire `candidateGuid` for `requester`. Validates gold + party space,
     // deducts the fee, spawns the bot and registers the follow directive.
     bool HireHenchman(Player* requester, uint32 candidateGuid, std::string const& role,

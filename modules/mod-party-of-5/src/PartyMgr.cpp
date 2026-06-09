@@ -1867,6 +1867,12 @@ namespace WowPsParty
                     ai->ChangeStrategy("+gather", BOT_STATE_NON_COMBAT);
                 }
             }
+
+            // All 5 are loaded and grouped now — heal any quest desync (a quest
+            // one char turned in but another is stuck holding: orphan "?" marker,
+            // quest items clogging bags). Repairs an already-broken account on the
+            // next login and backstops the live turn-in mirror.
+            WowPsParty::ReconcilePartyQuests(leader);
         }, std::chrono::seconds(6));
 
         LOG_INFO("module",
