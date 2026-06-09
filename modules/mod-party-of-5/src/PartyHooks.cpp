@@ -212,8 +212,32 @@ public:
         PLAYERHOOK_ON_CREATURE_KILL,
         PLAYERHOOK_ON_STORE_NEW_ITEM,
         PLAYERHOOK_ON_LEVEL_CHANGED,
-        PLAYERHOOK_ON_QUEST_ABANDON
+        PLAYERHOOK_ON_QUEST_ABANDON,
+        PLAYERHOOK_ON_LEARN_TAXI_NODE
     }) { }
+
+    // Mirror a freshly-discovered FLIGHT PATH (taxi node) to every other LOADED
+    // hero on the account, so flight paths are effectively ACCOUNT-BOUND: discover
+    // once on the active char and all your heroes know it. Only the active char
+    // physically visits flight masters (the rest follow as bots and never talk to
+    // the NPC), so without this they'd never learn a node and couldn't fly when you
+    // later play them. Henchmen (hired pool bots) are excluded — not your heroes.
+    // The engine only calls this for a genuinely NEW node, so no spam. The peers
+    // are bots (no real client), so SetTaximaskNode on their in-memory mask is all
+    // that's needed — it persists on their next character save.
+    void OnPlayerLearnTaxiNode(Player const* player, uint32 nodeId) override
+    {
+        using namespace WowPsParty;
+        if (!IsEnabled() || !player || !player->GetSession() || !nodeId) return;
+        Player* learner = const_cast<Player*>(player);   // hook is const; we only read it
+        if (!ProgressionShared(learner)) return;         // solo / companions off: don't mirror
+        if (!sPartyMgr.GetSlotForGuid(learner->GetGUID().GetCounter()))
+            return;   // discoverer isn't one of THIS account's enrolled heroes
+
+        for (Player* peer : LoadedPartyPeers(learner->GetSession()->GetAccountId(), learner))
+            if (sPartyMgr.GetSlotForGuid(peer->GetGUID().GetCounter()))   // enrolled hero, never a henchman
+                peer->m_taxi.SetTaximaskNode(nodeId);
+    }
 
     // Mirror a quest ABANDON across the party: when one party character drops a
     // quest, every other LOADED hero that still has it in their log drops it too
