@@ -795,58 +795,6 @@ void WowPsParty_OnQuestRewarded_Trampoline(Player* who, Quest const* quest, uint
     WowPsParty::g_propagatingQuest = false;
 }
 
-// Heal quest desync across a loaded party. If ANY member has rewarded a
-// (non-repeatable) quest but another member still carries it as an active quest,
-// that member is stuck — silently turn it in so its log slot, "?" turn-in marker
-// and quest items clear and it stays in lockstep on the chain. Called from the
-// deferred OnActiveLogin once all party members are in-world. This is what
-// repairs an ALREADY-broken account (Viv's): the next login reconciles it. It
-// also backstops any future case the live turn-in mirror misses.
-void WowPsParty::ReconcilePartyQuests(Player* leader)
-{
-    if (!IsEnabled() || !leader || !leader->GetSession()) return;
-    if (!ProgressionShared(leader)) return;
-
-    std::vector<Player*> members{ leader };
-    for (Player* p : LoadedPartyPeers(leader->GetSession()->GetAccountId(), leader))
-        members.push_back(p);
-    if (members.size() < 2) return;
-
-    // Union of non-repeatable quests anyone in the party has already rewarded.
-    std::unordered_set<uint32> rewardedUnion;
-    for (Player* m : members)
-        for (uint32 qid : m->getRewardedQuests())
-            if (Quest const* q = sObjectMgr->GetQuestTemplate(qid))
-                if (!q->IsRepeatable())
-                    rewardedUnion.insert(qid);
-    if (rewardedUnion.empty()) return;
-
-    // Collect (member, quest) desyncs first, then heal — ForceCompleteTurnIn
-    // clears the log slot we'd be iterating.
-    std::vector<std::pair<Player*, Quest const*>> stuck;
-    for (Player* m : members)
-        for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
-        {
-            uint32 const qid = m->GetQuestSlotQuestId(slot);
-            if (!qid || !rewardedUnion.count(qid)) continue;
-            if (m->getRewardedQuests().count(qid)) continue;   // already done here
-            if (Quest const* q = sObjectMgr->GetQuestTemplate(qid))
-                stuck.emplace_back(m, q);
-        }
-    if (stuck.empty()) return;
-
-    g_propagatingQuest = true;   // don't re-enter the accept/abandon mirrors
-    g_heroQuestTurnin  = true;
-    for (auto const& [m, q] : stuck)
-        ForceCompleteTurnIn(m, q);
-    g_heroQuestTurnin  = false;
-    g_propagatingQuest = false;
-
-    LOG_INFO("module",
-        "[WowPsParty] quest reconcile: healed {} stuck quest(s) for account {}",
-        stuck.size(), leader->GetSession()->GetAccountId());
-}
-
 // Trampoline called from the [WowPsParty PATCH] in Spell.cpp::CheckItems.
 // Total count of crafting reagent `itemId` available to the crafter across the
 // WHOLE shared party — the crafter's own bags plus every loaded party member's.

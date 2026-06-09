@@ -1867,12 +1867,13 @@ namespace WowPsParty
                     ai->ChangeStrategy("+gather", BOT_STATE_NON_COMBAT);
                 }
             }
-
-            // All 5 are loaded and grouped now — heal any quest desync (a quest
-            // one char turned in but another is stuck holding: orphan "?" marker,
-            // quest items clogging bags). Repairs an already-broken account on the
-            // next login and backstops the live turn-in mirror.
-            WowPsParty::ReconcilePartyQuests(leader);
+            // (No login quest-reconcile here. An earlier version force-"completed"
+            // any quest a PEER had already rewarded — which destroyed the active
+            // questline of a low-level char catching up through content the
+            // higher-level alts had long finished, e.g. Nisseanderz losing his
+            // Goldshire quests. The live turn-in mirror's ForceCompleteTurnIn
+            // fallback already prevents the original full-bags stuck-quest bug at
+            // the source; a blanket login reconcile is too blunt and was removed.)
         }, std::chrono::seconds(6));
 
         LOG_INFO("module",
