@@ -814,8 +814,14 @@ void Player::RewardQuest(Quest const* quest, uint32 reward, Object* questGiver, 
         CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
         if (quest->GetRewMailSenderEntry() != 0)
             MailDraft(mail_template_id).SendMailTo(trans, this, quest->GetRewMailSenderEntry(), MAIL_CHECK_MASK_HAS_BODY, quest->GetRewMailDelaySecs());
-        else
+        // [WowPsParty PATCH] A mirrored party turn-in (PartyHooks quest mirror)
+        // calls RewardQuest with a NULL questGiver; MailSender(questGiver) then
+        // derefs null and crashes the worldserver on ANY quest that rewards by
+        // mail. Fall back to the receiver as the sender — harmless and never null.
+        else if (questGiver)
             MailDraft(mail_template_id).SendMailTo(trans, this, questGiver, MAIL_CHECK_MASK_HAS_BODY, quest->GetRewMailDelaySecs());
+        else
+            MailDraft(mail_template_id).SendMailTo(trans, this, this, MAIL_CHECK_MASK_HAS_BODY, quest->GetRewMailDelaySecs());
         CharacterDatabase.CommitTransaction(trans);
     }
 
