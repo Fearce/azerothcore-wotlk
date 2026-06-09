@@ -5486,6 +5486,13 @@ void Unit::RemoveAurasWithInterruptFlags(uint32 flag, uint32 except, bool isAuto
     {
         if (spell->getState() == SPELL_STATE_CASTING && (spell->m_spellInfo->ChannelInterruptFlags & flag) && spell->m_spellInfo->Id != except)
         {
+            // [WowPsParty DIAG] WHICH interrupt flag is breaking the channel — the
+            // decisive clue (channel-break/movement diag was empty, so it's a
+            // RemoveAurasWithInterruptFlags caller passing a NON-movement flag).
+            LOG_INFO("module",
+                "[WowPsParty DIAG] channel-flag-interrupt caster={} spell={} flag={:#x} chanFlags={:#x} except={} isAutoshot={}",
+                GetGUID().GetCounter(), spell->m_spellInfo->Id, flag,
+                spell->m_spellInfo->ChannelInterruptFlags, except, isAutoshot ? 1 : 0);
             // Do not interrupt if auto shot
             if (!(isAutoshot && spell->m_spellInfo->HasAttribute(SPELL_ATTR2_DO_NOT_RESET_COMBAT_TIMERS)))
             {
