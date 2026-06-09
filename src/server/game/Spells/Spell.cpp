@@ -4417,7 +4417,10 @@ void Spell::update(uint32 difftime)
                 // Xinef: so the aura can be removed in different updates for all units
                 else if ((m_timer < 0 || m_timer > 300) && !UpdateChanneledTargetList())
                 {
-                    LOG_DEBUG("spells.aura", "Channeled spell {} is removed due to lack of targets", m_spellInfo->Id);
+                    // [WowPsParty DIAG] elevated from DEBUG: shows if a channel ends
+                    // because it lost its target list (aura not applied / out of range).
+                    LOG_INFO("module", "[WowPsParty DIAG] channel-lost-targets caster={} spell={}",
+                        m_caster ? m_caster->GetGUID().GetCounter() : 0, m_spellInfo->Id);
                     SendChannelUpdate(0);
                     finish();
                 }
@@ -4435,6 +4438,16 @@ void Spell::finish(bool ok)
 
     if (m_spellState == SPELL_STATE_FINISHED)
         return;
+
+    // [WowPsParty DIAG] A channel reaching finish() while still CASTING with timer
+    // left was interrupted (not completed) — logs the spell + ms remaining so we
+    // can see whether it dies instantly or after ticks, and pair it with the
+    // channel-break (movement/turn) diag in Unit::UpdatePosition.
+    if (m_spellInfo->IsChanneled() && m_spellState == SPELL_STATE_CASTING && m_timer > 0)
+        LOG_INFO("module",
+            "[WowPsParty DIAG] channel-finish-early caster={} spell={} timerLeft={} ok={}",
+            m_caster->GetGUID().GetCounter(), m_spellInfo->Id, m_timer, ok ? 1 : 0);
+
     m_spellState = SPELL_STATE_FINISHED;
 
     if (m_spellInfo->IsChanneled())

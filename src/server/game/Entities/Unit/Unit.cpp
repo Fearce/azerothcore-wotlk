@@ -16034,7 +16034,26 @@ bool Unit::UpdatePosition(float x, float y, float z, float orientation, bool tel
         if (turn) mask |= AURA_INTERRUPT_FLAG_TURNING;
         if (relocated) mask |= AURA_INTERRUPT_FLAG_MOVE;
         if (mask)
+        {
+            // [WowPsParty DIAG] If this position/orientation update is about to
+            // interrupt an active CHANNEL, log exactly why (turn vs move + deltas)
+            // before it happens. Throttled implicitly (only fires when a channel is
+            // up + the mask actually matches its ChannelInterruptFlags).
+            if (Spell* _ch = GetCurrentSpell(CURRENT_CHANNELED_SPELL))
+                if (SpellInfo const* _si = _ch->GetSpellInfo())
+                    if (_si->ChannelInterruptFlags & mask)
+                    {
+                        float const _dx = GetPositionX() - x;
+                        float const _dy = GetPositionY() - y;
+                        float const _dz = current_z - z;
+                        LOG_INFO("module",
+                            "[WowPsParty DIAG] channel-break guid={} spell={} turn={} reloc={} dOri={:.5f} dPos={:.4f} teleport={}",
+                            GetGUID().GetCounter(), _si->Id, turn ? 1 : 0, relocated ? 1 : 0,
+                            std::fabs(old_orientation - orientation),
+                            std::sqrt(_dx * _dx + _dy * _dy + _dz * _dz), teleport ? 1 : 0);
+                    }
             RemoveAurasWithInterruptFlags(mask);
+        }
     }
 
     if (relocated)
