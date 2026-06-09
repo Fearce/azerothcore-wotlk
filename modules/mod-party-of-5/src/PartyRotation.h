@@ -23,6 +23,7 @@
  *     target_is_boss | target_is_elite | target_is_rare | target_is_normal
  *     target_type_{beast,dragonkin,demon,elemental,giant,undead,humanoid}
  *     target_casting | target_channeling | target_interruptible
+ *     self_casting | self_channeling     the bot's OWN cast/channel state
  *     target_ttd<N | target_ttd>N         estimated seconds-to-die
  *     target_has_aura:<spell> | target_missing_aura:<spell>
  *     self_has_aura:<spell> | self_missing_aura:<spell>

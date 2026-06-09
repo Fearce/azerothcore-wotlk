@@ -1133,6 +1133,27 @@ namespace WowPsParty
         if (cond == "is_moving")     return bot->isMoving();
         if (cond == "is_not_moving") return !bot->isMoving();
 
+        // The bot's OWN cast/channel state. `self_casting` = a generic cast bar
+        // is up (Frostbolt, Pyroblast); `self_channeling` = a channel is running
+        // (Blizzard, Arcane Missiles, Mind Flay, Volley). Mirror of
+        // target_casting/target_channeling. Gate other damage rules with
+        // `!self_channeling` so they don't compete for the GCD and clip the
+        // bot's own Blizzard. (The cast verbs already refuse to clip an
+        // in-progress cast unless flagged `clip`, and movement no longer breaks
+        // a channel — see the channel-duration hold in faceAndCast/faceAndCastAt
+        // — but this lets a user gate explicitly, e.g. keep a kite/reposition
+        // rule from firing mid-channel.)
+        if (cond == "self_casting")
+        {
+            bool ch = false, ir = false;
+            return CurrentCastSpell(bot, &ch, &ir) != nullptr && !ch;
+        }
+        if (cond == "self_channeling")
+        {
+            bool ch = false, ir = false;
+            return CurrentCastSpell(bot, &ch, &ir) != nullptr && ch;
+        }
+
         // Party-debuff checks — boolean, no <N/>N suffix.
         if (cond == "party_has_disease")
             return FindPartyMemberWithDispelType(bot, DISPEL_DISEASE) != nullptr;
@@ -1924,23 +1945,32 @@ namespace WowPsParty
         // lower-priority rule.
         auto faceAndCast = [bot, &lastCastResult](Unit* target, uint32 spellId) -> bool
         {
-            int32 castMs = 0;
+            // How long to stay planted: cast time, or — for a CHANNELED spell
+            // (Arcane Missiles, Mind Flay, Drain Life) whose CalcCastTime is 0 —
+            // the channel duration. Movement clears UNIT_STATE_CASTING and breaks
+            // BOTH, so a channel held only for its (zero) cast time gets clipped by
+            // the follow/assist ticker after one tick.
+            int32 holdMs = 0;
             if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId))
-                castMs = info->CalcCastTime();
-            // Plant ONLY for cast-time spells: a moving Player's motion update
-            // clears UNIT_STATE_CASTING and interrupts the cast, so freeze for
-            // the cast bar. Instant shots are NOT planted — doing so on every
-            // tick fought AssistTarget's chase (StopMoving+Clear, then the chase
-            // re-installs) and made the hunter stutter in place. A ranged bot
-            // settles at its standoff and shoots while stationary; the only cost
-            // is a transient UNIT_NOT_INFRONT on a shot fired mid-reposition,
-            // which simply retries next tick once planted at range.
-            if (target && target != bot && castMs > 0)
+            {
+                holdMs = info->CalcCastTime();
+                if (info->IsChanneled() && info->GetDuration() > holdMs)
+                    holdMs = info->GetDuration();
+            }
+            // Plant ONLY for spells with a stationary window (cast time or
+            // channel): a moving Player's motion update clears UNIT_STATE_CASTING
+            // and interrupts it, so freeze for the duration. Instant shots are NOT
+            // planted — doing so on every tick fought AssistTarget's chase
+            // (StopMoving+Clear, then the chase re-installs) and made the hunter
+            // stutter in place. A ranged bot settles at its standoff and shoots
+            // while stationary; the only cost is a transient UNIT_NOT_INFRONT on a
+            // shot fired mid-reposition, which simply retries next tick.
+            if (target && target != bot && holdMs > 0)
             {
                 bot->StopMoving();
                 bot->GetMotionMaster()->Clear();
                 WowPsParty::HoldFollower(bot->GetGUID(),
-                    uint32(castMs) + 500);
+                    uint32(holdMs) + 500);
             }
             if (target && target != bot)
                 bot->SetFacingToObject(target);
@@ -1973,14 +2003,26 @@ namespace WowPsParty
         auto faceAndCastAt = [bot](Unit* aimAt, uint32 spellId) -> bool
         {
             if (aimAt) bot->SetFacingToObject(aimAt);
+            // castMs = cast-bar time (drives the predictive lead below — a channel
+            // places INSTANTLY so it gets no lead). holdMs = how long to stay
+            // planted: the channel duration for a channeled AoE (Blizzard, Rain of
+            // Fire, Volley — CalcCastTime 0), else the cast time. Without holding
+            // for the channel, the follow/assist ticker re-issues movement on the
+            // next tick and breaks Blizzard after a single tick.
             int32 castMs = 0;
+            int32 holdMs = 0;
             if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId))
+            {
                 castMs = info->CalcCastTime();
-            if (castMs > 0)
+                holdMs = castMs;
+                if (info->IsChanneled() && info->GetDuration() > holdMs)
+                    holdMs = info->GetDuration();
+            }
+            if (holdMs > 0)
             {
                 bot->StopMoving();
                 bot->GetMotionMaster()->Clear();
-                WowPsParty::HoldFollower(bot->GetGUID(), uint32(castMs) + 500);
+                WowPsParty::HoldFollower(bot->GetGUID(), uint32(holdMs) + 500);
             }
             float x, y, z;
             aimAt->GetPosition(x, y, z);
