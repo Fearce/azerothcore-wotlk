@@ -3610,17 +3610,6 @@ SpellCastResult Spell::prepare(SpellCastTargets const* targets, AuraEffect const
                 exceptSpellId = m_spellInfo->Id;
             }
 
-            // [WowPsParty DIAG] If casting THIS spell is about to CAST-interrupt an
-            // active channel, log which spell is the culprit (the missing link:
-            // flag 0x4 = AURA_INTERRUPT_FLAG_CAST fires here). Shows whether it's a
-            // re-cast of the channel itself or a different spell slipping past the
-            // commit-lock while the channel runs.
-            if (Spell* _ch = m_caster->GetCurrentSpell(CURRENT_CHANNELED_SPELL))
-                if (SpellInfo const* _ci = _ch->GetSpellInfo())
-                    if ((_ci->ChannelInterruptFlags & AURA_INTERRUPT_FLAG_CAST) && _ci->Id != exceptSpellId)
-                        LOG_INFO("module",
-                            "[WowPsParty DIAG] cast-breaks-channel caster={} castingSpell={} breaksChannel={}",
-                            m_caster->GetGUID().GetCounter(), m_spellInfo->Id, _ci->Id);
             m_caster->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_CAST, exceptSpellId, m_spellInfo->Id == 75);
             m_caster->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_SPELL_ATTACK, exceptSpellId, m_spellInfo->Id == 75);
         }
@@ -4428,10 +4417,7 @@ void Spell::update(uint32 difftime)
                 // Xinef: so the aura can be removed in different updates for all units
                 else if ((m_timer < 0 || m_timer > 300) && !UpdateChanneledTargetList())
                 {
-                    // [WowPsParty DIAG] elevated from DEBUG: shows if a channel ends
-                    // because it lost its target list (aura not applied / out of range).
-                    LOG_INFO("module", "[WowPsParty DIAG] channel-lost-targets caster={} spell={}",
-                        m_caster ? m_caster->GetGUID().GetCounter() : 0, m_spellInfo->Id);
+                    LOG_DEBUG("spells.aura", "Channeled spell {} is removed due to lack of targets", m_spellInfo->Id);
                     SendChannelUpdate(0);
                     finish();
                 }
@@ -4449,16 +4435,6 @@ void Spell::finish(bool ok)
 
     if (m_spellState == SPELL_STATE_FINISHED)
         return;
-
-    // [WowPsParty DIAG] A channel reaching finish() while still CASTING with timer
-    // left was interrupted (not completed) — logs the spell + ms remaining so we
-    // can see whether it dies instantly or after ticks, and pair it with the
-    // channel-break (movement/turn) diag in Unit::UpdatePosition.
-    if (m_spellInfo->IsChanneled() && m_spellState == SPELL_STATE_CASTING && m_timer > 0)
-        LOG_INFO("module",
-            "[WowPsParty DIAG] channel-finish-early caster={} spell={} timerLeft={} ok={}",
-            m_caster->GetGUID().GetCounter(), m_spellInfo->Id, m_timer, ok ? 1 : 0);
-
     m_spellState = SPELL_STATE_FINISHED;
 
     if (m_spellInfo->IsChanneled())

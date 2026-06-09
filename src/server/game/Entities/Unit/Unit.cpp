@@ -4245,21 +4245,6 @@ void Unit::InterruptSpell(CurrentSpellTypes spellType, bool withDelayed, bool wi
 {
     //LOG_DEBUG("entities.unit", "Interrupt spell for unit {}.", GetEntry());
     Spell* spell = m_currentSpells[spellType];
-    // [WowPsParty DIAG] log who/what is interrupting an active CHANNEL: which other
-    // spells the caster has in flight (a fresh cast = generic; a wand/shot = repeat),
-    // withInstant/bySelf flags. This pins the InterruptSpell caller for the Mind
-    // Flay break (channel-break/movement diag was empty -> it's a direct interrupt).
-    if (spellType == CURRENT_CHANNELED_SPELL && spell && spell->getState() == SPELL_STATE_CASTING)
-    {
-        Spell* gen = m_currentSpells[CURRENT_GENERIC_SPELL];
-        Spell* rep = m_currentSpells[CURRENT_AUTOREPEAT_SPELL];
-        LOG_INFO("module",
-            "[WowPsParty DIAG] channel-interruptspell caster={} chan={} genCast={} repCast={} withDelayed={} withInstant={} bySelf={}",
-            GetGUID().GetCounter(), spell->GetSpellInfo() ? spell->GetSpellInfo()->Id : 0,
-            (gen && gen->GetSpellInfo()) ? gen->GetSpellInfo()->Id : 0,
-            (rep && rep->GetSpellInfo()) ? rep->GetSpellInfo()->Id : 0,
-            withDelayed ? 1 : 0, withInstant ? 1 : 0, bySelf ? 1 : 0);
-    }
     if (spell
         && (withDelayed || spell->getState() != SPELL_STATE_DELAYED)
         && (withInstant || spell->GetCastTime() > 0 || spell->getState() == SPELL_STATE_CASTING)) // xinef: or spell is in casting state (channeled spells only)
@@ -5486,13 +5471,6 @@ void Unit::RemoveAurasWithInterruptFlags(uint32 flag, uint32 except, bool isAuto
     {
         if (spell->getState() == SPELL_STATE_CASTING && (spell->m_spellInfo->ChannelInterruptFlags & flag) && spell->m_spellInfo->Id != except)
         {
-            // [WowPsParty DIAG] WHICH interrupt flag is breaking the channel — the
-            // decisive clue (channel-break/movement diag was empty, so it's a
-            // RemoveAurasWithInterruptFlags caller passing a NON-movement flag).
-            LOG_INFO("module",
-                "[WowPsParty DIAG] channel-flag-interrupt caster={} spell={} flag={:#x} chanFlags={:#x} except={} isAutoshot={}",
-                GetGUID().GetCounter(), spell->m_spellInfo->Id, flag,
-                spell->m_spellInfo->ChannelInterruptFlags, except, isAutoshot ? 1 : 0);
             // Do not interrupt if auto shot
             if (!(isAutoshot && spell->m_spellInfo->HasAttribute(SPELL_ATTR2_DO_NOT_RESET_COMBAT_TIMERS)))
             {
@@ -16056,26 +16034,7 @@ bool Unit::UpdatePosition(float x, float y, float z, float orientation, bool tel
         if (turn) mask |= AURA_INTERRUPT_FLAG_TURNING;
         if (relocated) mask |= AURA_INTERRUPT_FLAG_MOVE;
         if (mask)
-        {
-            // [WowPsParty DIAG] If this position/orientation update is about to
-            // interrupt an active CHANNEL, log exactly why (turn vs move + deltas)
-            // before it happens. Throttled implicitly (only fires when a channel is
-            // up + the mask actually matches its ChannelInterruptFlags).
-            if (Spell* _ch = GetCurrentSpell(CURRENT_CHANNELED_SPELL))
-                if (SpellInfo const* _si = _ch->GetSpellInfo())
-                    if (_si->ChannelInterruptFlags & mask)
-                    {
-                        float const _dx = GetPositionX() - x;
-                        float const _dy = GetPositionY() - y;
-                        float const _dz = current_z - z;
-                        LOG_INFO("module",
-                            "[WowPsParty DIAG] channel-break guid={} spell={} turn={} reloc={} dOri={:.5f} dPos={:.4f} teleport={}",
-                            GetGUID().GetCounter(), _si->Id, turn ? 1 : 0, relocated ? 1 : 0,
-                            std::fabs(old_orientation - orientation),
-                            std::sqrt(_dx * _dx + _dy * _dy + _dz * _dz), teleport ? 1 : 0);
-                    }
             RemoveAurasWithInterruptFlags(mask);
-        }
     }
 
     if (relocated)

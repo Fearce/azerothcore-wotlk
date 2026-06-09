@@ -2122,26 +2122,7 @@ namespace WowPsParty
                 return false;
             }
             // Commit to the channel so the rotation can't re-cast/clip it.
-            if (isChannel)
-            {
-                MarkChannelCommit(bot, spellId, uint32(holdMs));
-                // Throttled confirmation a unit channel (Mind Flay, Drain Life)
-                // actually started + whether the core registered the channel slot.
-                // Pairs with the "cut short" log to show if it then breaks (melee
-                // pushback) — the Mind-Flay-"never casts" diagnosis.
-                static thread_local std::unordered_map<uint64, uint32> chLogMs;
-                uint64 const ck = (uint64(bot->GetGUID().GetCounter()) << 32) | spellId;
-                uint32 const cn = getMSTime();
-                uint32& cl = chLogMs[ck];
-                if (cn - cl > 3000)
-                {
-                    cl = cn;
-                    LOG_INFO("module",
-                        "[WowPsParty Rotation] unit-channel {} guid={} holdMs={} channelSlot={}",
-                        spellId, bot->GetGUID().GetCounter(), holdMs,
-                        bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL) ? 1 : 0);
-                }
-            }
+            if (isChannel) MarkChannelCommit(bot, spellId, uint32(holdMs));
             return true;
         };
 
@@ -2244,26 +2225,7 @@ namespace WowPsParty
                 }
                 return false;
             }
-            if (isChannel)
-            {
-                MarkChannelCommit(bot, spellId, uint32(holdMs));
-                // One-time-per-cast confirmation of how the core sees this channel:
-                // whether the channel slot actually registered. Throttled per
-                // (bot, spell). If channelSlot=0 here, the core isn't tracking the
-                // channel for this bot — the commit-lock is what carries it.
-                static thread_local std::unordered_map<uint64, uint32> chLogMs;
-                uint64 const ck = (uint64(bot->GetGUID().GetCounter()) << 32) | spellId;
-                uint32 const cn = getMSTime();
-                uint32& cl = chLogMs[ck];
-                if (cn - cl > 3000)
-                {
-                    cl = cn;
-                    LOG_INFO("module",
-                        "[WowPsParty Rotation] channel-commit {} guid={} holdMs={} channelSlot={}",
-                        spellId, bot->GetGUID().GetCounter(), holdMs,
-                        bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL) ? 1 : 0);
-                }
-            }
+            if (isChannel) MarkChannelCommit(bot, spellId, uint32(holdMs));
             return true;
         };
 
@@ -3171,6 +3133,22 @@ namespace WowPsParty
         else if (sub == ITEM_SUBCLASS_WEAPON_WAND)   // priest/mage/warlock with a wand
         { autoSpell = 5019; maxRange = 30.0f; }
         if (!autoSpell) return;
+
+        // The WAND shot (5019) fires AURA_INTERRUPT_FLAG_CAST, which interrupts the
+        // bot's OWN in-progress channel (Mind Flay, Drain Life) or cast-time spell —
+        // it was breaking Mind Flay every tick for 0 damage (confirmed via the
+        // core channel-interrupt diag: castingSpell=5019 breaksChannel=15407). So
+        // while the caster is casting/channeling anything, the wand must STAND DOWN:
+        // interrupt any live wand repeat and don't start one. (Auto Shot 75 is
+        // exempt from that interrupt — it's the hunter's main attack — so it is NOT
+        // gated here; it keeps weaving between shots.) The wand resumes the moment
+        // the caster isn't casting (its real job is the out-of-mana filler).
+        if (autoSpell == 5019 && bot->IsNonMeleeSpellCast(false, false, /*skipAutorepeat=*/true))
+        {
+            if (bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+                bot->InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
+            return;
+        }
 
         Unit* victim = bot->GetVictim();
 
