@@ -2091,7 +2091,17 @@ namespace WowPsParty
                     uint32(holdMs) + 500);
             }
             if (target && target != bot)
-                bot->SetFacingToObject(target);
+            {
+                // A channel interrupts on TURNING, and SetFacingToObject launches a
+                // facing MOVE-SPLINE — starting the channel mid-spline kills it
+                // instantly (0 damage; THIS is why Mind Flay/Drain Life never landed
+                // while every non-channel spell did — cast-time spells interrupt on
+                // MOVE only, not turning, and the spline has no displacement). Set
+                // orientation directly (no spline, no turn event) for channels; keep
+                // the smooth spline-turn for cast-time/instant spells.
+                if (isChannel) bot->SetOrientation(bot->GetAngle(target));
+                else           bot->SetFacingToObject(target);
+            }
             SpellCastResult const r = bot->CastSpell(target, spellId, false);
             lastCastResult = r;
             if (r != SPELL_CAST_OK)
@@ -2144,7 +2154,6 @@ namespace WowPsParty
             // Skip a ground channel that was just cut short (pushback) — see
             // ChannelCommitActive. Falls through to the next rule.
             if (ChannelOnBackoff(bot, spellId)) return false;
-            if (aimAt) bot->SetFacingToObject(aimAt);
             // castMs = cast-bar time (drives the predictive lead below — a channel
             // places INSTANTLY so it gets no lead). holdMs = how long to stay
             // planted: the channel duration for a channeled AoE (Blizzard, Rain of
@@ -2192,6 +2201,15 @@ namespace WowPsParty
                 bot->StopMoving();
                 bot->GetMotionMaster()->Clear();
                 WowPsParty::HoldFollower(bot->GetGUID(), uint32(holdMs) + 500);
+            }
+            // Face the cluster. For a CHANNEL set orientation directly — a
+            // SetFacingToObject facing-spline triggers the channel's TURNING
+            // interrupt and kills it instantly. Cast-time AoE (Flamestrike) keeps
+            // the smooth spline-turn.
+            if (aimAt)
+            {
+                if (isChannel) bot->SetOrientation(bot->GetAngle(aimAt));
+                else           bot->SetFacingToObject(aimAt);
             }
             float x, y, z;
             aimAt->GetPosition(x, y, z);
