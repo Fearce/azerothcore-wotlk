@@ -132,6 +132,10 @@ namespace WowPsParty
 
         static std::mutex                g_mutex;
         static std::vector<Directive>    g_directives;
+        // account -> the ACTIVE leader's own account_party role. The leader isn't a
+        // follower, so it has no Directive (RoleForGuid can't see it); captured in
+        // SetActiveFollowers so the human-tank wait-gate can read the leader's role.
+        static std::unordered_map<uint32, std::string> g_leaderRole;
         static std::atomic<bool>         g_tickerInstalled{false};
         static constexpr uint32          TICK_INTERVAL_MS = 1000;
 
@@ -181,7 +185,13 @@ namespace WowPsParty
             uint8 const  memberSlot    = f[1].Get<uint8>();
             std::string  memberRole    = f[2].Get<std::string>();
             ObjectGuid const memberGuid = ObjectGuid::Create<HighGuid::Player>(memberGuidLow);
-            if (memberGuid == leaderGuid) continue;
+            if (memberGuid == leaderGuid)
+            {
+                // The leader gets no directive, but remember its role so the
+                // human-tank wait-gate (AssistTarget) can tell a tank lead apart.
+                g_leaderRole[account] = memberRole.empty() ? "dps" : memberRole;
+                continue;
+            }
 
             Directive d;
             d.account = account;
@@ -303,6 +313,15 @@ namespace WowPsParty
         for (auto const& d : g_directives)
             if (d.followerGuid == botGuid) return d.role;
         return std::string();
+    }
+
+    // The active leader's own account_party role (captured in SetActiveFollowers).
+    // Distinct from RoleForGuid, which only knows FOLLOWER directives.
+    std::string LeaderRole(uint32 account)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_leaderRole.find(account);
+        return it == g_leaderRole.end() ? std::string() : it->second;
     }
 
     // Pick a LEVEL- and RACE-appropriate mount for the bot, matching the
@@ -1680,10 +1699,12 @@ namespace WowPsParty
     // existing lead-tank pull coordination (IsTankPulling / IsPartyPullPending).
     static bool HumanTankLeadActive(Player* bot, Player* leader)
     {
-        if (!bot || !leader) return false;
+        if (!bot || !leader || !leader->GetSession()) return false;
         if (!bot->GetMap() || !bot->GetMap()->IsDungeon()) return false;
         if (sPlayerbotsMgr.GetPlayerbotAI(leader)) return false;   // leader is a bot, not human
-        return RoleForGuid(leader->GetGUID()) == "tank";
+        // Leader's OWN role (it has no follower directive, so RoleForGuid is blind
+        // to it) — read the cache captured in SetActiveFollowers.
+        return LeaderRole(leader->GetSession()->GetAccountId()) == "tank";
     }
 
     // True when `mob` is already fighting THIS bot's party — its current target is
