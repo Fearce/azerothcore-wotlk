@@ -941,6 +941,51 @@ namespace WowPsParty
         return info;
     }
 
+    // ---- Channel commit-lock ------------------------------------------------
+    // When a bot casts a CHANNELED spell (Blizzard, Rain of Fire, Volley, Mind
+    // Flay, …) we lock its rotation for the channel duration: while the lock
+    // holds, TickRotation does nothing — no re-cast, no kite, no reposition — so
+    // the bot's OWN AI can't clip the channel.
+    //
+    // Why a module-owned lock instead of the core's IsNonMeleeSpellCast /
+    // GetCurrentSpell(CHANNELED): for a bot, the usual channelClipOk guard READ
+    // those and found NO cast in progress on the tick after a Blizzard cast — so
+    // it happily re-fired Blizzard every tick, and each re-cast restarted the
+    // channel from zero ("circle + mana drain but it never actually goes off").
+    // The re-cast (and the kite's MovePoint) is what killed the channel; once we
+    // stop firing the rotation for the duration, the channel survives and the
+    // core slot DOES populate — so after a short grace we trust it to release the
+    // lock early if the channel really ended (target died, bot stunned).
+    struct ChannelLock { uint32 untilMs = 0; uint32 graceUntilMs = 0; };
+    static std::mutex g_channelLockMutex;
+    static std::unordered_map<uint32, ChannelLock> g_channelLocks;
+
+    static void MarkChannelCommit(Player* bot, uint32 durationMs)
+    {
+        std::lock_guard<std::mutex> lock(g_channelLockMutex);
+        uint32 const now = getMSTime();
+        ChannelLock& cl = g_channelLocks[bot->GetGUID().GetCounter()];
+        cl.untilMs      = now + durationMs;
+        cl.graceUntilMs = now + 1500;   // trust "just cast" until the slot registers
+    }
+
+    // True while the bot is committed to a channel it just started. Within the
+    // grace window we trust the cast; past it we trust the core channel slot
+    // (kept alive because we stopped clipping it), with a hard duration cap so a
+    // never-registering channel can't freeze the bot forever.
+    static bool ChannelCommitActive(Player* bot)
+    {
+        std::lock_guard<std::mutex> lock(g_channelLockMutex);
+        auto it = g_channelLocks.find(bot->GetGUID().GetCounter());
+        if (it == g_channelLocks.end()) return false;
+        uint32 const now = getMSTime();
+        if (now >= it->second.untilMs) { g_channelLocks.erase(it); return false; }
+        if (now < it->second.graceUntilMs) return true;
+        if (bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL)) return true;
+        g_channelLocks.erase(it);   // channel ended early — let the bot resume
+        return false;
+    }
+
     // Forward decls: EvalCondition recurses through AND-chains, and the
     // aura/cooldown conditions resolve spells by name (defined further down).
     static bool EvalSingleCondition(std::string const& cond, Player* bot);
@@ -1951,10 +1996,15 @@ namespace WowPsParty
             // BOTH, so a channel held only for its (zero) cast time gets clipped by
             // the follow/assist ticker after one tick.
             int32 holdMs = 0;
+            bool  isChannel = false;
             if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId))
             {
                 holdMs = info->CalcCastTime();
-                if (info->IsChanneled() && info->GetDuration() > holdMs)
+                // Unit-targeted channel (Mind Flay, Drain Life, Arcane Missiles):
+                // gate on IsChanneled() — a castMs==0 spell with a duration could
+                // also be an instant DoT (Corruption, SW:P), which must NOT lock.
+                isChannel = info->IsChanneled() && info->GetDuration() > 0;
+                if (isChannel && info->GetDuration() > holdMs)
                     holdMs = info->GetDuration();
             }
             // Plant ONLY for spells with a stationary window (cast time or
@@ -1993,6 +2043,8 @@ namespace WowPsParty
                 }
                 return false;
             }
+            // Commit to the channel so the rotation can't re-cast/clip it.
+            if (isChannel) MarkChannelCommit(bot, uint32(holdMs));
             return true;
         };
 
@@ -2011,11 +2063,22 @@ namespace WowPsParty
             // next tick and breaks Blizzard after a single tick.
             int32 castMs = 0;
             int32 holdMs = 0;
+            bool  isChannel = false;
             if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId))
             {
                 castMs = info->CalcCastTime();
                 holdMs = castMs;
-                if (info->IsChanneled() && info->GetDuration() > holdMs)
+                // A ground AoE with NO cast time but a real duration IS a channel
+                // (Blizzard, Rain of Fire, Volley): the caster stands and channels
+                // for GetDuration(). Detect it by castMs==0 rather than
+                // IsChanneled() — that flag proved unreliable for these spells when
+                // cast by a bot, which is exactly why the channel slot never
+                // registered and the rotation re-cast it every tick. Flamestrike
+                // has a real cast time (castMs>0), so it stays on the cast-time path
+                // and is NOT treated as a channel.
+                isChannel = (castMs == 0 && info->GetDuration() >= 1000)
+                            || (info->IsChanneled() && info->GetDuration() > 0);
+                if (isChannel && info->GetDuration() > holdMs)
                     holdMs = info->GetDuration();
             }
             if (holdMs > 0)
@@ -2056,6 +2119,26 @@ namespace WowPsParty
                         spellId, bot->GetGUID().GetCounter(), uint32(r));
                 }
                 return false;
+            }
+            if (isChannel)
+            {
+                MarkChannelCommit(bot, uint32(holdMs));
+                // One-time-per-cast confirmation of how the core sees this channel:
+                // whether the channel slot actually registered. Throttled per
+                // (bot, spell). If channelSlot=0 here, the core isn't tracking the
+                // channel for this bot — the commit-lock is what carries it.
+                static thread_local std::unordered_map<uint64, uint32> chLogMs;
+                uint64 const ck = (uint64(bot->GetGUID().GetCounter()) << 32) | spellId;
+                uint32 const cn = getMSTime();
+                uint32& cl = chLogMs[ck];
+                if (cn - cl > 3000)
+                {
+                    cl = cn;
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation] channel-commit {} guid={} holdMs={} channelSlot={}",
+                        spellId, bot->GetGUID().GetCounter(), holdMs,
+                        bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL) ? 1 : 0);
+                }
             }
             return true;
         };
@@ -3162,6 +3245,14 @@ namespace WowPsParty
             return true;
         }
 
+        // Committed to a channel we just started? Then only a clip-flagged rule
+        // (the explicit "interrupt my own cast" opt-in) may run this tick —
+        // everything else is suppressed so the rotation can't re-cast the channel
+        // or kite/reposition out of it. This is what actually lets Blizzard run to
+        // completion: the core didn't expose the channel via IsNonMeleeSpellCast,
+        // so without this guard the rotation re-fired Blizzard every tick.
+        bool const committed = ChannelCommitActive(bot);
+
         for (RotationRule const& r : rules)
         {
             // A rule disabled in the editor (checkbox off) carries the
@@ -3172,6 +3263,15 @@ namespace WowPsParty
                 if (trace)
                     LOG_INFO("module",
                         "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> DISABLED",
+                        r.priority, r.condition, r.action);
+                continue;
+            }
+
+            if (committed && !CsvContains(Lower(r.flags), "clip"))
+            {
+                if (trace)
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> CHANNELING",
                         r.priority, r.condition, r.action);
                 continue;
             }
