@@ -2042,6 +2042,13 @@ namespace WowPsParty
                 if (isChannel && info->GetDuration() > holdMs)
                     holdMs = info->GetDuration();
             }
+            // Don't START a channel while something is on top of us. Melee hits
+            // push a channel back ~25% of its duration EACH, so a meleed caster's
+            // channel dies in ~1s and just burns mana. Skip it and fall through to
+            // instants / a peel (Frost Nova) / kite; once the caster has cleared
+            // melee range the channel fires and actually ticks. (Hard casts only
+            // get pushed back, not killed, so they're left alone.)
+            if (isChannel && CountHostilesWithin(bot, 8.0f) > 0) return false;
             // Plant ONLY for spells with a stationary window (cast time or
             // channel): a moving Player's motion update clears UNIT_STATE_CASTING
             // and interrupts it, so freeze for the duration. Instant shots are NOT
@@ -2119,6 +2126,12 @@ namespace WowPsParty
                 if (isChannel && info->GetDuration() > holdMs)
                     holdMs = info->GetDuration();
             }
+            // Don't START a ground channel (Blizzard / Rain of Fire / Volley)
+            // while the caster itself is being meleed — pushback would shred it in
+            // ~1s. Fall through to instants / a peel / kite first. The caster
+            // stands at range to cast these, so a hostile within 8y of IT (not the
+            // target cluster downrange) means a mob has reached the caster.
+            if (isChannel && CountHostilesWithin(bot, 8.0f) > 0) return false;
             if (holdMs > 0)
             {
                 bot->StopMoving();
