@@ -52,6 +52,7 @@ namespace WowPsParty
     uint32 CountFollowersFor(ObjectGuid leaderGuid);   // alts + henchmen
     int    FormationIndexFor(ObjectGuid follower, ObjectGuid leaderGuid);
     bool   IsLeadTank(ObjectGuid botGuid);   // role-based; works for henchmen
+    bool   PartyHasLiveTank(ObjectGuid memberGuid);  // live tank-role member → ranged stand at range, don't kite
     // True while a lead tank is mid ranged-pull (holding at throwing range so the
     // pack closes on it). repositionToCast reads this to refuse chasing a melee
     // ability into the pack during the pull.

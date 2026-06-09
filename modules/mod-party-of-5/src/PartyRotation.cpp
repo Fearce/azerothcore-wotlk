@@ -155,6 +155,13 @@ namespace WowPsParty
     // the rotation so the two don't fight (only one mover at a time).
     bool BotIsKiting(ObjectGuid guid)
     {
+        // A live tank in the party means STAND at range and let it hold — don't
+        // kite (kiting hops the caster around, drags mobs and pulls them off the
+        // tank onto itself). With a tank, AssistTarget owns positioning (closes to
+        // firing range, holds there); without one, the rotation's kite drives the
+        // feet as before. Checked first, outside g_rotationCacheMutex, so it can't
+        // nest locks.
+        if (WowPsParty::PartyHasLiveTank(guid)) return false;
         std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
         auto it = g_rotationCache.find(guid.GetCounter());
         if (it == g_rotationCache.end()) return false;
@@ -2777,6 +2784,10 @@ namespace WowPsParty
         // in-flight cast. AssistTarget yields all movement while this rule exists.
         if (verb == "keep_distance_enemy")
         {
+            // With a live tank, don't kite — stand at range and let AssistTarget
+            // hold position (BotIsKiting is false then, so AssistTarget owns the
+            // feet; a hop here would fight it). Falls through to the cast rules.
+            if (WowPsParty::PartyHasLiveTank(bot->GetGUID())) return false;
             Unit* enemy = bot->GetVictim();
             if (!enemy || !enemy->IsAlive()) return false;
             if (bot->IsNonMeleeSpellCast(false, false, true)) return false;
@@ -2839,6 +2850,8 @@ namespace WowPsParty
         // a kiter doesn't backpedal out of heal range. Same between-casts timing.
         if (verb == "keep_distance_healer")
         {
+            // No kiting while a tank is up — AssistTarget owns positioning then.
+            if (WowPsParty::PartyHasLiveTank(bot->GetGUID())) return false;
             Player* healer = FindPartyMemberByRole(bot, "healer");
             if (!healer || healer == bot || !healer->IsAlive()) return false;
             if (bot->IsNonMeleeSpellCast(false, false, true)) return false;
@@ -2874,6 +2887,9 @@ namespace WowPsParty
         // rules above fire the instant we're in range.
         if (verb == "close_to_enemy")
         {
+            // With a tank up, AssistTarget owns the feet (closes to firing range,
+            // holds there) — don't also drive movement from here or they fight.
+            if (WowPsParty::PartyHasLiveTank(bot->GetGUID())) return false;
             Unit* enemy = bot->GetVictim();
             if (!enemy || !enemy->IsAlive()) return false;
             if (bot->IsNonMeleeSpellCast(false, false, true)) return false;

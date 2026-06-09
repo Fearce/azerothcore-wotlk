@@ -396,6 +396,37 @@ namespace WowPsParty
         return !lead.IsEmpty() && lead == botGuid;
     }
 
+    // True if `memberGuid`'s party has a LIVE tank right now — a tank-role
+    // follower (alt bot / henchman) OR the human leader set to tank — alive and
+    // in-world. Ranged bots read this to STOP kiting when a tank is present: with
+    // a tank they should stand at range behind it and let it hold threat, not hop
+    // around (which drags mobs and pulls them off the tank onto the caster). When
+    // there's no tank, kiting stays on (the tankless "stand and fight"/kite logic).
+    bool PartyHasLiveTank(ObjectGuid memberGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        uint32 account = 0;
+        ObjectGuid leaderGuid;
+        for (auto const& d : g_directives)
+            if (d.followerGuid == memberGuid)
+                { account = d.account; leaderGuid = d.leaderGuid; break; }
+        if (!account) return false;
+        auto liveTank = [](ObjectGuid g) -> bool
+        {
+            Player* p = ObjectAccessor::FindConnectedPlayer(g);
+            return p && p->IsAlive() && p->IsInWorld();
+        };
+        // Human leader set to tank?
+        auto lr = g_leaderRole.find(account);
+        if (lr != g_leaderRole.end() && lr->second == "tank" && liveTank(leaderGuid))
+            return true;
+        // A tank-role follower (bot/henchman) alive + in-world?
+        for (auto const& d : g_directives)
+            if (d.account == account && d.role == "tank" && liveTank(d.followerGuid))
+                return true;
+        return false;
+    }
+
     // Stable 0-based ordinal of `follower` among all of `leaderGuid`'s
     // companions (sorted by guid). Drives formation spread — distinct per
     // companion regardless of account_party slot, so HENCHMEN (which have no
