@@ -842,6 +842,26 @@ void WowPsParty_TakeReagent(Player* crafter, uint32 itemId, uint32 count)
     }
 }
 
+// Trampoline called from the [WowPsParty PATCH] in Spell.cpp::CheckItems.
+// Shaman totem spells require a totem RELIC item of the matching category in the
+// caster's bags (the relics handed out by the early totem quests). Our party
+// shamans — the player's hero alts AND hired henchmen — are spun up without ever
+// running those quests, so the relic check would block every totem they cast.
+// Skip it for them: TRUE means "don't enforce Totem/TotemCategory for this cast".
+//
+// Scoped to caster-is-a-shaman so the bypass only ever touches totem spells (the
+// only ones a shaman casts that carry these fields) and never a profession's
+// TotemCategory tool requirement (mining pick, blacksmith hammer, …). Scoped to
+// managed party members so random-pool / AH bots and unrelated players are
+// unaffected: an enrolled hero (GetSlotForGuid, includes the active char) or any
+// follower bot (BotHasActiveFollowDirective, includes henchmen with no party_slot).
+bool WowPsParty_ShouldBypassTotemReq(Player* caster)
+{
+    if (!caster || caster->getClass() != CLASS_SHAMAN) return false;
+    if (WowPsParty::BotHasActiveFollowDirective(caster->GetGUID())) return true;
+    return sPartyMgr.GetSlotForGuid(caster->GetGUID().GetCounter()).has_value();
+}
+
 // Trampoline called from the [WowPsParty PATCH] in Spell.cpp::CheckCast for
 // SPELL_EFFECT_SKINNING. The engine refuses to skin a beast whose NORMAL loot
 // isn't fully gone (UNIT_FLAG_SKINNABLE unset and/or loot not looted). In a

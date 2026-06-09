@@ -7337,41 +7337,49 @@ SpellCastResult Spell::CheckItems(uint32* param1, uint32* param2)
             }
         }
 
-        // check totem-item requirements (items presence in inventory)
-        uint32 totems = 2;
-        for (int i = 0; i < 2; ++i)
+        // [WowPsParty PATCH] Our party shamans (hero alts + hired henchmen) are
+        // created without running the early totem quests, so they never get the
+        // totem RELIC items these checks demand. Skip the relic requirement for
+        // them so they can cast totems; everyone else is unaffected.
+        extern bool WowPsParty_ShouldBypassTotemReq(Player*);
+        if (!WowPsParty_ShouldBypassTotemReq(player))
         {
-            if (m_spellInfo->Totem[i] != 0)
+            // check totem-item requirements (items presence in inventory)
+            uint32 totems = 2;
+            for (int i = 0; i < 2; ++i)
             {
-                if (player->HasItemCount(m_spellInfo->Totem[i]))
+                if (m_spellInfo->Totem[i] != 0)
                 {
+                    if (player->HasItemCount(m_spellInfo->Totem[i]))
+                    {
+                        totems -= 1;
+                        continue;
+                    }
+                }
+                else
                     totems -= 1;
-                    continue;
-                }
             }
-            else
-                totems -= 1;
-        }
-        if (totems != 0)
-            return SPELL_FAILED_TOTEMS;                         //0x7C
+            if (totems != 0)
+                return SPELL_FAILED_TOTEMS;                         //0x7C
 
-        // Check items for TotemCategory  (items presence in inventory)
-        uint32 TotemCategory = 2;
-        for (int i = 0; i < 2; ++i)
-        {
-            if (m_spellInfo->TotemCategory[i] != 0)
+            // Check items for TotemCategory  (items presence in inventory)
+            uint32 TotemCategory = 2;
+            for (int i = 0; i < 2; ++i)
             {
-                if (player->HasItemTotemCategory(m_spellInfo->TotemCategory[i]))
+                if (m_spellInfo->TotemCategory[i] != 0)
                 {
-                    TotemCategory -= 1;
-                    continue;
+                    if (player->HasItemTotemCategory(m_spellInfo->TotemCategory[i]))
+                    {
+                        TotemCategory -= 1;
+                        continue;
+                    }
                 }
+                else
+                    TotemCategory -= 1;
             }
-            else
-                TotemCategory -= 1;
+            if (TotemCategory != 0)
+                return SPELL_FAILED_TOTEM_CATEGORY;                 //0x7B
         }
-        if (TotemCategory != 0)
-            return SPELL_FAILED_TOTEM_CATEGORY;                 //0x7B
     }
 
     // special checks for spell effects
