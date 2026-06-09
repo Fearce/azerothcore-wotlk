@@ -1339,6 +1339,44 @@ static void HandleUse(Player* requester, std::string_view payload)
         }
     if (!useSpell)
     {
+        // No on-use spell — but a LOOTABLE container (Satchel of Helpful Goods, the
+        // random-dungeon reward bag, lootable pouches, …) is OPENED, not "used":
+        // right-clicking pops its loot window. The looter must OWN the item, so if
+        // it's sitting in another party char's bags, re-own it to the requester
+        // first, then open. (LFG satchels land on the char that finished the run —
+        // i.e. the active char — so usually it's already theirs.)
+        if (t->HasFlag(ITEM_FLAG_HAS_LOOT) && !srcItem->IsWrapped())
+        {
+            if (!requester->IsAlive())
+            {
+                ChatHandler(requester->GetSession()).PSendSysMessage(
+                    "|cffff5555[WowPsParty]|r Can't open |cffffffff{}|r while dead.", t->Name1);
+                return;
+            }
+            if (srcChar != requester)
+            {
+                ItemPosCountVec destPos;
+                if (requester->CanStoreItem(NULL_BAG, NULL_SLOT, destPos, srcItem, false) != EQUIP_ERR_OK)
+                {
+                    ChatHandler(requester->GetSession()).PSendSysMessage(
+                        "|cffff5555[WowPsParty]|r No room to open |cffffffff{}|r.", t->Name1);
+                    return;
+                }
+                srcChar->MoveItemFromInventory(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+                requester->MoveItemToInventory(destPos, srcItem, true);
+            }
+            if (srcItem->IsLocked())
+            {
+                ChatHandler(requester->GetSession()).PSendSysMessage(
+                    "|cffff5555[WowPsParty]|r |cffffffff{}|r is locked.", t->Name1);
+                return;
+            }
+            // Same call HandleOpenItemOpcode makes for a lootable item — pops the
+            // loot window on the requester; the loot system consumes the container.
+            requester->SendLoot(srcItem->GetGUID(), LOOT_CORPSE);
+            WowPsParty::SendInventoryTo(requester);
+            return;
+        }
         ChatHandler(requester->GetSession()).PSendSysMessage(
             "|cffff5555[WowPsParty]|r |cffffffff{}|r isn't usable.", t->Name1);
         return;
