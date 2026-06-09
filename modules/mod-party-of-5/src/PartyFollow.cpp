@@ -896,6 +896,47 @@ namespace WowPsParty
         return best;
     }
 
+    // "highest" target mode: the HIGHEST-current-health enemy the party is already
+    // engaged with, within range — the mirror of PickLowestHealthTarget. Useful to
+    // focus the beefiest target (the one that'll take longest to die / hits hardest)
+    // while incidental adds get cleaned up by splash. Same combat-only gating, so it
+    // never pulls an idle mob.
+    static Unit* PickHighestHealthTarget(Player* bot)
+    {
+        constexpr float MAX_RANGE = 40.0f;
+        Unit* best = nullptr;
+        uint32 bestHp = 0;
+        bool   found  = false;
+        auto consider = [&](Unit* a)
+        {
+            if (!a || !a->IsAlive() || !a->IsInCombat()) return;
+            if (!bot->IsValidAttackTarget(a)) return;
+            if (bot->GetDistance(a) > MAX_RANGE) return;
+            uint32 const hp = a->GetHealth();
+            if (!found || hp > bestHp) { bestHp = hp; best = a; found = true; }
+        };
+        auto considerAround = [&](Unit* u)
+        {
+            if (!u) return;
+            for (Unit* a : u->getAttackers()) consider(a);   // mobs attacking u
+            if (Unit* v = u->GetVictim()) consider(v);       // and the mob u is attacking
+        };
+        considerAround(bot);
+        for (Unit* ctrl : bot->m_Controlled) considerAround(ctrl);
+        if (Group* g = bot->GetGroup())
+        {
+            for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
+            {
+                Player* m = itr->GetSource();
+                if (!m || !m->IsInWorld() || m == bot || m->GetMapId() != bot->GetMapId())
+                    continue;
+                considerAround(m);
+                for (Unit* ctrl : m->m_Controlled) considerAround(ctrl);
+            }
+        }
+        return best;
+    }
+
     // "nearest" target mode: the NEAREST enemy the party is ALREADY engaged with,
     // within the bot's range. Like PickLowestHealthTarget it only considers mobs
     // in combat (attacking, or attacked by, the bot / its pet / a group member or
@@ -1937,6 +1978,12 @@ namespace WowPsParty
         {
             // Focus the weakest enemy already engaged with the party.
             desired = PickLowestHealthTarget(bot);
+            if (!desired) desired = pickPartyDefenseTarget();
+        }
+        else if (mode == "highest")
+        {
+            // Focus the beefiest enemy already engaged with the party.
+            desired = PickHighestHealthTarget(bot);
             if (!desired) desired = pickPartyDefenseTarget();
         }
         else if (mode == "loose")

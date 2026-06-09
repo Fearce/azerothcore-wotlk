@@ -2344,7 +2344,7 @@ public:
             // Whitelist — only known modes reach the DB (also blocks any
             // injection via the stored-into-SQL string).
             if (mode != "master" && mode != "tank" && mode != "nearest"
-                && mode != "loose" && mode != "lowest")
+                && mode != "loose" && mode != "lowest" && mode != "highest")
                 return;
             uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
             if (!guid) return;
