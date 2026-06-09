@@ -61,6 +61,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <sstream>
+#include <unordered_set>
 #include <vector>
 
 namespace WowPsParty
@@ -1034,6 +1035,8 @@ namespace {
 //   We deliberately bypass the durability-refund path in HandleSellItemOpcode:
 //   it only kicks in for equipped items with lost durability, which the
 //   shared-inventory UI doesn't surface anyway (only bag items).
+static void SendBuybackTo(Player* requester);   // defined below; refreshes the Buyback view
+
 static void HandleSell(Player* requester, std::string_view payload)
 {
     if (!requester || !requester->GetSession()) return;
@@ -1081,14 +1084,274 @@ static void HandleSell(Player* requester, std::string_view payload)
     uint32 const money = tmpl->SellPrice * count;
     std::string const soldName = tmpl->Name1;
 
-    srcChar->DestroyItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+    // Route the sale through the BUYBACK list (exactly like the core merchant)
+    // instead of destroying the item, so an accidental sale is recoverable from
+    // the party inventory's Buyback view. The item stays owned by srcChar and
+    // lands in its 12-slot buyback list (in-memory like vanilla — lost on logout).
+    srcChar->RemoveItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+    srcItem->RemoveFromUpdateQueueOf(srcChar);
+    srcChar->AddItemToBuyBackSlot(srcItem, money);
     requester->ModifyMoney(int32(money));
 
     ChatHandler(requester->GetSession()).PSendSysMessage(
-        "|cff66ccff[WowPsParty]|r Sold |cffffffff{}|r for |cffffd100{}.{}.{}|r.",
+        "|cff66ccff[WowPsParty]|r Sold |cffffffff{}|r for |cffffd100{}.{}.{}|r "
+        "(recover it from the Buyback view).",
         soldName,
         money / 10000, (money / 100) % 100, money % 100);
 
+    WowPsParty::SendInventoryTo(requester);
+    SendBuybackTo(requester);
+}
+
+// BB_BEGIN / BUYBACK <chunk>… / BB_END — every loaded party member's 12-slot
+// buyback list (items they've sold, recoverable). Mirrors SendInventoryTo's
+// chunked stream. Record:
+//   <ownerSlot>:<bbIdx>:<itemId>:<count>:<price>:<itemGuidLow>:<randProp>:<suffixFactor>
+static void SendBuybackTo(Player* requester)
+{
+    if (!requester || !requester->GetSession()) return;
+    uint32 const account = requester->GetSession()->GetAccountId();
+
+    std::vector<std::string> records;
+    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
+    {
+        uint32 const guid = WowPsParty::GuidForAccountSlot(account, partySlot);
+        if (!guid) continue;
+        ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
+        Player* p = ObjectAccessor::FindConnectedPlayer(og);
+        if (!p) p = ObjectAccessor::FindPlayer(og);
+        if (!p) continue;
+
+        for (uint8 s = BUYBACK_SLOT_START; s < BUYBACK_SLOT_END; ++s)
+        {
+            Item* it = p->GetItemFromBuyBackSlot(s);
+            if (!it) continue;
+            uint8 const idx = uint8(s - BUYBACK_SLOT_START);
+            uint32 const price = p->GetUInt32Value(PLAYER_FIELD_BUYBACK_PRICE_1 + idx);
+            std::ostringstream r;
+            r << uint32(partySlot) << ':' << uint32(idx) << ':'
+              << it->GetEntry() << ':' << it->GetCount() << ':' << price << ':'
+              << it->GetGUID().GetCounter() << ':'
+              << it->GetItemRandomPropertyId() << ':' << it->GetItemSuffixFactor();
+            records.push_back(r.str());
+        }
+    }
+
+    SendWPSP(requester, "BB_BEGIN");
+    constexpr size_t MAX_PAYLOAD = 220;
+    std::string chunk;
+    auto flush = [&]()
+    {
+        if (!chunk.empty()) { SendWPSP(requester, "BUYBACK\t" + chunk); chunk.clear(); }
+    };
+    for (std::string const& rec : records)
+    {
+        if (!chunk.empty() && chunk.size() + 1 + rec.size() > MAX_PAYLOAD) flush();
+        if (!chunk.empty()) chunk += ';';
+        chunk += rec;
+    }
+    flush();
+    SendWPSP(requester, "BB_END");
+}
+
+// BUYBACK\t<ownerPartySlot>\t<bbIdx> — restore a sold item from that member's
+// buyback list back to the member, charging the shared pool the original sale
+// price. No vendor needed (we call the storage primitives directly, not the
+// vendor-gated HandleBuybackItem).
+static void HandleBuyback(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const ownerSlot = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const bbIdx     = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+    if (bbIdx >= uint32(BUYBACK_SLOT_END - BUYBACK_SLOT_START)) return;
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    QueryResult q = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, ownerSlot);
+    if (!q) return;
+    Player* ownerChar = ObjectAccessor::FindConnectedPlayer(
+        ObjectGuid::Create<HighGuid::Player>(q->Fetch()[0].Get<uint32>()));
+    if (!ownerChar) return;
+
+    uint32 const slot = BUYBACK_SLOT_START + bbIdx;
+    Item* item = ownerChar->GetItemFromBuyBackSlot(slot);
+    if (!item)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r That buyback item is no longer available.");
+        return;
+    }
+    uint32 const price = ownerChar->GetUInt32Value(PLAYER_FIELD_BUYBACK_PRICE_1 + bbIdx);
+    if (!requester->HasEnoughMoney(price))
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Not enough gold in the shared pool to buy that back.");
+        return;
+    }
+    ItemPosCountVec dest;
+    if (ownerChar->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false) != EQUIP_ERR_OK)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r {}'s bags are full — can't buy that back.", ownerChar->GetName());
+        return;
+    }
+    std::string const itemName = item->GetTemplate() ? item->GetTemplate()->Name1 : "item";
+    requester->ModifyMoney(-int32(price));
+    ownerChar->RemoveItemFromBuyBackSlot(slot, false);
+    ownerChar->ItemAddedQuestCheck(item->GetEntry(), item->GetCount());
+    ownerChar->StoreItem(dest, item, true);
+
+    ChatHandler(requester->GetSession()).PSendSysMessage(
+        "|cff66ccff[WowPsParty]|r Bought back |cffffffff{}|r for |cffffd100{}.{}.{}|r to {}.",
+        itemName, price / 10000, (price / 100) % 100, price % 100, ownerChar->GetName());
+
+    WowPsParty::SendInventoryTo(requester);
+    SendBuybackTo(requester);
+}
+
+// The permanent-enchant id a spell applies (SPELL_EFFECT_ENCHANT_ITEM MiscValue),
+// or 0 if the spell isn't a permanent item-enchant. Used to list/apply enchants.
+static uint32 PermEnchantIdOfSpell(SpellInfo const* spell)
+{
+    if (!spell) return 0;
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        if (spell->Effects[i].Effect == SPELL_EFFECT_ENCHANT_ITEM)
+            return uint32(spell->Effects[i].MiscValue);
+    return 0;
+}
+
+// REQ_ENCHANTS\t<targetPartySlot>\t<targetItemGuidLow> — reply with ENCHANTS, the
+// enchant spell ids any loaded party member knows that FIT that specific item
+// (so the picker only ever shows valid choices for what was clicked).
+static void HandleReqEnchants(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const tgtSlot        = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const tgtItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    uint32 const tgtGuid = WowPsParty::GuidForAccountSlot(account, tgtSlot);
+    if (!tgtGuid) return;
+    Player* tgtChar = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(tgtGuid));
+    if (!tgtChar) return;
+    Item* tgtItem = tgtChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(tgtItemGuidLow));
+    if (!tgtItem) return;
+
+    std::vector<uint32> spellIds;
+    std::unordered_set<uint32> seen;
+    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
+    {
+        uint32 const guid = WowPsParty::GuidForAccountSlot(account, partySlot);
+        if (!guid) continue;
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid));
+        if (!p) continue;
+        for (auto const& kv : p->GetSpellMap())
+        {
+            if (kv.second->State == PLAYERSPELL_REMOVED) continue;
+            uint32 const spellId = kv.first;
+            if (seen.count(spellId)) continue;
+            SpellInfo const* spell = sSpellMgr->GetSpellInfo(spellId);
+            if (!PermEnchantIdOfSpell(spell)) continue;
+            if (!tgtItem->IsFitToSpellRequirements(spell)) continue;
+            seen.insert(spellId);
+            spellIds.push_back(spellId);
+        }
+    }
+
+    std::ostringstream out;
+    out << "ENCHANTS\t" << tgtSlot << '\t' << tgtItemGuidLow << '\t';
+    for (size_t i = 0; i < spellIds.size(); ++i)
+        out << (i ? "," : "") << spellIds[i];
+    SendWPSP(requester, out.str());
+}
+
+// ENCHANT\t<targetPartySlot>\t<targetItemGuidLow>\t<enchantSpellId> — apply the
+// permanent enchant to a shared item (equipped or bagged) owned by any member.
+// A party member who knows the enchant is the caster; reagents come from the
+// shared pool. We apply directly (no spell cast) so it works cross-character.
+static void HandleEnchant(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    std::string s(payload);
+    auto t1 = s.find('\t');               if (t1 == std::string::npos) return;
+    auto t2 = s.find('\t', t1 + 1);       if (t2 == std::string::npos) return;
+    uint32 const tgtSlot        = std::strtoul(s.substr(0, t1).c_str(), nullptr, 10);
+    uint32 const tgtItemGuidLow = std::strtoul(s.substr(t1 + 1, t2 - t1 - 1).c_str(), nullptr, 10);
+    uint32 const enchantSpellId = std::strtoul(s.substr(t2 + 1).c_str(), nullptr, 10);
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    uint32 const tgtGuid = WowPsParty::GuidForAccountSlot(account, tgtSlot);
+    if (!tgtGuid) return;
+    Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(tgtGuid));
+    if (!owner) return;
+    Item* item = owner->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(tgtItemGuidLow));
+    if (!item) return;
+
+    SpellInfo const* spell = sSpellMgr->GetSpellInfo(enchantSpellId);
+    uint32 const enchantId = PermEnchantIdOfSpell(spell);
+    if (!enchantId || !sSpellItemEnchantmentStore.LookupEntry(enchantId))
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r That isn't a usable enchant.");
+        return;
+    }
+    if (!item->IsFitToSpellRequirements(spell))
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r That enchant doesn't fit |cffffffff{}|r.",
+            item->GetTemplate() ? item->GetTemplate()->Name1 : "that item");
+        return;
+    }
+
+    // Find a loaded party member who actually knows the enchant — the caster.
+    Player* enchanter = nullptr;
+    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE && !enchanter; ++partySlot)
+    {
+        uint32 const guid = WowPsParty::GuidForAccountSlot(account, partySlot);
+        if (!guid) continue;
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid));
+        if (p && p->HasSpell(enchantSpellId)) enchanter = p;
+    }
+    if (!enchanter)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r No-one in the party knows that enchant.");
+        return;
+    }
+
+    // Reagents: check the shared pool covers ALL of them before consuming any.
+    extern uint32 WowPsParty_PartyReagentCount(Player*, uint32);
+    extern void   WowPsParty_TakeReagent(Player*, uint32, uint32);
+    for (uint8 r = 0; r < MAX_SPELL_REAGENTS; ++r)
+    {
+        if (spell->Reagent[r] <= 0) continue;
+        if (WowPsParty_PartyReagentCount(enchanter, uint32(spell->Reagent[r])) < uint32(spell->ReagentCount[r]))
+        {
+            ChatHandler(requester->GetSession()).PSendSysMessage(
+                "|cffff5555[WowPsParty]|r Missing reagents for that enchant.");
+            return;
+        }
+    }
+    for (uint8 r = 0; r < MAX_SPELL_REAGENTS; ++r)
+        if (spell->Reagent[r] > 0)
+            WowPsParty_TakeReagent(enchanter, uint32(spell->Reagent[r]), uint32(spell->ReagentCount[r]));
+
+    // Apply on the item's OWNER so equipped stats take effect (no-op for a bagged
+    // item until equipped). Remove the old enchant first, then set + reapply.
+    owner->ApplyEnchantment(item, PERM_ENCHANTMENT_SLOT, false);
+    item->SetEnchantment(PERM_ENCHANTMENT_SLOT, enchantId, 0, 0, enchanter->GetGUID());
+    owner->ApplyEnchantment(item, PERM_ENCHANTMENT_SLOT, true);
+    item->SetState(ITEM_CHANGED, owner);
+
+    ChatHandler(requester->GetSession()).PSendSysMessage(
+        "|cff66ccff[WowPsParty]|r {} enchanted |cffffffff{}|r ({}'s).",
+        enchanter->GetName(), item->GetTemplate() ? item->GetTemplate()->Name1 : "item", owner->GetName());
+
+    WowPsParty::SendGearTo(requester, tgtSlot);
     WowPsParty::SendInventoryTo(requester);
 }
 
@@ -2187,6 +2450,22 @@ public:
         else if (command == "SELL_TRASH")
         {
             HandleSellTrash(player);
+        }
+        else if (command == "REQ_BUYBACK")
+        {
+            SendBuybackTo(player);
+        }
+        else if (command == "BUYBACK")
+        {
+            HandleBuyback(player, payload);
+        }
+        else if (command == "REQ_ENCHANTS")
+        {
+            HandleReqEnchants(player, payload);
+        }
+        else if (command == "ENCHANT")
+        {
+            HandleEnchant(player, payload);
         }
         // REQ_TALENTS\t<token>  → TALENTS\t...  (alt slot OR henchman "h<guid>")
         else if (command == "REQ_TALENTS")
