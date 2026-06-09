@@ -38,6 +38,9 @@
  *     pet_exists | pet_missing | pet_dead | pet_health<N|>N
  *     party_lowest_health<N|>N  healer_mana  tank_health
  *     party_has_{disease,poison,magic,curse,dead}
+ *     self_totem_active:<fire|earth|water|air>   shaman: element totem up
+ *     self_totem_missing:<fire|earth|water|air>  shaman: element totem down
+ *     self_totem_count<N | self_totem_count>N    shaman: # totems up (0-4)
  *
  * Supported actions:
  *     cast:<spell name>            cast on the bot's current target

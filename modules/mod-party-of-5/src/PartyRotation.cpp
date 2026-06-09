@@ -948,6 +948,45 @@ namespace WowPsParty
         return info;
     }
 
+    // ---- Shaman totem state -------------------------------------------------
+    // The core dedicates one summon slot per element (SUMMON_SLOT_TOTEM_FIRE..
+    // _AIR). A slot holds a live totem's GUID exactly while that totem exists —
+    // Totem::UnSummon clears it on death/expiry — so the slot is the authoritative
+    // "is my <element> totem down" signal. Map an element name to its slot; 0 (an
+    // invalid totem slot) signals an unknown element so the caller fails closed.
+    static uint8 TotemSlotForElement(std::string const& element)
+    {
+        std::string e;
+        e.reserve(element.size());
+        for (char c : element) e.push_back(char(std::tolower((unsigned char)c)));
+        if (e == "fire")  return SUMMON_SLOT_TOTEM_FIRE;
+        if (e == "earth") return SUMMON_SLOT_TOTEM_EARTH;
+        if (e == "water") return SUMMON_SLOT_TOTEM_WATER;
+        if (e == "air")   return SUMMON_SLOT_TOTEM_AIR;
+        return 0;
+    }
+
+    // True when the element's totem slot holds a totem that's actually alive
+    // (defensively re-checked via the map in case a GUID outlives its creature).
+    static bool TotemElementActive(Player* bot, uint8 slot)
+    {
+        if (!bot || slot < SUMMON_SLOT_TOTEM_FIRE || slot >= MAX_TOTEM_SLOT)
+            return false;
+        ObjectGuid const g = bot->m_SummonSlot[slot];
+        if (!g) return false;
+        Creature* totem = bot->GetMap() ? bot->GetMap()->GetCreature(g) : nullptr;
+        return totem && totem->IsAlive();
+    }
+
+    // How many of the 4 element totems are currently up (0..4).
+    static int ActiveTotemCount(Player* bot)
+    {
+        int n = 0;
+        for (uint8 i = SUMMON_SLOT_TOTEM_FIRE; i < MAX_TOTEM_SLOT; ++i)
+            if (TotemElementActive(bot, i)) ++n;
+        return n;
+    }
+
     // ---- Channel commit-lock ------------------------------------------------
     // When a bot casts a CHANNELED spell (Blizzard, Rain of Fire, Volley, Mind
     // Flay, …) we lock its rotation for the channel duration: while the lock
@@ -1176,6 +1215,21 @@ namespace WowPsParty
             // for the inverse.
             if (cname == "primary_tree")
                 return int(PrimaryTalentTree(bot)) == std::atoi(arg.c_str());
+
+            // Shaman totem presence by element: self_totem_active:<fire|earth|
+            // water|air> is TRUE while that element's totem is summoned and alive;
+            // self_totem_missing is its inverse. One slot per element, so this is
+            // the precise "don't re-drop a totem that's already down" gate — pair
+            // self_totem_missing:fire with cast:Searing Totem, self_totem_missing:
+            // earth with cast:Strength of Earth Totem, etc. An unknown element
+            // fails CLOSED (both return false) so a typo can't spam a re-cast.
+            if (cname == "self_totem_active" || cname == "self_totem_missing")
+            {
+                uint8 const slot = TotemSlotForElement(arg);
+                if (!slot) return false;
+                bool const active = TotemElementActive(bot, slot);
+                return cname == "self_totem_active" ? active : !active;
+            }
         }
         if (cond == "in_combat")     return bot->IsInCombat();
         if (cond == "out_of_combat") return !bot->IsInCombat();
@@ -1506,6 +1560,11 @@ namespace WowPsParty
         // Combo points are 0-5, compared RAW (not as a percent of anything).
         if (name == "self_combo")
             return cmp(int(bot->GetComboPoints()));
+        // Shaman: number of element totems currently up (0-4), compared RAW.
+        // self_totem_count<1 = nothing down (drop the opener set);
+        // self_totem_count<4 = at least one element slot is free.
+        if (name == "self_totem_count")
+            return cmp(ActiveTotemCount(bot));
         // Pet health %, for Mend Pet gating.
         if (name == "pet_health")
         {
