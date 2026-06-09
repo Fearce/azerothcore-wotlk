@@ -33,6 +33,9 @@
  *     enemies_within:<R><op>N  enemies_in_melee  enemies_in_range
  *     enemies_clustered:<R><op>N  most enemies within R yd of each other
  *                                 (gate for Blizzard/Flamestrike-style AoE)
+ *     party_injured_clustered:<R><op>N  most INJURED allies (<90% HP, in cast
+ *                                 range) within R yd of each other — gate for
+ *                                 Chain Heal / Wild Growth / Prayer of Healing
  *     master_dist<N | master_dist>N      yards from the party leader
  *     stance_is_none                     warrior in no stance (apply one)
  *     pet_exists | pet_missing | pet_dead | pet_health<N|>N

@@ -525,6 +525,35 @@ namespace WowPsParty
         return best;
     }
 
+    // The largest cluster of INJURED party members all within `radius` of one of
+    // them — the friendly mirror of MaxEnemyCluster, for "is a Chain Heal / Wild
+    // Growth / Prayer of Healing worth it" gating. "Injured" = below hpPct of max.
+    // Only members within the healer's cast range (40y) count — you can't start the
+    // chain on someone you can't reach. Counts the bot itself if it's injured.
+    static uint32 MaxInjuredAllyCluster(Player* bot, float radius, int hpPct)
+    {
+        std::vector<Player*> party;
+        GatherPartyPlayers(bot, party, /*includeDead=*/false);
+        std::vector<Player*> injured;
+        for (Player* m : party)
+        {
+            float const maxHp = float(m->GetMaxHealth());
+            if (maxHp <= 0) continue;
+            if ((float(m->GetHealth()) / maxHp) * 100.0f >= float(hpPct)) continue;
+            if (bot->GetDistance(m) > 40.0f) continue;   // beyond the healer's cast range
+            injured.push_back(m);
+        }
+        uint32 best = 0;
+        for (Player* a : injured)
+        {
+            uint32 c = 0;
+            for (Player* b : injured)
+                if (a->GetDistance(b) <= radius) ++c;    // counts a itself too
+            if (c > best) best = c;
+        }
+        return best;
+    }
+
     // Dominant talent tree (tabpage 0/1/2) of a LIVE bot, by points spent.
     // Mirrors PartyMgr's offline InferHenchmanRole but reads learned talent
     // ranks straight from the player in memory (HasSpell), so it tracks the
@@ -1206,6 +1235,24 @@ namespace WowPsParty
                 char const opA = arg[opPosA];
                 int const countN = std::atoi(arg.substr(opPosA + 1).c_str());
                 int const found  = int(MaxEnemyCluster(bot, radius));
+                return opA == '<' ? (found < countN) : (found > countN);
+            }
+            // Friendly clustering gate for chain/AoE heals (Chain Heal, Wild
+            // Growth, Prayer of Healing, Circle of Healing):
+            // "party_injured_clustered:12>2" → more than 2 INJURED party members
+            // (below ~90% HP, within the healer's 40y cast range) are within 12y of
+            // EACH OTHER, so a chain/AoE heal would actually land on several. Same
+            // R<op>N grammar as enemies_clustered. AND-chain party_lowest_health for
+            // a severity floor (e.g. "...:12>2&party_lowest_health<80").
+            if (cname == "party_injured_clustered")
+            {
+                auto opPosA = arg.find_first_of("<>");
+                if (opPosA == std::string::npos) return false;
+                float const radius = float(std::atof(arg.substr(0, opPosA).c_str()));
+                if (radius <= 0.0f) return false;
+                char const opA = arg[opPosA];
+                int const countN = std::atoi(arg.substr(opPosA + 1).c_str());
+                int const found  = int(MaxInjuredAllyCluster(bot, radius, 90));
                 return opA == '<' ? (found < countN) : (found > countN);
             }
             // "primary_tree:N" — TRUE when the bot's dominant talent tree is
