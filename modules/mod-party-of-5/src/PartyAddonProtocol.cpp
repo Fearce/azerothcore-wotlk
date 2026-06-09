@@ -1088,6 +1088,7 @@ static void HandleSell(Player* requester, std::string_view payload)
     // instead of destroying the item, so an accidental sale is recoverable from
     // the party inventory's Buyback view. The item stays owned by srcChar and
     // lands in its 12-slot buyback list (in-memory like vanilla — lost on logout).
+    srcChar->ItemRemovedQuestCheck(srcItem->GetEntry(), count);   // mirror core; HandleBuyback re-adds
     srcChar->RemoveItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
     srcItem->RemoveFromUpdateQueueOf(srcChar);
     srcChar->AddItemToBuyBackSlot(srcItem, money);
