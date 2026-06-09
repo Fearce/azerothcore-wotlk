@@ -2677,7 +2677,7 @@ namespace WowPsParty
             // and teleported on nearly every step (legs never moving). Tracking
             // the follower's OWN movement fixes it: a walking bot is moving, so
             // it's never flagged; only a genuinely frozen one is.
-            struct StuckSample { float x = 0.0f, y = 0.0f; uint32 idle = 0; };
+            struct StuckSample { float x = 0.0f, y = 0.0f; uint32 idle = 0; uint32 unstickAttempts = 0; };
             static thread_local std::unordered_map<uint32, StuckSample> stuckTracker;
             StuckSample& s = stuckTracker[guidLow];
             float const dxs = follower->GetPositionX() - s.x;
@@ -2686,14 +2686,28 @@ namespace WowPsParty
             s.x = follower->GetPositionX();
             s.y = follower->GetPositionY();
             if (dist > 8.0f && movedSelf < 1.0f) ++s.idle;
-            else                                  s.idle = 0;
+            else { s.idle = 0; s.unstickAttempts = 0; }   // moved or caught up = recovered
             // Genuine long-distance gaps are already handled above (the >50y
             // leash re-walks, >100y snaps), so by here dist <= 50: a "stuck" bot
-            // is idle-frozen, NOT far. Such a freeze is almost always a
-            // movement-blocking state the bot's missing client never cleared
-            // (post-revive root/etc.), so don't yank it to the leader — log what
-            // was set, force a movable slate, and re-assert MoveFollow IN PLACE
-            // so it walks from where it stands.
+            // is idle-frozen, NOT far. Two distinct causes, two remedies:
+            //   1. A movement-BLOCKING state the bot's missing client never cleared
+            //      (post-revive root/stun/death). ForceMovableState + re-asserting
+            //      MoveFollow IN PLACE fixes it — the bot walks from where it stands,
+            //      no disruptive teleport.
+            //   2. The follow generator is already installed (unitState carries
+            //      UNIT_STATE_FOLLOW=0x200) but its path computed empty, so it stands
+            //      still with NO block at all (moveFlags=0). This is the post-rez
+            //      freeze Kevin hit — two bots auto-revived on a boss corpse, then
+            //      "refused to move" through the next pull and wiped the party.
+            //      Re-asserting the SAME MoveFollow just re-installs the same stalled
+            //      generator and it never moves (the logs show unstick-in-place firing
+            //      over and over on the same bots, unitState=0x200 moveFlags=0, never
+            //      recovering). The only thing that fixes a dead follow PATH is a fresh
+            //      pathable position, so escalate to a teleport onto the leader.
+            // We can't tell the two apart up front (both look idle), so try the gentle
+            // in-place fix ONCE; if the bot is STILL stuck after it, the block wasn't
+            // the problem — teleport. A bot whose root the in-place fix cleared starts
+            // moving and resets unstickAttempts before ever reaching the teleport.
             bool const stuckClose = s.idle >= 3;   // not moving for 3 ticks while >8y out
             if (stuckClose)
             {
@@ -2702,16 +2716,39 @@ namespace WowPsParty
 
                 uint32 const ustate = follower->GetUnitState();
                 ForceMovableState(follower);
-                follower->StopMoving();
-                follower->GetMotionMaster()->Clear();
-                follower->GetMotionMaster()->MoveFollow(
-                    leader, PET_FOLLOW_DIST, follower->GetFollowAngle());
-                LOG_INFO("module",
-                    "[WowPsParty Follow] unstick-in-place: {} dist={:.1f} idle={} "
-                    "unitState={:#x} moveFlags={:#x}",
-                    follower->GetName(), dist, s.idle, ustate,
-                    follower->GetUnitMovementFlags());
+
+                if (s.unstickAttempts == 0)
+                {
+                    follower->StopMoving();
+                    follower->GetMotionMaster()->Clear();
+                    follower->GetMotionMaster()->MoveFollow(
+                        leader, PET_FOLLOW_DIST, follower->GetFollowAngle());
+                    LOG_INFO("module",
+                        "[WowPsParty Follow] unstick-in-place: {} dist={:.1f} idle={} "
+                        "unitState={:#x} moveFlags={:#x}",
+                        follower->GetName(), dist, s.idle, ustate,
+                        follower->GetUnitMovementFlags());
+                }
+                else
+                {
+                    follower->GetMotionMaster()->Clear();
+                    follower->StopMoving();
+                    follower->TeleportTo(leader->GetMapId(),
+                        leader->GetPositionX(), leader->GetPositionY(),
+                        leader->GetPositionZ(), leader->GetOrientation());
+                    LOG_INFO("module",
+                        "[WowPsParty Follow] unstick-teleport: {} dist={:.1f} (in-place "
+                        "unstick didn't take — follow path stalled, unitState={:#x})",
+                        follower->GetName(), dist, ustate);
+                }
+
+                // Preserve the escalation counter across the sample reset so the next
+                // stuck detection knows the in-place fix already failed.
+                uint32 const keepAttempts = s.unstickAttempts + 1;
                 s = StuckSample{};
+                s.unstickAttempts = keepAttempts;
+                s.x = follower->GetPositionX();
+                s.y = follower->GetPositionY();
                 return true;
             }
 
