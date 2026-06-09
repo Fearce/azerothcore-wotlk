@@ -1628,30 +1628,34 @@ static bool OpenLootableContainer(Player* requester, Player* srcChar, Item* srcI
         return true;
     }
 
-    // The owning char opens it. SendLoot fills the item's loot from its template
-    // (engine does the heavy lifting). Active char → the loot window pops and they
-    // loot normally. Alt/bot owner → auto-loot into ITS bags.
+    // Fill the satchel's loot from its template, then AUTO-LOOT it into the
+    // OWNER's bags — for EVERYONE, the active char included. We deliberately do
+    // NOT rely on the client loot window: the open came from the shared-inventory
+    // addon, not a CMSG_OPEN_ITEM, so the client never initiated a loot and an
+    // unsolicited SendLoot window doesn't reliably appear. That's exactly why the
+    // active char's OWN satchels "wouldn't open" while alts (which always
+    // auto-looted) did. Server-side auto-loot is deterministic for all of them.
+    // (Satchel of Helpful Goods has 3-4 loot groups, so several items per open is
+    // expected, not a bug.)
     srcChar->SendLoot(srcItem->GetGUID(), LOOT_CORPSE);
-    if (srcChar == requester)
-    {
-        WowPsParty::SendInventoryTo(requester);
-        return true;
-    }
-
     Loot& loot = srcItem->loot;
     if (loot.gold)
     {
         srcChar->ModifyMoney(int32(loot.gold));   // shared-gold mirror runs off the money hook
         loot.gold = 0;
     }
+    uint32 stored = 0;
     for (LootItem& li : loot.items)
     {
-        if (li.is_looted || li.freeforall) continue;
+        if (li.is_looted) continue;
         ItemPosCountVec dst;
         if (srcChar->CanStoreNewItem(NULL_BAG, NULL_SLOT, dst, li.itemid, li.count) != EQUIP_ERR_OK)
             continue;   // owner bag full for this one — leave it in the satchel
         if (srcChar->StoreNewItem(dst, li.itemid, true, li.randomPropertyId))
+        {
             li.is_looted = true;
+            ++stored;
+        }
     }
     srcChar->SendLootRelease(srcItem->GetGUID());   // clear the owner's loot state
     bool emptied = (loot.gold == 0);
@@ -1661,8 +1665,13 @@ static bool OpenLootableContainer(Player* requester, Player* srcChar, Item* srcI
         srcChar->DestroyItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
     std::string const ownerName = srcChar->GetName();
     std::string const satchelName = t->Name1;
-    ChatHandler(requester->GetSession()).PSendSysMessage(
-        "|cff66ccff[WowPsParty]|r Opened |cffffffff{}|r on {}.", satchelName, ownerName);
+    if (stored == 0 && !emptied)
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r {}'s bags are full — couldn't take |cffffffff{}|r's contents.",
+            ownerName, satchelName);
+    else
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r Opened |cffffffff{}|r on {} (+{} item(s)).", satchelName, ownerName, stored);
     WowPsParty::SendInventoryTo(requester);
     return true;
 }
