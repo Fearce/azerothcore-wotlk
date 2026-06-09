@@ -4245,6 +4245,21 @@ void Unit::InterruptSpell(CurrentSpellTypes spellType, bool withDelayed, bool wi
 {
     //LOG_DEBUG("entities.unit", "Interrupt spell for unit {}.", GetEntry());
     Spell* spell = m_currentSpells[spellType];
+    // [WowPsParty DIAG] log who/what is interrupting an active CHANNEL: which other
+    // spells the caster has in flight (a fresh cast = generic; a wand/shot = repeat),
+    // withInstant/bySelf flags. This pins the InterruptSpell caller for the Mind
+    // Flay break (channel-break/movement diag was empty -> it's a direct interrupt).
+    if (spellType == CURRENT_CHANNELED_SPELL && spell && spell->getState() == SPELL_STATE_CASTING)
+    {
+        Spell* gen = m_currentSpells[CURRENT_GENERIC_SPELL];
+        Spell* rep = m_currentSpells[CURRENT_AUTOREPEAT_SPELL];
+        LOG_INFO("module",
+            "[WowPsParty DIAG] channel-interruptspell caster={} chan={} genCast={} repCast={} withDelayed={} withInstant={} bySelf={}",
+            GetGUID().GetCounter(), spell->GetSpellInfo() ? spell->GetSpellInfo()->Id : 0,
+            (gen && gen->GetSpellInfo()) ? gen->GetSpellInfo()->Id : 0,
+            (rep && rep->GetSpellInfo()) ? rep->GetSpellInfo()->Id : 0,
+            withDelayed ? 1 : 0, withInstant ? 1 : 0, bySelf ? 1 : 0);
+    }
     if (spell
         && (withDelayed || spell->getState() != SPELL_STATE_DELAYED)
         && (withInstant || spell->GetCastTime() > 0 || spell->getState() == SPELL_STATE_CASTING)) // xinef: or spell is in casting state (channeled spells only)
