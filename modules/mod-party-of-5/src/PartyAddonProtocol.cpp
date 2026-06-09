@@ -1676,6 +1676,60 @@ static bool OpenLootableContainer(Player* requester, Player* srcChar, Item* srcI
     return true;
 }
 
+// Apply a GLYPH item to `target` in the first FREE slot whose type (major/minor)
+// matches and is level-unlocked, then consume one glyph from `itemOwner`. A glyph
+// item's on-use spell APPLIES the glyph, but a plain CastSpell always uses slot 0
+// (m_glyphIndex defaults to 0) — that's the "every glyph lands in the first slot,
+// can only equip one" bug. Mirrors Spell::EffectApplyGlyph for an empty slot.
+static void ApplyGlyphFromItem(Player* target, Player* itemOwner, Item* glyphItem, uint32 glyphId)
+{
+    if (!target || !target->GetSession() || !itemOwner || !glyphItem) return;
+    GlyphPropertiesEntry const* gp = sGlyphPropertiesStore.LookupEntry(glyphId);
+    if (!gp) return;
+
+    // Per-slot unlock level (Spell::EffectApplyGlyph): slots 0/1=15, 3=30, 2=50,
+    // 4=70, 5=80. Indexed by slot.
+    static uint8 const SLOT_MIN_LEVEL[MAX_GLYPH_SLOT_INDEX] = { 15, 15, 50, 30, 70, 80 };
+    int slot = -1;
+    for (uint8 i = 0; i < MAX_GLYPH_SLOT_INDEX; ++i)
+    {
+        if (target->GetLevel() < SLOT_MIN_LEVEL[i]) continue;   // socket not unlocked yet
+        if (target->GetGlyph(i) != 0) continue;                 // already occupied
+        GlyphSlotEntry const* gs = sGlyphSlotStore.LookupEntry(target->GetGlyphSlot(i));
+        if (!gs || gs->TypeFlags != gp->TypeFlags) continue;    // major/minor mismatch
+        slot = int(i);
+        break;
+    }
+    std::string const glyphName = glyphItem->GetTemplate() ? glyphItem->GetTemplate()->Name1 : "glyph";
+    if (slot < 0)
+    {
+        ChatHandler(target->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r No free matching glyph slot for |cffffffff{}|r "
+            "(that type is full, or not unlocked at your level).", glyphName);
+        return;
+    }
+
+    // Apply (empty slot, so no old glyph to strip) — same sequence as the core.
+    target->SendLearnPacket(gp->SpellId, true);
+    target->CastSpell(target, gp->SpellId,
+        TriggerCastFlags(TRIGGERED_FULL_MASK & ~(TRIGGERED_IGNORE_SHAPESHIFT | TRIGGERED_IGNORE_CASTER_AURASTATE)));
+    target->SetGlyph(uint8(slot), glyphId, true);
+    target->SendTalentsInfoData(false);
+
+    // Consume one glyph from the owner.
+    if (glyphItem->GetCount() > 1)
+    {
+        glyphItem->SetCount(glyphItem->GetCount() - 1);
+        glyphItem->SetState(ITEM_CHANGED, itemOwner);
+    }
+    else
+        itemOwner->DestroyItem(glyphItem->GetBagSlot(), glyphItem->GetSlot(), true);
+
+    ChatHandler(target->GetSession()).PSendSysMessage(
+        "|cff66ccff[WowPsParty]|r Applied |cffffffff{}|r to glyph slot {}.", glyphName, slot + 1);
+    WowPsParty::SendInventoryTo(target);
+}
+
 // USE\t<srcPartySlot>\t<srcItemGuidLow> — use a bag consumable. The item's
 // ON_USE spell fires on the requesting (controlled) character; a consumable
 // loses one charge from its owner. Lets you right-click food/potions/quest
@@ -1724,6 +1778,16 @@ static void HandleUse(Player* requester, std::string_view payload)
             "|cffff5555[WowPsParty]|r |cffffffff{}|r isn't usable.", t->Name1);
         return;
     }
+
+    // A GLYPH's on-use spell applies the glyph. Route it to the correct free slot
+    // (see ApplyGlyphFromItem) instead of CastSpell, which would always pick slot 0.
+    if (SpellInfo const* si = sSpellMgr->GetSpellInfo(useSpell))
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            if (si->Effects[i].Effect == SPELL_EFFECT_APPLY_GLYPH)
+            {
+                ApplyGlyphFromItem(requester, srcChar, srcItem, uint32(si->Effects[i].MiscValue));
+                return;
+            }
 
     requester->CastSpell(requester, useSpell, true);
     if (t->Class == ITEM_CLASS_CONSUMABLE)
