@@ -43,6 +43,7 @@
 #include "GameTime.h"
 #include "Item.h"
 #include "ItemTemplate.h"
+#include "LootMgr.h"   // Loot / LootItem — open lootable satchels from the shared bags
 #include "Log.h"
 #include "Map.h"
 #include "MotionMaster.h"
@@ -1341,39 +1342,66 @@ static void HandleUse(Player* requester, std::string_view payload)
     {
         // No on-use spell — but a LOOTABLE container (Satchel of Helpful Goods, the
         // random-dungeon reward bag, lootable pouches, …) is OPENED, not "used":
-        // right-clicking pops its loot window. The looter must OWN the item, so if
-        // it's sitting in another party char's bags, re-own it to the requester
-        // first, then open. (LFG satchels land on the char that finished the run —
-        // i.e. the active char — so usually it's already theirs.)
+        // right-click pops its loot. These are BoP/unique and BOUND to the char that
+        // earned them, so they must be opened ON THAT CHAR — never moved to the
+        // requester (that fails the unique/bind check → the bogus "no room").
         if (t->HasFlag(ITEM_FLAG_HAS_LOOT) && !srcItem->IsWrapped())
         {
-            if (!requester->IsAlive())
+            if (!srcChar->IsAlive())
             {
                 ChatHandler(requester->GetSession()).PSendSysMessage(
-                    "|cffff5555[WowPsParty]|r Can't open |cffffffff{}|r while dead.", t->Name1);
+                    "|cffff5555[WowPsParty]|r Can't open |cffffffff{}|r — its owner is dead.", t->Name1);
                 return;
             }
-            if (srcChar != requester)
-            {
-                ItemPosCountVec destPos;
-                if (requester->CanStoreItem(NULL_BAG, NULL_SLOT, destPos, srcItem, false) != EQUIP_ERR_OK)
-                {
-                    ChatHandler(requester->GetSession()).PSendSysMessage(
-                        "|cffff5555[WowPsParty]|r No room to open |cffffffff{}|r.", t->Name1);
-                    return;
-                }
-                srcChar->MoveItemFromInventory(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
-                requester->MoveItemToInventory(destPos, srcItem, true);
-            }
-            if (srcItem->IsLocked())
+            // ONLY gate on the lock when the item actually HAS a lock (LockID). A
+            // lock-less satchel still reports IsLocked() (the UNLOCKED bit is unset)
+            // but opens fine — the engine only checks the lock if LockID != 0, so the
+            // old unconditional IsLocked() check produced the bogus "is locked".
+            if (t->LockID && srcItem->IsLocked())
             {
                 ChatHandler(requester->GetSession()).PSendSysMessage(
                     "|cffff5555[WowPsParty]|r |cffffffff{}|r is locked.", t->Name1);
                 return;
             }
-            // Same call HandleOpenItemOpcode makes for a lootable item — pops the
-            // loot window on the requester; the loot system consumes the container.
-            requester->SendLoot(srcItem->GetGUID(), LOOT_CORPSE);
+
+            // The owning char opens it. SendLoot fills the item's loot from its
+            // template (engine does the heavy lifting). If the owner is the human
+            // (active char), that's all we do — the loot window pops and they loot
+            // it normally. If the owner is an ALT/bot (no client to click a window),
+            // auto-loot the contents into ITS bags so the loot isn't stranded; it
+            // surfaces in the shared inventory either way.
+            srcChar->SendLoot(srcItem->GetGUID(), LOOT_CORPSE);
+            if (srcChar == requester)
+            {
+                WowPsParty::SendInventoryTo(requester);
+                return;
+            }
+
+            Loot& loot = srcItem->loot;
+            if (loot.gold)
+            {
+                srcChar->ModifyMoney(int32(loot.gold));   // shared-gold mirror runs off the money hook
+                loot.gold = 0;
+            }
+            for (LootItem& li : loot.items)
+            {
+                if (li.is_looted || li.freeforall) continue;
+                ItemPosCountVec dst;
+                if (srcChar->CanStoreNewItem(NULL_BAG, NULL_SLOT, dst, li.itemid, li.count) != EQUIP_ERR_OK)
+                    continue;   // owner bag full for this one — leave it in the satchel
+                if (srcChar->StoreNewItem(dst, li.itemid, true, li.randomPropertyId))
+                    li.is_looted = true;
+            }
+            srcChar->SendLootRelease(srcItem->GetGUID());   // clear the owner's loot state
+            bool emptied = (loot.gold == 0);
+            for (LootItem const& li : loot.items)
+                if (!li.is_looted) { emptied = false; break; }
+            if (emptied)
+                srcChar->DestroyItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+            std::string const ownerName = srcChar->GetName();
+            std::string const satchelName = t->Name1;
+            ChatHandler(requester->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Opened |cffffffff{}|r on {}.", satchelName, ownerName);
             WowPsParty::SendInventoryTo(requester);
             return;
         }
