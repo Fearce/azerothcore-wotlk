@@ -333,7 +333,14 @@ namespace WowPsParty
             std::ostringstream r;
             r << partySlot << ':' << bag << ':' << pos << ':'
               << item->GetEntry() << ':' << item->GetCount() << ':'
-              << item->GetGUID().GetCounter();
+              << item->GetGUID().GetCounter()
+              // Random property / suffix so the addon tooltip renders the FULL item
+              // (e.g. a rare with "of the Bear") instead of the base item with no
+              // stats. RandomPropertyId is NEGATIVE for a random SUFFIX; the suffix
+              // factor (property seed) scales its stats. Appended, so an older addon
+              // that only reads the first 6 fields still parses fine.
+              << ':' << item->GetItemRandomPropertyId()
+              << ':' << item->GetItemSuffixFactor();
             records.push_back(r.str());
         };
 
