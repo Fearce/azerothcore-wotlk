@@ -1878,7 +1878,25 @@ namespace WowPsParty
         }
         else // "master" / default
         {
-            desired = leaderTargetValid ? leaderTarget : pickPartyDefenseTarget();
+            if (leaderTargetValid)
+                desired = leaderTarget;
+            else
+            {
+                // The leader isn't ATTACKING anything, but if they've SELECTED a
+                // valid hostile, treat that as "party, attack this" — GW1/DAI-style
+                // direction. Without this the party only engages a mob you're
+                // already auto-attacking, so a freshly-selected pull just gets
+                // stared at (Kevin's mom: bots stood looking at the enemy, never
+                // moved in to wand it). This is player-DIRECTED (you picked the
+                // target), not the bot auto-choosing a mob, so it isn't the
+                // "nearest-mode pulls the room" hazard; the 50y party leash still
+                // caps how far they'll chase a stray click.
+                Unit* const sel = leader->GetSelectedUnit();
+                if (sel && sel->IsAlive() && bot->IsValidAttackTarget(sel))
+                    desired = sel;
+                else
+                    desired = pickPartyDefenseTarget();
+            }
         }
         // Final safety: never hand back a dead/invalid target.
         if (desired && (!desired->IsAlive() || !bot->IsValidAttackTarget(desired)))
