@@ -2091,7 +2091,26 @@ namespace WowPsParty
                 return false;
             }
             // Commit to the channel so the rotation can't re-cast/clip it.
-            if (isChannel) MarkChannelCommit(bot, spellId, uint32(holdMs));
+            if (isChannel)
+            {
+                MarkChannelCommit(bot, spellId, uint32(holdMs));
+                // Throttled confirmation a unit channel (Mind Flay, Drain Life)
+                // actually started + whether the core registered the channel slot.
+                // Pairs with the "cut short" log to show if it then breaks (melee
+                // pushback) — the Mind-Flay-"never casts" diagnosis.
+                static thread_local std::unordered_map<uint64, uint32> chLogMs;
+                uint64 const ck = (uint64(bot->GetGUID().GetCounter()) << 32) | spellId;
+                uint32 const cn = getMSTime();
+                uint32& cl = chLogMs[ck];
+                if (cn - cl > 3000)
+                {
+                    cl = cn;
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation] unit-channel {} guid={} holdMs={} channelSlot={}",
+                        spellId, bot->GetGUID().GetCounter(), holdMs,
+                        bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL) ? 1 : 0);
+                }
+            }
             return true;
         };
 
