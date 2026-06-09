@@ -3610,6 +3610,17 @@ SpellCastResult Spell::prepare(SpellCastTargets const* targets, AuraEffect const
                 exceptSpellId = m_spellInfo->Id;
             }
 
+            // [WowPsParty DIAG] If casting THIS spell is about to CAST-interrupt an
+            // active channel, log which spell is the culprit (the missing link:
+            // flag 0x4 = AURA_INTERRUPT_FLAG_CAST fires here). Shows whether it's a
+            // re-cast of the channel itself or a different spell slipping past the
+            // commit-lock while the channel runs.
+            if (Spell* _ch = m_caster->GetCurrentSpell(CURRENT_CHANNELED_SPELL))
+                if (SpellInfo const* _ci = _ch->GetSpellInfo())
+                    if ((_ci->ChannelInterruptFlags & AURA_INTERRUPT_FLAG_CAST) && _ci->Id != exceptSpellId)
+                        LOG_INFO("module",
+                            "[WowPsParty DIAG] cast-breaks-channel caster={} castingSpell={} breaksChannel={}",
+                            m_caster->GetGUID().GetCounter(), m_spellInfo->Id, _ci->Id);
             m_caster->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_CAST, exceptSpellId, m_spellInfo->Id == 75);
             m_caster->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_SPELL_ATTACK, exceptSpellId, m_spellInfo->Id == 75);
         }
