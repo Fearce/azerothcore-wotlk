@@ -138,6 +138,13 @@ namespace WowPsParty
     // when a bot is detected frozen. Safe only out of combat (no legit CC).
     void ForceMovableState(Player* p);
 
+    // "Come Hither" recall: bring every follower bound to `leader` to the leader's
+    // position and HOLD them there for holdMs (the hold suppresses both the follow
+    // ticker and the combat assist, so they don't immediately path back). Used by
+    // the keybind to drag the party out of ground effects; normal movement resumes
+    // when the hold expires.
+    void RecallFollowers(Player* leader, uint32 holdMs);
+
     // Out-of-combat gathering. If `bot` is one of the player's alts (not a
     // henchman) and was trained in Mining or Herbalism, harvest a nearby node
     // (within 30y, within the bot's skill) while travelling with the party,

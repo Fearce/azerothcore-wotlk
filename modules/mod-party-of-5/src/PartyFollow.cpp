@@ -497,6 +497,44 @@ namespace WowPsParty
         p->RemoveUnitMovementFlag(MOVEMENTFLAG_ROOT);
     }
 
+    // MotionMaster point id for the "Come Hither" recall (just needs to be unique
+    // among our explicit MovePoints so arrival callbacks don't collide).
+    static constexpr uint32 RECALL_POINT_ID = 0xCA11;
+
+    void RecallFollowers(Player* leader, uint32 holdMs)
+    {
+        if (!leader || !leader->IsInWorld()) return;
+        ObjectGuid const leaderGuid = leader->GetGUID();
+        uint32 const leaderMap = leader->GetMapId();
+        float const lx = leader->GetPositionX();
+        float const ly = leader->GetPositionY();
+        float const lz = leader->GetPositionZ();
+
+        // Snapshot the followers UNDER the lock, then act WITHOUT it: HoldFollower
+        // takes the same (non-recursive) mutex, so holding it across the loop would
+        // self-deadlock.
+        std::vector<ObjectGuid> followers;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            for (auto const& d : g_directives)
+                if (d.leaderGuid == leaderGuid)
+                    followers.push_back(d.followerGuid);
+        }
+
+        for (ObjectGuid const& g : followers)
+        {
+            Player* bot = ObjectAccessor::FindPlayer(g);
+            if (!bot || !bot->IsInWorld() || !bot->IsAlive()) continue;
+            if (bot->GetMapId() != leaderMap) continue;
+            // Run to the leader's exact spot — pathfinding + unit collision spread
+            // them into a tight cluster. MovePoint overrides any in-progress
+            // chase/kite; the hold keeps both the follow ticker and the combat
+            // assist (both honour IsFollowerHeld) off them for holdMs.
+            bot->GetMotionMaster()->MovePoint(RECALL_POINT_ID, lx, ly, lz);
+            HoldFollower(g, holdMs);
+        }
+    }
+
     // followerGuidLow -> ms until which the bot is actively leading the
     // dungeon path. Distinct from HoldFollower (which TankFollowPath also
     // honours, so it can't hold itself): this signal is read ONLY by the

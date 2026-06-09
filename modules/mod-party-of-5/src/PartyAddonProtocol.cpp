@@ -2477,6 +2477,12 @@ public:
         {
             HandleEnchant(player, payload);
         }
+        else if (command == "COME_HITHER")
+        {
+            // Recall the party to me and hold them ~2s — drag them out of ground
+            // effects. `player` is the active controlled body the followers track.
+            WowPsParty::RecallFollowers(player, 2000);
+        }
         // REQ_TALENTS\t<token>  → TALENTS\t...  (alt slot OR henchman "h<guid>")
         else if (command == "REQ_TALENTS")
         {
