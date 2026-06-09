@@ -2022,14 +2022,19 @@ namespace WowPsParty
         // lower-priority rule.
         auto faceAndCast = [bot, &lastCastResult](Unit* target, uint32 spellId) -> bool
         {
-            // A channel that just got cut short (pushback) is on backoff — skip it
-            // so the rotation falls through to cheaper/instant spells.
-            if (ChannelOnBackoff(bot, spellId)) return false;
             // How long to stay planted: cast time, or — for a CHANNELED spell
             // (Arcane Missiles, Mind Flay, Drain Life) whose CalcCastTime is 0 —
             // the channel duration. Movement clears UNIT_STATE_CASTING and breaks
             // BOTH, so a channel held only for its (zero) cast time gets clipped by
             // the follow/assist ticker after one tick.
+            //
+            // NOTE: the melee-gate and cut-short backoff are deliberately NOT applied
+            // to SINGLE-TARGET channels (Mind Flay, Drain Life). Those are a caster's
+            // core filler — they still deal damage through pushback and should fire
+            // even with a mob in melee. Both gates exist only on the ground-AoE path
+            // (faceAndCastAt) where the channel is expensive (Blizzard) and the caster
+            // is meant to stand at range. (Self-clip is still prevented by the commit
+            // lock below.)
             int32 holdMs = 0;
             bool  isChannel = false;
             if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId))
@@ -2042,13 +2047,6 @@ namespace WowPsParty
                 if (isChannel && info->GetDuration() > holdMs)
                     holdMs = info->GetDuration();
             }
-            // Don't START a channel while something is on top of us. Melee hits
-            // push a channel back ~25% of its duration EACH, so a meleed caster's
-            // channel dies in ~1s and just burns mana. Skip it and fall through to
-            // instants / a peel (Frost Nova) / kite; once the caster has cleared
-            // melee range the channel fires and actually ticks. (Hard casts only
-            // get pushed back, not killed, so they're left alone.)
-            if (isChannel && CountHostilesWithin(bot, 8.0f) > 0) return false;
             // Plant ONLY for spells with a stationary window (cast time or
             // channel): a moving Player's motion update clears UNIT_STATE_CASTING
             // and interrupts it, so freeze for the duration. Instant shots are NOT
