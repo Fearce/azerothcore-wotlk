@@ -62,8 +62,10 @@
 #include "WorldSessionMgr.h"
 #include "WorldPacket.h"
 #include "Opcodes.h"
+#include "Random.h"   // urand/frand for the movement-humanization jitter + wander
 
 #include <atomic>
+#include <cmath>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -2649,6 +2651,83 @@ namespace WowPsParty
             float(M_PI) * 0.9f,     // back-left inner
         };
 
+        // ====================================================================
+        //  Movement humanization
+        // --------------------------------------------------------------------
+        // Followers used to MoveFollow rigid, identical bearings and snap in
+        // lockstep the instant the leader moved — unmistakably robotic. The
+        // 1 Hz ApplyDirective pass still owns ALL safety (leash, stuck-teleport,
+        // combat yield, revive, cross-map); for a bot it judges to be in pure
+        // open-follow it now just records an eligibility flag + a jittered slot
+        // and DELEGATES the actual follow-install to a fast (250 ms) humanize
+        // tick. That fast tick re-checks the cheap critical guards live so it
+        // can never fight AssistTarget, and adds the human texture: per-bot
+        // formation jitter, a sub-second STAGGERED peel-off when the leader
+        // starts moving, and gentle idle WANDER on a short leash. Its worst-
+        // case failure is a bot standing a beat or taking one stray step — the
+        // 1 Hz net (which measures real position movement, cadence-agnostic)
+        // still rescues any genuinely stuck bot.
+        struct FollowHumanize
+        {
+            bool   eligible       = false;  // 1 Hz pass: this bot is in pure open-follow
+            float  slotAngle      = float(M_PI);
+            float  slotDist       = 2.0f;
+            float  apptAngle      = 0.0f;    // last slot we actually asserted (idempotency)
+            float  apptDist       = 0.0f;
+            bool   followAsserted = false;
+            bool   wasLeaderMoving = false;
+            uint32 reactAtMs      = 0;       // staggered peel-off: don't move before this
+            uint32 driftRerollMs  = 0;       // next slow-drift reroll
+            float  driftAngle     = 0.0f;
+            float  driftDist      = 0.0f;
+            bool   wandering      = false;
+            uint32 wanderUntilMs  = 0;
+            uint32 nextFidgetMs   = 0;
+        };
+        // World-thread only (the follow WorldScript OnUpdate drives both the
+        // 1 Hz pass and the fast tick), so no mutex is needed.
+        static std::unordered_map<uint32, FollowHumanize> g_humanize;
+
+        static constexpr uint32 HUMANIZE_INTERVAL_MS = 250;
+        static constexpr uint32 WANDER_POINT_ID       = 0x7A9D;  // distinct MovePoint id
+
+        // Stable per-bot offset in [-amp, amp], constant across ticks (a bot's
+        // "personality" — so two of the same class don't sit on one bearing).
+        static float StableJitter(uint32 guidLow, uint32 salt, float amp)
+        {
+            uint32 h = guidLow * 2654435761u + salt * 2246822519u;
+            h ^= h >> 15;
+            float const u = float(h & 0xFFFFu) / 65535.0f;   // 0..1
+            return (u * 2.0f - 1.0f) * amp;
+        }
+
+        // Per-bot peel-off delay (ms) so the party doesn't lurch as one unit:
+        // formation index sequences the wave, a stable hash scatters within it.
+        static uint32 StaggerDelayMs(uint32 guidLow, int formationIndex)
+        {
+            float const base = float(formationIndex % 5) * 110.0f;
+            float const jit  = StableJitter(guidLow, 7, 90.0f) + 90.0f;  // 0..180
+            return uint32(base + jit);                                   // ~0..620 ms
+        }
+
+        // Does any OTHER party member have a victim / is in combat? Mirrors the
+        // 1 Hz "don't follow into a pull" yield so the fast tick honours it too.
+        static bool AnyPartyMemberEngaged(ObjectGuid self, Player* follower)
+        {
+            std::vector<ObjectGuid> party;
+            GetPartyGuidsFor(self, party);
+            for (ObjectGuid const& gg : party)
+            {
+                if (gg == self) continue;
+                Player* m = ObjectAccessor::FindConnectedPlayer(gg);
+                if (m && m->IsInWorld() && m->IsAlive()
+                    && m->GetMapId() == follower->GetMapId()
+                    && (m->IsInCombat() || m->GetVictim()))
+                    return true;
+            }
+            return false;
+        }
+
         // Auto-vote on every pending group-loot roll for this bot. We hard-return
         // out of mod-playerbots' UpdateAI, suppressing its default loot-roll
         // action, so without this our party bots never respond to a roll and the
@@ -2682,6 +2761,12 @@ namespace WowPsParty
             if (!follower || !leader) return true;
             if (!follower->IsInWorld() || !leader->IsInWorld()) return true;
             if (follower == leader) return true;
+
+            // Default the humanize tick OFF for this bot. Only the pure open-
+            // follow tail below flips it back on; every early-return path
+            // (combat, hold, leash, stuck, cross-map, dead, tank-lead) thus
+            // leaves the fast tick disabled, so it never fights those systems.
+            g_humanize[d.followerGuid.GetCounter()].eligible = false;
 
             // Greed any pending loot rolls before the combat/death returns.
             AutoGreedRolls(follower);
@@ -3120,50 +3205,206 @@ namespace WowPsParty
             bool const inDungeon = leader->GetMap() && leader->GetMap()->IsDungeon();
             bool const isLeadTank = inDungeon && IsLeadTank(d.followerGuid);
 
-            float angle = follower->GetFollowAngle();
-            float followDist = PET_FOLLOW_DIST;
-            if (isLeadTank)
-            {
-                // If the dungeon has a recorded path, the path-follow
-                // ticker drives the tank's motion. Skip MoveFollow so the
-                // two systems don't fight each other on every tick.
-                if (WowPsParty::GetPathWaypointCount(leader->GetMapId()) >= 2)
-                    return true;
-                // MoveFollow's angle is relative to the leader's facing:
-                // 0 = directly in front, M_PI = directly behind (see FORM_ANGLES
-                // above). The lead tank must be IN FRONT — the old M_PI here put
-                // it 12y BEHIND the leader, which is exactly the "tank trails far
-                // behind" bug. Keep it a few yards ahead so it body-pulls.
-                angle = 0.0f;
-                followDist = 8.0f;
-            }
-            else
-            {
-                int const fi = FormationIndexFor(d.followerGuid, d.leaderGuid);
-                angle = FORM_ANGLES[fi % 6];
-                followDist = PET_FOLLOW_DIST + float(fi / 6) * 2.5f;
-            }
-
             // If the bot was sitting (post-drink), stand up before moving
             // so the spline doesn't fight the seated stand-state.
             if (follower->getStandState() != UNIT_STAND_STATE_STAND)
                 follower->SetStandState(UNIT_STAND_STATE_STAND);
 
-            follower->GetMotionMaster()->Clear();
-            follower->GetMotionMaster()->MoveFollow(
-                leader, followDist, angle);
+            // The LEAD TANK body-pulls from a precise spot ahead of the leader —
+            // never jittered/wandered. Install it immediately here and leave the
+            // humanize tick disabled for it (eligible already false).
+            if (isLeadTank)
+            {
+                // If the dungeon has a recorded path, the path-follow ticker
+                // drives the tank's motion. Skip MoveFollow so the two systems
+                // don't fight each other on every tick.
+                if (WowPsParty::GetPathWaypointCount(leader->GetMapId()) >= 2)
+                    return true;
+                // MoveFollow's angle is relative to the leader's facing: 0 =
+                // directly in front, M_PI = directly behind. The lead tank must
+                // be IN FRONT (the old M_PI put it 12y behind — the "tank trails
+                // far behind" bug). A few yards ahead so it body-pulls.
+                follower->GetMotionMaster()->Clear();
+                follower->GetMotionMaster()->MoveFollow(leader, 8.0f, 0.0f);
+                return true;
+            }
+
+            // Normal follower: hand off to the humanize tick. Compute this bot's
+            // jittered formation slot (stable personality offset + a slow drift
+            // that re-rolls every several seconds), record it, and mark eligible
+            // — the 250 ms tick installs/maintains the follow, staggers the
+            // peel-off, and adds idle wander. We do NOT install MoveFollow here.
+            int const fi = FormationIndexFor(d.followerGuid, d.leaderGuid);
+            uint32 const gLow = d.followerGuid.GetCounter();
+            uint32 const nowMs = getMSTime();
+            FollowHumanize& h = g_humanize[gLow];
+
+            if (h.driftRerollMs == 0)
+                h.driftRerollMs = nowMs + urand(3000, 9000);
+            if (nowMs >= h.driftRerollMs)
+            {
+                h.driftAngle    = frand(-0.16f, 0.16f);
+                h.driftDist     = frand(-1.0f, 1.0f);
+                h.driftRerollMs = nowMs + urand(8000, 15000);
+            }
+
+            float const baseAngle = FORM_ANGLES[fi % 6];
+            float const baseDist  = PET_FOLLOW_DIST + float(fi / 6) * 2.5f;
+            float slot = baseAngle + StableJitter(gLow, 1, 0.30f) + h.driftAngle;
+            float sdist = baseDist + StableJitter(gLow, 2, 1.8f) + h.driftDist;
+            if (sdist < PET_FOLLOW_DIST) sdist = PET_FOLLOW_DIST;
+
+            h.slotAngle = slot;
+            h.slotDist  = sdist;
+            h.eligible  = true;
 
             static thread_local std::unordered_map<uint32, uint32> lastLogMs;
-            uint32 nowMs = getMSTime();
-            uint32& last = lastLogMs[d.followerGuid.GetCounter()];
+            uint32& last = lastLogMs[gLow];
             if (nowMs - last > 10000)
             {
                 last = nowMs;
                 LOG_INFO("module",
-                    "[WowPsParty Follow] tick: {} -> MoveFollow {} dist={:.1f}",
+                    "[WowPsParty Follow] tick: {} -> humanized follow {} dist={:.1f}",
                     follower->GetName(), leader->GetName(), dist);
             }
             return true;
+        }
+
+        // Fast (250 ms) humanize tick — see the FollowHumanize comment above.
+        // Drives the actual follow-install for bots the 1 Hz pass flagged as
+        // pure open-follow, with a per-bot staggered peel-off and short-leash
+        // idle wander. Re-checks the cheap critical guards live so it never
+        // fights AssistTarget / a hold / a pull.
+        void HumanizeTick()
+        {
+            std::vector<Directive> snapshot;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                snapshot = g_directives;
+            }
+
+            uint32 const now = getMSTime();
+            for (Directive const& d : snapshot)
+            {
+                uint32 const gLow = d.followerGuid.GetCounter();
+                auto it = g_humanize.find(gLow);
+                if (it == g_humanize.end() || !it->second.eligible) continue;
+                FollowHumanize& h = it->second;
+
+                Player* follower = ObjectAccessor::FindConnectedPlayer(d.followerGuid);
+                Player* leader   = ObjectAccessor::FindConnectedPlayer(d.leaderGuid);
+                if (!follower || !leader || !follower->IsInWorld()
+                    || !leader->IsInWorld() || follower == leader)
+                { h.wandering = false; continue; }
+
+                // Live guard re-check — bail (yield to whoever owns it) the instant
+                // this bot is anything but a calm open-follower.
+                if (!follower->IsAlive()
+                    || follower->GetMapId() != leader->GetMapId()
+                    || follower->IsInCombat() || follower->GetVictim()
+                    || follower->IsNonMeleeSpellCast(false, false, true)
+                    || follower->IsBeingTeleported()
+                    || IsFollowerHeld(d.followerGuid)
+                    || IsTankLeading(d.followerGuid)
+                    || AnyPartyMemberEngaged(d.followerGuid, follower))
+                { h.wandering = false; continue; }
+
+                MovementGeneratorType const mg =
+                    follower->GetMotionMaster()->GetCurrentMovementGeneratorType();
+                bool const leaderMoving = leader->isMoving();
+
+                // Re-assert the jittered follow slot only when it isn't already in
+                // effect (gen isn't FOLLOW, or the slot drifted) — so the follow
+                // generator runs continuously/smoothly instead of being Cleared
+                // every tick, and self-heals after combat clears it.
+                auto assertFollow = [&]()
+                {
+                    bool const slotChanged =
+                        std::fabs(h.slotAngle - h.apptAngle) > 0.03f ||
+                        std::fabs(h.slotDist  - h.apptDist)  > 0.20f;
+                    if (mg == FOLLOW_MOTION_TYPE && h.followAsserted && !slotChanged)
+                        return;
+                    follower->GetMotionMaster()->Clear();
+                    follower->GetMotionMaster()->MoveFollow(leader, h.slotDist, h.slotAngle);
+                    h.followAsserted = true;
+                    h.apptAngle = h.slotAngle;
+                    h.apptDist  = h.slotDist;
+                };
+
+                // ---- staggered peel-off: arm a per-bot delay on the stop->move edge
+                if (leaderMoving && !h.wasLeaderMoving)
+                {
+                    int const fi = FormationIndexFor(d.followerGuid, d.leaderGuid);
+                    h.reactAtMs = now + StaggerDelayMs(gLow, fi);
+                }
+                h.wasLeaderMoving = leaderMoving;
+
+                if (leaderMoving)
+                {
+                    h.wandering = false;
+                    if (now < h.reactAtMs)
+                    {
+                        // Not our turn to peel off yet — hold a beat in place so
+                        // the party doesn't lurch as one block.
+                        if (mg != IDLE_MOTION_TYPE && mg != FOLLOW_MOTION_TYPE)
+                        { /* leave a back-out/point move alone */ }
+                        else if (mg == FOLLOW_MOTION_TYPE)
+                        {
+                            follower->StopMoving();
+                            follower->GetMotionMaster()->Clear();
+                            follower->GetMotionMaster()->MoveIdle();
+                            h.followAsserted = false;
+                        }
+                        continue;
+                    }
+                    assertFollow();
+                    continue;
+                }
+
+                // ---- leader stationary --------------------------------------
+                if (h.wandering)
+                {
+                    if (now >= h.wanderUntilMs) h.wandering = false;  // stroll done -> re-anchor below
+                    else continue;                                    // let the stroll finish
+                }
+
+                // Occasionally take a short stroll within a tight leash so the
+                // party fidgets instead of standing as frozen statues.
+                if (now >= h.nextFidgetMs)
+                {
+                    h.nextFidgetMs = now + urand(2500, 6000);
+                    bool const nearFormation =
+                        follower->GetDistance(leader) < h.slotDist + 5.0f;
+                    if (urand(0, 99) < 45 && nearFormation)
+                    {
+                        float const a = frand(0.0f, 2.0f * float(M_PI));
+                        float const r = frand(1.5f, 3.5f);
+                        float wx = follower->GetPositionX() + r * std::cos(a);
+                        float wy = follower->GetPositionY() + r * std::sin(a);
+                        float wz = follower->GetPositionZ();
+                        // Keep the stroll destination inside the "near" band:
+                        // never past 7y from the leader, so a wandering bot can't
+                        // sit in the 1 Hz stuck-detector's >8y window (which would
+                        // trigger a needless unstick on a big party).
+                        float const wanderLeash = std::min(h.slotDist + 6.0f, 7.0f);
+                        if (follower->GetMap()
+                            && follower->GetMap()->CanReachPositionAndGetValidCoords(follower, wx, wy, wz)
+                            && leader->GetExactDist2d(wx, wy) < wanderLeash)
+                        {
+                            follower->GetMotionMaster()->Clear();
+                            follower->GetMotionMaster()->MovePoint(WANDER_POINT_ID, wx, wy, wz);
+                            h.followAsserted = false;
+                            h.wandering      = true;
+                            h.wanderUntilMs  = now + urand(1500, 3000);
+                            continue;
+                        }
+                    }
+                }
+
+                // Anchor at the jittered slot (walks a finished stroll back;
+                // idempotent when already settled there).
+                assertFollow();
+            }
         }
 
     } // anonymous namespace
@@ -3183,6 +3424,17 @@ namespace WowPsParty
             // recording happens before the user has assigned tanks/healers.
             WowPsParty::TickPathRecording(diff);
 
+            // Fast humanize pass: drives the per-bot jittered follow, staggered
+            // peel-off, and idle wander for bots the 1 Hz pass flagged eligible.
+            // Runs between the heavy 1 Hz directive ticks so reactions desync at
+            // sub-second resolution instead of lockstep.
+            _humanizeAccum += diff;
+            if (_humanizeAccum >= HUMANIZE_INTERVAL_MS)
+            {
+                _humanizeAccum = 0;
+                HumanizeTick();
+            }
+
             _accum += diff;
             if (_accum < TICK_INTERVAL_MS) return;
             _accum = 0;
@@ -3199,6 +3451,7 @@ namespace WowPsParty
 
     private:
         uint32 _accum = 0;
+        uint32 _humanizeAccum = 0;
     };
 
     void InstallFollowTicker()
