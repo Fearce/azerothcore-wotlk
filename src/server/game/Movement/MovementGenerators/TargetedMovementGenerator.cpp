@@ -593,7 +593,15 @@ bool FollowMovementGenerator<T>::DoUpdate(T* owner, uint32 time_diff)
         ; // closes "bool forceDest", that way it is more appropriate, so we can comment out crap whenever we need to
 
     bool targetIsMoving = false;
-    bool isPlayerPet = owner->IsGuardian() && target->IsPlayer();
+    // Position prediction smooths following between the target's ~0.5-1s
+    // movement heartbeats — without it a follower re-aims in discrete steps as
+    // the leader's server-side position jumps each heartbeat (the "direction
+    // snaps once a second" look). It was gated to GUARDIAN pets, so PLAYER
+    // followers (mod-party-of-5 party bots, whose owner is a Player not a
+    // Guardian) never got it. Extend it to any player following a player; the
+    // speed path (GetVelocity, below) stays gated on IsGuardian() so this only
+    // turns on prediction, not pet speed-matching.
+    bool isPlayerPet = (owner->IsGuardian() || owner->IsPlayer()) && target->IsPlayer();
     bool isFollowingPlayer = target->IsPlayer();
 
     if (PositionOkay(target, isPlayerPet, targetIsMoving, time_diff))
