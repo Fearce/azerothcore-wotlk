@@ -1167,10 +1167,20 @@ namespace WowPsParty
 
     // Forward decls: EvalCondition recurses through AND-chains, and the
     // aura/cooldown conditions resolve spells by name (defined further down).
-    static bool EvalSingleCondition(std::string const& cond, Player* bot);
+    static bool EvalSingleCondition(std::string const& cond, Player* bot,
+                                    Unit* tOverride);
     static uint32 FindKnownSpellByName(Player* bot, std::string const& name);
 
-    static bool EvalCondition(std::string const& cond, Player* bot)
+    // `tOverride` substitutes "the target" for every target_* clause (null →
+    // the bot's victim, the normal case). `skipTargetClauses` drops target_*
+    // clauses from this evaluation entirely — cast_spread rules use it at
+    // rule level because those clauses are enforced PER CANDIDATE inside the
+    // action: each enemy must pass its own TTD/aura/type gates, and the
+    // current victim's state must neither veto nor green-light a spread to a
+    // DIFFERENT mob.
+    static bool EvalCondition(std::string const& cond, Player* bot,
+                              Unit* tOverride = nullptr,
+                              bool skipTargetClauses = false)
     {
         // AND chain: any number of conditions separated by `&` — every
         // clause must evaluate true. Lets Kevkili-style warrior rules
@@ -1188,9 +1198,17 @@ namespace WowPsParty
                 // without a dedicated opposite condition for each one.
                 bool negate = false;
                 if (clause[0] == '!') { negate = true; clause.erase(0, 1); }
-                bool r = clause.empty() ? true : EvalSingleCondition(clause, bot);
-                if (negate) r = !r;
-                if (!r) return false;
+                if (skipTargetClauses && clause.rfind("target_", 0) == 0)
+                {
+                    // deferred to the per-enemy re-check inside the action
+                }
+                else
+                {
+                    bool r = clause.empty() ? true
+                        : EvalSingleCondition(clause, bot, tOverride);
+                    if (negate) r = !r;
+                    if (!r) return false;
+                }
             }
             if (amp == std::string::npos) break;
             p = amp + 1;
@@ -1198,8 +1216,15 @@ namespace WowPsParty
         return true;
     }
 
-    static bool EvalSingleCondition(std::string const& cond, Player* bot)
+    static bool EvalSingleCondition(std::string const& cond, Player* bot,
+                                    Unit* tOverride)
     {
+        // Every target_* clause resolves "the target" through this: the
+        // override (a cast_spread candidate) when set, else the bot's victim.
+        auto theTarget = [bot, tOverride]() -> Unit*
+        {
+            return tOverride ? tOverride : BotTarget(bot);
+        };
         if (cond == "always") return true;
         // Conditions with a string arg: `<name>:<spell-name>`.
         // target_has_aura:Hamstring / target_missing_aura:Mortal Strike /
@@ -1211,7 +1236,7 @@ namespace WowPsParty
             std::string const arg   = cond.substr(colon + 1);
             if (cname == "target_has_aura" || cname == "target_missing_aura")
             {
-                Unit* victim = bot->GetVictim();
+                Unit* victim = theTarget();
                 if (!victim) return cname == "target_missing_aura"; // no target = no aura
                 bool const has = TargetHasNamedAura(victim, arg);
                 return cname == "target_has_aura" ? has : !has;
@@ -1243,7 +1268,7 @@ namespace WowPsParty
             {
                 std::string n; char op; int sec;
                 if (!unpackNameOpVal(n, op, sec)) return false;
-                Unit* u = (cname == "self_aura_remain") ? bot : bot->GetVictim();
+                Unit* u = (cname == "self_aura_remain") ? bot : theTarget();
                 if (!u) return op == '<';   // no target → "expiring/absent" true
                 int const remSec = NamedAuraRemainingMs(u, n) / 1000;
                 return op == '<' ? (remSec < sec) : (remSec > sec);
@@ -1252,7 +1277,7 @@ namespace WowPsParty
             {
                 std::string n; char op; int want;
                 if (!unpackNameOpVal(n, op, want)) return false;
-                Unit* u = (cname == "self_aura_stacks") ? bot : bot->GetVictim();
+                Unit* u = (cname == "self_aura_stacks") ? bot : theTarget();
                 int const stacks = u ? int(NamedAuraStacks(u, n)) : 0;
                 return op == '<' ? (stacks < want) : (stacks > want);
             }
@@ -1383,7 +1408,7 @@ namespace WowPsParty
         // the mob is already in melee on the bot, so the strike lands in place.
         if (cond == "target_attacking_me")
         {
-            Unit* const v = bot->GetVictim();
+            Unit* const v = theTarget();
             return v && v->GetVictim() == bot;
         }
         // Movement gate — pair "is_moving" with instant-only rules, or
@@ -1459,17 +1484,17 @@ namespace WowPsParty
         // "no target" → false for every flavour (nothing to classify).
         if (cond == "target_is_player")
         {
-            Unit* t = BotTarget(bot);
+            Unit* t = theTarget();
             return t && t->IsPlayer();
         }
         if (cond == "target_is_npc")
         {
-            Unit* t = BotTarget(bot);
+            Unit* t = theTarget();
             return t && !t->IsPlayer();
         }
         if (cond == "target_is_boss")
         {
-            Unit* t = BotTarget(bot);
+            Unit* t = theTarget();
             if (!t) return false;
             if (Creature* c = t->ToCreature())
                 if (c->isWorldBoss()) return true;
@@ -1477,23 +1502,23 @@ namespace WowPsParty
         }
         if (cond == "target_is_elite")
         {
-            int const r = UnitCreatureRank(BotTarget(bot));
+            int const r = UnitCreatureRank(theTarget());
             return r == CREATURE_ELITE_ELITE || r == CREATURE_ELITE_RAREELITE
                 || r == CREATURE_ELITE_WORLDBOSS;
         }
         if (cond == "target_is_rare")
         {
-            int const r = UnitCreatureRank(BotTarget(bot));
+            int const r = UnitCreatureRank(theTarget());
             return r == CREATURE_ELITE_RARE || r == CREATURE_ELITE_RAREELITE;
         }
         if (cond == "target_is_normal")
-            return UnitCreatureRank(BotTarget(bot)) == CREATURE_ELITE_NORMAL;
+            return UnitCreatureRank(theTarget()) == CREATURE_ELITE_NORMAL;
 
         // Creature type — drives Banish (Demon/Elemental), Turn Undead,
         // Hibernate (Beast/Dragonkin), Polymorph (Beast/Humanoid), etc.
         if (cond.rfind("target_type_", 0) == 0)
         {
-            Unit* t = BotTarget(bot);
+            Unit* t = theTarget();
             Creature* c = t ? t->ToCreature() : nullptr;
             if (!c) return false;
             uint32 const ct = c->GetCreatureType();
@@ -1515,17 +1540,17 @@ namespace WowPsParty
         if (cond == "target_casting")
         {
             bool ch = false, ir = false;
-            return CurrentCastSpell(BotTarget(bot), &ch, &ir) != nullptr && !ch;
+            return CurrentCastSpell(theTarget(), &ch, &ir) != nullptr && !ch;
         }
         if (cond == "target_channeling")
         {
             bool ch = false, ir = false;
-            return CurrentCastSpell(BotTarget(bot), &ch, &ir) != nullptr && ch;
+            return CurrentCastSpell(theTarget(), &ch, &ir) != nullptr && ch;
         }
         if (cond == "target_interruptible")
         {
             bool ch = false, ir = false;
-            return CurrentCastSpell(BotTarget(bot), &ch, &ir) != nullptr && ir;
+            return CurrentCastSpell(theTarget(), &ch, &ir) != nullptr && ir;
         }
 
         // --- Target movement ---------------------------------------------
@@ -1533,12 +1558,12 @@ namespace WowPsParty
         // to spend the GCD when the target is actually running.
         if (cond == "target_moving")
         {
-            Unit* t = BotTarget(bot);
+            Unit* t = theTarget();
             return t && t->isMoving();
         }
         if (cond == "target_not_moving")
         {
-            Unit* t = BotTarget(bot);
+            Unit* t = theTarget();
             return t && !t->isMoving();
         }
 
@@ -1628,7 +1653,7 @@ namespace WowPsParty
         }
         if (name == "target_health")
         {
-            Unit* tgt = bot->GetVictim();
+            Unit* tgt = theTarget();
             if (!tgt) return false;
             return cmp(pct(float(tgt->GetHealth()), float(tgt->GetMaxHealth())));
         }
@@ -1673,7 +1698,7 @@ namespace WowPsParty
         // Kevkili's `TargetTTD(...) or 999` default.
         if (name == "target_ttd")
         {
-            Unit* t = bot->GetVictim();
+            Unit* t = theTarget();
             if (!t) return false;
             return cmp(TtdSeconds(t));
         }
@@ -2016,7 +2041,7 @@ namespace WowPsParty
     }
 
     static bool ExecAction(std::string const& act, Player* bot,
-                           std::string const& flags)
+                           std::string const& flags, std::string const& cond)
     {
         // action format: <verb>:<arg>
         auto colon = act.find(':');
@@ -2751,6 +2776,11 @@ namespace WowPsParty
         // ("cast_spread:Corruption", "cast_spread:Unstable Affliction", …) above the
         // filler. Casts on the unit without abandoning the assist target, so the
         // bot's filler / auto-attack stay on the main target between spreads.
+        // The rule's target_* clauses (target_ttd, target_is_elite, aura gates,
+        // …) are re-evaluated against EACH candidate — a `target_ttd>15` spread
+        // rule won't dot a mob that's about to die just because the assist
+        // target is healthy (TickRotation skips target_* clauses at rule level
+        // for spread rules; this per-enemy check is where they're enforced).
         if (verb == "cast_spread")
         {
             uint32 const spellId = FindKnownSpellByName(bot, arg);
@@ -2762,7 +2792,8 @@ namespace WowPsParty
                 return u && u->IsAlive() && bot->IsValidAttackTarget(u)
                     && !TargetHasNamedAura(u, arg)            // not already dotted (any rank)
                     && MobEngagedByParty(bot, u, party)       // never a neutral → no accidental pull
-                    && canFireSpellOn(spellId, u);            // in range / LoS / affordable
+                    && canFireSpellOn(spellId, u)             // in range / LoS / affordable
+                    && EvalCondition(cond, bot, u);           // rule's target_* gates vs THIS enemy
             };
             Unit* pick = nullptr;
             if (Unit* v = bot->GetVictim())
@@ -2781,7 +2812,15 @@ namespace WowPsParty
             }
             if (!pick) return false;
             if (!channelClipOk()) return false;
-            return faceAndCast(pick, spellId);
+            bool const fired = faceAndCast(pick, spellId);
+            if (fired)
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] {} spread {} -> {} (hp={}%)",
+                    bot->GetName(), arg, pick->GetName(),
+                    pick->GetMaxHealth()
+                        ? int(100.0f * float(pick->GetHealth()) / float(pick->GetMaxHealth()))
+                        : 0);
+            return fired;
         }
 
         // "pull:<spell>" — initiate a RANGED pull. Picks the nearest hostile
@@ -3619,7 +3658,12 @@ namespace WowPsParty
                 continue;
             }
 
-            bool const condOk = EvalCondition(r.condition, bot);
+            // cast_spread enforces target_* clauses per candidate enemy, so
+            // rule-level eval must not also gate them on the current victim
+            // (a dying CURRENT target would otherwise veto a spread to a
+            // perfectly fresh add, and vice versa).
+            bool const isSpread = r.action.rfind("cast_spread", 0) == 0;
+            bool const condOk = EvalCondition(r.condition, bot, nullptr, isSpread);
             if (!condOk)
             {
                 if (trace)
@@ -3628,7 +3672,7 @@ namespace WowPsParty
                         r.priority, r.condition, r.action);
                 continue;
             }
-            bool const execOk = ExecAction(r.action, bot, r.flags);
+            bool const execOk = ExecAction(r.action, bot, r.flags, r.condition);
             if (trace)
                 LOG_INFO("module",
                     "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> {}",
