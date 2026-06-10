@@ -396,6 +396,31 @@ namespace WowPsParty
         return uint32(targets.size());
     }
 
+    // True ONLY if the party is already fighting `mob` — it's attacking the bot or a
+    // party member (or their pets), or one of them is attacking it. cast_spread uses
+    // this so a DoT spread can NEVER land on a neutral / unpulled mob (a DoT is an
+    // attack — that would pull the room). `party` comes from GatherPartyPlayers.
+    static bool MobEngagedByParty(Player* bot, Unit* mob, std::vector<Player*> const& party)
+    {
+        if (!bot || !mob || !mob->IsInCombat()) return false;
+        auto isOurs = [&](Unit* u) -> bool
+        {
+            if (!u) return false;
+            if (u == bot) return true;
+            for (Unit* c : bot->m_Controlled) if (u == c) return true;
+            for (Player* m : party)
+            {
+                if (u == m) return true;
+                for (Unit* c : m->m_Controlled) if (u == c) return true;
+            }
+            return false;
+        };
+        if (isOurs(mob->GetVictim())) return true;          // mob is attacking us
+        for (Unit* a : mob->getAttackers())
+            if (isOurs(a)) return true;                     // we're attacking the mob
+        return false;
+    }
+
     // 2D distance from point (px,py) to the segment (ax,ay)->(bx,by). Used to
     // test whether a hostile sits near a bot's retreat LANE, not just its
     // endpoint — clipping past a mob mid-kite pulls it just as surely as
@@ -2702,6 +2727,50 @@ namespace WowPsParty
             Unit* target = FindLooseEnemy(bot, 30.0f);
             if (!target) return false;
             return castOrApproach(target, spellId, /*friendlyApproach=*/true);
+        }
+
+        // "cast_spread:<dot>" — MULTI-DOT. Apply <dot> to the current target if it's
+        // missing it, else to the highest-health OTHER enemy the party is already
+        // fighting that lacks it. Lets a DoT class (Affliction lock, Shadow priest,
+        // Balance druid, etc.) keep the whole pull dotted instead of stacking every
+        // DoT on the tank's one target. ONLY mobs the party is already engaged with
+        // are eligible (MobEngagedByParty), so a spread can never pull a neutral.
+        // Self-gating: once every reachable engaged enemy already has the DoT it
+        // returns false and the rotation drops to the filler. Add one rule per DoT
+        // ("cast_spread:Corruption", "cast_spread:Unstable Affliction", …) above the
+        // filler. Casts on the unit without abandoning the assist target, so the
+        // bot's filler / auto-attack stay on the main target between spreads.
+        if (verb == "cast_spread")
+        {
+            uint32 const spellId = FindKnownSpellByName(bot, arg);
+            if (!spellId) return false;
+            std::vector<Player*> party;
+            GatherPartyPlayers(bot, party, /*includeDead=*/false);
+            auto eligible = [&](Unit* u) -> bool
+            {
+                return u && u->IsAlive() && bot->IsValidAttackTarget(u)
+                    && !TargetHasNamedAura(u, arg)            // not already dotted (any rank)
+                    && MobEngagedByParty(bot, u, party)       // never a neutral → no accidental pull
+                    && canFireSpellOn(spellId, u);            // in range / LoS / affordable
+            };
+            Unit* pick = nullptr;
+            if (Unit* v = bot->GetVictim())
+                if (eligible(v)) pick = v;                    // dot what we're on first
+            if (!pick)
+            {
+                std::list<Unit*> hostiles;
+                GatherHostilesAround(bot, 41.0f, hostiles);   // canFireSpellOn does the precise range check
+                uint32 bestHp = 0;
+                for (Unit* a : hostiles)
+                    if (eligible(a))
+                    {
+                        uint32 const hp = a->GetHealth();     // beefiest = longest fight = most DoT value
+                        if (!pick || hp > bestHp) { bestHp = hp; pick = a; }
+                    }
+            }
+            if (!pick) return false;
+            if (!channelClipOk()) return false;
+            return faceAndCast(pick, spellId);
         }
 
         // "pull:<spell>" — initiate a RANGED pull. Picks the nearest hostile
