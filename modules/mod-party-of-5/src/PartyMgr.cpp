@@ -1110,11 +1110,13 @@ namespace WowPsParty
             c.name  = mf[1].Get<std::string>();
             c.cls   = cls;
             c.level = L;   // shown + costed at the player's level; re-leveled on hire
-            // Inferred from current talents like the other path. NOTE: an
-            // out-of-band pick is re-rolled by Randomize on spawn, so the role
-            // is re-derived AFTER that re-roll in HireHenchman — this label is
-            // the best pre-hire estimate.
-            c.role  = InferHenchmanRole(c.guid, cls, ClassDefaultRole(cls));
+            // Inferred from current talents like the other path — BOTH role and
+            // spec, so a coverage-fill candidate shows its spec tag too (the old
+            // single-role call left c.spec blank: the "high-level henchman, no spec"
+            // bug). NOTE: an out-of-band pick is re-rolled by Randomize on spawn, so
+            // role/spec are re-derived AFTER that re-roll in HireHenchman — this
+            // label is the best pre-hire estimate.
+            InferHenchmanRoleAndSpec(c.guid, cls, ClassDefaultRole(cls), c.role, c.spec);
             deduped.push_back(std::move(c));
         }
         return deduped;
