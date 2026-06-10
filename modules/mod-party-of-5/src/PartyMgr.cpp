@@ -418,18 +418,44 @@ namespace WowPsParty
             case 2: // Paladin
                 if (isHealer)
                 {
-                    add("party_lowest_health<60", "cast_party_lowest:Holy Shock", 94);
-                    add("party_lowest_health<35", "cast_party_lowest:Holy Light", 90);
-                    add("tank_health<55", "cast_party_lowest:Flash of Light", 86);
-                    add("party_has_dead", "rez_party:Redemption", 82);
-                    add("party_has_magic", "cure_party:Cleanse", 78);
-                    add("party_has_poison", "cure_party:Cleanse", 77);
-                    add("party_has_disease", "cure_party:Cleanse", 76);
-                    add("party_lowest_health<75", "cast_party_lowest:Flash of Light", 70);
-                    add("always", "buff_self:Devotion Aura", 62);
-                    add("always", "buff_self:Seal of Wisdom", 58);
-                    // Healers only DPS at near-full mana — conserve for healing.
-                    add("self_mana>85&has_target", "cast:Judgement of Light", 36);
+                    // Holy paladin: a SINGLE-TARGET healer (no AoE heal in 3.3.5a).
+                    // Holy Light = big efficient slow heal (learnable from L1, so a
+                    // low paladin always heals); Flash of Light = fast top-off (L20);
+                    // Holy Shock = instant (Holy talent). Best-first; unlearned spells
+                    // fall through, so it works at every level and any spec depth.
+
+                    // EMERGENCY — fast heal, or the only heal a sub-20 pala has.
+                    add("party_lowest_health<40", "cast_party_lowest:Holy Shock", 98);     // instant (talent)
+                    add("party_lowest_health<40", "cast_party_lowest:Flash of Light", 97); // fast (L20)
+                    add("party_lowest_health<40", "cast_party_lowest:Holy Light", 96);     // L1 efficient fallback
+                    add("party_lowest_health<20", "cast_party_lowest:Lay on Hands", 95);   // full-heal panic CD
+
+                    add("party_has_dead", "rez_party:Redemption", 90);
+                    add("party_has_magic", "cure_party:Cleanse", 88);
+                    add("party_has_poison", "cure_party:Cleanse", 87);
+                    add("party_has_disease", "cure_party:Cleanse", 86);
+
+                    // MULTIPLE HURT — no AoE heal, so FAST single-target on the lowest;
+                    // never the slow Holy Light on the tank while the group is low.
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Holy Shock", 80);
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Flash of Light", 79);
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Holy Light", 78);
+
+                    // Proactive (Holy talents; fall through if unspecced).
+                    add("always", "cast_role_missing:tank:Beacon of Light", 72);       // mirror heals to the tank
+                    add("tank_health<90", "cast_role_missing:tank:Sacred Shield", 70); // absorb on the tank
+
+                    // SINGLE TARGET, SAFE (one hurt) — efficient slow Holy Light to
+                    // conserve mana; gated !cluster so it never fires while several are low.
+                    add("party_lowest_health<75&!party_injured_clustered:30>1", "cast_party_lowest:Holy Light", 60);
+                    add("party_lowest_health<85&self_mana>65", "cast_party_lowest:Flash of Light", 50);
+
+                    // Mana upkeep + auras.
+                    add("self_mana<30", "buff_self:Divine Plea", 46);   // +mana regen
+                    add("always", "buff_self:Devotion Aura", 44);
+                    add("always", "buff_self:Seal of Wisdom", 42);
+                    // Filler at near-full mana — conserve for healing.
+                    add("self_mana>88&has_target", "cast:Judgement of Light", 30);
                 }
                 else if (isTank)
                 {
@@ -677,18 +703,42 @@ namespace WowPsParty
             case 7: // Shaman
                 if (isHealer)
                 {
-                    add("party_lowest_health<30", "cast_party_lowest:Healing Wave", 96);
-                    add("tank_health<55", "cast_party_lowest:Lesser Healing Wave", 90);
-                    add("party_has_dead", "rez_party:Ancestral Spirit", 84);
-                    add("party_has_poison", "cure_party:Cure Toxins", 80);
-                    add("party_has_disease", "cure_party:Cure Toxins", 79);
-                    add("party_has_curse", "cure_party:Cleanse Spirit", 78);
-                    add("party_lowest_health<70", "cast_party_lowest_hot:Riptide", 72);
-                    add("party_lowest_health<75", "cast_party_lowest:Lesser Healing Wave", 64);
-                    add("always", "buff_self:Water Shield", 58);
-                    // Healers only DPS at near-full mana — conserve for healing.
-                    add("self_mana>85&target_missing_aura:Flame Shock", "cast:Flame Shock", 34);
-                    add("self_mana>85&has_target", "cast:Lightning Bolt", 30);
+                    // Resto shaman: Healing Wave = big efficient slow heal (L1, so a low
+                    // shaman always heals); Lesser Healing Wave = fast top-off (L20);
+                    // Chain Heal = the AoE chain (L40); Riptide = instant HoT (Resto
+                    // talent). Best-first; unlearned spells fall through at every level.
+
+                    // EMERGENCY — instant/fast, or the only heal a sub-20 shaman has.
+                    add("party_lowest_health<40", "cast_party_lowest:Riptide", 98);             // instant HoT (talent)
+                    add("party_lowest_health<40", "cast_party_lowest:Lesser Healing Wave", 97); // fast (L20)
+                    add("party_lowest_health<40", "cast_party_lowest:Healing Wave", 96);        // L1 efficient fallback
+
+                    add("party_has_dead", "rez_party:Ancestral Spirit", 90);
+                    add("party_has_poison", "cure_party:Cure Toxins", 88);
+                    add("party_has_disease", "cure_party:Cure Toxins", 87);
+                    add("party_has_curse", "cure_party:Cleanse Spirit", 86);
+
+                    // MULTIPLE HURT — Chain Heal (L40) jumps between them; below 40 / when
+                    // it can't help, fast single-target on the lowest (never the slow
+                    // Healing Wave on the tank while several are low).
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Chain Heal", 80);          // AoE chain (L40)
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Riptide", 79);
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Lesser Healing Wave", 78);
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Healing Wave", 77);
+
+                    // Proactive.
+                    add("always", "cast_role_missing:tank:Earth Shield", 72);            // absorb-on-hit on the tank (talent)
+                    add("party_lowest_health<85", "cast_party_lowest_hot:Riptide", 68);  // instant HoT top-up
+
+                    // SINGLE TARGET, SAFE (one hurt) — efficient slow Healing Wave to
+                    // conserve mana; gated !cluster so it never fires while several are low.
+                    add("party_lowest_health<75&!party_injured_clustered:30>1", "cast_party_lowest:Healing Wave", 60);
+                    add("party_lowest_health<85&self_mana>65", "cast_party_lowest:Lesser Healing Wave", 50);
+
+                    // Mana shield + buff + filler.
+                    add("always", "buff_self:Water Shield", 44);   // mana-return shield
+                    add("self_mana>88&target_missing_aura:Flame Shock", "cast:Flame Shock", 34);
+                    add("self_mana>88&has_target", "cast:Lightning Bolt", 30);
                 }
                 else
                 {
@@ -764,18 +814,44 @@ namespace WowPsParty
             case 11: // Druid
                 if (isHealer)
                 {
-                    add("party_lowest_health<30", "cast_party_lowest:Healing Touch", 96);
-                    add("tank_health<55", "cast_party_lowest:Regrowth", 90);
-                    add("party_has_dead", "rez_party:Revive", 84);
-                    add("party_has_curse", "cure_party:Remove Curse", 80);
-                    add("party_has_poison", "cure_party:Abolish Poison", 79);
-                    add("party_lowest_health<70", "cast_party_lowest_hot:Rejuvenation", 72);
-                    add("party_lowest_health<75", "cast_party_lowest_hot:Regrowth", 66);
-                    add("party_lowest_health<85", "cast_party_lowest:Nourish", 60);
-                    add("always", "cast_party_missing:Mark of the Wild", 54);
-                    // Healers only DPS at near-full mana — conserve for healing.
-                    add("self_mana>85&target_missing_aura:Moonfire", "cast:Moonfire", 32);
-                    add("self_mana>85&has_target", "cast:Wrath", 28);
+                    // Resto druid: Healing Touch = big slow heal (L1, low druids always
+                    // heal); Nourish = fast efficient filler (L80); Regrowth = fast
+                    // direct+HoT (L12); Rejuvenation = HoT (L4); Wild Growth = AoE HoT
+                    // (Resto talent); Swiftmend = instant (talent, consumes a HoT).
+                    // Best-first; unlearned spells fall through at every level.
+
+                    // EMERGENCY — instant/fast, or the only big heal a low druid has.
+                    add("party_lowest_health<40", "cast_party_lowest:Swiftmend", 98);     // instant (talent)
+                    add("party_lowest_health<40", "cast_party_lowest:Regrowth", 97);      // fast direct+HoT (L12)
+                    add("party_lowest_health<40", "cast_party_lowest:Nourish", 96);       // fast efficient (L80)
+                    add("party_lowest_health<40", "cast_party_lowest:Healing Touch", 95); // L1 big-heal fallback
+
+                    add("party_has_dead", "rez_party:Revive", 90);
+                    add("party_has_curse", "cure_party:Remove Curse", 88);
+                    add("party_has_poison", "cure_party:Abolish Poison", 87);
+
+                    // MULTIPLE HURT — Wild Growth (AoE HoT talent) / Tranquility (L30
+                    // channel) / blanket Rejuvenation; else fast single-target. Never
+                    // the slow Healing Touch on the tank while several are low.
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Wild Growth", 80);      // AoE HoT (talent)
+                    add("party_injured_clustered:30>1", "cast_party_lowest_hot:Rejuvenation", 79); // blanket HoT
+                    add("party_injured_clustered:30>1", "cast_self:Tranquility", 78);              // AoE channel (L30)
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Regrowth", 77);         // fast single fallback
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Healing Touch", 76);    // pre-12 fallback
+
+                    // Proactive HoTs (cheap, efficient — keep them rolling).
+                    add("party_lowest_health<90", "cast_party_lowest_hot:Rejuvenation", 70);  // HoT (L4)
+                    add("party_lowest_health<80", "cast_party_lowest_hot:Regrowth", 66);      // HoT+heal (L12)
+
+                    // SINGLE TARGET, SAFE (one hurt) — efficient heal to conserve mana:
+                    // Nourish at 80, the slow Healing Touch below it. Gated !cluster.
+                    add("party_lowest_health<75&!party_injured_clustered:30>1", "cast_party_lowest:Nourish", 61);       // fast efficient (L80)
+                    add("party_lowest_health<75&!party_injured_clustered:30>1", "cast_party_lowest:Healing Touch", 60); // big slow (L1)
+
+                    // Buff + filler.
+                    add("always", "cast_party_missing:Mark of the Wild", 44);
+                    add("self_mana>88&target_missing_aura:Moonfire", "cast:Moonfire", 32);
+                    add("self_mana>88&has_target", "cast:Wrath", 28);
                 }
                 else if (isTank)
                 {
