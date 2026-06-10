@@ -137,8 +137,9 @@ namespace WowPsParty
         SendWPSP(player, out.str());
     }
 
-    // HENCHMEN\t<rec>;<rec>;...   rec = guid:name:cls:level:role:cost
-    // The hireable random-pool candidates near the player's level.
+    // HENCHMEN\t<rec>;<rec>;...   rec = guid:name:cls:level:role:cost:spec
+    // The hireable random-pool candidates near the player's level. (spec is a short
+    // abbrev, possibly empty for a talentless low-level char.)
     void SendHenchmenTo(Player* player)
     {
         if (!player) return;
@@ -152,7 +153,7 @@ namespace WowPsParty
             first = false;
             out << c.guid << ':' << c.name << ':' << uint32(c.cls) << ':'
                 << uint32(c.level) << ':' << c.role << ':'
-                << HenchmanHireCost(c.level);
+                << HenchmanHireCost(c.level) << ':' << c.spec;
         }
         std::string const body = out.str();
         LOG_INFO("module",

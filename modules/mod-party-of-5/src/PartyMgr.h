@@ -96,6 +96,7 @@ namespace WowPsParty
         uint8       cls   = 0;
         uint8       level = 0;
         std::string role;       // tank / healer / dps
+        std::string spec;       // short spec abbrev (e.g. "Holy"/"Resto"); "" if none
     };
 
     // Up to 10 candidates (2 tank / 2 healer / 6 dps) from offline random-pool

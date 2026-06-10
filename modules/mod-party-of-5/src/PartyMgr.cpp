@@ -286,6 +286,65 @@ namespace WowPsParty
         }
     }
 
+    // Short spec abbreviation for the hire screen (e.g. "Holy", "Resto", "Frost").
+    // Same dominant-tree resolution as RoleFromTalents; "" when the char has no
+    // talents yet (very low level — the screen then shows just the role).
+    static std::string SpecAbbrevFromTalents(uint8 cls,
+                                             std::unordered_set<uint32> const& known)
+    {
+        if (known.empty()) return "";
+        uint32 points[3] = { 0, 0, 0 };
+        for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
+        {
+            TalentEntry const* tal = sTalentStore.LookupEntry(i);
+            if (!tal) continue;
+            TalentTabEntry const* tab = sTalentTabStore.LookupEntry(tal->TalentTab);
+            if (!tab || tab->tabpage > 2) continue;
+            for (int rank = int(tal->RankID.size()) - 1; rank >= 0; --rank)
+                if (tal->RankID[rank] && known.count(tal->RankID[rank]))
+                {
+                    points[tab->tabpage] += uint32(rank + 1);
+                    break;
+                }
+        }
+        if (!points[0] && !points[1] && !points[2]) return "";
+        uint8 tree = 0;
+        if (points[1] > points[tree]) tree = 1;
+        if (points[2] > points[tree]) tree = 2;
+
+        // tabpage order = the standard WotLK tree layout per class.
+        static char const* const SPEC[12][3] = {
+            { "", "", "" },                       // 0 unused
+            { "Arms", "Fury", "Prot" },           // 1  Warrior
+            { "Holy", "Prot", "Ret" },            // 2  Paladin
+            { "BM", "MM", "Surv" },               // 3  Hunter
+            { "Assa", "Combat", "Subt" },         // 4  Rogue
+            { "Disc", "Holy", "Shadow" },         // 5  Priest
+            { "Blood", "Frost", "Unholy" },       // 6  Death Knight
+            { "Ele", "Enh", "Resto" },            // 7  Shaman
+            { "Arcane", "Fire", "Frost" },        // 8  Mage
+            { "Affl", "Demo", "Destro" },         // 9  Warlock
+            { "", "", "" },                       // 10 unused
+            { "Balance", "Feral", "Resto" },      // 11 Druid
+        };
+        if (cls >= 1 && cls <= 11) return SPEC[cls][tree];
+        return "";
+    }
+
+    // One DB read → both the candidate's role AND spec abbreviation (avoids a
+    // second query per hire-screen row).
+    static void InferHenchmanRoleAndSpec(uint32 guid, uint8 cls, std::string const& fallback,
+                                         std::string& outRole, std::string& outSpec)
+    {
+        std::unordered_set<uint32> known;
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `spell` FROM `character_talent` WHERE `guid` = {}", guid);
+        if (q)
+            do { known.insert(q->Fetch()[0].Get<uint32>()); } while (q->NextRow());
+        outRole = RoleFromTalents(cls, known, fallback);
+        outSpec = SpecAbbrevFromTalents(cls, known);
+    }
+
     // Role of an OFFLINE candidate, read from character_talent in the DB. Used
     // pre-hire (the bot isn't in world yet).
     static std::string InferHenchmanRole(uint32 guid, uint8 cls,
@@ -983,7 +1042,7 @@ namespace WowPsParty
             // inference the hire uses — not the flat class default. Otherwise
             // the list "marks" every druid a healer while a feral one hires in
             // as a tank (the reported bug).
-            c.role  = InferHenchmanRole(c.guid, c.cls, ClassDefaultRole(c.cls));
+            InferHenchmanRoleAndSpec(c.guid, c.cls, ClassDefaultRole(c.cls), c.role, c.spec);
             out.push_back(std::move(c));
         } while (q->NextRow());
     }
