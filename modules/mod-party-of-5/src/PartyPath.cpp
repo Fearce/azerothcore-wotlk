@@ -34,6 +34,8 @@ namespace WowPsParty
             uint32           mapId      = 0;
             uint32           accumMs    = 0;
             std::vector<Vec3> buffer;
+            float            lastHeading = 0.0f;   // heading into the last recorded waypoint
+            bool             hasHeading  = false;  // false until the 2nd point gives us a segment
         };
 
         // playerGuidLow -> recording state
@@ -59,8 +61,16 @@ namespace WowPsParty
         static std::mutex                                           g_tankStallMutex;
         static std::unordered_map<uint32, TankStall>               g_tankStall;
 
-        constexpr uint32 SAMPLE_INTERVAL_MS = 150;   // ~7 Hz — denser capture so fast recording still has tight waypoints
-        constexpr float  DEDUPE_MIN_DIST    = 1.5f;
+        // Recording is DISTANCE + TURN based, NOT time based — so waypoint
+        // density is independent of the 5x ghost speed (time sampling left ~5y
+        // gaps at speed that cut corners and stalled the tank). Drop a point at
+        // least every REC_SEGMENT_MAX yards on a straight, and an EXTRA one
+        // whenever the heading turns by REC_TURN_RAD so tight corridors stay
+        // crisp. REC_MIN_STEP suppresses points while standing still / jittering.
+        constexpr float  REC_MIN_STEP       = 0.8f;
+        constexpr float  REC_SEGMENT_MAX    = 3.0f;
+        constexpr float  REC_TURN_RAD       = 0.26f;   // ~15 degrees
+        constexpr float  REC_PI             = 3.14159265f;
         constexpr float  TANK_LEASH         = 45.0f;   // stop & wait past this from leader
         constexpr float  LEAD_DISTANCE      = 30.0f;   // aim this far ahead ALONG the path
         constexpr float  WAYPOINT_REACHED   = 3.5f;
@@ -268,22 +278,18 @@ namespace WowPsParty
             "(ghost mode cleared)", guidLow);
     }
 
-    void TickPathRecording(uint32 diffMs)
+    void TickPathRecording(uint32 /*diffMs*/)
     {
-        std::vector<uint32> toSample;
+        // Sample EVERY tick — density is decided by DISTANCE + TURN, not time,
+        // so the route stays crisp at 5x ghost speed (per-tick work is a few
+        // float ops for the lone recorder).
+        std::vector<uint32> recorders;
         {
             std::lock_guard<std::mutex> lock(g_recMutex);
-            for (auto& kv : g_recording)
-            {
-                kv.second.accumMs += diffMs;
-                if (kv.second.accumMs >= SAMPLE_INTERVAL_MS)
-                {
-                    kv.second.accumMs = 0;
-                    toSample.push_back(kv.first);
-                }
-            }
+            recorders.reserve(g_recording.size());
+            for (auto const& kv : g_recording) recorders.push_back(kv.first);
         }
-        for (uint32 guidLow : toSample)
+        for (uint32 guidLow : recorders)
         {
             Player* p = ObjectAccessor::FindConnectedPlayer(
                 ObjectGuid::Create<HighGuid::Player>(guidLow));
@@ -298,16 +304,40 @@ namespace WowPsParty
             if (it == g_recording.end()) continue;
             RecordingState& st = it->second;
 
-            // Dedupe: skip if we haven't moved meaningfully since the last point.
-            if (!st.buffer.empty())
+            float const px = p->GetPositionX();
+            float const py = p->GetPositionY();
+            float const pz = p->GetPositionZ();
+
+            if (st.buffer.empty())
             {
-                Vec3 const& last = st.buffer.back();
-                float const d = Dist3D(p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(),
-                                       last.x, last.y, last.z);
-                if (d < DEDUPE_MIN_DIST) continue;
+                st.buffer.push_back({ px, py, pz, p->GetOrientation() });
+                continue;
             }
-            st.buffer.push_back({ p->GetPositionX(), p->GetPositionY(),
-                                   p->GetPositionZ(), p->GetOrientation() });
+
+            Vec3 const& last = st.buffer.back();
+            float const dx = px - last.x, dy = py - last.y;
+            float const moved = std::sqrt(dx * dx + dy * dy);
+            if (moved < REC_MIN_STEP) continue;   // standing still / jitter — no point
+
+            // Heading from the last waypoint to here. A big change vs the heading
+            // INTO the last waypoint means we've turned — drop a crisp corner
+            // point even if we haven't covered a full segment yet.
+            float const candHeading = std::atan2(dy, dx);
+            bool turned = false;
+            if (st.hasHeading)
+            {
+                float d = candHeading - st.lastHeading;
+                while (d >  REC_PI) d -= 2.0f * REC_PI;
+                while (d < -REC_PI) d += 2.0f * REC_PI;
+                if (std::fabs(d) >= REC_TURN_RAD) turned = true;
+            }
+
+            if (moved >= REC_SEGMENT_MAX || turned)
+            {
+                st.buffer.push_back({ px, py, pz, p->GetOrientation() });
+                st.lastHeading = candHeading;
+                st.hasHeading  = true;
+            }
         }
     }
 
