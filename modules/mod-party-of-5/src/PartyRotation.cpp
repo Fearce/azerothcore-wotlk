@@ -1016,6 +1016,42 @@ namespace WowPsParty
         return n;
     }
 
+    // Is a totem with the given SPELL NAME currently up — e.g. "Mana Tide Totem".
+    // The element form (above) picks ONE slot; this checks EVERY totem slot and
+    // matches the creating-spell name (what the user types in the editor), falling
+    // back to the totem creature's own name. Lets a rotation gate on WHICH totem
+    // fills an element slot — Mana Spring vs Mana Tide both occupy water — so you
+    // can refresh Mana Spring on its buff timer yet NOT clobber a live Mana Tide
+    // (`self_missing_aura:Mana Spring & !self_totem_active:Mana Tide Totem`).
+    static bool TotemNamedActive(Player* bot, std::string const& name)
+    {
+        if (!bot || !bot->GetMap() || name.empty()) return false;
+        std::string needle;
+        needle.reserve(name.size());
+        for (char c : name) needle.push_back(char(std::tolower((unsigned char)c)));
+        auto matches = [&needle](std::string const& s) -> bool
+        {
+            if (s.size() != needle.size()) return false;
+            for (size_t i = 0; i < s.size(); ++i)
+                if (char(std::tolower((unsigned char)s[i])) != needle[i]) return false;
+            return true;
+        };
+        for (uint8 i = SUMMON_SLOT_TOTEM_FIRE; i < MAX_TOTEM_SLOT; ++i)
+        {
+            ObjectGuid const g = bot->m_SummonSlot[i];
+            if (!g) continue;
+            Creature* totem = bot->GetMap()->GetCreature(g);
+            if (!totem || !totem->IsAlive()) continue;
+            if (uint32 const spellId = totem->GetUInt32Value(UNIT_CREATED_BY_SPELL))
+                if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
+                    if (si->SpellName[0] && matches(si->SpellName[0]))
+                        return true;
+            if (matches(totem->GetName()))
+                return true;
+        }
+        return false;
+    }
+
     // ---- Channel commit-lock ------------------------------------------------
     // When a bot casts a CHANNELED spell (Blizzard, Rain of Fire, Volley, Mind
     // Flay, …) we lock its rotation for the channel duration: while the lock
@@ -1263,18 +1299,19 @@ namespace WowPsParty
             if (cname == "primary_tree")
                 return int(PrimaryTalentTree(bot)) == std::atoi(arg.c_str());
 
-            // Shaman totem presence by element: self_totem_active:<fire|earth|
-            // water|air> is TRUE while that element's totem is summoned and alive;
-            // self_totem_missing is its inverse. One slot per element, so this is
-            // the precise "don't re-drop a totem that's already down" gate — pair
-            // self_totem_missing:fire with cast:Searing Totem, self_totem_missing:
-            // earth with cast:Strength of Earth Totem, etc. An unknown element
-            // fails CLOSED (both return false) so a typo can't spam a re-cast.
+            // Shaman totem presence. self_totem_active:<arg> is TRUE while a matching
+            // totem is summoned and alive; self_totem_missing is its inverse. The arg
+            // is EITHER an element (fire/earth/water/air → that one slot) OR a totem
+            // SPELL NAME (e.g. "Mana Tide Totem" → matched across all slots). The name
+            // form lets you distinguish which totem fills an element slot — pair
+            // self_totem_missing:fire with cast:Searing Totem for the element gate, or
+            // `self_missing_aura:Mana Spring & !self_totem_active:Mana Tide Totem` to
+            // refresh Mana Spring on its buff timer without clobbering a live Mana Tide.
             if (cname == "self_totem_active" || cname == "self_totem_missing")
             {
                 uint8 const slot = TotemSlotForElement(arg);
-                if (!slot) return false;
-                bool const active = TotemElementActive(bot, slot);
+                bool const active = slot ? TotemElementActive(bot, slot)   // element form
+                                         : TotemNamedActive(bot, arg);      // totem-name form
                 return cname == "self_totem_active" ? active : !active;
             }
         }
