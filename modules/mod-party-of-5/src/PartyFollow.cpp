@@ -878,6 +878,91 @@ namespace WowPsParty
         g_lastRetargetMs[guidLow] = nowMs;
     }
 
+    // --- Ranged-caster anti-bunching (the corner spread step) ---------------
+    // When several casters chase the same victim around a tight corner they all
+    // plant on the first pixel where LoS+range clear, stacking on one point. On
+    // the chase->arrive transition we let a stacked caster take ONE step a few
+    // yards into the open (fanned by its formation index). The cooldown stops it
+    // re-firing every tick once the chase generator resumes under the POINT move.
+    static constexpr float  RANGED_SPREAD_RADIUS  = 5.0f;   // "stacked" if a peer is this close
+    static constexpr uint32 SPREAD_STEP_COOLDOWN_MS = 6000;
+    static std::unordered_map<uint32, uint32> g_lastSpreadMs;  // guidLow -> ms
+    static std::mutex g_spreadMutex;
+
+    static bool SpreadStepReady(uint32 guidLow, uint32 nowMs)
+    {
+        std::lock_guard<std::mutex> lock(g_spreadMutex);
+        auto it = g_lastSpreadMs.find(guidLow);
+        return it == g_lastSpreadMs.end()
+            || (nowMs - it->second) >= SPREAD_STEP_COOLDOWN_MS;
+    }
+
+    static void MarkSpreadStep(uint32 guidLow, uint32 nowMs)
+    {
+        std::lock_guard<std::mutex> lock(g_spreadMutex);
+        g_lastSpreadMs[guidLow] = nowMs;
+    }
+
+    // True if a party member that's ALSO standing off (>8y from the shared
+    // victim, i.e. another caster/hunter rather than a melee at the mob) is
+    // stacked within `radius` of `bot`.
+    static bool IsBunchedAtStandoff(Player* bot, Unit* victim, float radius)
+    {
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(bot->GetGUID(), party);
+        for (ObjectGuid g : party)
+        {
+            if (g == bot->GetGUID()) continue;
+            Player* m = ObjectAccessor::FindPlayer(g);
+            if (!m || !m->IsAlive() || m->FindMap() != bot->FindMap()) continue;
+            if (bot->GetDistance(m) > radius) continue;
+            if (victim && m->GetDistance(victim) <= 8.0f) continue;  // a melee at the mob, not a stacked caster
+            return true;
+        }
+        return false;
+    }
+
+    // A reachable, still-in-LoS point a few yards into the open from where the
+    // caster currently stands, fanned laterally by its formation index so the
+    // party spreads around the chokepoint instead of stacking on it. Returns
+    // false (caller just holds at the corner) if no such point is safe — better
+    // to bunch than to walk into a wall or break the LoS we just earned.
+    static bool ComputeRangedSpreadSpot(Player* bot, Unit* victim, float hold,
+                                        float& outX, float& outY, float& outZ)
+    {
+        int const fi = FormationIndexFor(bot->GetGUID(), GetLeaderFor(bot->GetGUID()));
+        // Fan around the bot's current bearing to the victim (~12 deg/step,
+        // centred near index 2 so the party splays both ways).
+        float const angle = victim->GetAngle(bot) + (float(fi) - 2.0f) * 0.21f;
+        // Pull a few yards INTO the open (toward the victim, where LoS is freer)
+        // but stay a sane firing distance out. Clamp into [10, hold].
+        float dist = bot->GetDistance(victim) - 3.0f;
+        if (dist > hold)  dist = hold;
+        if (dist < 10.0f) dist = 10.0f;
+
+        float x, y, z;
+        victim->GetNearPoint(bot, x, y, z, 0.0f, dist, angle);
+
+        // Navmesh-reachable? (snaps to a valid coord; refuses to cross geometry.)
+        if (!bot->GetMap()->CanReachPositionAndGetValidCoords(bot, x, y, z))
+            return false;
+
+        // Don't trade the corner LoS we just earned for a wall.
+        float const cz = z + bot->GetCollisionHeight();
+        float vx, vy, vz;
+        victim->GetHitSpherePointFor({ x, y, cz }, vx, vy, vz);
+        if (!bot->GetMap()->isInLineOfSight(x, y, cz, vx, vy, vz,
+                bot->GetPhaseMask(), LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::M2))
+            return false;
+
+        // Only worth a move if it's a meaningful step (avoid micro-jitter).
+        if (bot->GetExactDist2d(x, y) < 2.0f)
+            return false;
+
+        outX = x; outY = y; outZ = z;
+        return true;
+    }
+
     // Nearest hostile (within `range`) whose current victim is NOT `bot` —
     // i.e. an add that's loose on the casters/healer. Returns nullptr if every
     // nearby hostile is already on the bot (or there are none). Built from the
@@ -2477,6 +2562,26 @@ namespace WowPsParty
                 // the feet completely alone; just keep facing the target.
                 if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
                     bot->Attack(desired, false);   // back at range — stop meleeing, resume shots
+                // On the chase->arrive transition, if we've stacked on another
+                // stood-off caster at the LoS chokepoint, take a ONE-SHOT step a
+                // few yards into the open (fanned by formation index) so the party
+                // doesn't bunch pixel-perfect at a tight corner. The POINT move is
+                // left to complete by the back-out guard below; the cooldown stops
+                // it re-firing when the chase generator resumes underneath.
+                if (mg == CHASE_MOTION_TYPE &&
+                    SpreadStepReady(gLow, nowMs) &&
+                    IsBunchedAtStandoff(bot, desired, RANGED_SPREAD_RADIUS))
+                {
+                    float sx, sy, sz;
+                    if (ComputeRangedSpreadSpot(bot, desired, hold, sx, sy, sz))
+                    {
+                        MarkSpreadStep(gLow, nowMs);
+                        bot->GetMotionMaster()->MovePoint(0, sx, sy, sz);
+                        bot->SetFacingToObject(desired);
+                        AssistLog(gLow, "ranged: bunched at the corner — stepping into the open to spread");
+                        return;
+                    }
+                }
                 // CRUCIAL: a back-out (POINT motion) carries the bot from the <8y
                 // dead zone out to ~13y, and it passes THROUGH this 8..hold band on
                 // the way. Stopping all non-idle motion here cut the back-out at
