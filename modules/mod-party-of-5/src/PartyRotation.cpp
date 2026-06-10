@@ -925,14 +925,17 @@ namespace WowPsParty
             if (!a) continue;
             SpellInfo const* si = a->GetSpellInfo();
             if (!si) continue;
-            // Skip PASSIVE auras. A proc TALENT (a Fire mage's Hot Streak, a
-            // shaman's Maelstrom Weapon trigger, …) applies a PERMANENT passive
-            // aura that shares its name with the actual proc BUFF — so the
-            // name-only match was always true (the mage spammed Pyroblast with no
-            // Hot Streak proc; "aura_remain" treats the permanent passive as
-            // never-expiring, so >Ns was always true too). The real proc buff and
-            // every cast buff/debuff/HoT/form a rotation checks are non-passive.
-            if (si->IsPassive()) continue;
+            // Skip the unit's own SELF-CAST passive auras. A proc TALENT (a
+            // Fire mage's Hot Streak, a shaman's Maelstrom Weapon trigger, …)
+            // applies a permanent self-cast passive that shares its name with
+            // the actual proc BUFF, making a name-only match always true (the
+            // mage spammed Pyroblast with no proc; "aura_remain" saw it as
+            // never-expiring). But passives applied BY ANOTHER UNIT must stay
+            // visible: totem area auras (Mana Spring, Strength of Earth, …)
+            // are flagged passive too, and ARE the buff a rotation checks for
+            // — skipping them made "missing aura: Mana Spring" always true and
+            // the shaman re-dropped the totem every tick.
+            if (si->IsPassive() && a->GetCasterGUID() == unit->GetGUID()) continue;
             char const* sname = si->SpellName[0];
             if (!sname) continue;
             std::string lower;
