@@ -2831,21 +2831,24 @@ namespace WowPsParty
             if (!spellId) return false;
             SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
             if (!info) return false;
-            // Walk the spell's effects to find what dispel type it actually
-            // removes (Effect == SPELL_EFFECT_DISPEL + MiscValue == dispel
-            // type). This is more reliable than guessing from name.
-            DispelType targetType = DISPEL_NONE;
-            for (uint8 i = 0; i < 3; ++i)
+            // Find a member afflicted with ANY dispel type this spell removes — not
+            // just the FIRST effect's. A multi-type cleanse has several
+            // SPELL_EFFECT_DISPEL effects (paladin Cleanse = poison+disease+magic,
+            // Purify = disease+poison); the old "first effect only" inference picked
+            // ONE type (e.g. Cleanse's first effect is poison), so a
+            // `party_has_magic → cure_party:Cleanse` rule searched for a POISON
+            // debuff and never cured the magic one — the "paladin never cleanses"
+            // bug. The condition path was always correct (it checks the debuff's own
+            // type); only the cure target-pick was looking at the wrong type.
+            Player* target = nullptr;
+            for (uint8 i = 0; i < 3 && !target; ++i)
             {
                 SpellEffectInfo const& eff = info->Effects[i];
-                if (eff.Effect == SPELL_EFFECT_DISPEL)
-                {
-                    targetType = DispelType(eff.MiscValue);
-                    break;
-                }
+                if (eff.Effect != SPELL_EFFECT_DISPEL) continue;
+                DispelType const dt = DispelType(eff.MiscValue);
+                if (dt == DISPEL_NONE) continue;
+                target = FindPartyMemberWithDispelType(bot, dt);
             }
-            if (targetType == DISPEL_NONE) return false;
-            Player* target = FindPartyMemberWithDispelType(bot, targetType);
             if (!target) return false;
             return castOrApproach(target, spellId, /*friendlyApproach=*/true);
         }
