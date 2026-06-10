@@ -1298,6 +1298,21 @@ namespace WowPsParty
     static std::unordered_map<uint32, GatherState> g_gather;  // botLow -> state
     static std::mutex g_gatherMutex;
 
+    // True while a bot is actively committed to walking to a gather node. The
+    // follow systems (the 1 Hz re-asserter AND the 250 ms humanize tick) MUST
+    // yield to this — TickGathering drives the bot to the node with its own
+    // MovePoint, and a follow re-assert / free-stand / wander would yank it off
+    // mid-approach so it never reaches the ore (Viv: "my miner just stands
+    // there"). The 2500 ms HoldFollower the gather path sets is not enough on
+    // its own: the humanize tick samples 4x as fast and would interrupt in any
+    // brief gap between the bot's AI ticks, so gate on the committed node too.
+    bool BotIsApproachingGatherNode(uint32 botLow)
+    {
+        std::lock_guard<std::mutex> lock(g_gatherMutex);
+        auto it = g_gather.find(botLow);
+        return it != g_gather.end() && it->second.node;
+    }
+
     // If `go` is a mining/herb node, return its profession skill + required
     // skill value. False for anything else (treasure chests, lockpick doors,
     // quest objects — their lock isn't a mining/herb skill lock).
@@ -1655,19 +1670,22 @@ namespace WowPsParty
     void TickGathering(Player* bot)
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld() || !bot->GetSession()) return;
-        if (bot->IsInCombat()) return;                     // only when idle
         if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) return; // the controlled body
-        if (bot->IsNonMeleeSpellCast(false, false, true)) return;
-        if (IsHenchman(bot->GetGUID())) return;            // only the player's alts
-        if (IsTankLeading(bot->GetGUID())) return;         // busy leading a dungeon
 
-        // Fast skill gate — most bots have no gather profession, exit at once.
+        // Skill gate FIRST — most bots have no gather profession, exit silently.
+        // Past this point the bot CAN gather, so every other skip is logged
+        // (throttled per reason) — that's how we diagnose "my miner won't mine".
         bool const canNode = bot->HasSkill(SKILL_MINING) || bot->HasSkill(SKILL_HERBALISM);
         bool const canSkin = bot->HasSkill(SKILL_SKINNING);
         if (!canNode && !canSkin) return;
 
         uint32 const gLow = bot->GetGUID().GetCounter();
         uint32 const now  = getMSTime();
+
+        if (bot->IsInCombat())                            { GatherLog(gLow, "skip: in combat"); return; }
+        if (bot->IsNonMeleeSpellCast(false, false, true)) { GatherLog(gLow, "skip: casting"); return; }
+        if (IsHenchman(bot->GetGUID()))                   { GatherLog(gLow, "skip: henchman (only the player's alts gather)"); return; }
+        if (IsTankLeading(bot->GetGUID()))                { GatherLog(gLow, "skip: leading the dungeon"); return; }
 
         // Nowhere to put the mats — don't harvest (AutoStoreLoot silently drops
         // items that don't fit, which would deplete the node for nothing) and
@@ -3057,6 +3075,11 @@ namespace WowPsParty
             // Active hold = drinking, holding-for-healer-mana, etc.
             if (IsFollowerHeld(d.followerGuid)) return true;
 
+            // Actively walking to a mining/herb node — TickGathering owns its
+            // motion. Re-asserting MoveFollow here would drag it back to the
+            // leader before it reaches the ore.
+            if (BotIsApproachingGatherNode(d.followerGuid.GetCounter())) return true;
+
             // Tank is actively leading the dungeon route — hands off entirely.
             // TankFollowPath owns its movement; if we re-assert MoveFollow or
             // run the "stuck = constant distance" catch-up teleport here, a
@@ -3324,6 +3347,7 @@ namespace WowPsParty
                     || follower->IsBeingTeleported()
                     || IsFollowerHeld(d.followerGuid)
                     || IsTankLeading(d.followerGuid)
+                    || BotIsApproachingGatherNode(gLow)   // mining/herbing — don't yank it off the node
                     || AnyPartyMemberEngaged(d.followerGuid, follower))
                 { h.wandering = false; continue; }
 
