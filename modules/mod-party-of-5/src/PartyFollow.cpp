@@ -1279,7 +1279,7 @@ namespace WowPsParty
     // toggle: training the profession IS the opt-in.
 
     static constexpr float GATHER_SCAN_RANGE = 30.0f;  // node search radius
-    static constexpr float GATHER_REACH      = 5.0f;   // interaction distance
+    static constexpr float GATHER_REACH      = 11.0f;  // interaction distance — long reach so bots harvest without walking on top of the node
     static constexpr float GATHER_LEADER_LEASH = 40.0f; // don't gather if lagging
     static constexpr uint32 GATHER_APPROACH_TIMEOUT_MS = 6000; // give up if stuck
     static constexpr uint32 GATHER_AVOID_MS = 30000;   // ignore an unreachable node
