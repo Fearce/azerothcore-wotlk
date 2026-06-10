@@ -622,19 +622,37 @@ namespace lfg
         LfgGuidSet players;
         uint32 rDungeonId = 0;
         // [WowPsParty] A persistent custom party (mod-party-of-5) that ran one
-        // LFG dungeon keeps GROUPTYPE_LFG set forever — the core never clears it.
-        // That makes isContinue below true and the finder rejects every later
-        // queue as "already in a dungeon" (LFG_JOIN_PARTY_NOT_MEET_REQS). If the
-        // group is flagged LFG but is NOT actually queued or in a dungeon (state
-        // NONE and no current dungeon), the flag is stale — clear it so the
-        // queue proceeds as a normal party.
-        if (grp && grp->isLFGGroup()
-            && GetState(gguid) == LFG_STATE_NONE && GetDungeon(gguid) == 0)
+        // LFG dungeon keeps GROUPTYPE_LFG set forever — the core only clears it
+        // on disband, which this party never does. Two stale shapes then block
+        // every later queue as "already in a dungeon"
+        // (LFG_JOIN_PARTY_NOT_MEET_REQS):
+        //  - flag set but state NONE and no dungeon recorded, or
+        //  - state DUNGEON with a recorded dungeon NO member is inside anymore
+        //    (the party bailed mid-run: wipe, hearth, rescue teleport).
+        // Reset through RemoveGroupData — the same cleanup a real disband runs —
+        // so the queue proceeds as a normal party. A genuine continue (someone
+        // still inside the dungeon's map) is left untouched.
+        if (grp && grp->isLFGGroup())
         {
-            grp->RemoveLFGFlag();
-            LOG_INFO("module",
-                "[WowPsParty LFG] cleared stale LFG flag on {}'s party so it can queue",
-                player->GetName());
+            uint32 const recordedDungeon = GetDungeon(gguid);
+            bool stale = GetState(gguid) == LFG_STATE_NONE && recordedDungeon == 0;
+            if (!stale && GetState(gguid) == LFG_STATE_DUNGEON)
+                if (LFGDungeonData const* dungeon = GetLFGDungeon(recordedDungeon))
+                {
+                    stale = true;
+                    for (GroupReference* itr = grp->GetFirstMember(); itr && stale; itr = itr->next())
+                        if (Player* member = itr->GetSource())
+                            if (member->GetMapId() == dungeon->map)
+                                stale = false;
+                }
+            if (stale)
+            {
+                RemoveGroupData(gguid);
+                grp->RemoveLFGFlag();
+                LOG_INFO("module",
+                    "[WowPsParty LFG] cleared stale LFG state on {}'s party (recorded dungeon={}) so it can queue",
+                    player->GetName(), recordedDungeon);
+            }
         }
 
         bool isContinue = grp && grp->isLFGGroup() && GetState(gguid) != LFG_STATE_FINISHED_DUNGEON;
