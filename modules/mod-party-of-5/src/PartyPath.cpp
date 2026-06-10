@@ -2,8 +2,13 @@
 #include "PartyFollow.h"
 #include "PartyMgr.h"
 
+#include "Cell.h"
+#include "CellImpl.h"
 #include "Chat.h"
 #include "DatabaseEnv.h"
+#include "GameObject.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
 #include "Log.h"
 #include "Map.h"
 #include "MotionMaster.h"
@@ -12,6 +17,7 @@
 #include "WorldSession.h"
 
 #include <cmath>
+#include <list>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -148,6 +154,44 @@ namespace WowPsParty
             p->SetCanFly(on);
             p->SetDisableGravity(on);
         }
+
+        // Closed door near the recorder. Ghost mode's fly + ignore-aggro lets
+        // you walk PAST enemies, but a shut door is solid client-side collision
+        // you can't fly through — so a boss-gated door stopped the recording
+        // dead. We're in the recorder's OWN dungeon instance, so swing nearby
+        // closed doors open (collision drops with the open state) and they reset
+        // when the instance does — letting the ghost walk through and lay the
+        // rest of the path. Only GAMEOBJECT_TYPE_DOOR, only while recording.
+        struct NearbyClosedDoorCheck
+        {
+            NearbyClosedDoorCheck(WorldObject const* src, float range)
+                : _src(src), _range(range) {}
+            bool operator()(GameObject* go) const
+            {
+                return go && go->isSpawned()
+                    && go->GetGoType() == GAMEOBJECT_TYPE_DOOR
+                    && go->GetGoState() == GO_STATE_READY        // closed
+                    && _src->IsWithinDist(go, _range, false);
+            }
+            WorldObject const* _src;
+            float _range;
+        };
+
+        static void OpenNearbyDoorsForRecorder(Player* p)
+        {
+            constexpr float DOOR_OPEN_RANGE = 12.0f;   // open with lead at 5x ghost speed
+            std::list<GameObject*> doors;
+            NearbyClosedDoorCheck check(p, DOOR_OPEN_RANGE);
+            Acore::GameObjectListSearcher<NearbyClosedDoorCheck> searcher(p, doors, check);
+            Cell::VisitObjects(p, searcher, DOOR_OPEN_RANGE);
+            for (GameObject* go : doors)
+            {
+                go->SetGoState(GO_STATE_ACTIVE);   // swing open -> collision drops
+                LOG_INFO("module",
+                    "[WowPsParty Path] recorder opened door entry={} for guid={}",
+                    go->GetEntry(), p->GetGUID().GetCounter());
+            }
+        }
     }
 
     bool TogglePathRecording(Player* player)
@@ -244,6 +288,10 @@ namespace WowPsParty
             Player* p = ObjectAccessor::FindConnectedPlayer(
                 ObjectGuid::Create<HighGuid::Player>(guidLow));
             if (!p || !p->IsInWorld()) continue;
+
+            // Swing open any closed door the ghost is approaching so a boss-gated
+            // door can't wall off the rest of the recording (instance-local).
+            OpenNearbyDoorsForRecorder(p);
 
             std::lock_guard<std::mutex> lock(g_recMutex);
             auto it = g_recording.find(guidLow);
