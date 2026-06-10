@@ -560,18 +560,64 @@ namespace WowPsParty
             case 5: // Priest
                 if (isHealer)
                 {
-                    add("party_lowest_health<30", "cast_party_lowest:Flash Heal", 96);
-                    add("tank_health<50", "cast_party_lowest:Greater Heal", 90);
-                    add("party_has_dead", "rez_party:Resurrection", 84);
-                    add("party_has_magic", "cure_party:Dispel Magic", 80);
-                    add("party_has_disease", "cure_party:Cure Disease", 79);
-                    add("party_lowest_health<75", "cast_party_lowest:Power Word: Shield", 74);
-                    add("party_lowest_health<70", "cast_party_lowest_hot:Renew", 68);
-                    add("party_lowest_health<75", "cast_party_lowest:Flash Heal", 62);
-                    add("always", "cast_party_missing:Power Word: Fortitude", 54);
-                    // Healers only DPS at near-full mana — conserve for healing.
-                    add("self_mana>85&target_missing_aura:Shadow Word: Pain", "cast:Shadow Word: Pain", 34);
-                    add("self_mana>85&has_target", "cast:Smite", 30);
+                    // Holy & Discipline healing. Spells are listed BEST-FIRST and the
+                    // engine falls through to the next rule when a spell isn't KNOWN
+                    // (cast_party_lowest returns false on FindKnownSpellByName==0). So
+                    // a sub-20 priest with only Lesser Heal/Heal still heals, and Disc
+                    // vs Holy each use whichever spec spells they actually own — no
+                    // rotation ever dead-ends on an unlearned spell (the Flash-Heal-
+                    // only bug). Heal SELECTION is condition-gated: fast heals for
+                    // emergencies, the mana-efficient slow heals only when ONE target
+                    // is hurt and it's calm, and AoE / fast-spread when several are hurt
+                    // (never a slow tank heal while the group is low).
+
+                    // EMERGENCY — someone critically low: the FASTEST heal known, or
+                    // the only heals a low-level priest has. Speed beats efficiency.
+                    add("party_lowest_health<40", "cast_party_lowest:Penance", 99);       // Disc: fast + efficient
+                    add("party_lowest_health<40", "cast_party_lowest:Flash Heal", 98);    // fast (L20)
+                    add("party_lowest_health<40", "cast_party_lowest:Binding Heal", 97);  // heals the priest too (L64)
+                    add("party_lowest_health<40", "cast_party_lowest:Heal", 96);          // mid-level fallback
+                    add("party_lowest_health<40", "cast_party_lowest:Lesser Heal", 95);   // L1 fallback
+                    // Near-death panic cooldowns on the dying member (talented; fall through).
+                    add("party_lowest_health<25", "cast_party_lowest:Guardian Spirit", 94);  // Holy
+                    add("party_lowest_health<25", "cast_party_lowest:Pain Suppression", 93); // Disc
+
+                    // Rez + dispels.
+                    add("party_has_dead", "rez_party:Resurrection", 90);
+                    add("party_has_magic", "cure_party:Dispel Magic", 88);
+                    add("party_has_disease", "cure_party:Cure Disease", 87);
+
+                    // MULTIPLE HURT (2+ injured near each other) — AoE heal if known,
+                    // else FAST single-target on the lowest. NEVER the slow mana-saver
+                    // on the tank while the group is low (Kevin's rule).
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Circle of Healing", 84); // Holy talent, smart AoE
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Prayer of Healing", 83); // base L30 group heal
+                    add("party_injured_clustered:30>1", "cast_self:Holy Nova", 82);                 // short-range AoE (L20)
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Penance", 81);           // no AoE yet: fast single
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Flash Heal", 80);
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Heal", 79);
+                    add("party_injured_clustered:30>1", "cast_party_lowest:Lesser Heal", 78);
+
+                    // Cheap proactive mitigation on the most-hurt member.
+                    add("party_lowest_health<85", "cast_party_lowest:Prayer of Mending", 72);  // bounce heal, efficient
+                    add("party_lowest_health<80", "cast_party_lowest:Power Word: Shield", 70); // absorb
+                    add("party_lowest_health<75", "cast_party_lowest_hot:Renew", 66);          // HoT
+
+                    // SINGLE TARGET, SAFE (only ONE member hurt) — the EFFICIENT slow
+                    // heal, to conserve mana in calm moments. Gated !cluster so it never
+                    // fires while several are hurt. Greater Heal -> Heal -> Lesser Heal.
+                    add("party_lowest_health<75&!party_injured_clustered:30>1", "cast_party_lowest:Greater Heal", 60);
+                    add("party_lowest_health<75&!party_injured_clustered:30>1", "cast_party_lowest:Heal", 59);
+                    add("party_lowest_health<70&!party_injured_clustered:30>1", "cast_party_lowest:Lesser Heal", 58);
+                    // Plenty of mana + a light single-target dip -> just Flash-top them.
+                    add("party_lowest_health<85&self_mana>65", "cast_party_lowest:Flash Heal", 50);
+
+                    // Group buff.
+                    add("always", "cast_party_missing:Power Word: Fortitude", 44);
+
+                    // Filler DPS ONLY at near-full mana — conserve mana for healing.
+                    add("self_mana>88&target_missing_aura:Shadow Word: Pain", "cast:Shadow Word: Pain", 34);
+                    add("self_mana>88&has_target", "cast:Smite", 30);
                 }
                 else
                 {
