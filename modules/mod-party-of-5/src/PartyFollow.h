@@ -145,6 +145,12 @@ namespace WowPsParty
     // when the hold expires.
     void RecallFollowers(Player* leader, uint32 holdMs);
 
+    // True while a "Come Hither" recall is holding this follower. TickRotation
+    // checks it to PAUSE the rotation so a ranged DPS runs to the leader instead
+    // of hard-casting in place. (Separate from IsFollowerHeld so drink/hold, which
+    // re-assert via the rotation, aren't paused.)
+    bool IsBeingRecalled(ObjectGuid followerGuid);
+
     // Out-of-combat gathering. If `bot` is one of the player's alts (not a
     // henchman) and was trained in Mining or Herbalism, harvest a nearby node
     // (within 30y, within the bot's skill) while travelling with the party,

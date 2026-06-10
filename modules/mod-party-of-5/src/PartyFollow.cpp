@@ -130,6 +130,14 @@ namespace WowPsParty
         // bot is intentionally stationary (drinking, holding for healer, etc).
         static std::unordered_map<uint32, uint32> g_holdUntilMs;
 
+        // followerGuidLow -> getMSTime() at which a "Come Hither" recall ends. Read
+        // ONLY by TickRotation, to PAUSE the rotation during the recall so a ranged
+        // DPS runs to the leader instead of hard-casting in place (faceAndCast would
+        // re-plant it each tick). Deliberately separate from g_holdUntilMs: drink /
+        // hold_position use that one and the rotation must KEEP running for them
+        // (their actions re-assert the hold every tick).
+        static std::unordered_map<uint32, uint32> g_recallUntilMs;
+
         static std::mutex                g_mutex;
         static std::vector<Directive>    g_directives;
         // account -> the ACTIVE leader's own account_party role. The leader isn't a
@@ -470,6 +478,19 @@ namespace WowPsParty
         return true;
     }
 
+    bool IsBeingRecalled(ObjectGuid followerGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_recallUntilMs.find(followerGuid.GetCounter());
+        if (it == g_recallUntilMs.end()) return false;
+        if (getMSTime() >= it->second)
+        {
+            g_recallUntilMs.erase(it);
+            return false;
+        }
+        return true;
+    }
+
     // Force a freshly-revived / stuck bot back into a MOVABLE state.
     //
     // Root/stun/etc. live in two places: the unit-state mask (m_state, gated by
@@ -526,12 +547,20 @@ namespace WowPsParty
             Player* bot = ObjectAccessor::FindPlayer(g);
             if (!bot || !bot->IsInWorld() || !bot->IsAlive()) continue;
             if (bot->GetMapId() != leaderMap) continue;
+            // Interrupt any in-progress cast FIRST: a ranged DPS mid-Frostbolt would
+            // otherwise keep re-casting in place (faceAndCast re-plants it every
+            // rotation tick) and ignore the recall — exactly the reported bug.
+            bot->InterruptNonMeleeSpells(true);
             // Run to the leader's exact spot — pathfinding + unit collision spread
             // them into a tight cluster. MovePoint overrides any in-progress
-            // chase/kite; the hold keeps both the follow ticker and the combat
-            // assist (both honour IsFollowerHeld) off them for holdMs.
+            // chase/kite; the holds keep the follow ticker + combat assist (via
+            // IsFollowerHeld) AND the rotation (via IsBeingRecalled) off them.
             bot->GetMotionMaster()->MovePoint(RECALL_POINT_ID, lx, ly, lz);
             HoldFollower(g, holdMs);
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_recallUntilMs[g.GetCounter()] = getMSTime() + holdMs;
+            }
         }
     }
 

@@ -3346,6 +3346,12 @@ namespace WowPsParty
         // tick. (Resurrect-accept is handled separately in ApplyDirective.)
         if (!bot->IsAlive()) return false;
 
+        // "Come Hither" recall in progress: pause the rotation entirely so the bot
+        // RUNS to the leader (MovePoint) instead of hard-casting in place — a ranged
+        // DPS's faceAndCast would otherwise re-plant it every tick and ignore the
+        // recall. Resumes the instant the recall hold expires (~2s).
+        if (WowPsParty::IsBeingRecalled(bot->GetGUID())) return false;
+
         // Mounted while traveling with the leader: do NOTHING out of combat. An
         // out_of_combat rule — a rogue's Stealth, a hunter's Call Pet, a self-buff,
         // eat/drink — would cast and DISMOUNT the bot, which the follow ticker's
