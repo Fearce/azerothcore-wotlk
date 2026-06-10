@@ -2165,20 +2165,29 @@ namespace WowPsParty
                 desired = leaderTarget;
             else
             {
-                // The leader isn't ATTACKING anything, but if they've SELECTED a
-                // valid hostile, treat that as "party, attack this" — GW1/DAI-style
-                // direction. Without this the party only engages a mob you're
-                // already auto-attacking, so a freshly-selected pull just gets
-                // stared at (Kevin's mom: bots stood looking at the enemy, never
-                // moved in to wand it). This is player-DIRECTED (you picked the
-                // target), not the bot auto-choosing a mob, so it isn't the
-                // "nearest-mode pulls the room" hazard; the 50y party leash still
-                // caps how far they'll chase a stray click.
-                Unit* const sel = leader->GetSelectedUnit();
-                if (sel && sel->IsAlive() && bot->IsValidAttackTarget(sel))
-                    desired = sel;
-                else
-                    desired = pickPartyDefenseTarget();
+                // The leader isn't ATTACKING anything. A bot set to follow the
+                // leader's target must NOT idle (or chase a stale selection)
+                // while the party is in a fight — so DEFEND first: if the bot or
+                // any party member is being attacked, engage that threat.
+                // pickPartyDefenseTarget is combat-only (it only returns a mob
+                // already swinging at someone), so this can never start a pull —
+                // it's the "find your own target / kill what's hitting the
+                // suffering party members" behaviour, gated behind real combat.
+                desired = pickPartyDefenseTarget();
+                if (!desired)
+                {
+                    // Nobody's under attack — the party is idle. NOW honour a
+                    // player-DIRECTED pull: attack the mob the leader has merely
+                    // SELECTED (GW1/DAI-style "party, get that one"). Without this
+                    // a freshly-selected pull just gets stared at (Kevin's mom:
+                    // bots stood looking at the enemy, never moved in to wand it).
+                    // This is the ONLY pre-combat engage and only fires when no
+                    // one is fighting, so it never overrides defending an ally;
+                    // the 50y party leash still caps a stray click.
+                    Unit* const sel = leader->GetSelectedUnit();
+                    if (sel && sel->IsAlive() && bot->IsValidAttackTarget(sel))
+                        desired = sel;
+                }
             }
         }
         // Final safety: never hand back a dead/invalid target.
