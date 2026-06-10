@@ -925,6 +925,14 @@ namespace WowPsParty
             if (!a) continue;
             SpellInfo const* si = a->GetSpellInfo();
             if (!si) continue;
+            // Skip PASSIVE auras. A proc TALENT (a Fire mage's Hot Streak, a
+            // shaman's Maelstrom Weapon trigger, …) applies a PERMANENT passive
+            // aura that shares its name with the actual proc BUFF — so the
+            // name-only match was always true (the mage spammed Pyroblast with no
+            // Hot Streak proc; "aura_remain" treats the permanent passive as
+            // never-expiring, so >Ns was always true too). The real proc buff and
+            // every cast buff/debuff/HoT/form a rotation checks are non-passive.
+            if (si->IsPassive()) continue;
             char const* sname = si->SpellName[0];
             if (!sname) continue;
             std::string lower;
