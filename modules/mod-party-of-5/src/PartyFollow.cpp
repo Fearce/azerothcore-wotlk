@@ -2701,6 +2701,15 @@ namespace WowPsParty
             return (u * 2.0f - 1.0f) * amp;
         }
 
+        // Shortest-arc interpolation between two absolute bearings (radians).
+        static float LerpAngle(float from, float to, float t)
+        {
+            float diff = to - from;
+            while (diff >  float(M_PI)) diff -= 2.0f * float(M_PI);
+            while (diff < -float(M_PI)) diff += 2.0f * float(M_PI);
+            return from + diff * t;
+        }
+
         // Per-bot peel-off delay (ms) so the party doesn't lurch as one unit:
         // formation index sequences the wave, a stable hash scatters within it.
         static uint32 StaggerDelayMs(uint32 guidLow, int formationIndex)
@@ -3364,32 +3373,63 @@ namespace WowPsParty
                 // ---- leader stationary --------------------------------------
                 if (h.wandering)
                 {
-                    if (now >= h.wanderUntilMs) h.wandering = false;  // stroll done -> re-anchor below
+                    if (now >= h.wanderUntilMs) h.wandering = false;  // stroll done -> hold here
                     else continue;                                    // let the stroll finish
                 }
 
-                // Occasionally take a short stroll within a tight leash so the
-                // party fidgets instead of standing as frozen statues.
+                float const wanderCap = std::min(h.slotDist + 6.0f, 7.0f);
+                float const dLead     = follower->GetDistance(leader);
+
+                // Notably out of formation — e.g. just left combat away from the
+                // party — walk back toward the slot. The threshold sits ABOVE the
+                // wander cap, so a bot that merely strolled out is never yanked
+                // back (the user wants it to keep its wandered spot); only a real
+                // post-combat drift reforms.
+                if (dLead > wanderCap + 0.5f)
+                {
+                    assertFollow();
+                    continue;
+                }
+
+                // Settle in place. Once the leader stops, drop the follow
+                // generator so the bot HOLDS its current position rather than
+                // being tugged back to its formation slot — this is what lets it
+                // stay wherever it last wandered to and pick the next stroll from
+                // there. The formation re-forms naturally when the leader moves
+                // again (the moving branch above re-asserts MoveFollow).
+                if (mg == FOLLOW_MOTION_TYPE || follower->isMoving())
+                {
+                    follower->StopMoving();
+                    follower->GetMotionMaster()->Clear();
+                    follower->GetMotionMaster()->MoveIdle();
+                    h.followAsserted = false;
+                }
+
+                // Occasionally take a short stroll from the CURRENT spot (not a
+                // return to formation) so the party keeps shifting its weight
+                // instead of freezing. Frequency is ~half the first cut. The
+                // direction is weighted back toward the leader the further out
+                // we are, so repeated strolls can't creep into the leash.
                 if (now >= h.nextFidgetMs)
                 {
-                    h.nextFidgetMs = now + urand(2500, 6000);
-                    bool const nearFormation =
-                        follower->GetDistance(leader) < h.slotDist + 5.0f;
-                    if (urand(0, 99) < 45 && nearFormation)
+                    h.nextFidgetMs = now + urand(3000, 7000);
+                    if (urand(0, 99) < 22)
                     {
-                        float const a = frand(0.0f, 2.0f * float(M_PI));
+                        float wBack = (dLead - h.slotDist)
+                                    / std::max(1.0f, wanderCap - h.slotDist);
+                        wBack = wBack < 0.0f ? 0.0f : (wBack > 1.0f ? 1.0f : wBack);
+                        float const randDir = frand(0.0f, 2.0f * float(M_PI));
+                        float const dir = LerpAngle(randDir, follower->GetAngle(leader), wBack);
                         float const r = frand(1.5f, 3.5f);
-                        float wx = follower->GetPositionX() + r * std::cos(a);
-                        float wy = follower->GetPositionY() + r * std::sin(a);
+                        float wx = follower->GetPositionX() + r * std::cos(dir);
+                        float wy = follower->GetPositionY() + r * std::sin(dir);
                         float wz = follower->GetPositionZ();
-                        // Keep the stroll destination inside the "near" band:
-                        // never past 7y from the leader, so a wandering bot can't
-                        // sit in the 1 Hz stuck-detector's >8y window (which would
-                        // trigger a needless unstick on a big party).
-                        float const wanderLeash = std::min(h.slotDist + 6.0f, 7.0f);
+                        // Hard cap: never settle past the wander leash, so a
+                        // wandering bot can't sit in the 1 Hz stuck-detector's
+                        // >8y window (needless unstick on a big party).
                         if (follower->GetMap()
                             && follower->GetMap()->CanReachPositionAndGetValidCoords(follower, wx, wy, wz)
-                            && leader->GetExactDist2d(wx, wy) < wanderLeash)
+                            && leader->GetExactDist2d(wx, wy) < wanderCap)
                         {
                             follower->GetMotionMaster()->Clear();
                             follower->GetMotionMaster()->MovePoint(WANDER_POINT_ID, wx, wy, wz);
@@ -3401,9 +3441,8 @@ namespace WowPsParty
                     }
                 }
 
-                // Anchor at the jittered slot (walks a finished stroll back;
-                // idempotent when already settled there).
-                assertFollow();
+                // Otherwise just hold the current spot (already idle) — no
+                // re-anchor to the formation slot.
             }
         }
 
