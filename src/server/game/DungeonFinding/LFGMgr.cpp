@@ -1042,7 +1042,45 @@ namespace lfg
             case LFG_STATE_FINISHED_DUNGEON:
             case LFG_STATE_BOOT:
                 if (guid != gguid) // Player
+                {
                     SetState(guid, LFG_STATE_NONE);
+                    // [WowPsParty PATCH] A party-of-5's bots have their AI paused and
+                    // never leave LFG on their own, so after the human "Leave Dungeon"s
+                    // the group stays GROUPTYPE_LFG forever — the dungeon-finder eye
+                    // lingers and the party reads as "still in a dungeon". When the
+                    // LAST human leaves, clear every party bot's LFG state and drop the
+                    // group's LFG flag so it reverts to a normal group. Guarded on
+                    // anyBot so ordinary all-human LFG groups are untouched, and on
+                    // "no human still inside" so a 2-human party doesn't drop LFG while
+                    // the other player is still running it.
+                    if (gguid)
+                        if (Group* grp = sGroupMgr->GetGroupByGUID(gguid.GetCounter()))
+                        {
+                            bool anyBot = false, anyHumanStillIn = false;
+                            for (GroupReference* itr = grp->GetFirstMember(); itr; itr = itr->next())
+                            {
+                                Player* m = itr->GetSource();
+                                if (!m || m->GetGUID() == guid) continue;
+                                if (WowPsParty_BotHasActiveFollowDirective_Trampoline(m->GetGUID()))
+                                    anyBot = true;
+                                else if (GetState(m->GetGUID()) == LFG_STATE_DUNGEON
+                                      || GetState(m->GetGUID()) == LFG_STATE_FINISHED_DUNGEON)
+                                    anyHumanStillIn = true;
+                            }
+                            if (anyBot && !anyHumanStillIn && grp->isLFGGroup())
+                            {
+                                for (GroupReference* itr = grp->GetFirstMember(); itr; itr = itr->next())
+                                    if (Player* m = itr->GetSource())
+                                        if (WowPsParty_BotHasActiveFollowDirective_Trampoline(m->GetGUID()))
+                                            SetState(m->GetGUID(), LFG_STATE_NONE);
+                                SetState(gguid, LFG_STATE_NONE);
+                                grp->RemoveLFGFlag();   // reverts to a normal group; SendUpdate() clears the eye
+                                LOG_INFO("module",
+                                    "[WowPsParty LFG] last human left the dungeon — reverted party {} to a normal group",
+                                    gguid.ToString());
+                            }
+                        }
+                }
                 break;
             case LFG_STATE_RAIDBROWSER:
                 LeaveRaidBrowser(guid);
