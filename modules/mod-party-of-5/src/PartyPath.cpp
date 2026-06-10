@@ -45,16 +45,32 @@ namespace WowPsParty
         static std::mutex                                           g_tankProgressMutex;
         static std::unordered_map<uint32, uint32>                   g_tankCursor;
 
-        constexpr uint32 SAMPLE_INTERVAL_MS = 250;   // 4 Hz — tight corners + jumps both captured
-        constexpr float  DEDUPE_MIN_DIST    = 2.0f;
-        constexpr float  TANK_LEASH         = 35.0f;   // stop & wait past this from leader
-        constexpr float  LEAD_DISTANCE      = 25.0f;   // aim this far ahead ALONG the path
+        // Per-bot stall tracker for the path-playback blink. If the tank should
+        // be walking toward its lookahead but isn't making ground, a door / baked
+        // geometry / a recording gap has wedged it — blink it forward along the
+        // recorded path to clear it (see TankFollowPath).
+        struct TankStall { float x = 0.0f, y = 0.0f, z = 0.0f; uint32 lastMs = 0; uint32 ticks = 0; };
+        static std::mutex                                           g_tankStallMutex;
+        static std::unordered_map<uint32, TankStall>               g_tankStall;
+
+        constexpr uint32 SAMPLE_INTERVAL_MS = 150;   // ~7 Hz — denser capture so fast recording still has tight waypoints
+        constexpr float  DEDUPE_MIN_DIST    = 1.5f;
+        constexpr float  TANK_LEASH         = 45.0f;   // stop & wait past this from leader
+        constexpr float  LEAD_DISTANCE      = 30.0f;   // aim this far ahead ALONG the path
         constexpr float  WAYPOINT_REACHED   = 3.5f;
         // Vertical step size that pathfinding can't handle (jumps, drops,
         // dropdowns through holes). Checked over the IMMEDIATE next stride
         // (~2y), so only a true cliff trips it — descending ramps (Deadmines)
         // have small per-stride Z change and are walked, not teleported.
         constexpr float  VERTICAL_STEP_TP   = 6.0f;
+        // Path-playback stall->blink: if the tank moves less than this between
+        // samples for STALL_LIMIT samples while it should be advancing, it's
+        // wedged (door / baked geometry / gap) — blink forward BLINK_CLEAR_DIST
+        // along the recorded path to clear it.
+        constexpr uint32 STALL_SAMPLE_MS    = 400;
+        constexpr uint32 STALL_LIMIT        = 3;      // ~1.2 s wedged before blinking
+        constexpr float  STALL_MIN_MOVE     = 1.0f;   // moved less than this between samples = wedged
+        constexpr float  BLINK_CLEAR_DIST   = 9.0f;   // teleport this far along the path past the wedge
 
         static float Dist3D(float ax, float ay, float az, float bx, float by, float bz)
         {
@@ -340,23 +356,10 @@ namespace WowPsParty
                                        wp.x, wp.y, wp.z);
         if (distToWp <= WAYPOINT_REACHED) { tlog("idle: already at lookahead waypoint"); return; }
 
-        // Avoid re-issuing MovePoint to the same waypoint every tick.
         uint32 const botGuidLow = bot->GetGUID().GetCounter();
-        {
-            std::lock_guard<std::mutex> lock(g_tankProgressMutex);
-            auto& cur = g_tankCursor[botGuidLow];
-            if (cur == targetIdx + 1) return;  // already moving toward this one
-            cur = targetIdx + 1;
-        }
 
-        // Vertical step too large for the navmesh? (jumps in BFD, dropdowns
-        // in Stockades, the giant fall in LBRS …) Teleport instead of
-        // trying to path. User-facing this looks like the tank "blinks"
-        // through the obstacle, which Kevin signed off on.
-        // Teleport ONLY across a genuine cliff/hole — a big Z change over the
-        // tank's IMMEDIATE next stride (recorded waypoints are ~2y apart).
-        // Comparing Z to the far lookahead made smooth descents teleport every
-        // tick. Find the tank's own cursor, then look at its very next step.
+        // Tank's own nearest waypoint — used by both the stall-blink and the
+        // cliff-blink below.
         uint32 tankNearest = 0;
         float  tankNearD   = std::numeric_limits<float>::max();
         for (uint32 i = 0; i < path.size(); ++i)
@@ -365,6 +368,77 @@ namespace WowPsParty
                                    path[i].x, path[i].y, path[i].z);
             if (d < tankNearD) { tankNearD = d; tankNearest = i; }
         }
+
+        // Stall -> blink. We have a lookahead target beyond reach but the tank
+        // can be wedged on a DOOR / baked-closed geometry / a recording gap that
+        // the navmesh can't path. Sample progress; if it hasn't moved for ~1.2s,
+        // NearTeleport it forward along the RECORDED path (the route the player
+        // actually walked, so always valid) far enough to clear the obstacle —
+        // the same blink Kevin OK'd for cliffs, now for doors too. A boss-gated
+        // door is open by the time the tank arrives (it pauses in combat, so it
+        // only resumes once the boss is dead). Runs BEFORE the re-issue dedup so
+        // a tank wedged mid-MovePoint is still rescued (the dedup would otherwise
+        // sit on the same blocked target until the player nudged forward — the
+        // "tank just stops, we have to walk forward manually" report).
+        {
+            bool wedged = false;
+            {
+                std::lock_guard<std::mutex> lock(g_tankStallMutex);
+                TankStall& s = g_tankStall[botGuidLow];
+                uint32 const now = getMSTime();
+                if (now - s.lastMs >= STALL_SAMPLE_MS)
+                {
+                    float const moved = Dist3D(bot->GetPositionX(), bot->GetPositionY(),
+                                               bot->GetPositionZ(), s.x, s.y, s.z);
+                    if (s.lastMs != 0 && moved < STALL_MIN_MOVE) ++s.ticks;
+                    else                                          s.ticks = 0;
+                    s.x = bot->GetPositionX(); s.y = bot->GetPositionY(); s.z = bot->GetPositionZ();
+                    s.lastMs = now;
+                    if (s.ticks >= STALL_LIMIT) { wedged = true; s.ticks = 0; }
+                }
+            }
+            if (wedged)
+            {
+                // Advance from the tank's cursor accumulating ~BLINK_CLEAR_DIST of
+                // path length (capped at the lookahead so we never blink past
+                // where we're leading to), then teleport there.
+                uint32 blinkIdx = tankNearest;
+                float acc = 0.0f;
+                while (blinkIdx + 1 < path.size() && blinkIdx < targetIdx && acc < BLINK_CLEAR_DIST)
+                {
+                    acc += Dist3D(path[blinkIdx].x, path[blinkIdx].y, path[blinkIdx].z,
+                                  path[blinkIdx + 1].x, path[blinkIdx + 1].y, path[blinkIdx + 1].z);
+                    ++blinkIdx;
+                }
+                if (blinkIdx > tankNearest)
+                {
+                    // Only blink if the destination is in LINE OF SIGHT. An OPEN
+                    // door (or a navmesh-baked-closed-but-now-open passage) has
+                    // clear LoS, so we blink through; a CLOSED door or a real wall
+                    // blocks LoS, so we wait. This is what makes a boss-gated door
+                    // work: while it's shut the tank waits, and the instant it
+                    // opens (boss dead) the next stall cycle sees LoS and blinks
+                    // through — without ever teleporting past content still walled
+                    // off.
+                    if (!bot->IsWithinLOS(path[blinkIdx].x, path[blinkIdx].y, path[blinkIdx].z))
+                    {
+                        tlog("wedged but no LoS to blink target (closed door / wall) — waiting");
+                        return;
+                    }
+                    tlog("blink: wedged (open door / geometry / gap), NearTeleport forward along path");
+                    bot->GetMotionMaster()->Clear();
+                    bot->NearTeleportTo(path[blinkIdx].x, path[blinkIdx].y, path[blinkIdx].z, path[blinkIdx].o);
+                    std::lock_guard<std::mutex> lock(g_tankProgressMutex);
+                    g_tankCursor[botGuidLow] = blinkIdx;
+                    return;
+                }
+            }
+        }
+
+        // Vertical step too large for the navmesh? (jumps in BFD, dropdowns in
+        // Stockades, the giant fall in LBRS …) Teleport across — same blink.
+        // Checked over the tank's IMMEDIATE next stride so only a true cliff
+        // trips it; descending ramps (Deadmines) walk normally.
         uint32 const stepIdx = std::min(tankNearest + 1, uint32(path.size()) - 1);
         float const dzStep = std::fabs(path[stepIdx].z - bot->GetPositionZ());
         if (dzStep > VERTICAL_STEP_TP)
@@ -372,6 +446,14 @@ namespace WowPsParty
             tlog("blink: cliff on next stride, NearTeleport across");
             bot->NearTeleportTo(path[stepIdx].x, path[stepIdx].y, path[stepIdx].z, path[stepIdx].o);
             return;
+        }
+
+        // Avoid re-issuing MovePoint to the same waypoint every tick.
+        {
+            std::lock_guard<std::mutex> lock(g_tankProgressMutex);
+            auto& cur = g_tankCursor[botGuidLow];
+            if (cur == targetIdx + 1) return;  // already moving toward this one
+            cur = targetIdx + 1;
         }
 
         tlog("LEAD: MovePoint to lookahead waypoint");
