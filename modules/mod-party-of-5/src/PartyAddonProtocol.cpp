@@ -116,8 +116,18 @@ namespace WowPsParty
     {
         if (!player || !player->GetSession())
             return;
-        std::string const payload = BuildRosterPayload(player->GetSession()->GetAccountId());
+        uint32 const accountId = player->GetSession()->GetAccountId();
+        std::string const payload = BuildRosterPayload(accountId);
         SendWPSP(player, "ROSTER\t" + payload);
+
+        // The account's henchman guids, so the client can distinguish a managed
+        // henchman from a SECOND HUMAN in the group (without this the addon tags
+        // the other player as a henchman — shows them in the rotation editor).
+        std::vector<uint32> hench;
+        WowPsParty::GetHenchmanGuidsForAccount(accountId, hench);
+        std::ostringstream hp;
+        for (size_t i = 0; i < hench.size(); ++i) { if (i) hp << ':'; hp << hench[i]; }
+        SendWPSP(player, "HENCHGUIDS\t" + hp.str());
     }
 
     // SETTINGS\t<spawn>\t<inv>\t<gear>\t<prog>  (each 0/1) — the account's

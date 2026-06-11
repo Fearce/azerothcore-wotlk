@@ -91,6 +91,10 @@ namespace WowPsParty
     // included; empty if the member isn't a tracked follower.
     void GetPartyGuidsFor(ObjectGuid member, std::vector<ObjectGuid>& out);
 
+    // The account's hired henchman guid-counters — so the client can tell a
+    // managed henchman from a second human sharing the WoW group.
+    void GetHenchmanGuidsForAccount(uint32 account, std::vector<uint32>& out);
+
     // Returns the leader guid that this follower is bound to, or an
     // empty ObjectGuid if no directive exists. Used by AssistTarget to
     // mirror the controlled body's target onto the rest of the party.

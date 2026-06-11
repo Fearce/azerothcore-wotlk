@@ -750,6 +750,18 @@ namespace WowPsParty
             out.push_back(leader);
     }
 
+    // The account's hired HENCHMAN guid-counters. The addon needs this to tell a
+    // managed henchman apart from a SECOND HUMAN sharing the WoW group: both are
+    // non-alt group members, and without this the client wrongly tags the other
+    // player as a henchman (shows them in the rotation editor, etc.).
+    void GetHenchmanGuidsForAccount(uint32 account, std::vector<uint32>& out)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (auto const& d : g_directives)
+            if (d.account == account && d.henchman)
+                out.push_back(d.followerGuid.GetCounter());
+    }
+
     // Throttled log helper — at most one line per bot per 4 seconds, per
     // unique reason. Otherwise diagnostic logging here floods the file.
     static void AssistLog(uint32 guidLow, char const* reason)
