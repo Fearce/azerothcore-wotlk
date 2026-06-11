@@ -312,14 +312,19 @@ namespace WowPsParty
         for (ObjectGuid const& g : guids)
             consider(ObjectAccessor::FindConnectedPlayer(g));
 
+        // ALSO fold in the WoW GROUP — a SECOND human (a different account) and
+        // their own bots sharing the dungeon. The directive roster only covers
+        // OUR account's party, so without this a bot healer never heals, cures or
+        // RESURRECTS the other player's side (Kevin: "bot healer won't rez the
+        // other human when they die"). consider() dedupes by pointer, so our own
+        // account-mates already added above aren't counted twice, and it filters
+        // to same-map / in-world, so an off-map groupmate is ignored.
+        if (Group* grp = bot->GetGroup())
+            for (GroupReference* itr = grp->GetFirstMember(); itr; itr = itr->next())
+                consider(itr->GetSource());
+
         if (out.empty())
-        {
-            if (Group* grp = bot->GetGroup())
-                for (GroupReference* itr = grp->GetFirstMember(); itr; itr = itr->next())
-                    consider(itr->GetSource());
-            else
-                consider(bot);
-        }
+            consider(bot);
     }
 
     static Player* GetLowestHpPartyMember(Player* bot)
