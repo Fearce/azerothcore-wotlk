@@ -2005,31 +2005,46 @@ namespace WowPsParty
     static Player* FindRoleFilteredMissing(Player* bot,
         std::string const& roleFilter, uint32 spellId)
     {
-        if (!bot || !bot->GetSession() || !spellId) return nullptr;
-        bool negate = !roleFilter.empty() && roleFilter[0] == '!';
-        std::string wantedRole = negate ? roleFilter.substr(1) : roleFilter;
-        wantedRole = Lower(wantedRole);
+        if (!bot || !spellId) return nullptr;
+        bool const negate = !roleFilter.empty() && roleFilter[0] == '!';
+        std::string const wantedRole = Lower(negate ? roleFilter.substr(1) : roleFilter);
 
-        uint32 const account = bot->GetSession()->GetAccountId();
-        QueryResult q = CharacterDatabase.Query(
-            "SELECT `guid`, COALESCE(`role`, 'dps') FROM `account_party` "
-            "WHERE `account` = {}", account);
-        if (!q) return nullptr;
-        do
+        // Roster = our account-party PLUS the WoW group (a second human + bots).
+        std::vector<Player*> party;
+        GatherPartyPlayers(bot, party, /*includeDead=*/false);
+        if (party.empty()) return nullptr;
+
+        // Each member's role comes from whatever account OWNS them — so a second
+        // human's role is read from THEIR account_party row, not ours (which is
+        // why role-targeted buffs like Beacon used to skip the other player).
+        // One batched query keyed by guid; default 'dps' if unrostered.
+        std::string ids;
+        for (Player* m : party)
         {
-            uint32 const memberGuid = q->Fetch()[0].Get<uint32>();
-            std::string memberRole = q->Fetch()[1].Get<std::string>();
-            memberRole = Lower(memberRole);
+            if (!ids.empty()) ids += ',';
+            ids += std::to_string(m->GetGUID().GetCounter());
+        }
+        std::vector<std::pair<uint32, std::string>> roles;
+        if (QueryResult q = CharacterDatabase.Query(
+                "SELECT `guid`, COALESCE(`role`, 'dps') FROM `account_party` WHERE `guid` IN ({})", ids))
+        {
+            do
+            {
+                Field* f = q->Fetch();
+                roles.emplace_back(f[0].Get<uint32>(), Lower(f[1].Get<std::string>()));
+            } while (q->NextRow());
+        }
+
+        for (Player* m : party)
+        {
+            std::string memberRole = "dps";
+            for (auto const& pr : roles)
+                if (pr.first == m->GetGUID().GetCounter()) { memberRole = pr.second; break; }
             bool const matches = (memberRole == wantedRole);
-            bool const include = negate ? !matches : matches;
-            if (!include) continue;
-            Player* m = ObjectAccessor::FindConnectedPlayer(
-                ObjectGuid::Create<HighGuid::Player>(memberGuid));
-            if (!m || !m->IsAlive() || !m->IsInWorld()) continue;
-            if (m->GetMapId() != bot->GetMapId()) continue;
+            if (negate ? matches : !matches) continue;
             if (HasAuraFromSpell(m, spellId)) continue;
-            return m;
-        } while (q->NextRow());
+            return m;   // GatherPartyPlayers already filtered to alive / in-world / same map
+        }
         return nullptr;
     }
 
