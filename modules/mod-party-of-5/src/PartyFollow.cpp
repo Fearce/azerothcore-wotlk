@@ -2699,7 +2699,7 @@ namespace WowPsParty
             bool   eligible       = false;  // 1 Hz pass: this bot is in pure open-follow
             float  slotAngle      = float(M_PI);
             float  slotDist       = 2.0f;
-            float  apptAngle      = 0.0f;    // last slot we actually asserted (idempotency)
+            float  apptAngle      = 0.0f;    // last follow angle we asserted (re-issue throttle)
             float  apptDist       = 0.0f;
             bool   followAsserted = false;
             bool   wasLeaderMoving = false;
@@ -2710,6 +2710,12 @@ namespace WowPsParty
             bool   wandering      = false;
             uint32 wanderUntilMs  = 0;
             uint32 nextFidgetMs   = 0;
+            // Smoothed MOVEMENT heading (the direction the leader is GOING, from
+            // its movement flags — NOT its facing). The formation trails this, so
+            // a mouse-turn while standing doesn't rotate the party and a real
+            // direction change eases in over ~1s instead of snapping.
+            float  smoothHeading   = 0.0f;
+            bool   hasSmoothHeading = false;
         };
         // World-thread only (the follow WorldScript OnUpdate drives both the
         // 1 Hz pass and the fast tick), so no mutex is needed.
@@ -2717,6 +2723,9 @@ namespace WowPsParty
 
         static constexpr uint32 HUMANIZE_INTERVAL_MS = 250;
         static constexpr uint32 WANDER_POINT_ID       = 0x7A9D;  // distinct MovePoint id
+        // Per-tick easing of the movement heading: ~0.3 -> a direction change is
+        // ~63% applied after ~1s, fully after ~2s, so turns look human, not snapped.
+        static constexpr float  HEADING_SMOOTH_ALPHA  = 0.30f;
 
         // Stable per-bot offset in [-amp, amp], constant across ticks (a bot's
         // "personality" — so two of the same class don't sit on one bearing).
@@ -3355,21 +3364,52 @@ namespace WowPsParty
                     follower->GetMotionMaster()->GetCurrentMovementGeneratorType();
                 bool const leaderMoving = leader->isMoving();
 
-                // Re-assert the jittered follow slot only when it isn't already in
-                // effect (gen isn't FOLLOW, or the slot drifted) — so the follow
-                // generator runs continuously/smoothly instead of being Cleared
-                // every tick, and self-heals after combat clears it.
-                auto assertFollow = [&]()
+                // Update the smoothed MOVEMENT heading from the leader's movement
+                // FLAGS (responsive every tick, no heartbeat dependency) — the
+                // direction it's actually translating, combining forward/back with
+                // strafe. Held when not translating, so a mouse-turn in place never
+                // injects facing into the formation. This is what the slot trails.
                 {
+                    float fwd = 0.0f, side = 0.0f;
+                    if (leader->HasUnitMovementFlag(MOVEMENTFLAG_FORWARD))      fwd  += 1.0f;
+                    if (leader->HasUnitMovementFlag(MOVEMENTFLAG_BACKWARD))     fwd  -= 1.0f;
+                    if (leader->HasUnitMovementFlag(MOVEMENTFLAG_STRAFE_LEFT))  side += 1.0f;
+                    if (leader->HasUnitMovementFlag(MOVEMENTFLAG_STRAFE_RIGHT)) side -= 1.0f;
+                    if (fwd != 0.0f || side != 0.0f)
+                    {
+                        float const raw = leader->GetOrientation() + std::atan2(side, fwd);
+                        if (!h.hasSmoothHeading) { h.smoothHeading = raw; h.hasSmoothHeading = true; }
+                        else h.smoothHeading = LerpAngle(h.smoothHeading, raw, HEADING_SMOOTH_ALPHA);
+                    }
+                }
+
+                // Place the formation slot BEHIND the smoothed movement heading,
+                // then express it as the facing-relative angle MoveFollow wants
+                // (we keep MoveFollow for its built-in heartbeat prediction =
+                // smooth position). Because the WORLD bearing comes from the
+                // smoothed heading, a mouse-turn (facing changes, heading doesn't)
+                // holds the party in place, and a real turn eases in. Re-issue
+                // only when the angle drifts ~5deg, so straight running never
+                // resets the spline.
+                auto moveToFormation = [&]()
+                {
+                    float const ref = h.hasSmoothHeading ? h.smoothHeading : leader->GetOrientation();
+                    float rel = ref + h.slotAngle - leader->GetOrientation();
+                    while (rel >  float(M_PI)) rel -= 2.0f * float(M_PI);
+                    while (rel < -float(M_PI)) rel += 2.0f * float(M_PI);
+
+                    float ad = rel - h.apptAngle;
+                    while (ad >  float(M_PI)) ad -= 2.0f * float(M_PI);
+                    while (ad < -float(M_PI)) ad += 2.0f * float(M_PI);
                     bool const slotChanged =
-                        std::fabs(h.slotAngle - h.apptAngle) > 0.03f ||
-                        std::fabs(h.slotDist  - h.apptDist)  > 0.20f;
+                        std::fabs(ad) > 0.087f /*~5deg*/ ||
+                        std::fabs(h.slotDist - h.apptDist) > 0.20f;
                     if (mg == FOLLOW_MOTION_TYPE && h.followAsserted && !slotChanged)
                         return;
                     follower->GetMotionMaster()->Clear();
-                    follower->GetMotionMaster()->MoveFollow(leader, h.slotDist, h.slotAngle);
+                    follower->GetMotionMaster()->MoveFollow(leader, h.slotDist, rel);
                     h.followAsserted = true;
-                    h.apptAngle = h.slotAngle;
+                    h.apptAngle = rel;
                     h.apptDist  = h.slotDist;
                 };
 
@@ -3388,9 +3428,7 @@ namespace WowPsParty
                     {
                         // Not our turn to peel off yet — hold a beat in place so
                         // the party doesn't lurch as one block.
-                        if (mg != IDLE_MOTION_TYPE && mg != FOLLOW_MOTION_TYPE)
-                        { /* leave a back-out/point move alone */ }
-                        else if (mg == FOLLOW_MOTION_TYPE)
+                        if (mg != IDLE_MOTION_TYPE)
                         {
                             follower->StopMoving();
                             follower->GetMotionMaster()->Clear();
@@ -3399,7 +3437,7 @@ namespace WowPsParty
                         }
                         continue;
                     }
-                    assertFollow();
+                    moveToFormation();
                     continue;
                 }
 
@@ -3420,17 +3458,16 @@ namespace WowPsParty
                 // post-combat drift reforms.
                 if (dLead > wanderCap + 0.5f)
                 {
-                    assertFollow();
+                    moveToFormation();
                     continue;
                 }
 
-                // Settle in place. Once the leader stops, drop the follow
-                // generator so the bot HOLDS its current position rather than
-                // being tugged back to its formation slot — this is what lets it
-                // stay wherever it last wandered to and pick the next stroll from
-                // there. The formation re-forms naturally when the leader moves
-                // again (the moving branch above re-asserts MoveFollow).
-                if (mg == FOLLOW_MOTION_TYPE || follower->isMoving())
+                // Settle in place. Once the leader stops, drop the follow move
+                // so the bot HOLDS its current position rather than being tugged
+                // back to its formation slot — this is what lets it stay wherever
+                // it last wandered to and pick the next stroll from there. The
+                // formation re-forms when the leader moves again (moving branch).
+                if (mg != IDLE_MOTION_TYPE || follower->isMoving())
                 {
                     follower->StopMoving();
                     follower->GetMotionMaster()->Clear();
