@@ -2710,12 +2710,6 @@ namespace WowPsParty
             bool   wandering      = false;
             uint32 wanderUntilMs  = 0;
             uint32 nextFidgetMs   = 0;
-            // Smoothed MOVEMENT heading (the direction the leader is GOING, from
-            // its movement flags — NOT its facing). The formation trails this, so
-            // a mouse-turn while standing doesn't rotate the party and a real
-            // direction change eases in over ~1s instead of snapping.
-            float  smoothHeading   = 0.0f;
-            bool   hasSmoothHeading = false;
         };
         // World-thread only (the follow WorldScript OnUpdate drives both the
         // 1 Hz pass and the fast tick), so no mutex is needed.
@@ -2723,9 +2717,6 @@ namespace WowPsParty
 
         static constexpr uint32 HUMANIZE_INTERVAL_MS = 250;
         static constexpr uint32 WANDER_POINT_ID       = 0x7A9D;  // distinct MovePoint id
-        // Per-tick easing of the movement heading: ~0.3 -> a direction change is
-        // ~63% applied after ~1s, fully after ~2s, so turns look human, not snapped.
-        static constexpr float  HEADING_SMOOTH_ALPHA  = 0.30f;
 
         // Stable per-bot offset in [-amp, amp], constant across ticks (a bot's
         // "personality" — so two of the same class don't sit on one bearing).
@@ -3364,52 +3355,24 @@ namespace WowPsParty
                     follower->GetMotionMaster()->GetCurrentMovementGeneratorType();
                 bool const leaderMoving = leader->isMoving();
 
-                // Update the smoothed MOVEMENT heading from the leader's movement
-                // FLAGS (responsive every tick, no heartbeat dependency) — the
-                // direction it's actually translating, combining forward/back with
-                // strafe. Held when not translating, so a mouse-turn in place never
-                // injects facing into the formation. This is what the slot trails.
-                {
-                    float fwd = 0.0f, side = 0.0f;
-                    if (leader->HasUnitMovementFlag(MOVEMENTFLAG_FORWARD))      fwd  += 1.0f;
-                    if (leader->HasUnitMovementFlag(MOVEMENTFLAG_BACKWARD))     fwd  -= 1.0f;
-                    if (leader->HasUnitMovementFlag(MOVEMENTFLAG_STRAFE_LEFT))  side += 1.0f;
-                    if (leader->HasUnitMovementFlag(MOVEMENTFLAG_STRAFE_RIGHT)) side -= 1.0f;
-                    if (fwd != 0.0f || side != 0.0f)
-                    {
-                        float const raw = leader->GetOrientation() + std::atan2(side, fwd);
-                        if (!h.hasSmoothHeading) { h.smoothHeading = raw; h.hasSmoothHeading = true; }
-                        else h.smoothHeading = LerpAngle(h.smoothHeading, raw, HEADING_SMOOTH_ALPHA);
-                    }
-                }
-
-                // Place the formation slot BEHIND the smoothed movement heading,
-                // then express it as the facing-relative angle MoveFollow wants
-                // (we keep MoveFollow for its built-in heartbeat prediction =
-                // smooth position). Because the WORLD bearing comes from the
-                // smoothed heading, a mouse-turn (facing changes, heading doesn't)
-                // holds the party in place, and a real turn eases in. Re-issue
-                // only when the angle drifts ~5deg, so straight running never
-                // resets the spline.
+                // Re-assert the formation slot ONLY when it isn't already in
+                // effect (gen isn't FOLLOW, or the jittered slot drifted) — so
+                // MoveFollow runs continuously and smoothly (with its built-in
+                // heartbeat prediction) instead of being re-issued every tick.
+                // Re-issuing MoveFollow Clears + reinstalls the generator, which
+                // resets the spline — doing that on every steering nudge is what
+                // made the bots jitter/glitch.
                 auto moveToFormation = [&]()
                 {
-                    float const ref = h.hasSmoothHeading ? h.smoothHeading : leader->GetOrientation();
-                    float rel = ref + h.slotAngle - leader->GetOrientation();
-                    while (rel >  float(M_PI)) rel -= 2.0f * float(M_PI);
-                    while (rel < -float(M_PI)) rel += 2.0f * float(M_PI);
-
-                    float ad = rel - h.apptAngle;
-                    while (ad >  float(M_PI)) ad -= 2.0f * float(M_PI);
-                    while (ad < -float(M_PI)) ad += 2.0f * float(M_PI);
                     bool const slotChanged =
-                        std::fabs(ad) > 0.087f /*~5deg*/ ||
-                        std::fabs(h.slotDist - h.apptDist) > 0.20f;
+                        std::fabs(h.slotAngle - h.apptAngle) > 0.03f ||
+                        std::fabs(h.slotDist  - h.apptDist)  > 0.20f;
                     if (mg == FOLLOW_MOTION_TYPE && h.followAsserted && !slotChanged)
                         return;
                     follower->GetMotionMaster()->Clear();
-                    follower->GetMotionMaster()->MoveFollow(leader, h.slotDist, rel);
+                    follower->GetMotionMaster()->MoveFollow(leader, h.slotDist, h.slotAngle);
                     h.followAsserted = true;
-                    h.apptAngle = rel;
+                    h.apptAngle = h.slotAngle;
                     h.apptDist  = h.slotDist;
                 };
 
