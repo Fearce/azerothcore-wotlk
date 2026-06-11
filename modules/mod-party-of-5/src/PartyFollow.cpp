@@ -2192,33 +2192,18 @@ namespace WowPsParty
         else // "master" / default
         {
             if (leaderTargetValid)
-                desired = leaderTarget;
+                desired = leaderTarget;            // the leader is ACTUALLY attacking -> assist
             else
-            {
-                // The leader isn't ATTACKING anything. A bot set to follow the
-                // leader's target must NOT idle (or chase a stale selection)
-                // while the party is in a fight — so DEFEND first: if the bot or
-                // any party member is being attacked, engage that threat.
-                // pickPartyDefenseTarget is combat-only (it only returns a mob
-                // already swinging at someone), so this can never start a pull —
-                // it's the "find your own target / kill what's hitting the
-                // suffering party members" behaviour, gated behind real combat.
+                // The leader isn't attacking — only DEFEND (a mob already swinging
+                // at the bot or an ally). We deliberately do NOT engage the mob the
+                // leader has merely SELECTED: a left-click is just targeting, and
+                // pulling on it broke following / dragged the party into combat
+                // (Kevin: "the party should not stop following just because the
+                // tank selects an enemy"). pickPartyDefenseTarget is combat-only,
+                // so a mere selection now produces NO target -> the bot keeps
+                // following until the leader actually engages (attacks/casts, which
+                // puts the mob in combat and the assist/defense paths pick it up).
                 desired = pickPartyDefenseTarget();
-                if (!desired)
-                {
-                    // Nobody's under attack — the party is idle. NOW honour a
-                    // player-DIRECTED pull: attack the mob the leader has merely
-                    // SELECTED (GW1/DAI-style "party, get that one"). Without this
-                    // a freshly-selected pull just gets stared at (Kevin's mom:
-                    // bots stood looking at the enemy, never moved in to wand it).
-                    // This is the ONLY pre-combat engage and only fires when no
-                    // one is fighting, so it never overrides defending an ally;
-                    // the 50y party leash still caps a stray click.
-                    Unit* const sel = leader->GetSelectedUnit();
-                    if (sel && sel->IsAlive() && bot->IsValidAttackTarget(sel))
-                        desired = sel;
-                }
-            }
         }
         // Final safety: never hand back a dead/invalid target.
         if (desired && (!desired->IsAlive() || !bot->IsValidAttackTarget(desired)))
@@ -2464,73 +2449,13 @@ namespace WowPsParty
             if (melee) rangedCaster = false;
         }
 
-        // HEALER: never melee or chase the leader's target / mere SELECTION — a
-        // healer follows and heals. Merely SELECTING a mob ("whoever I target"
-        // mode) must NOT give the healer a victim: a victim yields the follow
-        // ticker and strands it (Kevin: "left-click a mob, healer stops
-        // following"), and the bad victim is sticky, so switching target mode
-        // didn't clear it — only the fight ending did. So: only while the party
-        // is actually FIGHTING does the healer loose-anchor near the leader;
-        // otherwise it drops any stale victim and lets the follow system carry it
-        // (close follow) while the rotation heals.
-        if (role == "healer")
-        {
-            bool partyInCombat = bot->IsInCombat() || leader->IsInCombat()
-                                 || leader->GetVictim() != nullptr
-                                 || !bot->getAttackers().empty();
-            if (!partyInCombat)
-            {
-                std::vector<ObjectGuid> party;
-                GetPartyGuidsFor(bot->GetGUID(), party);
-                for (ObjectGuid const& g : party)
-                {
-                    Player* m = ObjectAccessor::FindConnectedPlayer(g);
-                    if (m && (m->IsInCombat() || m->GetVictim())) { partyInCombat = true; break; }
-                }
-            }
-
-            if (!partyInCombat)
-            {
-                if (bot->GetVictim()) bot->AttackStop();   // never hold a victim from a mere selection
-                AssistLog(gLow, "healer: out of combat — follow + heal, ignore the targeted mob");
-                return;   // the follow system + rotation own movement / healing
-            }
-
-            // Party is fighting — loose-anchor near the LEADER, heal, never chase
-            // the foe. Moving to a specific heal target for LoS/range is owned by
-            // the rotation's friendly-cast approach (HoldFollower), which pre-empts
-            // this via the "skip: held by rotation" guard above.
-            MovementGeneratorType const hmg =
-                bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
-            float const leashDist = bot->GetDistance(leader);
-            constexpr float HEAL_LEASH_FAR  = 30.0f;   // start catching up past this
-            constexpr float HEAL_LEASH_NEAR = 18.0f;   // settle once back within this
-            bool const following = (hmg == FOLLOW_MOTION_TYPE) && bot->isMoving();
-            bool const needClose = leashDist > HEAL_LEASH_FAR
-                                 || (following && leashDist > HEAL_LEASH_NEAR);
-            if (needClose)
-            {
-                if (hmg != FOLLOW_MOTION_TYPE)
-                    bot->GetMotionMaster()->MoveFollow(leader, 10.0f, bot->GetFollowAngle());
-                AssistLog(gLow, "healer: out of heal range — closing to the leader");
-            }
-            else
-            {
-                if (hmg != IDLE_MOTION_TYPE)
-                {
-                    bot->StopMoving();
-                    bot->GetMotionMaster()->Clear();
-                    bot->GetMotionMaster()->MoveIdle();
-                }
-                if (desired && !bot->HasInArc(float(M_PI), desired))
-                    bot->SetFacingToObject(desired);
-                AssistLog(gLow, "healer: holding near party — heal in place, no enemy chase");
-            }
-            return;
-        }
-
-        // Make sure the victim is set (drives auto-attack / has_target). Melee
-        // gets a melee swing; ranged does NOT (it must never run into melee).
+        // Set the victim (drives auto-attack / has_target — and gives the rotation
+        // a target so a healer can filler-DPS / wand at high mana). Melee gets a
+        // swing; ranged does NOT (must never run into melee). `desired` is ONLY
+        // ever the party's ACTUAL fight here — the mere-SELECTION engage was
+        // removed — so a healer's victim means a real fight, never a pull, and a
+        // mere left-click never strands a bot (out of combat desired==null and we
+        // already returned above, so everyone keeps following).
         bool const newVictim = bot->GetVictim() != desired;
         if (newVictim)
         {
@@ -2542,6 +2467,39 @@ namespace WowPsParty
 
         MovementGeneratorType const mg =
             bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
+
+        // HEALER: heal from RANGE, never chase the foe — loose-anchor near the
+        // leader (the offensive ranged bands below would kite it toward packs).
+        // It keeps the victim above ONLY so the rotation can filler-DPS / wand the
+        // party's already-engaged mob; it never melees and never pulls.
+        if (role == "healer")
+        {
+            float const leashDist = bot->GetDistance(leader);
+            constexpr float HEAL_LEASH_FAR  = 30.0f;   // start catching up past this
+            constexpr float HEAL_LEASH_NEAR = 18.0f;   // settle once back within this
+            bool const following = (mg == FOLLOW_MOTION_TYPE) && bot->isMoving();
+            bool const needClose = leashDist > HEAL_LEASH_FAR
+                                 || (following && leashDist > HEAL_LEASH_NEAR);
+            if (needClose)
+            {
+                if (mg != FOLLOW_MOTION_TYPE)
+                    bot->GetMotionMaster()->MoveFollow(leader, 10.0f, bot->GetFollowAngle());
+                AssistLog(gLow, "healer: out of heal range — closing to the leader");
+            }
+            else
+            {
+                if (mg != IDLE_MOTION_TYPE)
+                {
+                    bot->StopMoving();
+                    bot->GetMotionMaster()->Clear();
+                    bot->GetMotionMaster()->MoveIdle();
+                }
+                if (desired && !bot->HasInArc(float(M_PI), desired))
+                    bot->SetFacingToObject(desired);
+                AssistLog(gLow, "healer: holding near party — heal in place, no enemy chase");
+            }
+            return;
+        }
 
         if (rangedCaster)
         {

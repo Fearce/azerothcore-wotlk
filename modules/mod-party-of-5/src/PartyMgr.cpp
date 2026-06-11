@@ -703,6 +703,11 @@ namespace WowPsParty
                     // Filler DPS ONLY at near-full mana — conserve mana for healing.
                     add("self_mana>88&target_missing_aura:Shadow Word: Pain", "cast:Shadow Word: Pain", 34);
                     add("self_mana>88&has_target", "cast:Smite", 30);
+                    // Free filler when there's nothing else to do (no heal needed,
+                    // mana too low to Smite): wand the engaged mob. Costs no mana,
+                    // so no gate — lowest priority, only fires if everything above
+                    // fell through. No-ops if no wand is equipped (cast fails).
+                    add("has_target", "cast:Shoot", 5);
                 }
                 else
                 {
