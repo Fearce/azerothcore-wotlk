@@ -1800,17 +1800,22 @@ namespace WowPsParty
     static Unit* PartyMainCombatTarget(Player* bot)
     {
         if (!bot) return nullptr;
+
+        // Members = our directive roster PLUS the WoW group (a second human + their
+        // bots), so a bot aids ANY groupmate's fight — its own party, the leader,
+        // or another player on another account — not just its own account.
+        std::vector<Player*> members;
+        auto addMember = [&](Player* m) {
+            if (m && m->IsInWorld() && m->IsAlive() && m->GetMapId() == bot->GetMapId()
+                && std::find(members.begin(), members.end(), m) == members.end())
+                members.push_back(m);
+        };
         std::vector<ObjectGuid> party;
         GetPartyGuidsFor(bot->GetGUID(), party);
-
-        // Resolve live, same-map party members once for the in-combat test.
-        std::vector<Player*> members;
-        for (ObjectGuid const& g : party)
-        {
-            Player* m = ObjectAccessor::FindConnectedPlayer(g);
-            if (m && m->IsInWorld() && m->IsAlive() && m->GetMapId() == bot->GetMapId())
-                members.push_back(m);
-        }
+        for (ObjectGuid const& g : party) addMember(ObjectAccessor::FindConnectedPlayer(g));
+        if (Group* grp = bot->GetGroup())
+            for (GroupReference* itr = grp->GetFirstMember(); itr; itr = itr->next())
+                addMember(itr->GetSource());
 
         // Is `u` part of OUR fight? True if it's attacking, or simply in combat
         // with, any party member or their (non-totem) pet. IsInCombatWith is the
@@ -1843,14 +1848,12 @@ namespace WowPsParty
             if (d < bestDist) { bestDist = d; nearest = u; }
         };
 
-        // Prefer the tank's victim (focus fire the party's main kill).
-        for (ObjectGuid const& g : party)
-        {
-            if (RoleForGuid(g) != "tank") continue;
-            if (Player* m = ObjectAccessor::FindConnectedPlayer(g))
-                if (m->IsInWorld() && m->IsAlive() && m->GetMapId() == bot->GetMapId())
-                    consider(m->GetVictim(), true);
-        }
+        // EVERY member's victim — NO range cap, so an idle bot gap-closes to a
+        // groupmate fighting OUT of range (the >50y leader leash still bounds how
+        // far it strays). The tank's victim is flagged so the party focus-fires
+        // the tank's kill when there is one.
+        for (Player* m : members)
+            consider(m->GetVictim(), RoleForGuid(m->GetGUID()) == "tank");
 
         // Grid search: every nearby enemy actually engaged with the party —
         // melee OR ranged. Bounded to 45y so we don't grab a fight across the
@@ -2106,10 +2109,9 @@ namespace WowPsParty
                     for (Unit* a : ctrl->getAttackers())
                         if (a && a->IsAlive() && bot->IsValidAttackTarget(a))
                             return a;
-            // party-defense via our directive roster (leader + all bots +
-            // henchmen), NOT the WoW group — the group can form incompletely,
-            // which left bots ignoring a member under attack. This is what makes
-            // heroes and henchmen actually defend EACH OTHER. Capped to mobs
+            // party-defense across our directive roster (leader + all bots +
+            // henchmen) AND the WoW group (a second human + their bots) — so
+            // heroes, henchmen and grouped players all defend EACH OTHER. Capped to mobs
             // already NEAR us (PARTY_DEFEND_RANGE): a DPS must not sprint across a
             // room to peel for a distant ally — that pulls every pack on the way
             // and wipes the group. Distant threats are the tank's / leader's job.
@@ -2126,13 +2128,23 @@ namespace WowPsParty
                         return a;
                 return nullptr;
             };
+            // Members = our directive roster (reliable for our own account even
+            // when the WoW group formed incompletely) PLUS the WoW group, so a bot
+            // also peels a mob off a SECOND HUMAN — or their bots — grouped with us.
+            std::vector<Player*> members;
+            auto addMember = [&](Player* m) {
+                if (m && m->IsInWorld() && m != bot && m->GetMapId() == bot->GetMapId()
+                    && std::find(members.begin(), members.end(), m) == members.end())
+                    members.push_back(m);
+            };
             std::vector<ObjectGuid> party;
             GetPartyGuidsFor(bot->GetGUID(), party);
-            for (ObjectGuid const& gg : party)
+            for (ObjectGuid const& gg : party) addMember(ObjectAccessor::FindConnectedPlayer(gg));
+            if (Group* grp = bot->GetGroup())
+                for (GroupReference* itr = grp->GetFirstMember(); itr; itr = itr->next())
+                    addMember(itr->GetSource());
+            for (Player* m : members)
             {
-                Player* m = ObjectAccessor::FindConnectedPlayer(gg);
-                if (!m || !m->IsInWorld() || m == bot) continue;
-                if (m->GetMapId() != bot->GetMapId()) continue;
                 if (Unit* a = scanAttackers(m)) return a;
                 for (Unit* ctrl : m->m_Controlled)
                     if (Unit* a = scanAttackers(ctrl)) return a;
