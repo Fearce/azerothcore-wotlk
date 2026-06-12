@@ -919,6 +919,21 @@ namespace WowPsParty
         g_lastSpreadMs[guidLow] = nowMs;
     }
 
+    // Human-tank wait-gate timeout: a DPS bot holds off a mob until the tank has
+    // it, but for at most this long PER MOB — so a mob the tank can't reach (a
+    // ranged caster on the healer) is eventually peeled instead of ignored. The
+    // timer resets when the held mob changes.
+    static constexpr uint32 TANK_LEAD_WAIT_MAX_MS = 4000;
+    static std::unordered_map<uint32, std::pair<uint32, uint32>> g_tankLeadWait;  // botLow -> (mobLow, sinceMs)
+    static std::mutex g_tankLeadWaitMutex;
+    static bool TankLeadWaitStillHolding(uint32 botLow, uint32 mobLow, uint32 nowMs)
+    {
+        std::lock_guard<std::mutex> lock(g_tankLeadWaitMutex);
+        auto& w = g_tankLeadWait[botLow];
+        if (w.first != mobLow) { w.first = mobLow; w.second = nowMs; return true; }
+        return (nowMs - w.second) < TANK_LEAD_WAIT_MAX_MS;
+    }
+
     // True if a party member that's ALSO standing off (>8y from the shared
     // victim, i.e. another caster/hunter rather than a melee at the mob) is
     // stacked within `radius` of `bot`.
@@ -1988,20 +2003,26 @@ namespace WowPsParty
         return LeaderRole(leader->GetSession()->GetAccountId()) == "tank";
     }
 
-    // True when `mob` is already fighting THIS bot's party — its current target is
-    // the leader or one of the party bots. Used to gate DPS engagement behind a
-    // human tank's pull: until the mob is actually swinging at a party member (the
-    // tank connected and grabbed it), the DPS bots hold.
-    static bool MobFightingParty(Player* bot, Unit* mob)
+    // The human-tank wait-gate: a DPS bot may
+    // engage `mob` only once the TANK actually has it (its victim is the human
+    // tank-leader or a tank-role party member) OR it's swinging at the bot ITSELF
+    // (self-defence — never refuse to fight back). A mob merely on the healer or
+    // another bot returns false, so DPS hold and let the tank peel it instead of
+    // ripping it off and sending the tank chasing — UNLESS the wait times out
+    // (handled by the caller, for a mob the tank can't reach).
+    static bool MobHeldByTankOrOnSelf(Player* bot, Unit* mob, Player* leader)
     {
         if (!mob) return false;
         Unit* const v = mob->GetVictim();
-        if (!v) return false;
+        if (!v) return false;                    // fighting nobody yet -> still pull prep, hold
+        if (v == bot) return true;               // it's on US -> defend ourselves
+        if (leader && v == leader) return true;  // the human tank-leader has aggro
         std::vector<ObjectGuid> party;
         GetPartyGuidsFor(bot->GetGUID(), party);
         for (ObjectGuid const& g : party)
-            if (v->GetGUID() == g) return true;
-        return false;
+            if (v->GetGUID() == g && RoleForGuid(g) == "tank")
+                return true;                     // a (bot) tank has aggro
+        return false;                            // on a non-tank ally -> hold
     }
 
     void AssistTarget(Player* bot)
@@ -2243,24 +2264,25 @@ namespace WowPsParty
         if (desired && (!desired->IsAlive() || !bot->IsValidAttackTarget(desired)))
             desired = nullptr;
 
-        // ---- Wait for a real-player TANK to pull (dungeons only) -------------
-        // In a dungeon led by a human tank, DPS bots must NOT pre-pull or pile
-        // onto a mob the tank is merely auto-attacking / selecting as pull prep —
-        // they wait until the mob is actually fighting the party (the tank
-        // connected and grabbed it), then assist. Mill: "wait for me to make the
-        // pulls and grab aggro before going ham"; and right-clicking an enemy to
-        // start auto-attack is normal tank prep, not a 'go' signal. A bot already
-        // BEING attacked (mob's victim is a party member, incl. itself) is exempt
-        // via MobFightingParty, so it still defends itself. Tanks and healers are
-        // unaffected (healers heal from position; the human tank IS the puller).
+        // ---- Wait for a real-player TANK to grab AGGRO (dungeons only) --------
+        // In a dungeon led by a human tank, DPS bots must NOT pre-pull or pile on
+        // before the TANK actually has the mob — otherwise they rip it off and
+        // send the tank chasing all over to taunt it back, burning cooldowns
+        // (Kevin). They hold until the mob's victim is the tank (the human leader
+        // or a tank-role bot), then assist — NOT merely "the mob is fighting
+        // someone" (that released them onto a mob still on a bot). A mob swinging
+        // at the bot ITSELF is exempt (self-defence), and the hold times out after
+        // TANK_LEAD_WAIT_MAX_MS per mob so a mob the tank can't reach (a ranged
+        // caster on the healer) still gets peeled. Tanks/healers are unaffected.
         {
             std::string const myRole = RoleForGuid(bot->GetGUID());
             if (desired && myRole != "tank" && myRole != "healer"
                 && HumanTankLeadActive(bot, leader)
-                && !MobFightingParty(bot, desired))
+                && !MobHeldByTankOrOnSelf(bot, desired, leader)
+                && TankLeadWaitStillHolding(gLow, desired->GetGUID().GetCounter(), getMSTime()))
             {
                 if (bot->GetVictim()) bot->AttackStop();
-                AssistLog(gLow, "human-tank dungeon: holding until the tank pulls + grabs aggro");
+                AssistLog(gLow, "human-tank dungeon: holding until the TANK grabs aggro");
                 return;
             }
         }
