@@ -3434,6 +3434,20 @@ namespace WowPsParty
             delete pet;   // LoadPetFromDB self-cleans on success; delete only on failure
     }
 
+    // A taunt-type pet ability (hunter Growl, warlock voidwalker Torment &
+    // Suffering, …): it forces a mob to attack the pet. Detected by effect /
+    // mechanic so EVERY rank and pet class is covered without hardcoding ids.
+    static bool IsPetTauntSpell(SpellInfo const* si)
+    {
+        if (!si) return false;
+        // SPELL_EFFECT_ATTACK_ME is the taunt effect — Growl, Torment and the AoE
+        // Suffering all use it, every rank.
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            if (si->Effects[i].Effect == SPELL_EFFECT_ATTACK_ME)
+                return true;
+        return false;
+    }
+
     // Drive ANY bot's pet — hunter beast, warlock demon (imp/voidwalker/felguard/
     // …), mage water elemental, DK ghoul. mod-playerbots normally runs the pet
     // (stance, ability autocast, commanding attacks) but that's gated out for our
@@ -3479,12 +3493,17 @@ namespace WowPsParty
             27276, 27277, 48011,         // Devour Magic 5-7
             58867                         // Spirit Wolf Leap
         };
+        // In DUNGEONS, keep pet TAUNTS off autocast — Growl and the voidwalker's
+        // Torment / Suffering rip mobs off the human tank (Kevin). In the open
+        // world they stay on so a soloing pet can hold its own aggro.
+        bool const inDungeon = bot->GetMap() && bot->GetMap()->IsDungeon();
         for (auto const& s : pet->m_spells)
         {
             if (s.second.state == PETSPELL_REMOVED) continue;
             SpellInfo const* si = sSpellMgr->GetSpellInfo(s.first);
             if (!si || !si->IsAutocastable()) continue;
-            bool const wanted = !noAutocast.count(s.first);
+            bool wanted = !noAutocast.count(s.first);
+            if (wanted && inDungeon && IsPetTauntSpell(si)) wanted = false;
             bool isAuto = false;
             for (uint32 a : pet->m_autospells) if (a == s.first) { isAuto = true; break; }
             // Toggle only on a mismatch — enables the abilities we want and
