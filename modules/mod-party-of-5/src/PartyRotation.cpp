@@ -219,6 +219,7 @@ namespace WowPsParty
     static constexpr uint32 TTD_WINDOW_MS  = 12000; // keep ~12 s of history
     static constexpr uint32 TTD_SAMPLE_MS  = 500;   // at most one sample / 0.5 s
     static constexpr int    TTD_UNKNOWN    = 999;   // "effectively never dies"
+    static constexpr uint32 TTD_NEW_MOB_MS = 5000;  // first 5 s of a fight: TTD is 0
 
     // Record one health sample for `target` (throttled). Called once per tick
     // for each bot's current victim. Resets the history if the target healed
@@ -268,6 +269,18 @@ namespace WowPsParty
         auto it = g_ttdSamples.find(key);
         if (it == g_ttdSamples.end()) return TTD_UNKNOWN;
         auto const& dq = it->second;
+        if (dq.empty()) return TTD_UNKNOWN;
+
+        // First few seconds of the fight: pin TTD to 0 so a "target_ttd>N" gate
+        // can't fire during the pull, before any damage rate exists. Without this
+        // an unmeasured mob reads as TTD_UNKNOWN (≈never), so a "TTD > 12" rule
+        // (e.g. Heroism) fired the instant a mob — even a low-health one — was
+        // pulled (Kevin). Samples are shared per-mob across the party, so the
+        // front sample is when the party first engaged it (≈ the pull); the deque
+        // only prunes past 12 s, so within 5 s it's still the true start.
+        if (getMSTime() - dq.front().timeMs < TTD_NEW_MOB_MS)
+            return 0;
+
         if (dq.size() < 2) return TTD_UNKNOWN;
 
         TtdSample const& first = dq.front();
@@ -1762,10 +1775,11 @@ namespace WowPsParty
             return cmp(int(CountHostilesWithin(bot, 30.0f)));
 
         // Time-to-die (seconds), estimated from the target's recent health
-        // history. RAW seconds, not a percentage. No target / no data →
-        // TTD_UNKNOWN (≈never), so `target_ttd>20` fires on an unmeasured
-        // mob (assume a long fight) and `target_ttd<8` stays false — matching
-        // Kevkili's `TargetTTD(...) or 999` default.
+        // history. RAW seconds, not a percentage. The first 5 s of a fight TTD is
+        // 0 (no damage rate yet) so a "target_ttd>N" gate (e.g. Heroism) can't
+        // fire during the pull. A never-measured mob → TTD_UNKNOWN (≈never), so
+        // `target_ttd>20` assumes a long fight and `target_ttd<8` stays false —
+        // matching Kevkili's `TargetTTD(...) or 999` default.
         if (name == "target_ttd")
         {
             Unit* t = theTarget();
