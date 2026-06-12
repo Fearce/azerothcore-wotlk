@@ -871,6 +871,43 @@ namespace WowPsParty
         LeadDungeonCacheSet(guidLow, v != "0");
     }
 
+    // ---- "wait for tank threat" toggle (DPS) -------------------------------
+    // Whether a DPS bot holds / throttles under the human tank's threat before
+    // it engages (so it doesn't rip aggro) or blasts instantly. Stored in
+    // party_loadout.wait_tank_threat as '' (unset), '1' (wait) or '0' (blast).
+    // The cache holds only EXPLICIT overrides; an absent entry falls back to the
+    // per-type default (henchman -> wait, hero -> blast) in GetWaitTankThreat.
+    static std::unordered_map<uint32, int> g_waitTankThreat;  // guidLow -> 0/1 (explicit only)
+    static std::mutex g_waitTankMutex;
+
+    // val: 0 = explicit blast, 1 = explicit wait, <0 = clear (back to default).
+    void WaitTankThreatCacheSet(uint32 guidLow, int val)
+    {
+        std::lock_guard<std::mutex> lock(g_waitTankMutex);
+        if (val < 0) g_waitTankThreat.erase(guidLow);
+        else         g_waitTankThreat[guidLow] = val ? 1 : 0;
+    }
+
+    bool GetWaitTankThreat(ObjectGuid guid)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_waitTankMutex);
+            auto it = g_waitTankThreat.find(guid.GetCounter());
+            if (it != g_waitTankThreat.end()) return it->second != 0;
+        }
+        // Unset: per-type default. IsHenchman takes a DIFFERENT lock, so this
+        // call is outside the g_waitTankMutex scope above (no nested locking).
+        return IsHenchman(guid);   // henchman -> wait, hero -> blast as it used to
+    }
+
+    void WaitTankThreatRefreshFromDB(uint32 guidLow)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `wait_tank_threat` FROM `party_loadout` WHERE `guid` = {}", guidLow);
+        std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+        WaitTankThreatCacheSet(guidLow, v == "1" ? 1 : (v == "0" ? 0 : -1));
+    }
+
     // ---- retarget throttle --------------------------------------------------
     // Timestamp (getMSTime) of each bot's last target SWITCH. Used to stop the
     // "spinbot" when several mobs flank the tank and the nearest-loose pick
@@ -2303,7 +2340,8 @@ namespace WowPsParty
         {
             std::string const myRole = RoleForGuid(bot->GetGUID());
             if (desired && myRole != "tank" && myRole != "healer"
-                && HumanTankLeadActive(bot, leader))
+                && HumanTankLeadActive(bot, leader)
+                && GetWaitTankThreat(bot->GetGUID()))   // editor toggle: OFF -> blast like before
             {
                 bool release;
                 if (desired->GetVictim() == bot)

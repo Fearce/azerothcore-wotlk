@@ -1485,18 +1485,21 @@ namespace WowPsParty
         //               stacking) with sensible spells, same engine as heroes.
         //   targetmode: saved strategies_csv, else tank -> "loose" / "master".
         //   lead       : saved glyphs_csv ("0" = off), else ON.
+        //   waitthreat : saved wait_tank_threat ('1'/'0'), else unset -> a
+        //                henchman's per-type default is to WAIT for tank threat.
         bool hadCustomRotation = false;   // gates the post-relevel rebuild below
         {
             QueryResult lq = CharacterDatabase.Query(
-                "SELECT `priority_actions_json`,`strategies_csv`,`glyphs_csv` "
+                "SELECT `priority_actions_json`,`strategies_csv`,`glyphs_csv`,`wait_tank_threat` "
                 "FROM `party_loadout` WHERE `guid` = {}", candidateGuid);
-            std::string savedRot, savedMode, savedLead;
+            std::string savedRot, savedMode, savedLead, savedWait;
             if (lq)
             {
                 Field* lf = lq->Fetch();
                 savedRot  = lf[0].Get<std::string>();
                 savedMode = lf[1].Get<std::string>();
                 savedLead = lf[2].Get<std::string>();
+                savedWait = lf[3].Get<std::string>();
             }
             hadCustomRotation = !savedRot.empty();
 
@@ -1509,6 +1512,9 @@ namespace WowPsParty
                                    : (useRole == "tank" ? "loose" : "master"));
 
             WowPsParty::LeadDungeonCacheSet(candidateGuid, savedLead != "0");
+
+            WowPsParty::WaitTankThreatCacheSet(candidateGuid,
+                savedWait == "1" ? 1 : (savedWait == "0" ? 0 : -1));
         }
 
         mgr->AddPlayerBot(henchGuid, account);
@@ -1987,6 +1993,7 @@ namespace WowPsParty
                 RotationCacheRefreshFromDB(guid);
                 TargetModeRefreshFromDB(guid);
                 LeadDungeonRefreshFromDB(guid);
+                WaitTankThreatRefreshFromDB(guid);
                 if (guid == activeGuid) continue;
                 if (spawned >= 4) break;
                 ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);

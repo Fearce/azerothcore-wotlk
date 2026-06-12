@@ -124,6 +124,14 @@ namespace WowPsParty
     void LeadDungeonRefreshFromDB(uint32 guidLow);
     bool GetLeadInDungeon(uint32 guidLow);
 
+    // Per-DPS "wait for the human tank to build threat before engaging" toggle.
+    // The DEFAULT is per-type: henchmen WAIT (so a dumb helper never rips aggro),
+    // heroes BLAST as they used to; an explicit Rotation-Editor choice overrides.
+    // val: 0 = blast, 1 = wait, -1 = clear the override (back to per-type default).
+    void WaitTankThreatCacheSet(uint32 guidLow, int val);
+    void WaitTankThreatRefreshFromDB(uint32 guidLow);
+    bool GetWaitTankThreat(ObjectGuid guid);
+
     // Tell the follow ticker to LEAVE this bot alone for the next
     // `durationMs` milliseconds — used by the rotation engine's
     // `drink` / `hold_position` actions so a bot that's just been told

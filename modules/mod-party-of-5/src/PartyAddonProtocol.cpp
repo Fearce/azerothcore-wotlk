@@ -2633,6 +2633,50 @@ public:
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Lead-in-dungeons: {}.", on ? "ON" : "OFF");
         }
+        // REQ_WAITTHREAT\t<token>  ->  WAITTHREAT\t<token>\t<0|1>
+        // Reports the EFFECTIVE value (explicit override, else the per-type
+        // default: henchman waits, hero blasts) so the editor checkbox shows the
+        // real runtime behaviour even for a bot the user never configured.
+        else if (command == "REQ_WAITTHREAT")
+        {
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            bool on = false;
+            if (guid)
+            {
+                QueryResult q = CharacterDatabase.Query(
+                    "SELECT `wait_tank_threat` FROM `party_loadout` WHERE `guid` = {}", guid);
+                std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+                if (v == "1")      on = true;
+                else if (v == "0") on = false;
+                else               on = WowPsParty::IsHenchman(
+                                            ObjectGuid::Create<HighGuid::Player>(guid));
+            }
+            std::ostringstream out;
+            out << "WAITTHREAT\t" << token << '\t' << (on ? 1 : 0);
+            SendWPSP(player, out.str());
+        }
+        // SET_WAITTHREAT\t<token>\t<0|1>  — explicit override (the user toggled it)
+        else if (command == "SET_WAITTHREAT")
+        {
+            std::string rest;
+            std::string const token = WowPsParty::SplitToken(std::string(payload), rest);
+            if (rest != "0" && rest != "1") return;   // strict: ignore a malformed/empty value
+            bool const on = (rest == "1");
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            if (!guid) return;
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
+                "`gear_lock_json`, `priority_actions_json`, `wait_tank_threat`) "
+                "VALUES ({}, '', '', '', '', '', '{}') "
+                "ON DUPLICATE KEY UPDATE `wait_tank_threat` = VALUES(`wait_tank_threat`)",
+                guid, on ? "1" : "0");
+            CharacterDatabase.CommitTransaction(tx);
+            WowPsParty::WaitTankThreatCacheSet(guid, on ? 1 : 0);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Wait for tank threat: {}.", on ? "ON" : "OFF");
+        }
         else if (command == "EQUIP")
         {
             HandleEquip(player, payload);
