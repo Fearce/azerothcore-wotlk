@@ -1376,8 +1376,12 @@ namespace WowPsParty
 
     static constexpr float GATHER_SCAN_RANGE = 50.0f;  // node search radius — spot ore/herbs/corpses a good way off
     static constexpr float GATHER_REACH      = 11.0f;  // interaction distance — long reach so bots harvest without walking on top of the node
-    static constexpr float GATHER_LEADER_LEASH = 55.0f; // pursue a node up to here from the leader; past it, abandon + catch up.
-                                                        // Sits ABOVE the 50y follow leash, which yields to an in-progress gather (see ApplyDirective).
+    static constexpr float GATHER_LEADER_LEASH = 75.0f; // pursue a node up to here from the leader; past it, abandon + catch up.
+                                                        // MUST exceed SCAN_RANGE plus the bot's ~10y follow offset (a node 50y from the
+                                                        // bot is ~60y from the leader) PLUS slack for the leader drifting during the
+                                                        // walk — otherwise the bot crosses the leash mid-approach and abandons a node
+                                                        // it could have reached ("runs back and forth, never harvests"). Still well
+                                                        // under the 100y follow-leash hard teleport.
     static constexpr uint32 GATHER_APPROACH_TIMEOUT_MS = 6000; // give up if stuck
     static constexpr uint32 GATHER_AVOID_MS = 30000;   // ignore an unreachable node
 
@@ -1811,22 +1815,21 @@ namespace WowPsParty
         Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
         if (!leader || !leader->IsInWorld()) { GatherLog(gLow, "skip: leader not in world"); return; }
         if (leader->GetMapId() != bot->GetMapId()) { GatherLog(gLow, "skip: leader other map"); return; }
-        // Too far from the leader to keep chasing a node — ABANDON it (and avoid
-        // re-picking it briefly) so the follow leash, which yields while a gather
-        // is in progress, can finally reel the bot back in. Without clearing the
-        // node the follow yield + this skip would deadlock the bot out past 50y.
+        // Too far from the leader to keep chasing a node — drop the COMMITMENT so
+        // the follow leash (which yields while a gather is in progress) can reel
+        // the bot back in; without clearing the node the follow yield + this skip
+        // would deadlock the bot out past the leash. NOTE: do NOT avoid-list it —
+        // the node is perfectly reachable, we just lagged; blocking it for 30s was
+        // why a bot would run to a node, get pulled back, and then refuse to ever
+        // grab it once the leader stopped right next to it. The 6s approach-timeout
+        // below still avoid-lists nodes that are genuinely unreachable (geometry).
         if (bot->GetDistance(leader) > GATHER_LEADER_LEASH)
         {
             std::lock_guard<std::mutex> lock(g_gatherMutex);
             auto& st = g_gather[gLow];
-            if (st.node)
-            {
-                st.avoid      = st.node;
-                st.avoidUntil = now + GATHER_AVOID_MS;
-            }
             st.node     = ObjectGuid::Empty;
             st.commitMs = 0;
-            GatherLog(gLow, "skip: lagging leader (>55y) — dropped node, catching up");
+            GatherLog(gLow, "skip: lagging leader (>leash) — dropped node, catching up");
             return;
         }
 
