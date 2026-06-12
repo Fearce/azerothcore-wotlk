@@ -1367,6 +1367,147 @@ static void HandleEnchant(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// DISENCHANT\t<srcPartySlot>\t<srcItemGuidLow> — disenchant a bagged item from any
+// party member into enchanting mats. A party member with the Enchanting skill
+// (>= the item's RequiredDisenchantSkill) is the disenchanter; the rolled mats
+// drop into the party's bags and the item is consumed. Rolls the SAME table the
+// Disenchant spell uses (LootTemplates_Disenchant), but directly — a clientless
+// bot enchanter can't drive the core's disenchant loot WINDOW.
+static void HandleDisenchant(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const srcSlot        = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+    if (!srcItemGuidLow) return;
+
+    uint32 const account   = requester->GetSession()->GetAccountId();
+    uint32 const ownerGuid = WowPsParty::GuidForAccountSlot(account, srcSlot);
+    if (!ownerGuid) return;
+    Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(ownerGuid));
+    if (!owner) return;
+    Item* item = owner->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!item) return;
+    ItemTemplate const* tmpl = item->GetTemplate();
+    if (!tmpl) return;
+
+    ChatHandler ch(requester->GetSession());
+    if (item->IsEquipped() || item->IsNotEmptyBag())
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r Unequip / empty it before disenchanting.");
+        return;
+    }
+    if (tmpl->DisenchantID == 0)
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r |cffffffff{}|r can't be disenchanted.", tmpl->Name1);
+        return;
+    }
+
+    // A party member whose Enchanting skill covers this item's required level.
+    Player* disenchanter = nullptr;
+    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE && !disenchanter; ++partySlot)
+    {
+        uint32 const g = WowPsParty::GuidForAccountSlot(account, partySlot);
+        if (!g) continue;
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g));
+        if (p && p->HasSkill(SKILL_ENCHANTING)
+            && p->GetSkillValue(SKILL_ENCHANTING) >= tmpl->RequiredDisenchantSkill)
+            disenchanter = p;
+    }
+    if (!disenchanter)
+    {
+        ch.PSendSysMessage(
+            "|cffff5555[WowPsParty]|r No party enchanter skilled enough to disenchant "
+            "|cffffffff{}|r (needs Enchanting {}).", tmpl->Name1, tmpl->RequiredDisenchantSkill);
+        return;
+    }
+
+    // Roll the disenchant loot directly (same table as the spell).
+    Loot loot;
+    loot.FillLoot(tmpl->DisenchantID, LootTemplates_Disenchant, owner, true, true);
+    std::vector<std::pair<uint32, uint32>> mats;
+    for (LootItem const& li : loot.items)
+        if (li.itemid && li.count)
+            mats.emplace_back(li.itemid, uint32(li.count));
+    if (mats.empty())
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r Disenchant produced nothing — item kept.");
+        return;
+    }
+
+    // Disenchant is IRREVERSIBLE, so make sure the party can actually hold the
+    // rolled mats BEFORE consuming the item — never destroy it and then drop a mat
+    // because every bag was full. Count free slots across the party; the item's
+    // own slot frees on destroy, so it covers one mat. Conservative (ignores
+    // stacking onto a partial stack), which only ever errs toward "make room".
+    auto freeSlots = [](Player* p) -> uint32
+    {
+        uint32 n = 0;
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            if (!p->GetItemByPos(INVENTORY_SLOT_BAG_0, i)) ++n;
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = p->GetBagByPos(b))
+                for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                    if (!p->GetItemByPos(b, uint8(j))) ++n;
+        return n;
+    };
+    uint32 partyFree = 0;
+    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
+    {
+        uint32 const g = WowPsParty::GuidForAccountSlot(account, partySlot);
+        if (!g) continue;
+        if (Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g)))
+            partyFree += freeSlots(p);
+    }
+    if (mats.size() > size_t(partyFree) + 1)   // +1 = the item's slot that frees
+    {
+        ch.PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Not enough free bag space for the disenchant "
+            "mats — make room and try again. (Item kept.)");
+        return;
+    }
+
+    std::string const itemName = tmpl->Name1;
+    uint32 const itemEntry = tmpl->ItemId;
+    uint32 const disenchantId = tmpl->DisenchantID;
+    disenchanter->UpdateCraftSkill(13262 /* Disenchant */);   // skill-up chance
+    owner->DestroyItem(item->GetBagSlot(), item->GetSlot(), true);   // consume; frees a slot
+
+    std::ostringstream gained;
+    for (auto const& m : mats)
+    {
+        for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
+        {
+            uint32 const g = WowPsParty::GuidForAccountSlot(account, partySlot);
+            if (!g) continue;
+            Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g));
+            if (!p) continue;
+            ItemPosCountVec dest;
+            if (p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, m.first, m.second) != EQUIP_ERR_OK)
+                continue;
+            p->StoreNewItem(dest, m.first, true);
+            ItemTemplate const* mt = sObjectMgr->GetItemTemplate(m.first);
+            if (!gained.str().empty()) gained << ", ";
+            gained << m.second << "x " << (mt ? mt->Name1 : "?");
+            break;   // stored — next mat
+        }
+    }
+
+    ch.PSendSysMessage("|cff66ccff[WowPsParty]|r {} disenchanted |cffffffff{}|r -> {}.",
+        disenchanter->GetName(), itemName,
+        gained.str().empty() ? "nothing (party bags full)" : gained.str());
+
+    LOG_INFO("module",
+        "[WowPsParty Disenchant] requester={} owner={} disenchanter={} item='{}'(entry={}) "
+        "disenchantId={} -> {}",
+        requester->GetGUID().GetCounter(), owner->GetGUID().GetCounter(),
+        disenchanter->GetGUID().GetCounter(), itemName, itemEntry, disenchantId,
+        gained.str().empty() ? "NOTHING (bags full)" : gained.str());
+
+    WowPsParty::SendInventoryTo(requester);
+}
+
 // AH_SELL\t<srcPartySlot>\t<srcItemGuidLow>\t<copperBuyout>
 //   Lists an item out of any party member's bag on the owner's faction Auction
 //   House — no auctioneer required (same auctioneer-less posting the AH bot uses).
@@ -2551,6 +2692,10 @@ public:
         else if (command == "ENCHANT")
         {
             HandleEnchant(player, payload);
+        }
+        else if (command == "DISENCHANT")
+        {
+            HandleDisenchant(player, payload);
         }
         else if (command == "COME_HITHER")
         {
