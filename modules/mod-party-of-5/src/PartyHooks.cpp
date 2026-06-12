@@ -120,12 +120,21 @@ namespace WowPsParty
         { CLASS_WARRIOR,    71, 10 },  // Defensive Stance (lvl-10 class quest)
         { CLASS_WARRIOR,  2458, 30 },  // Berserker Stance  (lvl-30 class quest)
         { CLASS_DRUID,    5487, 10 },  // Bear Form
+        { CLASS_DRUID,    6807, 10 },  // Maul  — comes WITH Bear Form, NOT in the trainer list
+        { CLASS_DRUID,    6795, 10 },  // Growl — bear taunt, same (verified absent from trainer_spell)
         { CLASS_DRUID,    1066, 16 },  // Aquatic Form
         { CLASS_DRUID,     783, 16 },  // Travel Form
         { CLASS_DRUID,     768, 20 },  // Cat Form
+        // Shaman: the FIRST totem of each element is a "Call of …" class-quest
+        // reward, not trainer-taught (the LATER ones — Strength of Earth,
+        // Flametongue, Mana Spring — are). Verified absent from trainer_spell.
+        { CLASS_SHAMAN,   8071,  4 },  // Stoneskin Totem (earth)
+        { CLASS_SHAMAN,   3599, 10 },  // Searing Totem   (fire)
+        { CLASS_SHAMAN,   5394, 20 },  // Healing Stream Totem (water)
         { CLASS_WARLOCK,   697, 10 },  // Summon Voidwalker
         { CLASS_WARLOCK,   712, 20 },  // Summon Succubus
         { CLASS_WARLOCK,   691, 30 },  // Summon Felhunter
+        { CLASS_WARLOCK,  5784, 40 },  // Summon Felsteed — basic mount (Dreadsteed @60 is trainer-taught)
         { CLASS_PALADIN, 13819, 40 },  // Summon Warhorse
         { CLASS_PALADIN, 23214, 60 },  // Summon Charger
     };
