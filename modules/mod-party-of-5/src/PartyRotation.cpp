@@ -2835,11 +2835,12 @@ namespace WowPsParty
             bool const fired = faceAndCast(pick, spellId);
             if (fired)
                 LOG_INFO("module",
-                    "[WowPsParty Rotation] {} spread {} -> {} (hp={}%)",
+                    "[WowPsParty Rotation] {} spread {} -> {} (hp={}%, ttd={}s)",
                     bot->GetName(), arg, pick->GetName(),
                     pick->GetMaxHealth()
                         ? int(100.0f * float(pick->GetHealth()) / float(pick->GetMaxHealth()))
-                        : 0);
+                        : 0,
+                    TtdSeconds(pick));
             return fired;
         }
 
@@ -3604,11 +3605,30 @@ namespace WowPsParty
         bool const trace = (nowMs - last > 3000);
         if (trace) last = nowMs;
 
-        // Feed the TTD estimator one sample for the current victim every tick
-        // (the recorder throttles to one sample / 0.5 s per target). Must run
-        // unconditionally — before any early return on cond mismatch — or the
-        // target_ttd condition would never accumulate history.
+        // Feed the TTD estimator every tick. Sample not just OUR victim but every
+        // enemy the WHOLE party is fighting — each member's victim and everything
+        // attacking them — so a `cast_spread` candidate that no bot is directly
+        // tanking (an add on the human, a cleave/AoE target on the tank) still
+        // builds real TTD history. Without this an unsampled mob reads
+        // TTD_UNKNOWN (≈never), so a `target_ttd>N` spread dots it even as it dies
+        // (the "priest SW:P'd a mob with ~1 s to live" report). TtdRecord throttles
+        // to one sample / 0.5 s per target, so the cross-member overlap is cheap.
+        // Must run unconditionally — before any early return on cond mismatch — or
+        // the target_ttd condition would never accumulate history.
         TtdRecord(bot->GetVictim());
+        for (Unit* a : bot->getAttackers())
+            TtdRecord(a);
+        {
+            std::vector<Player*> ttdParty;
+            GatherPartyPlayers(bot, ttdParty, /*includeDead=*/false);
+            for (Player* m : ttdParty)
+            {
+                if (!m || m == bot) continue;
+                TtdRecord(m->GetVictim());
+                for (Unit* a : m->getAttackers())
+                    TtdRecord(a);
+            }
+        }
 
         if (trace)
         {
