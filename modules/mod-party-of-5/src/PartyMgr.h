@@ -183,6 +183,13 @@ namespace WowPsParty
     // hook so the party never has to visit a trainer. Talents are untouched.
     uint32 LearnAllClassSpells(Player* p);
 
+    // Teach `p` every WEAPON-MASTER proficiency its class+race can use (Axes,
+    // Swords, Bows, Staves, …). These come from weapon-master NPCs, not the class
+    // trainer, so LearnAllClassSpells never grants them — without this a fresh alt
+    // has to visit a weapon master to use anything but its starter weapons. Gated
+    // by IsSpellFitByClassAndRace (same check the weapon master uses), idempotent.
+    uint32 LearnAllWeaponSkills(Player* p);
+
     // Teach `p` the class-QUEST abilities it qualifies for at its current level —
     // druid forms, warlock pet summons, paladin mounts. These come from one-off
     // class quests, not the trainer, so LearnAllClassSpells never grants them and

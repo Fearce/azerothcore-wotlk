@@ -172,6 +172,7 @@ public:
         // here at login.
         WowPsParty::LearnClassQuestSkills(player);
         WowPsParty::LearnAllClassSpells(player);
+        WowPsParty::LearnAllWeaponSkills(player);   // every class-usable weapon proficiency — no weapon-master trip
 
         uint32 const guid = player->GetGUID().GetCounter();
         std::optional<uint8> const slot = sPartyMgr.GetSlotForGuid(guid);

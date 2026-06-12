@@ -108,6 +108,46 @@ namespace WowPsParty
         return learned;
     }
 
+    // Every WEAPON-MASTER proficiency the class+race can use (Axes, Swords,
+    // Daggers, Bows, Staves, …). Weapon skills are taught by weapon-master NPCs,
+    // NOT the class trainer, so LearnAllClassSpells never grants them — a fresh
+    // alt would have to visit a weapon master for each. The ids are the stable
+    // 3.3.5a proficiency spells; IsSpellFitByClassAndRace is the SAME class/race
+    // gate the weapon master itself applies (Trainer::GetSpellState), so e.g. a
+    // mage never gets axes. Idempotent (HasSpell skip), safe on any build
+    // (GetSpellInfo guard).
+    static constexpr uint32 kWeaponProficiencies[] = {
+        196,    // Axes (one-hand)
+        197,    // Two-Handed Axes
+        198,    // Maces (one-hand)
+        199,    // Two-Handed Maces
+        200,    // Polearms
+        201,    // Swords (one-hand)
+        202,    // Two-Handed Swords
+        227,    // Staves
+        264,    // Bows
+        266,    // Guns
+        1180,   // Daggers
+        2567,   // Thrown
+        5011,   // Crossbows
+        15590,  // Fist Weapons
+    };
+
+    uint32 LearnAllWeaponSkills(Player* p)
+    {
+        if (!p) return 0;
+        uint32 learned = 0;
+        for (uint32 spell : kWeaponProficiencies)
+        {
+            if (p->HasSpell(spell)) continue;
+            if (!sSpellMgr->GetSpellInfo(spell)) continue;
+            if (!p->IsSpellFitByClassAndRace(spell)) continue;  // class/race gate
+            p->learnSpell(spell, false);
+            ++learned;
+        }
+        return learned;
+    }
+
     // Class-quest abilities: things a class normally earns from a one-off class
     // QUEST rather than a trainer, so CanTeachSpell / LearnAllClassSpells never
     // grant them. Bots don't run quests — a bot druid would reach max level with
@@ -362,6 +402,8 @@ public:
             knownChains.insert(root ? root : kv.first);
         }
 
+        LearnAllWeaponSkills(player);   // weapon proficiencies — kept OUT of `n` so they
+                                        // don't trigger the "new abilities" report (not rotation-relevant)
         uint32 const n = LearnAllClassSpells(player) + LearnClassQuestSkills(player);
         if (!n) return;
 
