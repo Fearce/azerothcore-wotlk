@@ -1425,15 +1425,26 @@ namespace WowPsParty
             return false;
         }
 
-        // Party-space cap: leader + 4 companions max. Count current followers
-        // (alts + henchmen) from the directive registry — works even before
-        // the WoW group object exists (solo + first henchman).
-        uint32 const followers = WowPsParty::CountFollowersFor(requester->GetGUID());
-        if (followers >= 4)
+        // Party-space cap. A normal party holds the leader + 4 companions; once
+        // the leader CONVERTS the group to a RAID it holds up to 40 members, so a
+        // 10/25-man can be filled entirely with companions. Count THIS leader's
+        // followers (alts + henchmen) from the directive registry — registered
+        // synchronously at hire, so still-spawning hires count and rapid hiring
+        // can't overshoot; it also works before the WoW group object exists (solo
+        // + first henchman). A second hard-stop on the live group size keeps a
+        // multi-human raid from blowing past 40.
+        Group* const reqGroup = requester->GetGroup();
+        bool   const inRaid    = reqGroup && reqGroup->isRaidGroup();
+        uint32 const companionCap = inRaid ? 39u : 4u;   // 40-/5-member group minus the leader
+        uint32 const followers    = WowPsParty::CountFollowersFor(requester->GetGUID());
+        if (followers >= companionCap
+            || (reqGroup && reqGroup->GetMembersCount() >= (inRaid ? 40u : 5u)))
         {
-            outMsg = "Your party is full (4 companions).";
-            LOG_INFO("module", "[WowPsParty Henchmen] hire REFUSED guid={}: party full (followers={})",
-                     candidateGuid, followers);
+            outMsg = inRaid
+                ? "Your raid is full."
+                : "Your party is full (4 companions). Convert your group to a raid to add more.";
+            LOG_INFO("module", "[WowPsParty Henchmen] hire REFUSED guid={}: group full (followers={}, raid={})",
+                     candidateGuid, followers, inRaid ? 1 : 0);
             return false;
         }
 
@@ -1615,7 +1626,21 @@ namespace WowPsParty
                     WowPsParty::SetHenchmanRegrouping(henchGuid, true);
                     hen->RemoveFromGroup();   // flag cleared by guard, even on throw
                 }
-                g->AddMember(hen);
+                if (!g->AddMember(hen))
+                {
+                    // Group genuinely full (a 40-member raid, or a party that was
+                    // never converted to a raid) — never leave a spawned henchman
+                    // orphaned outside the group. Undo the hire: despawn + refund.
+                    WowPsParty::DismissHenchmanByGuid(henchGuid);
+                    lead->ModifyMoney(int32(cost));
+                    if (lead->GetSession())
+                        ChatHandler(lead->GetSession()).PSendSysMessage(
+                            "|cffff5555[WowPsParty]|r Group is full — couldn't add the henchman. Refunded.");
+                    LOG_WARN("module",
+                        "[WowPsParty Henchmen] AddMember FAILED hench_guid={} (group full) — despawned + refunded {}",
+                        henchGuid.GetCounter(), cost);
+                    return;
+                }
             }
             UpdateGroupLootForHenchmen(lead);
             // Loot/gather like the rest of the party.
