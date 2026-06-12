@@ -2079,7 +2079,18 @@ namespace WowPsParty
                 }
                 for (ObjectGuid const& g : toRemove)
                 {
-                    existing->RemoveMember(g);  // may delete the group object
+                    // RemoveMember calls BroadcastGroupUpdate immediately and
+                    // DISBANDS + deletes the group once it drops below 2 members,
+                    // so the captured `existing` can dangle mid-loop — calling
+                    // RemoveMember on the freed object crashes (use-after-free in
+                    // BroadcastGroupUpdate walking freed member slots). Re-fetch
+                    // from the leader each pass and stop the instant the group is
+                    // gone. (Exposed by raid-size parties: many stale offline
+                    // henchmen to purge => the disband can land before the last.)
+                    Group* grp = leader->GetGroup();
+                    if (!grp)
+                        break;
+                    grp->RemoveMember(g);
                     LOG_INFO("module",
                         "[WowPsParty] login purge: removed stale offline member guid={} "
                         "from party group", g.GetCounter());
