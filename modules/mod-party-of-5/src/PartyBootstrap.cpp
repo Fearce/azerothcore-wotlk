@@ -161,10 +161,17 @@ public:
         if (sPlayerbotsMgr.GetPlayerbotAI(player))
             return;
 
-        // Backfill class-quest abilities the human's own char missed (e.g. a druid
-        // that never did the Bear Form quest). Bots get this on the maintenance
-        // tick; the controlled char isn't a bot, so catch it here at login.
+        // Backfill abilities the human's own char missed. Quest skills FIRST
+        // (Bear/Cat Form, stances, totems, pets, mounts) so any form-gated trainer
+        // ability is then learnable, then EVERY trainer spell for its level —
+        // because a char that leveled past a form (e.g. dinged 20 / Cat Form)
+        // before this feature existed got the form on a prior login but never the
+        // trainer-taught cat abilities (Claw / Prowl / Rip). The ding hook covers
+        // the live case; this covers everything earned earlier. Bots get both on
+        // the maintenance/ding tick; the controlled char isn't a bot, so catch it
+        // here at login.
         WowPsParty::LearnClassQuestSkills(player);
+        WowPsParty::LearnAllClassSpells(player);
 
         uint32 const guid = player->GetGUID().GetCounter();
         std::optional<uint8> const slot = sPartyMgr.GetSlotForGuid(guid);
