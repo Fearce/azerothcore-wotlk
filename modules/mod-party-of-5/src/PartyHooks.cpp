@@ -117,6 +117,8 @@ namespace WowPsParty
     struct ClassQuestSkill { uint8 cls; uint32 spell; uint8 minLevel; };
     static ClassQuestSkill const kClassQuestSkills[] =
     {
+        { CLASS_WARRIOR,    71, 10 },  // Defensive Stance (lvl-10 class quest)
+        { CLASS_WARRIOR,  2458, 30 },  // Berserker Stance  (lvl-30 class quest)
         { CLASS_DRUID,    5487, 10 },  // Bear Form
         { CLASS_DRUID,    1066, 16 },  // Aquatic Form
         { CLASS_DRUID,     783, 16 },  // Travel Form
