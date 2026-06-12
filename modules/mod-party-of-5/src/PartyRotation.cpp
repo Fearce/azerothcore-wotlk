@@ -956,6 +956,34 @@ namespace WowPsParty
         return FindNamedAura(target, name) != nullptr;
     }
 
+    // True if `target` carries a beneficial MAGIC buff a mage Spellsteal could
+    // take. Mirrors Spell::EffectStealBeneficialBuff's stealable test EXACTLY
+    // (magic dispel type + positive + not passive + not flagged unstealable +
+    // has charges/stacks), so a Spellsteal rule gated on this can't fire when the
+    // steal would actually find nothing to take.
+    static bool TargetHasStealableMagic(Unit* target)
+    {
+        if (!target) return false;
+        uint32 const magicMask = SpellInfo::GetDispelMask(DISPEL_MAGIC);
+        for (auto const& kv : target->GetAppliedAuras())
+        {
+            AuraApplication const* aurApp = kv.second;
+            if (!aurApp) continue;
+            Aura const* aura = aurApp->GetBase();
+            if (!aura) continue;
+            SpellInfo const* si = aura->GetSpellInfo();
+            if (!si) continue;
+            if (!(si->GetDispelMask() & magicMask)) continue;   // magic only
+            if (!aurApp->IsPositive()) continue;                // a BUFF, not a debuff
+            if (aura->IsPassive()) continue;
+            if (si->HasAttribute(SPELL_ATTR4_CANNOT_BE_STOLEN)) continue;
+            uint8 const charges = si->HasAttribute(SPELL_ATTR7_DISPEL_REMOVES_CHARGES)
+                ? aura->GetCharges() : aura->GetStackAmount();
+            if (charges > 0) return true;
+        }
+        return false;
+    }
+
     // Remaining duration of a named aura, in milliseconds. 0 if absent.
     // Permanent auras (maxDuration == -1) report a very large value so
     // "remaining > N" gates treat them as never-expiring.
@@ -1529,6 +1557,15 @@ namespace WowPsParty
         }
         if (cond == "target_is_normal")
             return UnitCreatureRank(theTarget()) == CREATURE_ELITE_NORMAL;
+
+        // target_has_stealable_magic — TRUE when the target carries a beneficial
+        // MAGIC buff a mage Spellsteal could take. Gate a `cast:Spellsteal` rule
+        // on this; it mirrors the core steal test so it never fires on a whiff.
+        if (cond == "target_has_stealable_magic")
+        {
+            Unit* t = theTarget();
+            return t && TargetHasStealableMagic(t);
+        }
 
         // Creature type — drives Banish (Demon/Elemental), Turn Undead,
         // Hibernate (Beast/Dragonkin), Polymorph (Beast/Humanoid), etc.
