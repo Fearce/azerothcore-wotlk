@@ -1673,6 +1673,23 @@ namespace WowPsParty
             if (!tgt) return false;
             return cmp(pct(float(tgt->GetHealth()), float(tgt->GetMaxHealth())));
         }
+        // target_mana (%) / target_mana_value (raw points) — reads the MANA pool
+        // SPECIFICALLY (POWER_MANA), never the unit's display power, so it's real
+        // mana and not a warrior's rage / rogue's energy / hunter's focus. A unit
+        // with no mana pool (MaxPower(MANA)==0) never matches, so a Mana Burn rule
+        // gated on this only fires on actual mana users — casters / healers /
+        // hybrids, including a druid shifted to cat that still carries a mana bar.
+        if (name == "target_mana" || name == "target_mana_value")
+        {
+            Unit* tgt = theTarget();
+            if (!tgt) return false;
+            uint32 const maxMana = tgt->GetMaxPower(POWER_MANA);
+            if (maxMana == 0) return false;
+            uint32 const curMana = tgt->GetPower(POWER_MANA);
+            if (name == "target_mana_value")
+                return cmp(int(curMana));
+            return cmp(pct(float(curMana), float(maxMana)));
+        }
         if (name == "party_lowest_health")
             return cmp(GetLowestPartyHpPercent(bot));
 
