@@ -934,6 +934,24 @@ namespace WowPsParty
         return (nowMs - w.second) < TANK_LEAD_WAIT_MAX_MS;
     }
 
+    // Threat-build delay: even once the tank HAS the mob, a DPS holds for this
+    // long so the tank can build a real threat LEAD — otherwise the DPS burst
+    // overtakes the tank's tiny opening threat and rips it off the instant the
+    // mob turns to the tank (Kevin: "wait until I've actually done damage and
+    // gotten aggro", not just until it attacks me). Keyed per MOB (the grab time
+    // is the same for every bot) and reset whenever the tank loses it.
+    static constexpr uint32 TANK_THREAT_BUILD_MS = 3000;
+    static std::unordered_map<uint32, uint32> g_mobOnTankSince;  // mobLow -> ms first on the tank
+    static std::mutex g_mobOnTankMutex;
+    static bool TankThreatEstablished(uint32 mobLow, bool onTank, uint32 nowMs)
+    {
+        std::lock_guard<std::mutex> lock(g_mobOnTankMutex);
+        uint32& since = g_mobOnTankSince[mobLow];
+        if (!onTank) { since = 0; return false; }   // tank doesn't have it -> restart
+        if (since == 0) since = nowMs;              // first tick the tank holds it
+        return (nowMs - since) >= TANK_THREAT_BUILD_MS;
+    }
+
     // True if a party member that's ALSO standing off (>8y from the shared
     // victim, i.e. another caster/hunter rather than a melee at the mob) is
     // stacked within `radius` of `bot`.
@@ -2003,26 +2021,22 @@ namespace WowPsParty
         return LeaderRole(leader->GetSession()->GetAccountId()) == "tank";
     }
 
-    // The human-tank wait-gate: a DPS bot may
-    // engage `mob` only once the TANK actually has it (its victim is the human
-    // tank-leader or a tank-role party member) OR it's swinging at the bot ITSELF
-    // (self-defence — never refuse to fight back). A mob merely on the healer or
-    // another bot returns false, so DPS hold and let the tank peel it instead of
-    // ripping it off and sending the tank chasing — UNLESS the wait times out
-    // (handled by the caller, for a mob the tank can't reach).
-    static bool MobHeldByTankOrOnSelf(Player* bot, Unit* mob, Player* leader)
+    // For the human-tank wait-gate: is `mob` currently attacking a TANK (the human
+    // tank-leader or a tank-role bot)? The caller still holds DPS for a threat-
+    // build delay even after this is true; a mob on the bot ITSELF / a non-tank
+    // ally is handled separately by the caller.
+    static bool MobOnTank(Player* bot, Unit* mob, Player* leader)
     {
         if (!mob) return false;
         Unit* const v = mob->GetVictim();
-        if (!v) return false;                    // fighting nobody yet -> still pull prep, hold
-        if (v == bot) return true;               // it's on US -> defend ourselves
+        if (!v) return false;
         if (leader && v == leader) return true;  // the human tank-leader has aggro
         std::vector<ObjectGuid> party;
         GetPartyGuidsFor(bot->GetGUID(), party);
         for (ObjectGuid const& g : party)
             if (v->GetGUID() == g && RoleForGuid(g) == "tank")
                 return true;                     // a (bot) tank has aggro
-        return false;                            // on a non-tank ally -> hold
+        return false;
     }
 
     void AssistTarget(Player* bot)
@@ -2264,26 +2278,44 @@ namespace WowPsParty
         if (desired && (!desired->IsAlive() || !bot->IsValidAttackTarget(desired)))
             desired = nullptr;
 
-        // ---- Wait for a real-player TANK to grab AGGRO (dungeons only) --------
-        // In a dungeon led by a human tank, DPS bots must NOT pre-pull or pile on
-        // before the TANK actually has the mob — otherwise they rip it off and
-        // send the tank chasing all over to taunt it back, burning cooldowns
-        // (Kevin). They hold until the mob's victim is the tank (the human leader
-        // or a tank-role bot), then assist — NOT merely "the mob is fighting
-        // someone" (that released them onto a mob still on a bot). A mob swinging
-        // at the bot ITSELF is exempt (self-defence), and the hold times out after
-        // TANK_LEAD_WAIT_MAX_MS per mob so a mob the tank can't reach (a ranged
-        // caster on the healer) still gets peeled. Tanks/healers are unaffected.
+        // ---- Wait for a real-player TANK to build AGGRO (dungeons only) -------
+        // In a dungeon led by a human tank, DPS bots must NOT pile on before the
+        // tank has a real threat LEAD. Releasing the instant the mob turned to the
+        // tank still let the burst rip it off, since the tank's opening threat is
+        // ~0 (Kevin: "wait until I've actually done damage and gotten aggro", not
+        // just until it attacks me). So:
+        //   * mob on the bot ITSELF  -> fight back (self-defence, no wait);
+        //   * mob on the TANK        -> hold until the tank has held it for
+        //                               TANK_THREAT_BUILD_MS (time to build a lead),
+        //                               then open up;
+        //   * mob on a non-tank ally / nobody -> hold until the tank grabs it, but
+        //                               at most TANK_LEAD_WAIT_MAX_MS so a mob the
+        //                               tank can't reach (a ranged caster on the
+        //                               healer) still gets peeled.
+        // Tanks/healers are unaffected.
         {
             std::string const myRole = RoleForGuid(bot->GetGUID());
             if (desired && myRole != "tank" && myRole != "healer"
-                && HumanTankLeadActive(bot, leader)
-                && !MobHeldByTankOrOnSelf(bot, desired, leader)
-                && TankLeadWaitStillHolding(gLow, desired->GetGUID().GetCounter(), getMSTime()))
+                && HumanTankLeadActive(bot, leader))
             {
-                if (bot->GetVictim()) bot->AttackStop();
-                AssistLog(gLow, "human-tank dungeon: holding until the TANK grabs aggro");
-                return;
+                uint32 const mobLow = desired->GetGUID().GetCounter();
+                uint32 const now    = getMSTime();
+                bool release;
+                if (desired->GetVictim() == bot)
+                    release = true;                                       // on us -> self-defence
+                else if (MobOnTank(bot, desired, leader))
+                    release = TankThreatEstablished(mobLow, true, now);   // tank has it -> wait for the threat build
+                else
+                {
+                    TankThreatEstablished(mobLow, false, now);            // tank lost/never had it -> reset the build timer
+                    release = !TankLeadWaitStillHolding(gLow, mobLow, now);
+                }
+                if (!release)
+                {
+                    if (bot->GetVictim()) bot->AttackStop();
+                    AssistLog(gLow, "human-tank dungeon: holding until the tank builds a threat lead");
+                    return;
+                }
             }
         }
 
