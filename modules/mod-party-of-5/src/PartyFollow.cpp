@@ -40,6 +40,7 @@
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "SpellAuraEffects.h"
+#include "ThreatManager.h"   // threat-cap throttle: bots back off near the tank's threat
 #include "SpellInfo.h"   // SpellInfo::Effects[] for the leader's mount-type check
 
 // Gathering (mining / herbalism) for follower bots.
@@ -934,23 +935,14 @@ namespace WowPsParty
         return (nowMs - w.second) < TANK_LEAD_WAIT_MAX_MS;
     }
 
-    // Threat-build delay: even once the tank HAS the mob, a DPS holds for this
-    // long so the tank can build a real threat LEAD — otherwise the DPS burst
-    // overtakes the tank's tiny opening threat and rips it off the instant the
-    // mob turns to the tank (Kevin: "wait until I've actually done damage and
-    // gotten aggro", not just until it attacks me). Keyed per MOB (the grab time
-    // is the same for every bot) and reset whenever the tank loses it.
-    static constexpr uint32 TANK_THREAT_BUILD_MS = 3000;
-    static std::unordered_map<uint32, uint32> g_mobOnTankSince;  // mobLow -> ms first on the tank
-    static std::mutex g_mobOnTankMutex;
-    static bool TankThreatEstablished(uint32 mobLow, bool onTank, uint32 nowMs)
-    {
-        std::lock_guard<std::mutex> lock(g_mobOnTankMutex);
-        uint32& since = g_mobOnTankSince[mobLow];
-        if (!onTank) { since = 0; return false; }   // tank doesn't have it -> restart
-        if (since == 0) since = nowMs;              // first tick the tank holds it
-        return (nowMs - since) >= TANK_THREAT_BUILD_MS;
-    }
+    // Threat-cap throttle (replaces a fixed timer): even once the tank HAS the
+    // mob, a DPS keeps DPSing only while its own threat stays below this fraction
+    // of the tank's threat ON THAT MOB. The instant it climbs past, it drops the
+    // target (auto-attack AND rotation idle — the rotation casts on GetVictim())
+    // so the tank can rebuild a lead, then resumes. 0.80 sits well under WoW's
+    // 110%/130% pull thresholds, so the bots never rip it off (Kevin: "base it on
+    // the actual threat, not a timer"). Auto-scales to any tank/DPS/gear.
+    static constexpr float THREAT_CAP_RATIO = 0.80f;
 
     // True if a party member that's ALSO standing off (>8y from the shared
     // victim, i.e. another caster/hunter rather than a melee at the mob) is
@@ -2039,6 +2031,22 @@ namespace WowPsParty
         return false;
     }
 
+    // Threat-cap throttle: true when this DPS bot's threat on `mob` has climbed to
+    // within THREAT_CAP_RATIO of the TANK's — i.e. it's about to pull, so it should
+    // back off and let the tank rebuild a lead. The tank is the mob's current
+    // top-threat unit (the caller only asks once MobOnTank is true, so GetVictim()
+    // IS the tank). Holds if there's no tank threat yet (don't pull off ~nothing).
+    static bool BotOverThreatVsTank(Player* bot, Unit* mob)
+    {
+        if (!bot || !mob) return false;
+        Unit* const tank = mob->GetVictim();
+        if (!tank || tank == bot) return false;             // no tank / we ARE the top -> not capped
+        ThreatManager& tm = mob->GetThreatMgr();
+        float const tankThreat = tm.GetThreat(tank);
+        if (tankThreat <= 0.0f) return true;                // tank has no threat yet -> hold
+        return tm.GetThreat(bot) >= tankThreat * THREAT_CAP_RATIO;
+    }
+
     void AssistTarget(Player* bot)
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
@@ -2278,16 +2286,15 @@ namespace WowPsParty
         if (desired && (!desired->IsAlive() || !bot->IsValidAttackTarget(desired)))
             desired = nullptr;
 
-        // ---- Wait for a real-player TANK to build AGGRO (dungeons only) -------
-        // In a dungeon led by a human tank, DPS bots must NOT pile on before the
-        // tank has a real threat LEAD. Releasing the instant the mob turned to the
-        // tank still let the burst rip it off, since the tank's opening threat is
-        // ~0 (Kevin: "wait until I've actually done damage and gotten aggro", not
-        // just until it attacks me). So:
-        //   * mob on the bot ITSELF  -> fight back (self-defence, no wait);
-        //   * mob on the TANK        -> hold until the tank has held it for
-        //                               TANK_THREAT_BUILD_MS (time to build a lead),
-        //                               then open up;
+        // ---- Threat-cap: don't out-threat a real-player TANK (dungeons only) --
+        // In a dungeon led by a human tank, a DPS bot DPSes only while its threat
+        // on the mob stays under THREAT_CAP_RATIO of the tank's — the instant it
+        // climbs past, it drops the target (auto-attack AND rotation idle, since
+        // the rotation casts on GetVictim()) so the tank can rebuild a lead, then
+        // resumes. This auto-scales (no fixed timer) and protects the tank the
+        // WHOLE fight, not just the opening (Kevin: "base it on the actual threat").
+        //   * mob on the bot ITSELF  -> fight back (self-defence, never throttle);
+        //   * mob on the TANK        -> throttle on the threat ratio above;
         //   * mob on a non-tank ally / nobody -> hold until the tank grabs it, but
         //                               at most TANK_LEAD_WAIT_MAX_MS so a mob the
         //                               tank can't reach (a ranged caster on the
@@ -2298,22 +2305,18 @@ namespace WowPsParty
             if (desired && myRole != "tank" && myRole != "healer"
                 && HumanTankLeadActive(bot, leader))
             {
-                uint32 const mobLow = desired->GetGUID().GetCounter();
-                uint32 const now    = getMSTime();
                 bool release;
                 if (desired->GetVictim() == bot)
-                    release = true;                                       // on us -> self-defence
+                    release = true;                              // on us -> self-defence
                 else if (MobOnTank(bot, desired, leader))
-                    release = TankThreatEstablished(mobLow, true, now);   // tank has it -> wait for the threat build
+                    release = !BotOverThreatVsTank(bot, desired);   // tank has it -> hold only if we're near its threat
                 else
-                {
-                    TankThreatEstablished(mobLow, false, now);            // tank lost/never had it -> reset the build timer
-                    release = !TankLeadWaitStillHolding(gLow, mobLow, now);
-                }
+                    release = !TankLeadWaitStillHolding(
+                        gLow, desired->GetGUID().GetCounter(), getMSTime());  // not on tank yet -> hold w/ timeout
                 if (!release)
                 {
                     if (bot->GetVictim()) bot->AttackStop();
-                    AssistLog(gLow, "human-tank dungeon: holding until the tank builds a threat lead");
+                    AssistLog(gLow, "human-tank dungeon: throttling to stay under the tank's threat");
                     return;
                 }
             }
