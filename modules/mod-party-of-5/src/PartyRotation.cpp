@@ -3720,6 +3720,27 @@ namespace WowPsParty
             || verb == "rez_party";
     }
 
+    // When a rule's ACTION targets a FRIENDLY unit (a heal/HoT/buff on the
+    // lowest party member, the tank, or self), that friendly unit — not the
+    // bot's enemy victim — is what its target_* conditions should evaluate
+    // against, since for a friendly cast "the target" IS the unit being healed.
+    // So `target_missing_my_aura:Rejuvenation` gating a `cast_party_lowest:
+    // Rejuvenation` checks the member we're about to heal, not the mob. Returns
+    // the same unit the action itself resolves (kept in sync with ExecAction).
+    // nullptr → an offensive / self-resolving / unknown action: keep the victim.
+    static Unit* FriendlyActionTarget(Player* bot, std::string const& action)
+    {
+        auto const colon = action.find(':');
+        std::string const verb = action.substr(0, colon);
+        if (verb == "cast_self" || verb == "buff_self")
+            return bot;
+        if (verb == "cast_party_lowest" || verb == "cast_party_lowest_hot")
+            return GetLowestHpPartyMember(bot);
+        if (verb == "cast_tank")
+            return FindPartyMemberByRole(bot, "tank");
+        return nullptr;
+    }
+
     bool TickRotation(Player* bot)
     {
         if (!bot) return false;
@@ -3922,7 +3943,12 @@ namespace WowPsParty
             // (a dying CURRENT target would otherwise veto a spread to a
             // perfectly fresh add, and vice versa).
             bool const isSpread = r.action.rfind("cast_spread", 0) == 0;
-            bool const condOk = EvalCondition(r.condition, bot, nullptr, isSpread);
+            // For a friendly-target action, evaluate target_* conditions against
+            // the unit we'll actually heal/buff (the heal target), not the enemy
+            // victim — so "target_missing_my_aura:Rejuvenation" gates on the
+            // member we're about to Rejuv. nullptr keeps the victim (offensive).
+            Unit* const condTarget = isSpread ? nullptr : FriendlyActionTarget(bot, r.action);
+            bool const condOk = EvalCondition(r.condition, bot, condTarget, isSpread);
             if (!condOk)
             {
                 if (trace)
