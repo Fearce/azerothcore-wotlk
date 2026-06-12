@@ -77,6 +77,8 @@
 
 namespace WowPsParty
 {
+    bool IsLogVerbose();   // from PartyBootstrap.cpp
+
     namespace
     {
         // Predicate for the grid searcher: any spawned GameObject within range.
@@ -2801,6 +2803,14 @@ namespace WowPsParty
             if (!follower->IsInWorld() || !leader->IsInWorld()) return true;
             if (follower == leader) return true;
 
+            // On a taxi flight (escorting the leader's flight path): the flight
+            // spline owns the bot's movement. Skip EVERYTHING below — MoveFollow,
+            // the leash, the mount-sync, and especially the cross-map teleport
+            // (which would otherwise yank the bot off its taxi the moment the
+            // flight crosses into the destination's map). Resumes the instant it
+            // lands (IsInFlight clears).
+            if (follower->IsInFlight()) return true;
+
             // Default the humanize tick OFF for this bot. Only the pure open-
             // follow tail below flips it back on; every early-return path
             // (combat, hold, leash, stuck, cross-map, dead, tank-lead) thus
@@ -2948,33 +2958,53 @@ namespace WowPsParty
             // Mount matching — keep the follower's mounted state synced with the
             // leader's so the party doesn't trail on foot during travel. The bot
             // mounts its OWN level/race-appropriate mount (not a clone of the
-            // leader's), matching only the leader's ground-vs-flying type. Skip
-            // while in combat / casting (can't mount then anyway).
-            if (!follower->IsInCombat()
-                && !follower->IsNonMeleeSpellCast(false, false, true))
+            // leader's), matching only the leader's ground-vs-flying type.
+            //
+            // A bot normally can't mount in combat — but if the LEADER is mounted
+            // AND out of combat, the human is travelling, not fighting, so the
+            // bot's combat is just incidental road aggro (a mob that tagged it as
+            // we rode past). Force-mount anyway (a triggered cast isn't blocked by
+            // combat) and let mounted speed carry it off — the mob falls behind
+            // and the fly-by guard in TickRotation keeps it mounted. Without this,
+            // a hero that catches aggro on the open road never mounts and runs on
+            // foot the whole way: the "heroes only mount up in cities" report
+            // (cities have no mobs to keep them in combat).
+            bool const leaderMounted   = leader->IsMounted();
+            bool const botMounted      = follower->IsMounted();
+            bool const botCasting      = follower->IsNonMeleeSpellCast(false, false, true);
+            bool const leaderTravelling = leaderMounted && !leader->IsInCombat();
+            if (leaderMounted && !botMounted && !botCasting
+                && (!follower->IsInCombat() || leaderTravelling))
             {
-                bool const leaderMounted = leader->IsMounted();
-                bool const botMounted    = follower->IsMounted();
-                if (leaderMounted && !botMounted)
-                {
-                    // Is the leader on a FLYING mount? (a mount aura whose speed
-                    // effect is flight speed, not ground.)
-                    bool leaderFlying = false;
-                    Unit::AuraEffectList const& m =
-                        leader->GetAuraEffectsByType(SPELL_AURA_MOUNTED);
-                    if (!m.empty())
-                        if (SpellInfo const* ls = m.front()->GetSpellInfo())
-                            leaderFlying =
-                                ls->Effects[1].ApplyAuraName == SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED ||
-                                ls->Effects[2].ApplyAuraName == SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED;
+                // Is the leader on a FLYING mount? (a mount aura whose speed
+                // effect is flight speed, not ground.)
+                bool leaderFlying = false;
+                Unit::AuraEffectList const& m =
+                    leader->GetAuraEffectsByType(SPELL_AURA_MOUNTED);
+                if (!m.empty())
+                    if (SpellInfo const* ls = m.front()->GetSpellInfo())
+                        leaderFlying =
+                            ls->Effects[1].ApplyAuraName == SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED ||
+                            ls->Effects[2].ApplyAuraName == SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED;
 
-                    if (uint32 const mountSpell = ChooseBotMountSpell(follower, leaderFlying))
-                        follower->CastSpell(follower, mountSpell, true);
-                }
-                else if (!leaderMounted && botMounted)
+                if (uint32 const mountSpell = ChooseBotMountSpell(follower, leaderFlying))
                 {
-                    follower->Dismount();
+                    follower->CastSpell(follower, mountSpell, true);
+                    // Verbose-gated: once mounted the bot stays mounted (the
+                    // TickRotation/AssistTarget mount guards keep mounted bots
+                    // from initiating attacks, so AURA_INTERRUPT_FLAG_MOUNT never
+                    // fires), so this logs ~once per travel-mount — but gate it
+                    // anyway so a pathological flicker can't flood Server.log.
+                    if (follower->IsInCombat() && IsLogVerbose())
+                        LOG_INFO("module",
+                            "[WowPsParty Follow] {} force-mounted through travel "
+                            "aggro (leader {} mounted + out of combat)",
+                            follower->GetName(), leader->GetName());
                 }
+            }
+            else if (!leaderMounted && botMounted && !follower->IsInCombat() && !botCasting)
+            {
+                follower->Dismount();
             }
 
             // ---- Party leash ----------------------------------------------

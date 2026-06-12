@@ -959,3 +959,80 @@ bool WowPsParty_ForceSkinReady(Player* skinner, Creature* creature)
         creature->SetUnitFlag(UNIT_FLAG_SKINNABLE);
     return true;
 }
+
+namespace WowPsParty
+{
+    // Put every hero and henchman following `human` onto the SAME taxi route the
+    // human just boarded, so the party flies the flight path together instead of
+    // ground-running beneath it. Bots fly FREE: the human already paid, so we
+    // grant each bot a temporary float to clear ActivateTaxiPathTo's fare check,
+    // then restore it — with the party money-mirror suppressed so the temp sum
+    // never propagates to the rest of the wallet. Gated to the human leader, so a
+    // bot's own taxi activation (which re-enters the trampoline) can't recurse.
+    void EscortPartyOnTaxi(Player* human, std::vector<uint32> const& nodes)
+    {
+        if (!IsEnabled() || !human || !human->GetSession()) return;
+        if (nodes.size() < 2) return;
+        if (sPlayerbotsMgr.GetPlayerbotAI(human)) return;   // only the human escorts
+
+        // Escort is pure travel convenience, so gate it on followers ACTUALLY
+        // following (g_directives), not on shared-progression — the follow and
+        // mount-sync systems key off the same directives, so a player with
+        // companions on but shared XP/gold off still gets a consistent party
+        // that flies together. GetPartyGuidsFor returns empty (just the leader,
+        // or nothing) when no companions follow, so the size check is the gate.
+        std::vector<ObjectGuid> guids;
+        GetPartyGuidsFor(human->GetGUID(), guids);
+        if (guids.size() < 2) return;                       // no followers to escort
+
+        uint32 const humanMap = human->GetMapId();
+        uint32 escorted = 0;
+        for (ObjectGuid const& g : guids)
+        {
+            if (g == human->GetGUID()) continue;
+            Player* bot = ObjectAccessor::FindConnectedPlayer(g);
+            if (!bot || !bot->IsInWorld() || !bot->IsAlive()) continue;
+            if (!sPlayerbotsMgr.GetPlayerbotAI(bot)) continue;  // bots only (safety)
+            if (bot->IsInFlight()) continue;                    // already flying
+            if (bot->GetMapId() != humanMap) continue;          // can't board cross-map
+
+            if (bot->IsInCombat()) bot->CombatStop();           // taxi rejects in-combat
+
+            // Fly free: temporarily top the bot up so the fare check passes, run
+            // the activation (it deducts firstcost), then restore — net zero, with
+            // the money-mirror suppressed so neither change escapes to the party.
+            // Set PLAYER_FIELD_COINAGE directly rather than via SetMoney(): SetMoney
+            // also drives MoneyChanged(), whose "gather N gold" quest scan would see
+            // the temporary top-up and could auto-complete such a quest (the restore
+            // wouldn't revert it). The raw field set skips that path; the fare
+            // deduction inside ActivateTaxiPathTo is a decrease and can't complete a
+            // gather-gold quest.
+            constexpr uint32 kTaxiEscortFloat = 5000000;        // 500g, ample for any fare
+            bool const prevSuppress = g_propagatingMoney;
+            g_propagatingMoney = true;
+            uint32 const moneyBefore = bot->GetMoney();
+            bot->SetUInt32Value(PLAYER_FIELD_COINAGE, moneyBefore + kTaxiEscortFloat);
+            bool const ok = bot->ActivateTaxiPathTo(nodes, nullptr, 1);
+            bot->SetUInt32Value(PLAYER_FIELD_COINAGE, moneyBefore);
+            g_propagatingMoney = prevSuppress;
+
+            if (ok) ++escorted;
+            else
+                LOG_INFO("module",
+                    "[WowPsParty Taxi] {} could not board {}'s flight ({} nodes)",
+                    bot->GetName(), human->GetName(), uint32(nodes.size()));
+        }
+        if (escorted)
+            LOG_INFO("module",
+                "[WowPsParty Taxi] escorted {} member(s) onto {}'s flight path ({} nodes)",
+                escorted, human->GetName(), uint32(nodes.size()));
+    }
+}
+
+// Global trampoline called from core Player::ActivateTaxiPathTo. Defined in this
+// TU (not PartyFollow.cpp) because the fly-free path needs g_propagatingMoney,
+// which lives here.
+void WowPsParty_OnTaxiFlightStart_Trampoline(Player* human, std::vector<uint32> const& nodes)
+{
+    WowPsParty::EscortPartyOnTaxi(human, nodes);
+}

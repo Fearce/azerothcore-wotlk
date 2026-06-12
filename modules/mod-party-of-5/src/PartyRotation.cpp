@@ -3525,6 +3525,11 @@ namespace WowPsParty
         // tick. (Resurrect-accept is handled separately in ApplyDirective.)
         if (!bot->IsAlive()) return false;
 
+        // On a taxi flight (escorting the leader's flight path): the flight spline
+        // owns movement. Running the rotation would faceAndCast / reposition the
+        // bot and fight the flight, so do nothing until it lands.
+        if (bot->IsInFlight()) return false;
+
         // "Come Hither" recall in progress: pause the rotation entirely so the bot
         // RUNS to the leader (MovePoint) instead of hard-casting in place — a ranged
         // DPS's faceAndCast would otherwise re-plant it every tick and ignore the

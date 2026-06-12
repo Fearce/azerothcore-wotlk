@@ -10373,6 +10373,15 @@ bool Player::ActivateTaxiPathTo(std::vector<uint32> const& nodes, Creature* npc 
         GetSession()->SendActivateTaxiReply(ERR_TAXIOK);
         GetSession()->SendDoFlight(mount_display_id, sourcepath);
     }
+
+    // [WowPsParty] The player just boarded a flight path — send every hero and
+    // henchman following them onto the same taxi route so the party flies the
+    // path together instead of ground-running below. The trampoline (defined in
+    // mod-party-of-5) no-ops for bots and for non-party players, so a bot's own
+    // taxi call here can't recurse.
+    extern void WowPsParty_OnTaxiFlightStart_Trampoline(Player*, std::vector<uint32> const&);
+    WowPsParty_OnTaxiFlightStart_Trampoline(this, nodes);
+
     return true;
 }
 
