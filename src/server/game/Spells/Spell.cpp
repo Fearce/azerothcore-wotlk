@@ -5494,6 +5494,17 @@ void Spell::TakeReagents()
     if (p_caster->CanNoReagentCast(m_spellInfo))
         return;
 
+    // [WowPsParty PATCH] Party-of-5 bots (hero alt-bots AND henchmen — anything
+    // with a PlayerbotAI) cast reagent spells for FREE; only the human-played
+    // body pays. A bot never restocks consumable reagents (Wild Quillvine, etc.),
+    // so consuming them would silently disable Gift of the Wild & friends after
+    // one cast. Mirrors the free-durability rule, which uses the same predicate.
+    {
+        extern bool WowPsParty_PlayerHasBotAI_Trampoline(Player*);
+        if (WowPsParty_PlayerHasBotAI_Trampoline(p_caster))
+            return;
+    }
+
     for (uint32 x = 0; x < MAX_SPELL_REAGENTS; ++x)
     {
         if (m_spellInfo->Reagent[x] <= 0)
@@ -7296,6 +7307,18 @@ SpellCastResult Spell::CheckItems(uint32* param1, uint32* param2)
             if (Item* targetItem = m_targets.GetItemTarget())
                 if (targetItem->GetOwnerGUID() != m_caster->GetGUID())
                     checkReagents = true;
+
+        // [WowPsParty PATCH] Party-of-5 bots (hero alt-bots AND henchmen — anything
+        // with a PlayerbotAI) never need to HOLD a reagent: they cast for free
+        // (TakeReagents skips consuming for them too). Only the human-played body
+        // pays. Final say, so a bot can fire Gift of the Wild & co. without ever
+        // stocking the reagent.
+        if (checkReagents)
+        {
+            extern bool WowPsParty_PlayerHasBotAI_Trampoline(Player*);
+            if (WowPsParty_PlayerHasBotAI_Trampoline(player))
+                checkReagents = false;
+        }
 
         // check reagents (ignore triggered spells with reagents processed by original spell) and special reagent ignore case.
         if (checkReagents)
