@@ -2602,15 +2602,15 @@ namespace WowPsParty
         // mere left-click never strands a bot (out of combat desired==null and we
         // already returned above, so everyone keeps following).
         bool const newVictim = bot->GetVictim() != desired;
-        // A MELEE-WEAPON healer (paladin/shaman/druid: no wand) can only deal FREE,
-        // no-mana damage with its white swing, which needs melee range — so it
-        // weaves into melee (the healer block below) and gets the melee-attack
-        // flag here. A WAND healer (priest) free-DPSes at range and stays put, so
-        // it doesn't get the melee flag.
-        bool const meleeHealer = role == "healer"
-            && (bot->getClass() == CLASS_PALADIN
-             || bot->getClass() == CLASS_SHAMAN
-             || bot->getClass() == CLASS_DRUID);
+        // A holy PALADIN healer weaves into melee to white-swing its only free,
+        // no-mana filler (the healer block below drives it there, and it gets the
+        // melee-attack flag here). Restricted to paladins on purpose: they're plate
+        // and tanky enough to eat melee-range AoE for the free damage. Resto
+        // SHAMAN/DRUID heal from range — their weapon swing is weak and their armor
+        // squishy, so the AoE tradeoff isn't worth it; they stay back (and being
+        // rangedCaster, they get no melee flag either). Wand healers (priest)
+        // free-DPS at range via Shoot.
+        bool const meleeHealer = role == "healer" && bot->getClass() == CLASS_PALADIN;
         if (newVictim)
         {
             MarkRetarget(gLow, nowMs);
@@ -2623,13 +2623,14 @@ namespace WowPsParty
         MovementGeneratorType const mg =
             bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
 
-        // HEALER positioning. A WAND healer heals/wands from RANGE and never
-        // chases (the offensive ranged bands below would kite it toward packs);
-        // it loose-anchors near the leader. A MELEE-WEAPON healer instead weaves
-        // into melee so its white swing — its only free, no-mana filler — lands;
-        // heals reach 40y, so it still tops the party from there. Both keep the
-        // victim above ONLY so the rotation/auto-attack can filler-DPS the party's
-        // already-engaged mob; neither pulls.
+        // HEALER positioning. A RANGED healer — a priest (wands via Shoot) or a
+        // resto shaman/druid — heals from RANGE and never chases (the offensive
+        // ranged bands below would kite it toward packs); it loose-anchors near the
+        // leader. Only a PALADIN healer (meleeHealer) weaves into melee so its
+        // white swing — its only free, no-mana filler — lands; heals reach 40y, so
+        // it still tops the party from there. All keep the victim above ONLY so the
+        // rotation/auto-attack can filler-DPS the party's already-engaged mob;
+        // none pull.
         if (role == "healer")
         {
             float const leashDist = bot->GetDistance(leader);
