@@ -1333,6 +1333,35 @@ namespace WowPsParty
         } while (q->NextRow());
     }
 
+    // Trim a bot's Soul Shards down to exactly one. `preferKeep` (when non-null)
+    // is the shard to spare — the OnPlayerStoreNewItem hook passes the item it
+    // just stored so StoreNewItem's caller still dereferences a live object;
+    // otherwise the first shard found is kept. Collects positions, decides the
+    // keeper, then destroys the surplus (inventory slots are positional, so a
+    // DestroyItem never shifts the others). Mirrors ClearHenchmanInventory's
+    // backpack + equipped-bag sweep — the soul pouch is one of those bags.
+    void TrimSoulShardsToOne(Player* bot, Item* preferKeep)
+    {
+        if (!bot) return;
+        constexpr uint32 SOUL_SHARD_ITEM_ID = 6265;
+
+        Item* spare = preferKeep;
+        auto sweep = [&](uint8 bag, uint8 slot, Item* it)
+        {
+            if (!it || it->GetEntry() != SOUL_SHARD_ITEM_ID) return;
+            if (!spare) { spare = it; return; }   // first shard becomes the keeper
+            if (it == spare) return;              // keep the designated shard
+            bot->DestroyItem(bag, slot, true);    // surplus
+        };
+
+        for (uint8 s = INVENTORY_SLOT_ITEM_START; s < INVENTORY_SLOT_ITEM_END; ++s)
+            sweep(INVENTORY_SLOT_BAG_0, s, bot->GetItemByPos(INVENTORY_SLOT_BAG_0, s));
+        for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+            if (Bag* container = bot->GetBagByPos(bag))
+                for (uint32 s = 0; s < container->GetBagSize(); ++s)
+                    sweep(bag, uint8(s), container->GetItemByPos(uint8(s)));
+    }
+
     void MaintainBotConsumables(Player* bot)
     {
         if (!bot || !bot->IsInWorld() || !bot->IsAlive() || !bot->GetSession()) return;
@@ -1352,6 +1381,12 @@ namespace WowPsParty
         uint8 const cls = bot->getClass();
         if (cls == CLASS_ROGUE)   MaintainPoisons(bot);
         if (cls == CLASS_WARRIOR) MaintainTankThrown(bot);   // before ammo: equips the thrown wpn
+        // Warlock bots only (defensive GetPlayerbotAI guard — a human warlock
+        // manages their own shards and must never be trimmed). Catches a bot
+        // that reloaded with a pre-existing pile or sits at zero free slots,
+        // where no new shard can be created to trip the store-hook cap.
+        if (cls == CLASS_WARLOCK && sPlayerbotsMgr.GetPlayerbotAI(bot))
+            TrimSoulShardsToOne(bot, nullptr);
         MaintainAmmo(bot);   // any class that wields a bow/gun/thrown benefits
     }
 

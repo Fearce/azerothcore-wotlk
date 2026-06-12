@@ -24,6 +24,7 @@
 #include <vector>
 
 class Player;
+class Item;
 
 namespace WowPsParty
 {
@@ -119,6 +120,13 @@ namespace WowPsParty
     // mod-playerbots' UpdateAI, so its own ammo/imbue maintenance never runs for
     // them — this is the replacement.
     void MaintainBotConsumables(Player* bot);
+
+    // Destroy a bot's surplus Soul Shards, leaving exactly one. `preferKeep`, if
+    // non-null, is the shard to spare — pass the item a store-hook just created
+    // so its caller keeps a live pointer; otherwise the first shard found stays.
+    // Bot warlocks only (the playerbot AI drains a shard per kill and never
+    // spends them, flooding the non-stacking shards across bag slots).
+    void TrimSoulShardsToOne(Player* bot, Item* preferKeep);
 
     // Hire `candidateGuid` for `requester`. Validates gold + party space,
     // deducts the fee, spawns the bot and registers the follow directive.

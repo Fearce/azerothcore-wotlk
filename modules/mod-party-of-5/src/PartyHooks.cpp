@@ -31,6 +31,8 @@
 #include "StringFormat.h"
 #include "Trainer.h"
 #include "WorldSession.h"
+#include "PlayerbotAI.h"
+#include "PlayerbotMgr.h"
 
 #include <algorithm>
 #include <unordered_set>
@@ -380,6 +382,23 @@ public:
         using namespace WowPsParty;
         if (!IsEnabled() || g_propagatingLoot) return;
         if (!player || !player->GetSession() || !item) return;
+
+        // Cap soul shards on a bot warlock (hero or henchman) at one. The
+        // playerbot AI casts Drain Soul on every kill and never spends the
+        // shards, and Soul Shard is non-stacking (one item per bag slot), so
+        // they pile up and flood the bags. A human-played warlock (no
+        // PlayerbotAI) manages their own shards and needs several on hand, so
+        // it is left untouched. Every shard-creation path funnels through
+        // StoreNewItem -> this hook, so this is the single choke point. Spare
+        // the just-stored `item` (destroy the OLDER shards) — DoCreateItem and
+        // the loot path still use that pointer after this hook returns.
+        constexpr uint32 SOUL_SHARD_ITEM_ID = 6265;
+        if (item->GetEntry() == SOUL_SHARD_ITEM_ID && sPlayerbotsMgr.GetPlayerbotAI(player))
+        {
+            WowPsParty::TrimSoulShardsToOne(player, item);
+            return;   // shards are never quest items — nothing to mirror below
+        }
+
         if (!ProgressionShared(player)) return;   // solo: keep own loot
 
         ItemTemplate const* tmpl = item->GetTemplate();
