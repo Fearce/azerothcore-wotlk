@@ -4701,9 +4701,19 @@ void Player::DurabilityPointsLossAll(int32 points, bool inventory)
     }
 }
 
+// [WowPsParty] Heroes (the human's alt characters) and hired henchmen are all
+// playerbot-controlled; their gear never wears out so the party only ever
+// repairs the characters the humans actually play. The trampoline lives in
+// mod-party-of-5 (Player.cpp can't reference the module directly). Every
+// durability-loss path funnels through here, so this one gate covers them all.
+extern bool WowPsParty_PlayerHasBotAI_Trampoline(Player* player);
+
 void Player::DurabilityPointsLoss(Item* item, int32 points)
 {
     if (HasPreventDurabilityLossAura())
+        return;
+
+    if (WowPsParty_PlayerHasBotAI_Trampoline(this))
         return;
 
     int32 pMaxDurability = item->GetUInt32Value(ITEM_FIELD_MAXDURABILITY);

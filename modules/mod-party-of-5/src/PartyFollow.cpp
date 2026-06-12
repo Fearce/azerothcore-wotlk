@@ -3558,6 +3558,15 @@ bool WowPsParty_IsHenchman_Trampoline(ObjectGuid guid)
     return WowPsParty::IsHenchman(guid);
 }
 
+// Trampoline: is this player AI-controlled (a hero alt OR a henchman)? Core's
+// Player::DurabilityPointsLoss calls this to give every bot infinite gear
+// durability — only the human-played body (no PlayerbotAI) ever wears down, so
+// the party never has to repair the heroes/henchmen, only their own characters.
+bool WowPsParty_PlayerHasBotAI_Trampoline(Player* player)
+{
+    return player && sPlayerbotsMgr.GetPlayerbotAI(player) != nullptr;
+}
+
 // Trampoline for the patched mod-playerbots UpdateAI to run our minimal
 // combat assist instead of the default strategy engine.
 void WowPsParty_AssistTarget_Trampoline(Player* bot)
