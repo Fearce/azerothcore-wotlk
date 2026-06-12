@@ -153,16 +153,23 @@ namespace WowPsParty
             float const rate = on ? 5.0f : 1.0f;
             // forced=true so the speed-change packet is actually sent to the
             // controlling client (without it the player's own speed often
-            // doesn't update). Enable flight + no-gravity too, so you can
-            // genuinely fly through walls/gaps to lay the path fast.
+            // doesn't update).
             p->SetSpeed(MOVE_RUN,        rate, true);
             p->SetSpeed(MOVE_RUN_BACK,   rate, true);
             p->SetSpeed(MOVE_WALK,       rate, true);
             p->SetSpeed(MOVE_SWIM,       rate, true);
             p->SetSpeed(MOVE_SWIM_BACK,  rate, true);
-            p->SetSpeed(MOVE_FLIGHT,     rate, true);
-            p->SetCanFly(on);
-            p->SetDisableGravity(on);
+            // Record on FOOT, with gravity. The route must follow walkable ground
+            // so the tank-playback can path it — and (the bug this fixes) a
+            // DOWNWARD ramp has to actually LOWER your Z. The old fly +
+            // disable-gravity left the recorder floating at a fixed height, unable
+            // to descend ramps (Deadmines and most dungeons), so a route could
+            // never be finished. GM mode still ignores aggro and
+            // OpenNearbyDoorsForRecorder swings shut doors open, so nothing walls
+            // off the route on the ground. Both flags are forced OFF on entry too,
+            // so a player who toggled recording while already flying is grounded.
+            p->SetCanFly(false);
+            p->SetDisableGravity(false);
         }
 
         // Closed door near the recorder. Ghost mode's fly + ignore-aggro lets
@@ -232,7 +239,8 @@ namespace WowPsParty
             ApplyGhostMode(player, true);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Path recording |cff66ff66ON|r — ghost mode "
-                "+ 5x speed. Fly through the dungeon, then press the bound key again to save.");
+                "+ 5x speed. Run the route through the dungeon (down ramps and all), "
+                "then press the bound key again to save.");
             return true;
         }
 
@@ -258,10 +266,10 @@ namespace WowPsParty
         return g_recording.find(playerGuid.GetCounter()) != g_recording.end();
     }
 
-    // Logging out mid-recording would otherwise persist ghost mode (fly +
-    // no-gravity + 5x speed) onto the character — they'd relog stuck in the
-    // air with broken movement. Drop the recording (without saving the
-    // partial buffer) and reset movement state on the way out.
+    // Logging out mid-recording would otherwise persist ghost mode (GM + 5x
+    // speed) onto the character — they'd relog with broken movement. Drop the
+    // recording (without saving the partial buffer) and reset movement state on
+    // the way out.
     void CancelPathRecording(Player* player)
     {
         if (!player) return;
