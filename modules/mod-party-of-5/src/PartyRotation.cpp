@@ -1249,6 +1249,17 @@ namespace WowPsParty
             if (cname == "self_has_aura")     return TargetHasNamedAura(bot, arg);
             if (cname == "self_missing_aura") return !TargetHasNamedAura(bot, arg);
 
+            // tank_has_aura / tank_missing_aura — check the party's TANK (role from
+            // the Party Roster), so a healer can keep Earth Shield / Beacon / a HoT
+            // up on the tank. No live tank in world → the rule doesn't fire.
+            if (cname == "tank_has_aura" || cname == "tank_missing_aura")
+            {
+                Player* tank = FindPartyMemberByRole(bot, "tank");
+                if (!tank) return false;
+                bool const has = TargetHasNamedAura(tank, arg);
+                return cname == "tank_has_aura" ? has : !has;
+            }
+
             // --- Aura timing / stacks / cooldown (the min-max primitives) ---
             // These all share an arg of the form "<spell name><op><number>",
             // where <op> is the first '<' or '>' in the arg. Spell names have
@@ -2779,6 +2790,19 @@ namespace WowPsParty
             if (verb == "cast_party_lowest_hot" && HasAuraFromSpell(target, spellId))
                 return false;
             return castOrApproach(target, spellId, /*friendlyApproach=*/true);
+        }
+
+        // "cast_tank:<spell>" — cast on the party's TANK (role from the Party
+        // Roster): a healer keeping Earth Shield / Beacon of Light / a HoT on the
+        // tank. Pair with a `tank_missing_aura:<spell>` condition so it only
+        // (re)applies when the tank lacks it.
+        if (verb == "cast_tank")
+        {
+            uint32 const spellId = FindKnownSpellByName(bot, arg);
+            if (!spellId) return false;
+            Player* tank = FindPartyMemberByRole(bot, "tank");
+            if (!tank) return false;
+            return castOrApproach(tank, spellId, /*friendlyApproach=*/true);
         }
 
         // "cast_class_missing:<classes>:<spell>" — cast spell on the first
