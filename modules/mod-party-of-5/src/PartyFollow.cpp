@@ -2586,15 +2586,19 @@ namespace WowPsParty
         // mere left-click never strands a bot (out of combat desired==null and we
         // already returned above, so everyone keeps following).
         bool const newVictim = bot->GetVictim() != desired;
+        // A MELEE-WEAPON healer (paladin/shaman/druid: no wand) can only deal FREE,
+        // no-mana damage with its white swing, which needs melee range — so it
+        // weaves into melee (the healer block below) and gets the melee-attack
+        // flag here. A WAND healer (priest) free-DPSes at range and stays put, so
+        // it doesn't get the melee flag.
+        bool const meleeHealer = role == "healer"
+            && (bot->getClass() == CLASS_PALADIN
+             || bot->getClass() == CLASS_SHAMAN
+             || bot->getClass() == CLASS_DRUID);
         if (newVictim)
         {
             MarkRetarget(gLow, nowMs);
-            // Melee swing for melee bots AND for HEALERS — a healer white-swings as
-            // a free low-mana filler when it happens to be in range (e.g. a holy
-            // paladin next to the tank), instead of standing idle. It never CHASES
-            // (its own block below owns movement and keeps it near the party), so
-            // this only adds damage when the mob is already at hand.
-            bool const meleeAuto = !rangedCaster || role == "healer";
+            bool const meleeAuto = !rangedCaster || meleeHealer;
             bot->Attack(desired, meleeAuto);
             LOG_INFO("module", "[WowPsParty Assist] guid={} ENGAGE victim_guid={} ranged={}",
                      gLow, desired->GetGUID().GetCounter(), rangedCaster ? 1 : 0);
@@ -2603,10 +2607,13 @@ namespace WowPsParty
         MovementGeneratorType const mg =
             bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
 
-        // HEALER: heal from RANGE, never chase the foe — loose-anchor near the
-        // leader (the offensive ranged bands below would kite it toward packs).
-        // It keeps the victim above ONLY so the rotation can filler-DPS / wand the
-        // party's already-engaged mob; it never melees and never pulls.
+        // HEALER positioning. A WAND healer heals/wands from RANGE and never
+        // chases (the offensive ranged bands below would kite it toward packs);
+        // it loose-anchors near the leader. A MELEE-WEAPON healer instead weaves
+        // into melee so its white swing — its only free, no-mana filler — lands;
+        // heals reach 40y, so it still tops the party from there. Both keep the
+        // victim above ONLY so the rotation/auto-attack can filler-DPS the party's
+        // already-engaged mob; neither pulls.
         if (role == "healer")
         {
             float const leashDist = bot->GetDistance(leader);
@@ -2620,6 +2627,17 @@ namespace WowPsParty
                 if (mg != FOLLOW_MOTION_TYPE)
                     bot->GetMotionMaster()->MoveFollow(leader, 10.0f, bot->GetFollowAngle());
                 AssistLog(gLow, "healer: out of heal range — closing to the leader");
+            }
+            // Melee-weapon healer: weave into melee to white-swing, but ONLY while
+            // the target sits near the party — never chase a loose mob out of the
+            // group. The leader-leash above reels it back if the fight wanders off.
+            else if (meleeHealer && desired && leader->GetDistance(desired) < 25.0f)
+            {
+                if (newVictim || mg != CHASE_MOTION_TYPE)
+                    bot->GetMotionMaster()->MoveChase(desired);
+                else if (!bot->HasInArc(float(M_PI), desired))
+                    bot->SetFacingToObject(desired);
+                AssistLog(gLow, "melee healer: weaving in to white-swing the party's target");
             }
             else
             {
