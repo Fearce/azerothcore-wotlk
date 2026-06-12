@@ -2379,6 +2379,44 @@ namespace lfg
             if (player->GetMapId() == uint32(dungeon->map))
                 player->TeleportToEntryPoint();
 
+            // [WowPsParty PATCH] The stock teleport-out is non-destructive — it keeps
+            // the player in the LFG group, so a persistent party-of-5 stays bound to
+            // the (already-cleared) dungeon: the eye lingers and the party reads as
+            // "still in a dungeon", and the run never resets. When the LAST human of
+            // a party-with-bots teleports OUT (no human left in the dungeon MAP —
+            // teleport-out doesn't change LFG state, so we test the map, not the
+            // state), revert the group to a normal group and clear the bots' LFG
+            // state. The eye clears, and the next run is a fresh LFG queue (the
+            // queue path already clears any stale LFG flag). Bots (paused AI) never
+            // leave on their own, so they're excluded from the "still in" test and
+            // follow the human out via the cross-map follow teleport.
+            if (group && group->isLFGGroup())
+            {
+                uint32 const dungeonMap = uint32(dungeon->map);
+                bool anyBot = false, anyHumanStillIn = false;
+                for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+                {
+                    Player* m = itr->GetSource();
+                    if (!m) continue;
+                    if (WowPsParty_BotHasActiveFollowDirective_Trampoline(m->GetGUID()))
+                        anyBot = true;
+                    else if (m->GetGUID() != player->GetGUID() && m->GetMapId() == dungeonMap)
+                        anyHumanStillIn = true;
+                }
+                if (anyBot && !anyHumanStillIn)
+                {
+                    for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+                        if (Player* m = itr->GetSource())
+                            if (WowPsParty_BotHasActiveFollowDirective_Trampoline(m->GetGUID()))
+                                SetState(m->GetGUID(), LFG_STATE_NONE);
+                    SetState(group->GetGUID(), LFG_STATE_NONE);
+                    group->RemoveLFGFlag();   // reverts to a normal group; SendUpdate() clears the eye
+                    LOG_INFO("module",
+                        "[WowPsParty LFG] party-of-5 teleported out (last human) — reverted group {} to a normal group",
+                        group->GetGUID().ToString());
+                }
+            }
+
             return;
         }
         else
