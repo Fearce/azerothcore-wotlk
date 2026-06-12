@@ -1374,9 +1374,10 @@ namespace WowPsParty
     // henchmen are temporary combat companions and are skipped. There's no
     // toggle: training the profession IS the opt-in.
 
-    static constexpr float GATHER_SCAN_RANGE = 30.0f;  // node search radius
+    static constexpr float GATHER_SCAN_RANGE = 50.0f;  // node search radius — spot ore/herbs/corpses a good way off
     static constexpr float GATHER_REACH      = 11.0f;  // interaction distance — long reach so bots harvest without walking on top of the node
-    static constexpr float GATHER_LEADER_LEASH = 40.0f; // don't gather if lagging
+    static constexpr float GATHER_LEADER_LEASH = 55.0f; // pursue a node up to here from the leader; past it, abandon + catch up.
+                                                        // Sits ABOVE the 50y follow leash, which yields to an in-progress gather (see ApplyDirective).
     static constexpr uint32 GATHER_APPROACH_TIMEOUT_MS = 6000; // give up if stuck
     static constexpr uint32 GATHER_AVOID_MS = 30000;   // ignore an unreachable node
 
@@ -1810,9 +1811,24 @@ namespace WowPsParty
         Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
         if (!leader || !leader->IsInWorld()) { GatherLog(gLow, "skip: leader not in world"); return; }
         if (leader->GetMapId() != bot->GetMapId()) { GatherLog(gLow, "skip: leader other map"); return; }
-        // Don't wander off to gather while still catching up to the party.
+        // Too far from the leader to keep chasing a node — ABANDON it (and avoid
+        // re-picking it briefly) so the follow leash, which yields while a gather
+        // is in progress, can finally reel the bot back in. Without clearing the
+        // node the follow yield + this skip would deadlock the bot out past 50y.
         if (bot->GetDistance(leader) > GATHER_LEADER_LEASH)
-        { GatherLog(gLow, "skip: lagging leader (>40y)"); return; }
+        {
+            std::lock_guard<std::mutex> lock(g_gatherMutex);
+            auto& st = g_gather[gLow];
+            if (st.node)
+            {
+                st.avoid      = st.node;
+                st.avoidUntil = now + GATHER_AVOID_MS;
+            }
+            st.node     = ObjectGuid::Empty;
+            st.commitMs = 0;
+            GatherLog(gLow, "skip: lagging leader (>55y) — dropped node, catching up");
+            return;
+        }
 
         // Read this bot's committed node + avoid entry.
         ObjectGuid committed, avoid;
@@ -3185,7 +3201,13 @@ namespace WowPsParty
                         follower->GetName());
                     return true;
                 }
-                if (leaderDist > 50.0f)
+                // A bot walking to a gather node may legitimately pass 50y; let it
+                // finish rather than reeling it straight back (the gather leash
+                // abandons the node past 55y, after which this fires normally). The
+                // >100y hard teleport above is unconditional, so a gather can never
+                // strand a bot.
+                if (leaderDist > 50.0f
+                    && !BotIsApproachingGatherNode(d.followerGuid.GetCounter()))
                 {
                     if (follower->GetVictim()) follower->AttackStop();
                     if (follower->IsInCombat()) follower->CombatStop();
