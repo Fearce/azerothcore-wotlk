@@ -2694,13 +2694,65 @@ namespace WowPsParty
         {
             uint32 const spellId = FindKnownSpellByName(bot, arg);
             if (!spellId) return false;
-            // Self-skip by NAME, not by the cast spell id. Seals (and some other
-            // buffs) apply an aura whose spell id differs from the spell you cast,
-            // so HasAura(castId) stayed false and the paladin re-cast Seal of
-            // Righteousness every tick, never falling through to Crusader Strike.
-            if (TargetHasNamedAura(bot, arg)) return false;
-            if (!canFireSpellOn(spellId, bot)) return false;
+
+            // A WEAPON IMBUE (shaman Earthliving / Flametongue / Rockbiter /
+            // Windfury / Frostbrand, etc.) does NOT apply a unit aura — it puts a
+            // TEMPORARY ENCHANT on the equipped weapon. TargetHasNamedAura never
+            // sees it, so the "skip if active" check failed and the bot recast the
+            // imbue every GCD, never falling through to heal/attack ("weapon buffs
+            // don't work"). Detect the spell's temp-enchant effect and skip if a
+            // hand already carries THAT imbue.
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            uint32 imbueEnchant = 0;
+            if (info)
+                for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                    if (info->Effects[i].Effect == SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY)
+                    { imbueEnchant = info->Effects[i].MiscValue; break; }
+
+            if (imbueEnchant)
+            {
+                auto imbuedWith = [&](uint8 slot)
+                {
+                    Item* w = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+                    return w && w->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT) == imbueEnchant;
+                };
+                if (imbuedWith(EQUIPMENT_SLOT_MAINHAND) || imbuedWith(EQUIPMENT_SLOT_OFFHAND))
+                    return false;   // already imbued with this — don't recast
+            }
+            // Normal self-buff: skip by NAME, not by the cast spell id. Seals (and
+            // some other buffs) apply an aura whose spell id differs from the spell
+            // you cast, so HasAura(castId) stayed false and the paladin re-cast Seal
+            // of Righteousness every tick, never reaching Crusader Strike.
+            else if (TargetHasNamedAura(bot, arg))
+                return false;
+
             if (!channelClipOk()) return false;
+
+            if (imbueEnchant)
+            {
+                // Cast WITH the weapon as the item target. A weapon-imbue's
+                // SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY applies NOTHING when
+                // itemTarget is null, and a clientless bot's plain unit CastSpell
+                // never sets one — so the imbue silently did nothing. Target the
+                // hand the spell can actually enchant (main, else off). CastSpell's
+                // own CheckCast covers mana here; canFireSpellOn would false-reject
+                // for the missing item target.
+                Item* weapon = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+                if (!weapon || !weapon->IsFitToSpellRequirements(info))
+                    weapon = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
+                if (!weapon || !weapon->IsFitToSpellRequirements(info))
+                    return false;   // no weapon this imbue can go on
+                SpellCastTargets targets;
+                targets.SetItemTarget(weapon);
+                bool const fired = bot->CastSpell(targets, info, nullptr, TRIGGERED_NONE) == SPELL_CAST_OK;
+                if (fired)
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation] {} imbued {} -> {} (temp-enchant {})",
+                        bot->GetName(), arg, weapon->GetTemplate()->Name1, imbueEnchant);
+                return fired;
+            }
+
+            if (!canFireSpellOn(spellId, bot)) return false;
             return faceAndCast(bot, spellId);
         }
 
