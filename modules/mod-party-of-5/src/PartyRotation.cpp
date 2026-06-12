@@ -3681,6 +3681,20 @@ namespace WowPsParty
         return false;
     }
 
+    // A REACTIVE party-emergency verb: heal the lowest, cleanse a debuff, or rez
+    // the dead. These are the actions a healer must drop an in-progress offensive
+    // FILLER (a 2.5s Smite / Lightning Bolt / Wrath) for the instant they become
+    // needed — "abort immediately once they need to heal". Maintenance buffs
+    // (Beacon, Sacred Shield, seals/auras) are NOT here: they can wait out the
+    // ≤2.5s filler rather than thrash it.
+    static bool IsReactiveHealVerb(std::string const& verb)
+    {
+        return verb == "cast_party_lowest"
+            || verb == "cast_party_lowest_hot"
+            || verb == "cure_party"
+            || verb == "rez_party";
+    }
+
     bool TickRotation(Player* bot)
     {
         if (!bot) return false;
@@ -3843,6 +3857,18 @@ namespace WowPsParty
         // so without this guard the rotation re-fired Blizzard every tick.
         bool const committed = ChannelCommitActive(bot);
 
+        // Is the bot mid-cast on an OFFENSIVE filler (a healer's high-mana Smite /
+        // Lightning Bolt / Wrath — harmful, non-channeled, so `committed` doesn't
+        // cover it)? If so, the loop below ABORTS it the instant a higher-priority
+        // reactive-heal rule matches, so a heal that came due mid-nuke fires now
+        // instead of waiting out the cast bar (the core would otherwise reject the
+        // heal with SPELL_IN_PROGRESS). Instant fillers leave no generic cast in
+        // flight, so this is naturally a no-op for them.
+        bool castingHarmfulFiller = false;
+        if (Spell* gen = bot->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+            if (SpellInfo const* gi = gen->GetSpellInfo())
+                castingHarmfulFiller = !gi->IsPositive();
+
         for (RotationRule const& r : rules)
         {
             // A rule disabled in the editor (checkbox off) carries the
@@ -3879,6 +3905,17 @@ namespace WowPsParty
                         "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> NO_MATCH",
                         r.priority, r.condition, r.action);
                 continue;
+            }
+            // The highest-priority rule that matched this tick wants a reactive
+            // heal/cleanse/rez while we're mid offensive filler — drop the nuke
+            // NOW so the heal lands this tick, not 1-2s later when the cast bar
+            // would have finished. One-shot: clear the flag so a heal that fails
+            // to land (out of range, on CD) can't re-interrupt every tick.
+            if (castingHarmfulFiller
+                && IsReactiveHealVerb(r.action.substr(0, r.action.find(':'))))
+            {
+                bot->InterruptNonMeleeSpells(false);
+                castingHarmfulFiller = false;
             }
             bool const execOk = ExecAction(r.action, bot, r.flags, r.condition);
             if (trace)

@@ -2551,7 +2551,13 @@ namespace WowPsParty
         if (newVictim)
         {
             MarkRetarget(gLow, nowMs);
-            bot->Attack(desired, !rangedCaster);
+            // Melee swing for melee bots AND for HEALERS — a healer white-swings as
+            // a free low-mana filler when it happens to be in range (e.g. a holy
+            // paladin next to the tank), instead of standing idle. It never CHASES
+            // (its own block below owns movement and keeps it near the party), so
+            // this only adds damage when the mob is already at hand.
+            bool const meleeAuto = !rangedCaster || role == "healer";
+            bot->Attack(desired, meleeAuto);
             LOG_INFO("module", "[WowPsParty Assist] guid={} ENGAGE victim_guid={} ranged={}",
                      gLow, desired->GetGUID().GetCounter(), rangedCaster ? 1 : 0);
         }
