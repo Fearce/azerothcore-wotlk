@@ -3013,6 +3013,92 @@ namespace WowPsParty
             return fired;
         }
 
+        // "cast_combo_spread:<builder>:<finisher>" — feral/rogue MULTI-DOT with a
+        // combo-point FINISHER. Plain cast_spread can't apply Rip: a finisher needs
+        // ≥1 combo point built ON that specific target first, so the dots must go on
+        // one target at a time (build → finish → next). Each tick this does ONE
+        // step:
+        //   * hold combo points on a live, in-range enemy still MISSING our
+        //     finisher -> spend them: cast <finisher> on it (the combo target);
+        //   * else BUILD: cast <builder> on the next party-engaged enemy missing
+        //     our finisher (current victim first) — Rake also lands its own bleed.
+        // Across ticks: rake→rip→(next)→rake→rip… It never leaves the assist
+        // target's spot — it dots clustered adds IN PLACE, and canFireSpellOn keeps
+        // it to enemies actually in (melee) range. The aura checks are per-CASTER
+        // (our own Rip), so several ferals each keep their own up. Use "Rake:Rip",
+        // or "Claw:Rip" before Rake is learned. Returns false once every reachable
+        // engaged enemy has our finisher, so the rotation drops to the single-
+        // target filler. Like cast_spread, its target_* clauses are enforced per
+        // candidate here (TickRotation skips them at rule level).
+        if (verb == "cast_combo_spread")
+        {
+            auto const sep = arg.find(':');
+            if (sep == std::string::npos) return false;
+            std::string const builderName  = arg.substr(0, sep);
+            std::string const finisherName = arg.substr(sep + 1);
+            uint32 const builderId  = FindKnownSpellByName(bot, builderName);
+            uint32 const finisherId = FindKnownSpellByName(bot, finisherName);
+            if (!builderId || !finisherId || builderId == finisherId) return false;
+            ObjectGuid const me = bot->GetGUID();
+            std::vector<Player*> party;
+            GatherPartyPlayers(bot, party, /*includeDead=*/false);
+
+            // 1) SPEND: finish the combo target if it's a live, party-engaged enemy
+            //    in range that still lacks OUR finisher (per-caster aura check).
+            if (Unit* combo = bot->GetComboTarget())
+                if (bot->GetComboPoints() > 0 && combo->IsAlive()
+                    && bot->IsValidAttackTarget(combo)
+                    && MobEngagedByParty(bot, combo, party)
+                    && !TargetHasNamedAura(combo, finisherName, me)
+                    && canFireSpellOn(finisherId, combo)
+                    && EvalCondition(cond, bot, combo))
+                {
+                    if (!channelClipOk()) return false;
+                    bool const fired = faceAndCast(combo, finisherId);
+                    if (fired)
+                        LOG_INFO("module",
+                            "[WowPsParty Rotation] {} combo-finish {} -> {} (cp={})",
+                            bot->GetName(), finisherName, combo->GetName(),
+                            int(bot->GetComboPoints()));
+                    return fired;
+                }
+
+            // 2) BUILD: a combo point on the next engaged enemy missing OUR
+            //    finisher (victim first, else beefiest in range), gated per enemy.
+            auto needsSetup = [&](Unit* u) -> bool
+            {
+                return u && u->IsAlive() && bot->IsValidAttackTarget(u)
+                    && !TargetHasNamedAura(u, finisherName, me)
+                    && MobEngagedByParty(bot, u, party)
+                    && canFireSpellOn(builderId, u)
+                    && EvalCondition(cond, bot, u);
+            };
+            Unit* pick = nullptr;
+            if (Unit* v = bot->GetVictim())
+                if (needsSetup(v)) pick = v;
+            if (!pick)
+            {
+                std::list<Unit*> hostiles;
+                GatherHostilesAround(bot, 41.0f, hostiles);
+                uint32 bestHp = 0;
+                for (Unit* a : hostiles)
+                    if (needsSetup(a))
+                    {
+                        uint32 const hp = a->GetHealth();
+                        if (!pick || hp > bestHp) { bestHp = hp; pick = a; }
+                    }
+            }
+            if (!pick) return false;
+            if (!channelClipOk()) return false;
+            bool const fired = faceAndCast(pick, builderId);
+            if (fired)
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] {} combo-build {} -> {} (cp={})",
+                    bot->GetName(), builderName, pick->GetName(),
+                    int(bot->GetComboPoints()));
+            return fired;
+        }
+
         // "pull:<spell>" — initiate a RANGED pull. Picks the nearest hostile
         // within 30y that ISN'T in combat yet and casts <spell> at it (Throw,
         // Shoot, Hunter's Mark, etc.) WITHOUT closing to melee. Pair with an
@@ -3942,7 +4028,8 @@ namespace WowPsParty
             // rule-level eval must not also gate them on the current victim
             // (a dying CURRENT target would otherwise veto a spread to a
             // perfectly fresh add, and vice versa).
-            bool const isSpread = r.action.rfind("cast_spread", 0) == 0;
+            bool const isSpread = r.action.rfind("cast_spread", 0) == 0
+                               || r.action.rfind("cast_combo_spread", 0) == 0;
             // For a friendly-target action, evaluate target_* conditions against
             // the unit we'll actually heal/buff (the heal target), not the enemy
             // victim — so "target_missing_my_aura:Rejuvenation" gates on the
