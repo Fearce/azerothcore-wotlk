@@ -2677,6 +2677,46 @@ public:
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Wait for tank threat: {}.", on ? "ON" : "OFF");
         }
+        // REQ_SAFEPULL\t<token>  ->  SAFEPULL\t<token>\t<0|1>
+        // Reports the EFFECTIVE value; an unset row means the default, which is
+        // ON for every tank (so an unconfigured tank still shows the safe pull).
+        else if (command == "REQ_SAFEPULL")
+        {
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            bool on = true;   // default ON
+            if (guid)
+            {
+                QueryResult q = CharacterDatabase.Query(
+                    "SELECT `safe_pull` FROM `party_loadout` WHERE `guid` = {}", guid);
+                std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+                if (v == "0") on = false;   // '1' or unset -> ON
+            }
+            std::ostringstream out;
+            out << "SAFEPULL\t" << token << '\t' << (on ? 1 : 0);
+            SendWPSP(player, out.str());
+        }
+        // SET_SAFEPULL\t<token>\t<0|1>  — explicit override (the user toggled it)
+        else if (command == "SET_SAFEPULL")
+        {
+            std::string rest;
+            std::string const token = WowPsParty::SplitToken(std::string(payload), rest);
+            if (rest != "0" && rest != "1") return;   // strict: ignore a malformed/empty value
+            bool const on = (rest == "1");
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            if (!guid) return;
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
+                "`gear_lock_json`, `priority_actions_json`, `safe_pull`) "
+                "VALUES ({}, '', '', '', '', '', '{}') "
+                "ON DUPLICATE KEY UPDATE `safe_pull` = VALUES(`safe_pull`)",
+                guid, on ? "1" : "0");
+            CharacterDatabase.CommitTransaction(tx);
+            WowPsParty::SafePullCacheSet(guid, on ? 1 : 0);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Safe pull: {}.", on ? "ON" : "OFF");
+        }
         else if (command == "EQUIP")
         {
             HandleEquip(player, payload);

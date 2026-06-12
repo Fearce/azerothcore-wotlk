@@ -1501,16 +1501,17 @@ namespace WowPsParty
         bool hadCustomRotation = false;   // gates the post-relevel rebuild below
         {
             QueryResult lq = CharacterDatabase.Query(
-                "SELECT `priority_actions_json`,`strategies_csv`,`glyphs_csv`,`wait_tank_threat` "
+                "SELECT `priority_actions_json`,`strategies_csv`,`glyphs_csv`,`wait_tank_threat`,`safe_pull` "
                 "FROM `party_loadout` WHERE `guid` = {}", candidateGuid);
-            std::string savedRot, savedMode, savedLead, savedWait;
+            std::string savedRot, savedMode, savedLead, savedWait, savedSafePull;
             if (lq)
             {
                 Field* lf = lq->Fetch();
-                savedRot  = lf[0].Get<std::string>();
-                savedMode = lf[1].Get<std::string>();
-                savedLead = lf[2].Get<std::string>();
-                savedWait = lf[3].Get<std::string>();
+                savedRot      = lf[0].Get<std::string>();
+                savedMode     = lf[1].Get<std::string>();
+                savedLead     = lf[2].Get<std::string>();
+                savedWait     = lf[3].Get<std::string>();
+                savedSafePull = lf[4].Get<std::string>();
             }
             hadCustomRotation = !savedRot.empty();
 
@@ -1526,6 +1527,9 @@ namespace WowPsParty
 
             WowPsParty::WaitTankThreatCacheSet(candidateGuid,
                 savedWait == "1" ? 1 : (savedWait == "0" ? 0 : -1));
+
+            WowPsParty::SafePullCacheSet(candidateGuid,
+                savedSafePull == "1" ? 1 : (savedSafePull == "0" ? 0 : -1));
         }
 
         mgr->AddPlayerBot(henchGuid, account);
@@ -2019,6 +2023,7 @@ namespace WowPsParty
                 TargetModeRefreshFromDB(guid);
                 LeadDungeonRefreshFromDB(guid);
                 WaitTankThreatRefreshFromDB(guid);
+                SafePullRefreshFromDB(guid);
                 if (guid == activeGuid) continue;
                 if (spawned >= 4) break;
                 ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);

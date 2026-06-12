@@ -132,6 +132,14 @@ namespace WowPsParty
     void WaitTankThreatRefreshFromDB(uint32 guidLow);
     bool GetWaitTankThreat(ObjectGuid guid);
 
+    // Per-TANK "safe pull" toggle. Default ON for every tank (the ranged
+    // tag-and-step-back opener); an explicit Rotation-Editor choice can switch a
+    // tank to barging straight into melee instead.
+    // val: 0 = barge, 1 = safe pull, -1 = clear the override (back to default ON).
+    void SafePullCacheSet(uint32 guidLow, int val);
+    void SafePullRefreshFromDB(uint32 guidLow);
+    bool GetSafePull(ObjectGuid guid);
+
     // Tell the follow ticker to LEAVE this bot alone for the next
     // `durationMs` milliseconds — used by the rotation engine's
     // `drink` / `hold_position` actions so a bot that's just been told

@@ -908,6 +908,40 @@ namespace WowPsParty
         WaitTankThreatCacheSet(guidLow, v == "1" ? 1 : (v == "0" ? 0 : -1));
     }
 
+    // ---- "safe pull" toggle (TANK) -----------------------------------------
+    // Whether the lead tank OPENS a pack with a ranged pull + step-back (tag the
+    // mob, back off, let the pack close in open space) or just barges straight
+    // into melee. Stored in party_loadout.safe_pull as '' (unset), '1' (safe
+    // pull) or '0' (barge). Unlike wait_tank_threat there's no per-type split:
+    // the safe pull is the long-standing default for EVERY tank, so an absent
+    // entry means ON; the toggle only lets a tank opt OUT.
+    static std::unordered_map<uint32, int> g_safePull;   // guidLow -> 0/1 (explicit only)
+    static std::mutex g_safePullMutex;
+
+    // val: 0 = explicit barge, 1 = explicit safe pull, <0 = clear (back to default).
+    void SafePullCacheSet(uint32 guidLow, int val)
+    {
+        std::lock_guard<std::mutex> lock(g_safePullMutex);
+        if (val < 0) g_safePull.erase(guidLow);
+        else         g_safePull[guidLow] = val ? 1 : 0;
+    }
+
+    bool GetSafePull(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(g_safePullMutex);
+        auto it = g_safePull.find(guid.GetCounter());
+        if (it != g_safePull.end()) return it->second != 0;
+        return true;   // unset -> safe pull ON (the long-standing default)
+    }
+
+    void SafePullRefreshFromDB(uint32 guidLow)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `safe_pull` FROM `party_loadout` WHERE `guid` = {}", guidLow);
+        std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+        SafePullCacheSet(guidLow, v == "1" ? 1 : (v == "0" ? 0 : -1));
+    }
+
     // ---- retarget throttle --------------------------------------------------
     // Timestamp (getMSTime) of each bot's last target SWITCH. Used to stop the
     // "spinbot" when several mobs flank the tank and the nearest-loose pick
@@ -1346,7 +1380,10 @@ namespace WowPsParty
         // keep the old behaviour of closing straight in.
         Item* const rangedW = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
         bool const hasRangedWeapon = rangedW && rangedW->GetTemplate()->IsRangedWeapon();
-        bool const canRangedPull = hasRangedWeapon || WowPsParty::TankRangedPullSpell(bot) != 0;
+        // Editor "safe pull" toggle OFF -> never range-pull; fall through to the
+        // melee close-in below so the tank just barges straight into the pack.
+        bool const canRangedPull = (hasRangedWeapon || WowPsParty::TankRangedPullSpell(bot) != 0)
+                                && WowPsParty::GetSafePull(bot->GetGUID());
         float const dist = bot->GetDistance(nearest);
         if (canRangedPull && dist > 8.0f)
         {
