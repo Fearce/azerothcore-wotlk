@@ -373,7 +373,8 @@ namespace WowPsParty
 
     // Defined further down; forward-declared so the rank-insensitive buff check
     // below (matched by spell name) can reuse it.
-    static Aura const* FindNamedAura(Unit* unit, std::string const& name);
+    static Aura const* FindNamedAura(Unit* unit, std::string const& name,
+                                     ObjectGuid caster = ObjectGuid::Empty);
 
     // True if target already has the buff `spellId` represents — matched by NAME
     // (any RANK counts), not the exact rank's id. Rank-sensitive matching caused
@@ -931,7 +932,12 @@ namespace WowPsParty
     // case-insensitively, or nullptr. Callers that only need presence use
     // TargetHasNamedAura; the timing/stack conditions need the Aura* to read
     // GetDuration()/GetStackAmount().
-    static Aura const* FindNamedAura(Unit* unit, std::string const& name)
+    // `caster` (when non-empty) restricts the match to auras applied BY that
+    // unit — the "_my_aura" condition variants pass the bot's GUID so several
+    // same-class bots can each track their OWN per-caster debuff/HoT (three
+    // boomkins each keeping their own Moonfire up). Empty = any caster (default).
+    static Aura const* FindNamedAura(Unit* unit, std::string const& name,
+                                     ObjectGuid caster)   // default on the forward decl above
     {
         if (!unit || name.empty()) return nullptr;
         std::string needle;
@@ -941,6 +947,7 @@ namespace WowPsParty
         {
             Aura const* a = kv.second ? kv.second->GetBase() : nullptr;
             if (!a) continue;
+            if (!caster.IsEmpty() && a->GetCasterGUID() != caster) continue;   // _my_ variant filter
             SpellInfo const* si = a->GetSpellInfo();
             if (!si) continue;
             // Skip the unit's own SELF-CAST passive auras. A proc TALENT (a
@@ -964,9 +971,10 @@ namespace WowPsParty
         return nullptr;
     }
 
-    static bool TargetHasNamedAura(Unit* target, std::string const& name)
+    static bool TargetHasNamedAura(Unit* target, std::string const& name,
+                                   ObjectGuid caster = ObjectGuid::Empty)
     {
-        return FindNamedAura(target, name) != nullptr;
+        return FindNamedAura(target, name, caster) != nullptr;
     }
 
     // True if `target` carries a beneficial MAGIC buff a mage Spellsteal could
@@ -1000,17 +1008,19 @@ namespace WowPsParty
     // Remaining duration of a named aura, in milliseconds. 0 if absent.
     // Permanent auras (maxDuration == -1) report a very large value so
     // "remaining > N" gates treat them as never-expiring.
-    static int32 NamedAuraRemainingMs(Unit* unit, std::string const& name)
+    static int32 NamedAuraRemainingMs(Unit* unit, std::string const& name,
+                                      ObjectGuid caster = ObjectGuid::Empty)
     {
-        Aura const* a = FindNamedAura(unit, name);
+        Aura const* a = FindNamedAura(unit, name, caster);
         if (!a) return 0;
         if (a->IsPermanent()) return 0x7FFFFFFF;
         return a->GetDuration();
     }
 
-    static uint32 NamedAuraStacks(Unit* unit, std::string const& name)
+    static uint32 NamedAuraStacks(Unit* unit, std::string const& name,
+                                  ObjectGuid caster = ObjectGuid::Empty)
     {
-        Aura const* a = FindNamedAura(unit, name);
+        Aura const* a = FindNamedAura(unit, name, caster);
         if (!a) return 0;
         uint8 const s = a->GetStackAmount();
         return s ? s : 1;  // a present non-stacking aura counts as 1
@@ -1278,17 +1288,32 @@ namespace WowPsParty
         auto colon = cond.find(':');
         if (colon != std::string::npos)
         {
-            std::string const cname = cond.substr(0, colon);
-            std::string const arg   = cond.substr(colon + 1);
+            std::string cname     = cond.substr(0, colon);
+            std::string const arg = cond.substr(colon + 1);
+
+            // Optional "_my_aura" variants of every aura condition: rewrite the
+            // "my_aura" token back to "aura" and remember to filter the lookup to
+            // auras THIS bot cast. So `target_missing_my_aura:Moonfire` (and the
+            // has / remain / stacks / self_ / tank_ forms) only see our own copy —
+            // letting N same-class bots each stack their own per-caster
+            // debuff/HoT. The plain form (any caster) stays the default for auras
+            // that DON'T stack per-caster, so the user opts in per rule.
+            ObjectGuid auraCaster;   // empty = any caster
+            if (size_t mp = cname.find("my_aura"); mp != std::string::npos)
+            {
+                cname.erase(mp, 3);            // "my_aura" -> "aura"
+                auraCaster = bot->GetGUID();
+            }
+
             if (cname == "target_has_aura" || cname == "target_missing_aura")
             {
                 Unit* victim = theTarget();
                 if (!victim) return cname == "target_missing_aura"; // no target = no aura
-                bool const has = TargetHasNamedAura(victim, arg);
+                bool const has = TargetHasNamedAura(victim, arg, auraCaster);
                 return cname == "target_has_aura" ? has : !has;
             }
-            if (cname == "self_has_aura")     return TargetHasNamedAura(bot, arg);
-            if (cname == "self_missing_aura") return !TargetHasNamedAura(bot, arg);
+            if (cname == "self_has_aura")     return TargetHasNamedAura(bot, arg, auraCaster);
+            if (cname == "self_missing_aura") return !TargetHasNamedAura(bot, arg, auraCaster);
 
             // tank_has_aura / tank_missing_aura — check the party's TANK (role from
             // the Party Roster), so a healer can keep Earth Shield / Beacon / a HoT
@@ -1297,7 +1322,7 @@ namespace WowPsParty
             {
                 Player* tank = FindPartyMemberByRole(bot, "tank");
                 if (!tank) return false;
-                bool const has = TargetHasNamedAura(tank, arg);
+                bool const has = TargetHasNamedAura(tank, arg, auraCaster);
                 return cname == "tank_has_aura" ? has : !has;
             }
 
@@ -1327,7 +1352,7 @@ namespace WowPsParty
                 if (!unpackNameOpVal(n, op, sec)) return false;
                 Unit* u = (cname == "self_aura_remain") ? bot : theTarget();
                 if (!u) return op == '<';   // no target → "expiring/absent" true
-                int const remSec = NamedAuraRemainingMs(u, n) / 1000;
+                int const remSec = NamedAuraRemainingMs(u, n, auraCaster) / 1000;
                 return op == '<' ? (remSec < sec) : (remSec > sec);
             }
             if (cname == "target_aura_stacks" || cname == "self_aura_stacks")
@@ -1335,7 +1360,7 @@ namespace WowPsParty
                 std::string n; char op; int want;
                 if (!unpackNameOpVal(n, op, want)) return false;
                 Unit* u = (cname == "self_aura_stacks") ? bot : theTarget();
-                int const stacks = u ? int(NamedAuraStacks(u, n)) : 0;
+                int const stacks = u ? int(NamedAuraStacks(u, n, auraCaster)) : 0;
                 return op == '<' ? (stacks < want) : (stacks > want);
             }
             // "spell_cd_remain:Mortal Strike<2" — TRUE when MS will be off
