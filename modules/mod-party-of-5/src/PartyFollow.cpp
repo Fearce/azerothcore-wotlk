@@ -3031,6 +3031,12 @@ namespace WowPsParty
 
                 if (uint32 const mountSpell = ChooseBotMountSpell(follower, leaderFlying))
                 {
+                    // Self-heal a stuck state: a lingering SPELL_AURA_MOUNTED while
+                    // NOT mounted (a desync from an old Dismount-only path) makes the
+                    // cast just refresh the aura without mounting. Strip it first so
+                    // the cast applies a FRESH aura and actually mounts.
+                    if (follower->HasAuraType(SPELL_AURA_MOUNTED))
+                        follower->RemoveAurasByType(SPELL_AURA_MOUNTED);
                     follower->CastSpell(follower, mountSpell, true);
                     // Verbose-gated: once mounted the bot stays mounted (the
                     // TickRotation/AssistTarget mount guards keep mounted bots
@@ -3046,7 +3052,15 @@ namespace WowPsParty
             }
             else if (!leaderMounted && botMounted && !follower->IsInCombat() && !botCasting)
             {
-                follower->Dismount();
+                // Remove the mount AURA, not just call Dismount(). Dismount()
+                // clears the mounted flag but leaves SPELL_AURA_MOUNTED applied,
+                // so the NEXT mount cast only refreshes that lingering aura — its
+                // apply handler (which calls Mount()) never re-runs — and the bot
+                // reads as un-mounted, spams the cast, and never mounts again
+                // (Kevin: "heroes can only mount up once"). RemoveAurasByType runs
+                // the aura's OnRemove -> Dismount() and leaves a clean state.
+                follower->RemoveAurasByType(SPELL_AURA_MOUNTED);
+                follower->Dismount();   // belt-and-braces if a mount set the flag without an aura
             }
 
             // ---- Party leash ----------------------------------------------
