@@ -1251,6 +1251,26 @@ namespace WowPsParty
         if (!bot->IsValidAttackTarget(nearest)) return;
 
         bool const ok = bot->Attack(nearest, true);
+        if (!ok)
+        {
+            // We CAN'T actually attack this mob even though it passed
+            // IsValidAttackTarget — Unit::Attack rejects an EVADING creature (it
+            // aggroed but couldn't path to us across the corner/wall, so it reset),
+            // and a few flag/event states. Critically, the old code ignored this
+            // `ok` and MoveChased / MarkTankPulling'd anyway, locking the tank onto
+            // a mob it can NEVER engage and freezing the whole party holding fire —
+            // the "party waited around the corner instead of moving into LoS"
+            // report (an Utgarde Dragonflayer Forge Master evading at ~3y). Bail:
+            // the follow system walks the tank with the leader, and the instant the
+            // mob is attackable again (reset finished / now in reach) the lead
+            // resumes and pulls it. Re-armed each tick, so it self-corrects.
+            LOG_INFO("module",
+                "[WowPsParty TankLead] guid={} CANT-ATTACK mob_guid={} entry={} dist={:.1f} "
+                "(evading/immune) — bailing, NOT holding the party",
+                bot->GetGUID().GetCounter(), nearest->GetGUID().GetCounter(),
+                nearest->GetEntry(), bot->GetDistance(nearest));
+            return;
+        }
         bot->SetFacingToObject(nearest);
 
         // Ranged pull: a tank that can open from range doesn't charge into the
