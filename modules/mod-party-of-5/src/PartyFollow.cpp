@@ -76,6 +76,12 @@
 #include <utility>
 #include <vector>
 
+// Defined in PartyHooks.cpp (global scope, same symbol the Spell.cpp skinning
+// patch calls): finish a party-killed corpse's leftover normal loot and flag it
+// UNIT_FLAG_SKINNABLE. Our bots leave corpse loot unfinished, so the engine
+// usually never sets that flag — without this a bot skinner finds nothing to skin.
+bool WowPsParty_ForceSkinReady(Player* skinner, Creature* creature);
+
 namespace WowPsParty
 {
     bool IsLogVerbose();   // from PartyBootstrap.cpp
@@ -95,17 +101,24 @@ namespace WowPsParty
             float _range;
         };
 
-        // Predicate for the grid searcher: any dead, currently-skinnable corpse
-        // within range. The per-bot skill/level gate happens in the caller.
+        // Predicate for the grid searcher: a dead, skinnable-TYPE corpse within
+        // range that the party killed. We deliberately do NOT require the engine's
+        // UNIT_FLAG_SKINNABLE here — our bots leave corpse loot unfinished, so that
+        // flag is usually never set, and gating on it meant bots never skinned
+        // anything. A genuine party kill (loot recipient/group set) is force-flagged
+        // at harvest. The per-bot skill/level gate happens in the caller.
         struct NearbySkinnableCheck
         {
             NearbySkinnableCheck(WorldObject const* src, float range)
                 : _src(src), _range(range) {}
             bool operator()(Creature* c) const
             {
-                return c && !c->IsAlive()
-                    && c->HasUnitFlag(UNIT_FLAG_SKINNABLE)
-                    && _src->IsWithinDist(c, _range, false);
+                if (!c || c->IsAlive() || !_src->IsWithinDist(c, _range, false))
+                    return false;
+                CreatureTemplate const* tmpl = c->GetCreatureTemplate();
+                if (!tmpl || tmpl->SkinLootId == 0) return false;   // not a skinnable beast
+                return c->HasUnitFlag(UNIT_FLAG_SKINNABLE)
+                    || c->GetLootRecipient() || c->GetLootRecipientGroup();
             }
             WorldObject const* _src;
             float _range;
@@ -1411,14 +1424,16 @@ namespace WowPsParty
     // henchmen are temporary combat companions and are skipped. There's no
     // toggle: training the profession IS the opt-in.
 
-    static constexpr float GATHER_SCAN_RANGE = 50.0f;  // node search radius — spot ore/herbs/corpses a good way off
-    static constexpr float GATHER_REACH      = 11.0f;  // interaction distance — long reach so bots harvest without walking on top of the node
-    static constexpr float GATHER_LEADER_LEASH = 75.0f; // pursue a node up to here from the leader; past it, abandon + catch up.
-                                                        // MUST exceed SCAN_RANGE plus the bot's ~10y follow offset (a node 50y from the
-                                                        // bot is ~60y from the leader) PLUS slack for the leader drifting during the
-                                                        // walk — otherwise the bot crosses the leash mid-approach and abandons a node
-                                                        // it could have reached ("runs back and forth, never harvests"). Still well
-                                                        // under the 100y follow-leash hard teleport.
+    // The leash and the scan range are deliberately EQUAL (Kevin: "make the gather
+    // range the same as the leash range"): a node the bot can SEE is one it's
+    // allowed to reach. The leash now only gates STARTING a new detour — once the
+    // bot commits to a node it finishes it (commit-and-complete), so it never walks
+    // halfway to a herb and then turns around. The only thing that interrupts a
+    // committed gather is the 100y follow-teleport, which clears the node (so the
+    // bot re-scans fresh at the leader rather than walking back out).
+    static constexpr float GATHER_LEADER_LEASH = 75.0f; // only START a new gather within this of the leader
+    static constexpr float GATHER_SCAN_RANGE   = GATHER_LEADER_LEASH; // node search radius == leash range
+    static constexpr float GATHER_REACH        = 11.0f;  // interaction distance — long reach so bots harvest without walking on top of the node
     static constexpr uint32 GATHER_APPROACH_TIMEOUT_MS = 6000; // give up if stuck
     static constexpr uint32 GATHER_AVOID_MS = 30000;   // ignore an unreachable node
 
@@ -1449,6 +1464,16 @@ namespace WowPsParty
         std::lock_guard<std::mutex> lock(g_gatherMutex);
         auto it = g_gather.find(botLow);
         return it != g_gather.end() && it->second.node;
+    }
+
+    // Drop a bot's committed gather node. Called when the >100y follow teleport
+    // yanks the bot back to the leader, so it doesn't immediately walk back out to
+    // the now-distant node and re-trigger the teleport — it re-scans fresh instead.
+    static void ClearGatherNode(uint32 botLow)
+    {
+        std::lock_guard<std::mutex> lock(g_gatherMutex);
+        auto it = g_gather.find(botLow);
+        if (it != g_gather.end()) { it->second.node = ObjectGuid::Empty; it->second.commitMs = 0; }
     }
 
     // If `go` is a mining/herb node, return its profession skill + required
@@ -1701,8 +1726,9 @@ namespace WowPsParty
     static bool IsSkinnableBy(Player* bot, Creature* c)
     {
         if (!c || c->IsAlive()) return false;
-        if (!c->HasUnitFlag(UNIT_FLAG_SKINNABLE)) return false;
-        uint32 const skill = c->GetCreatureTemplate()->GetRequiredLootSkill();
+        CreatureTemplate const* tmpl = c->GetCreatureTemplate();
+        if (!tmpl || tmpl->SkinLootId == 0) return false;   // not a skinnable beast
+        uint32 const skill = tmpl->GetRequiredLootSkill();
         if (!bot->HasSkill(skill)) return false;
         // Engine cast gate (Spell::CheckCast, skinning): the required value keys
         // off the bot's CURRENT skill, not the corpse-level bands above.
@@ -1710,7 +1736,11 @@ namespace WowPsParty
         int32 const level      = c->GetLevel();
         int32 const reqValue   = (skillValue < 100) ? (level - 10) * 10 : level * 5;
         if (reqValue > skillValue) return false;
-        return true;
+        // Ready if the engine already flagged it, OR it's a genuine party kill we
+        // can force ready at harvest time (our bots leave corpse loot unfinished,
+        // so the flag is usually never set — see WowPsParty_ForceSkinReady).
+        if (c->HasUnitFlag(UNIT_FLAG_SKINNABLE)) return true;
+        return c->GetLootRecipient() || c->GetLootRecipientGroup();
     }
 
     static Creature* FindNearestSkinnable(Player* bot, float range, ObjectGuid avoid)
@@ -1738,6 +1768,13 @@ namespace WowPsParty
     // hard-return from UpdateAI, so the default loot AI never runs for them.
     static void SkinCorpse(Player* bot, Creature* c)
     {
+        // The engine usually never set UNIT_FLAG_SKINNABLE for us (bots leave
+        // corpse loot unfinished), so finish the leftover loot + flag it exactly
+        // like the human skinning-cast patch does. Bail if it isn't a real party
+        // kill — IsSkinnableBy already vetted skill/level, this is the final gate.
+        if (!c->HasUnitFlag(UNIT_FLAG_SKINNABLE) && !WowPsParty_ForceSkinReady(bot, c))
+            return;
+
         uint32 const skill = c->GetCreatureTemplate()->GetRequiredLootSkill();
         int32 const reqValue = CorpseSkinReq(c->GetLevel());
 
@@ -1852,23 +1889,6 @@ namespace WowPsParty
         Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
         if (!leader || !leader->IsInWorld()) { GatherLog(gLow, "skip: leader not in world"); return; }
         if (leader->GetMapId() != bot->GetMapId()) { GatherLog(gLow, "skip: leader other map"); return; }
-        // Too far from the leader to keep chasing a node — drop the COMMITMENT so
-        // the follow leash (which yields while a gather is in progress) can reel
-        // the bot back in; without clearing the node the follow yield + this skip
-        // would deadlock the bot out past the leash. NOTE: do NOT avoid-list it —
-        // the node is perfectly reachable, we just lagged; blocking it for 30s was
-        // why a bot would run to a node, get pulled back, and then refuse to ever
-        // grab it once the leader stopped right next to it. The 6s approach-timeout
-        // below still avoid-lists nodes that are genuinely unreachable (geometry).
-        if (bot->GetDistance(leader) > GATHER_LEADER_LEASH)
-        {
-            std::lock_guard<std::mutex> lock(g_gatherMutex);
-            auto& st = g_gather[gLow];
-            st.node     = ObjectGuid::Empty;
-            st.commitMs = 0;
-            GatherLog(gLow, "skip: lagging leader (>leash) — dropped node, catching up");
-            return;
-        }
 
         // Read this bot's committed node + avoid entry.
         ObjectGuid committed, avoid;
@@ -1880,6 +1900,19 @@ namespace WowPsParty
             commitMs  = st.commitMs;
             avoid     = st.avoid;
             avoidUntil = st.avoidUntil;
+        }
+
+        // Commit-and-complete: only START a new gather while within leash of the
+        // leader. If we've fallen behind with NO node committed yet, catch up
+        // instead of peeling off — the follow leash reels us in. But a node we've
+        // ALREADY committed to is pursued to completion regardless of the leash,
+        // so the bot never walks halfway to a herb and then turns around. The only
+        // interrupt for a committed gather is the >100y follow teleport, which
+        // clears the node (ClearGatherNode) so there's no walk-back.
+        if (!committed && bot->GetDistance(leader) > GATHER_LEADER_LEASH)
+        {
+            GatherLog(gLow, "skip: lagging leader, not starting a new gather — catching up");
+            return;
         }
 
         WorldObject* target = ResolveHarvest(bot, committed);
@@ -3234,6 +3267,10 @@ namespace WowPsParty
                         follower->SetStandState(UNIT_STAND_STATE_STAND);
                     follower->GetMotionMaster()->Clear();
                     follower->StopMoving();
+                    // Drop any committed gather node: after the blink the node is
+                    // far behind, and re-walking to it would just re-trip this
+                    // teleport. Re-scan fresh at the leader instead.
+                    ClearGatherNode(d.followerGuid.GetCounter());
                     follower->TeleportTo(leader->GetMapId(),
                         leader->GetPositionX(), leader->GetPositionY(),
                         leader->GetPositionZ(), leader->GetOrientation());
@@ -3243,10 +3280,10 @@ namespace WowPsParty
                     return true;
                 }
                 // A bot walking to a gather node may legitimately pass 50y; let it
-                // finish rather than reeling it straight back (the gather leash
-                // abandons the node past 55y, after which this fires normally). The
-                // >100y hard teleport above is unconditional, so a gather can never
-                // strand a bot.
+                // finish rather than reeling it straight back — commit-and-complete
+                // keeps the node until it's harvested, so the only thing that ever
+                // interrupts the approach is the >100y hard teleport above (which
+                // clears the node). A gather can never strand a bot.
                 if (leaderDist > 50.0f
                     && !BotIsApproachingGatherNode(d.followerGuid.GetCounter()))
                 {
