@@ -107,6 +107,46 @@ namespace WowPsParty
         } while (hadNew);
         return learned;
     }
+
+    // Class-quest abilities: things a class normally earns from a one-off class
+    // QUEST rather than a trainer, so CanTeachSpell / LearnAllClassSpells never
+    // grant them. Bots don't run quests — a bot druid would reach max level with
+    // no Bear Form. Teach them by level instead. Trainer upgrades (e.g. Dire Bear
+    // Form) are already covered by LearnAllClassSpells; only the quest-gated base
+    // abilities live here. Spell ids are the stable 3.3.5a class-quest rewards.
+    struct ClassQuestSkill { uint8 cls; uint32 spell; uint8 minLevel; };
+    static ClassQuestSkill const kClassQuestSkills[] =
+    {
+        { CLASS_DRUID,    5487, 10 },  // Bear Form
+        { CLASS_DRUID,    1066, 16 },  // Aquatic Form
+        { CLASS_DRUID,     783, 16 },  // Travel Form
+        { CLASS_DRUID,     768, 20 },  // Cat Form
+        { CLASS_WARLOCK,   697, 10 },  // Summon Voidwalker
+        { CLASS_WARLOCK,   712, 20 },  // Summon Succubus
+        { CLASS_WARLOCK,   691, 30 },  // Summon Felhunter
+        { CLASS_PALADIN, 13819, 40 },  // Summon Warhorse
+        { CLASS_PALADIN, 23214, 60 },  // Summon Charger
+    };
+
+    uint32 LearnClassQuestSkills(Player* p)
+    {
+        if (!p) return 0;
+        uint8 const cls = p->getClass();
+        uint8 const lvl = p->GetLevel();
+        uint32 learned = 0;
+        for (ClassQuestSkill const& q : kClassQuestSkills)
+        {
+            if (q.cls != cls || lvl < q.minLevel) continue;
+            if (p->HasSpell(q.spell)) continue;
+            if (!sSpellMgr->GetSpellInfo(q.spell)) continue;  // absent on this build
+            p->learnSpell(q.spell, false);
+            ++learned;
+            LOG_INFO("module",
+                "[WowPsParty] taught class-quest spell {} to {} (class {}, level {})",
+                q.spell, p->GetName(), uint32(cls), uint32(lvl));
+        }
+        return learned;
+    }
 }
 
 namespace
@@ -311,7 +351,7 @@ public:
             knownChains.insert(root ? root : kv.first);
         }
 
-        uint32 const n = LearnAllClassSpells(player);
+        uint32 const n = LearnAllClassSpells(player) + LearnClassQuestSkills(player);
         if (!n) return;
 
         // Collect names of the new abilities (new chain-roots, active + shown).

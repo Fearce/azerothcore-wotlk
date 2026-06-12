@@ -714,7 +714,8 @@ public:
                 continue;
             }
 
-            uint32 const learned = WowPsParty::LearnAllClassSpells(p);
+            uint32 const learned = WowPsParty::LearnAllClassSpells(p)
+                                 + WowPsParty::LearnClassQuestSkills(p);
 
             handler->PSendSysMessage(
                 "  |cffaaaaff[{}]|r {} ({}) — learned {} new spell(s).",

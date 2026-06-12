@@ -514,7 +514,7 @@ namespace WowPsParty
                     add("always", "buff_self:Devotion Aura", 44);
                     add("always", "buff_self:Seal of Wisdom", 42);
                     // Filler at near-full mana — conserve for healing.
-                    add("self_mana>88&has_target", "cast:Judgement of Light", 30);
+                    add("self_mana>50&has_target", "cast:Judgement of Light", 30);
                 }
                 else if (isTank)
                 {
@@ -701,8 +701,8 @@ namespace WowPsParty
                     add("always", "cast_party_missing:Power Word: Fortitude", 44);
 
                     // Filler DPS ONLY at near-full mana — conserve mana for healing.
-                    add("self_mana>88&target_missing_aura:Shadow Word: Pain", "cast:Shadow Word: Pain", 34);
-                    add("self_mana>88&has_target", "cast:Smite", 30);
+                    add("self_mana>50&target_missing_aura:Shadow Word: Pain", "cast:Shadow Word: Pain", 34);
+                    add("self_mana>50&has_target", "cast:Smite", 30);
                     // Free filler when there's nothing else to do (no heal needed,
                     // mana too low to Smite): wand the engaged mob. Costs no mana,
                     // so no gate — lowest priority, only fires if everything above
@@ -801,8 +801,8 @@ namespace WowPsParty
 
                     // Mana shield + buff + filler.
                     add("always", "buff_self:Water Shield", 44);   // mana-return shield
-                    add("self_mana>88&target_missing_aura:Flame Shock", "cast:Flame Shock", 34);
-                    add("self_mana>88&has_target", "cast:Lightning Bolt", 30);
+                    add("self_mana>50&target_missing_aura:Flame Shock", "cast:Flame Shock", 34);
+                    add("self_mana>50&has_target", "cast:Lightning Bolt", 30);
                 }
                 else
                 {
@@ -914,8 +914,8 @@ namespace WowPsParty
 
                     // Buff + filler.
                     add("always", "cast_party_missing:Mark of the Wild", 44);
-                    add("self_mana>88&target_missing_aura:Moonfire", "cast:Moonfire", 32);
-                    add("self_mana>88&has_target", "cast:Wrath", 28);
+                    add("self_mana>50&target_missing_aura:Moonfire", "cast:Moonfire", 32);
+                    add("self_mana>50&has_target", "cast:Wrath", 28);
                 }
                 else if (isTank)
                 {
@@ -1388,6 +1388,12 @@ namespace WowPsParty
         if (cls == CLASS_WARLOCK && sPlayerbotsMgr.GetPlayerbotAI(bot))
             TrimSoulShardsToOne(bot, nullptr);
         MaintainAmmo(bot);   // any class that wields a bow/gun/thrown benefits
+
+        // Backfill class-QUEST abilities (druid forms, warlock pets, paladin
+        // mounts). Bots never run the class quests, so a hired druid henchman
+        // arrives with no Bear Form; LearnAllClassSpells (trainer set) won't cover
+        // it. HasSpell-gated, so this is a no-op once taught.
+        WowPsParty::LearnClassQuestSkills(bot);
     }
 
     bool HireHenchman(Player* requester, uint32 candidateGuid,

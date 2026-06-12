@@ -182,6 +182,14 @@ namespace WowPsParty
     // newly learned. Used by the .party learnall command AND the on-level-up
     // hook so the party never has to visit a trainer. Talents are untouched.
     uint32 LearnAllClassSpells(Player* p);
+
+    // Teach `p` the class-QUEST abilities it qualifies for at its current level —
+    // druid forms, warlock pet summons, paladin mounts. These come from one-off
+    // class quests, not the trainer, so LearnAllClassSpells never grants them and
+    // a bot (which never quests) would sit at max level with no Bear Form. Idempotent
+    // (HasSpell-gated). Returns the number newly learned. Called from the bot tick,
+    // the on-ding hook, .party learnall, and active-char login.
+    uint32 LearnClassQuestSkills(Player* p);
 }
 
 #define sPartyMgr WowPsParty::PartyMgr::Instance()

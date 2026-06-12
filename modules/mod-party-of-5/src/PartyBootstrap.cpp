@@ -161,6 +161,11 @@ public:
         if (sPlayerbotsMgr.GetPlayerbotAI(player))
             return;
 
+        // Backfill class-quest abilities the human's own char missed (e.g. a druid
+        // that never did the Bear Form quest). Bots get this on the maintenance
+        // tick; the controlled char isn't a bot, so catch it here at login.
+        WowPsParty::LearnClassQuestSkills(player);
+
         uint32 const guid = player->GetGUID().GetCounter();
         std::optional<uint8> const slot = sPartyMgr.GetSlotForGuid(guid);
 
