@@ -1009,11 +1009,13 @@ namespace WowPsParty
         g_lastSpreadMs[guidLow] = nowMs;
     }
 
-    // Human-tank wait-gate timeout: a DPS bot holds off a mob until the tank has
-    // it, but for at most this long PER MOB — so a mob the tank can't reach (a
-    // ranged caster on the healer) is eventually peeled instead of ignored. The
-    // timer resets when the held mob changes.
-    static constexpr uint32 TANK_LEAD_WAIT_MAX_MS = 4000;
+    // Human-tank wait-gate timeout: a DPS bot holds off a mob (one on itself from
+    // an out-of-combat wander, or on a non-tank ally) until the tank takes it, but
+    // for at most this long PER MOB — so a mob the tank can't reach (a ranged
+    // caster on the healer) is eventually peeled instead of ignored. Generous so
+    // the human reliably establishes threat first; a low-HP escape (see the
+    // throttle) still lets a bot defend itself before dying. Resets per held mob.
+    static constexpr uint32 TANK_LEAD_WAIT_MAX_MS = 8000;
     static std::unordered_map<uint32, std::pair<uint32, uint32>> g_tankLeadWait;  // botLow -> (mobLow, sinceMs)
     static std::mutex g_tankLeadWaitMutex;
     static bool TankLeadWaitStillHolding(uint32 botLow, uint32 mobLow, uint32 nowMs)
@@ -2457,12 +2459,14 @@ namespace WowPsParty
         // the rotation casts on GetVictim()) so the tank can rebuild a lead, then
         // resumes. This auto-scales (no fixed timer) and protects the tank the
         // WHOLE fight, not just the opening (Kevin: "base it on the actual threat").
-        //   * mob on the bot ITSELF  -> fight back (self-defence, never throttle);
         //   * mob on the TANK        -> throttle on the threat ratio above;
-        //   * mob on a non-tank ally / nobody -> hold until the tank grabs it, but
-        //                               at most TANK_LEAD_WAIT_MAX_MS so a mob the
-        //                               tank can't reach (a ranged caster on the
-        //                               healer) still gets peeled.
+        //   * mob on the bot ITSELF or a non-tank ally / nobody -> HOLD so the human
+        //                               can taunt it onto the tank first, for at most
+        //                               TANK_LEAD_WAIT_MAX_MS (a mob the tank can't
+        //                               reach still gets peeled), with a low-HP escape
+        //                               so a bot patiently holding never dies for it.
+        // Holding a mob that aggroed the bot out of combat is the fix for "an enemy
+        // wanders in and the bot engages before I have threat".
         // Tanks/healers are unaffected.
         {
             std::string const myRole = RoleForGuid(bot->GetGUID());
@@ -2471,13 +2475,13 @@ namespace WowPsParty
                 && GetWaitTankThreat(bot->GetGUID()))   // editor toggle: OFF -> blast like before
             {
                 bool release;
-                if (desired->GetVictim() == bot)
-                    release = true;                              // on us -> self-defence
-                else if (MobOnTank(bot, desired, leader))
+                if (MobOnTank(bot, desired, leader))
                     release = !BotOverThreatVsTank(bot, desired);   // tank has it -> hold only if we're near its threat
+                else if (desired->GetVictim() == bot && bot->GetHealthPct() < 40.0f)
+                    release = true;                                 // it's on us AND we're getting low -> defend self
                 else
                     release = !TankLeadWaitStillHolding(
-                        gLow, desired->GetGUID().GetCounter(), getMSTime());  // not on tank yet -> hold w/ timeout
+                        gLow, desired->GetGUID().GetCounter(), getMSTime());  // hold for the tank, peel after the cap
                 if (!release)
                 {
                     if (bot->GetVictim()) bot->AttackStop();
