@@ -27,6 +27,7 @@
 #include "Group.h"
 #include "GroupMgr.h"
 #include "InstanceSaveMgr.h"
+#include "Map.h"   // [WowPsParty] INSTANCE_RESET_ALL for the party-of-5 re-queue reset
 #include "LFGGroupData.h"
 #include "LFGPlayerData.h"
 #include "LFGQueue.h"
@@ -652,6 +653,33 @@ namespace lfg
                 LOG_INFO("module",
                     "[WowPsParty LFG] cleared stale LFG state on {}'s party (recorded dungeon={}) so it can queue",
                     player->GetName(), recordedDungeon);
+            }
+        }
+
+        // [WowPsParty] A persistent party-of-5 keeps its party across runs — the
+        // teleport-out revert turns it back into a NORMAL group instead of
+        // disbanding — so its members stay SOFT-BOUND to the just-finished dungeon
+        // instance. Re-queueing a SPECIFIC dungeon then drops them straight back
+        // into the dead run (bosses already killed), forcing a costly party rebuild
+        // + henchman re-hire. So when such a party (a non-LFG group that still holds
+        // managed bots) queues, RESET its normal-5-man instances first — that
+        // unbinds the whole party (Group::ResetInstances → UnbindAllFor) so the next
+        // run spawns FRESH. No-op when nothing is bound; ResetInstances early-returns
+        // for an LFG group (an active run) and itself skips an instance that still
+        // has players inside, so a mid-run re-queue is untouched.
+        if (grp && !grp->isLFGGroup())
+        {
+            bool hasBot = false;
+            for (GroupReference* itr = grp->GetFirstMember(); itr && !hasBot; itr = itr->next())
+                if (Player* m = itr->GetSource())
+                    if (WowPsParty_BotHasActiveFollowDirective_Trampoline(m->GetGUID()))
+                        hasBot = true;
+            if (hasBot)
+            {
+                grp->ResetInstances(INSTANCE_RESET_ALL, false, player);
+                LOG_INFO("module",
+                    "[WowPsParty LFG] party-of-5 {} re-queuing — reset its normal instances so the next run is fresh",
+                    player->GetName());
             }
         }
 
