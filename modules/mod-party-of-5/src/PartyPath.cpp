@@ -32,6 +32,7 @@ namespace WowPsParty
         {
             ObjectGuid       player;
             uint32           mapId      = 0;
+            uint32           areaId     = 0;   // recorder's area at start — the wing key
             uint32           accumMs    = 0;
             std::vector<Vec3> buffer;
             float            lastHeading = 0.0f;   // heading into the last recorded waypoint
@@ -42,10 +43,14 @@ namespace WowPsParty
         static std::mutex                                           g_recMutex;
         static std::unordered_map<uint32, RecordingState>           g_recording;
 
-        // Path cache: mapId -> ordered waypoint list. Loaded lazily; invalidated
-        // when the path for a map is updated or cleared.
+        // Path cache: mapId -> the recorded paths on that map. A multi-wing dungeon
+        // (Scarlet Monastery x4, Dire Maul x3) puts several wings on ONE map id, so
+        // we store one path PER WING keyed by the recorder's area; playback picks
+        // the wing whose waypoints are nearest the leader. Loaded lazily; invalidated
+        // when a map's paths are updated or cleared.
+        struct PathGroup { uint32 area = 0; std::vector<Vec3> pts; };
         static std::mutex                                           g_pathCacheMutex;
-        static std::unordered_map<uint32, std::vector<Vec3>>        g_pathCache;
+        static std::unordered_map<uint32, std::vector<PathGroup>>   g_pathCache;
         static std::unordered_map<uint32, bool>                     g_pathCacheLoaded;
 
         // Per-bot tank-playback cursor: which waypoint index we last advanced
@@ -101,28 +106,62 @@ namespace WowPsParty
             return std::sqrt(dx*dx + dy*dy + dz*dz);
         }
 
-        static std::vector<Vec3> const& EnsurePath(uint32 mapId)
+        static std::vector<PathGroup> const& EnsureGroups(uint32 mapId)
         {
             std::lock_guard<std::mutex> lock(g_pathCacheMutex);
             auto& loaded = g_pathCacheLoaded[mapId];
             if (loaded) return g_pathCache[mapId];
 
-            auto& vec = g_pathCache[mapId];
-            vec.clear();
+            auto& groups = g_pathCache[mapId];
+            groups.clear();
+            // ORDER BY area_id, sequence so consecutive same-area rows form one wing.
             QueryResult q = CharacterDatabase.Query(
-                "SELECT `x`,`y`,`z`,`orientation` FROM `dungeon_path` "
-                "WHERE `map_id` = {} ORDER BY `sequence`", mapId);
+                "SELECT `area_id`,`x`,`y`,`z`,`orientation` FROM `dungeon_path` "
+                "WHERE `map_id` = {} ORDER BY `area_id`, `sequence`", mapId);
             if (q)
             {
                 do
                 {
                     Field* f = q->Fetch();
-                    vec.push_back({ f[0].Get<float>(), f[1].Get<float>(),
-                                    f[2].Get<float>(), f[3].Get<float>() });
+                    uint32 const area = f[0].Get<uint32>();
+                    if (groups.empty() || groups.back().area != area)
+                        groups.push_back(PathGroup{ area, {} });
+                    groups.back().pts.push_back({ f[1].Get<float>(), f[2].Get<float>(),
+                                                  f[3].Get<float>(), f[4].Get<float>() });
                 } while (q->NextRow());
             }
             loaded = true;
-            return vec;
+            return groups;
+        }
+
+        // Pick the recorded path whose NEAREST waypoint to the leader is closest —
+        // the wing the party is actually in. Returns an empty path (so the tank
+        // doesn't lead) if even the closest is far away — a different wing or no
+        // recording here — so the tank never walks the wrong wing's route.
+        // WING_SELECT_MAX_DIST sits far below the ~1000y gap between Scarlet
+        // Monastery / Dire Maul wings, yet generous enough to cover a leader briefly
+        // off the recorded line.
+        static constexpr float WING_SELECT_MAX_DIST = 250.0f;
+        static std::vector<Vec3> const& SelectPathForLeader(uint32 mapId, Player* leader)
+        {
+            static std::vector<Vec3> const empty;
+            std::vector<PathGroup> const& groups = EnsureGroups(mapId);
+            if (!leader || groups.empty()) return empty;
+            float const lx = leader->GetPositionX(), ly = leader->GetPositionY(),
+                        lz = leader->GetPositionZ();
+            std::vector<Vec3> const* best = nullptr;
+            float bestD = WING_SELECT_MAX_DIST;
+            for (PathGroup const& g : groups)
+            {
+                float groupNear = std::numeric_limits<float>::max();
+                for (Vec3 const& w : g.pts)
+                {
+                    float const d = Dist3D(lx, ly, lz, w.x, w.y, w.z);
+                    if (d < groupNear) groupNear = d;
+                }
+                if (groupNear < bestD) { bestD = groupNear; best = &g.pts; }
+            }
+            return best ? *best : empty;
         }
 
         static void InvalidatePathCache(uint32 mapId)
@@ -132,18 +171,22 @@ namespace WowPsParty
             g_pathCacheLoaded[mapId] = false;
         }
 
-        static void PersistPath(uint32 mapId, std::vector<Vec3> const& points, uint32 recordedBy)
+        static void PersistPath(uint32 mapId, uint32 areaId,
+                                std::vector<Vec3> const& points, uint32 recordedBy)
         {
             CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
-            tx->Append("DELETE FROM `dungeon_path` WHERE `map_id` = {}", mapId);
+            // Replace only THIS wing's path (same map + area), leaving the other
+            // wings of a shared-map dungeon intact.
+            tx->Append("DELETE FROM `dungeon_path` WHERE `map_id` = {} AND `area_id` = {}",
+                       mapId, areaId);
             for (uint32 i = 0; i < points.size(); ++i)
             {
                 Vec3 const& p = points[i];
                 tx->Append(
                     "INSERT INTO `dungeon_path` "
-                    "(`map_id`,`sequence`,`x`,`y`,`z`,`orientation`,`recorded_by`) "
-                    "VALUES ({}, {}, {}, {}, {}, {}, {})",
-                    mapId, i, p.x, p.y, p.z, p.o, recordedBy);
+                    "(`map_id`,`area_id`,`sequence`,`x`,`y`,`z`,`orientation`,`recorded_by`) "
+                    "VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+                    mapId, areaId, i, p.x, p.y, p.z, p.o, recordedBy);
             }
             CharacterDatabase.CommitTransaction(tx);
             InvalidatePathCache(mapId);
@@ -239,6 +282,7 @@ namespace WowPsParty
             RecordingState st;
             st.player = player->GetGUID();
             st.mapId  = mapId;
+            st.areaId = player->GetAreaId();   // distinguishes wings of a shared-map dungeon
             st.buffer.push_back({ player->GetPositionX(), player->GetPositionY(),
                                    player->GetPositionZ(), player->GetOrientation() });
             g_recording[guidLow] = std::move(st);
@@ -258,10 +302,10 @@ namespace WowPsParty
 
         if (!st.buffer.empty())
         {
-            PersistPath(st.mapId, st.buffer, guidLow);
+            PersistPath(st.mapId, st.areaId, st.buffer, guidLow);
             ChatHandler(player->GetSession()).PSendSysMessage(
-                "|cff66ccff[WowPsParty]|r Saved {} waypoint(s) for map {}.",
-                uint32(st.buffer.size()), st.mapId);
+                "|cff66ccff[WowPsParty]|r Saved {} waypoint(s) for map {} (wing area {}).",
+                uint32(st.buffer.size()), st.mapId, st.areaId);
         }
         ApplyGhostMode(player, false);
         return false;
@@ -356,17 +400,54 @@ namespace WowPsParty
         }
     }
 
-    void ClearPath(uint32 mapId)
+    // Clear only the WING the clearer is standing in (the recorded path nearest
+    // them), so clearing SM Library doesn't wipe the other three wings. Returns the
+    // number of waypoints removed (0 = nothing recorded near them). The nearest-wing
+    // pick mirrors SelectPathForLeader, so it also catches legacy area_id=0 rows.
+    uint32 ClearPath(uint32 mapId, Player* clearer)
     {
+        uint32 area = 0, removed = 0;
+        bool haveArea = false;
+        std::vector<PathGroup> const& groups = EnsureGroups(mapId);
+        if (clearer)
+        {
+            float const lx = clearer->GetPositionX(), ly = clearer->GetPositionY(),
+                        lz = clearer->GetPositionZ();
+            float bestD = WING_SELECT_MAX_DIST;
+            for (PathGroup const& g : groups)
+            {
+                float groupNear = std::numeric_limits<float>::max();
+                for (Vec3 const& w : g.pts)
+                {
+                    float const d = Dist3D(lx, ly, lz, w.x, w.y, w.z);
+                    if (d < groupNear) groupNear = d;
+                }
+                if (groupNear < bestD)
+                { bestD = groupNear; area = g.area; removed = uint32(g.pts.size()); haveArea = true; }
+            }
+        }
+        if (!haveArea) return 0;   // no recorded path near the clearer -> nothing to clear
         CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
-        tx->Append("DELETE FROM `dungeon_path` WHERE `map_id` = {}", mapId);
+        tx->Append("DELETE FROM `dungeon_path` WHERE `map_id` = {} AND `area_id` = {}", mapId, area);
         CharacterDatabase.CommitTransaction(tx);
         InvalidatePathCache(mapId);
+        return removed;
     }
 
     uint32 GetPathWaypointCount(uint32 mapId)
     {
-        return uint32(EnsurePath(mapId).size());
+        uint32 n = 0;
+        for (auto const& g : EnsureGroups(mapId)) n += uint32(g.pts.size());
+        return n;   // total across all wings — a coarse "is anything recorded here" gate
+    }
+
+    // True if a recorded path exists for the WING the leader is in (the same
+    // proximity test playback uses). Lets the lead-tank gate match TankFollowPath:
+    // suppress MoveFollow only when this tank will actually path-follow, else a
+    // partially-recorded multi-wing dungeon would strand it (no path AND no follow).
+    bool HasPathForLeader(uint32 mapId, Player* leader)
+    {
+        return SelectPathForLeader(mapId, leader).size() >= 2;
     }
 
     void TankFollowPath(Player* bot)
@@ -398,9 +479,11 @@ namespace WowPsParty
         if (!leader->GetMap() || !leader->GetMap()->IsDungeon()) { tlog("skip: leader not in dungeon"); return; }
         if (leader->IsInCombat()) { tlog("skip: leader in combat"); return; }
 
-        // Don't lead if the path doesn't exist for this dungeon.
-        auto const& path = EnsurePath(bot->GetMapId());
-        if (path.size() < 2) { tlog("skip: no path for this map (<2 wp)"); return; }
+        // Pick the recorded path for the WING the leader is actually in (multi-wing
+        // dungeons share a map id). Empty -> no recording near the leader -> don't
+        // lead (and never walk another wing's route).
+        auto const& path = SelectPathForLeader(bot->GetMapId(), leader);
+        if (path.size() < 2) { tlog("skip: no recorded path for this wing (<2 wp)"); return; }
 
         // Leash check.
         if (bot->GetDistance(leader) > TANK_LEASH)

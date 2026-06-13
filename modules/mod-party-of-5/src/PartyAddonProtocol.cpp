@@ -2856,10 +2856,14 @@ public:
         {
             if (player->GetMap() && player->GetMap()->IsDungeon())
             {
-                uint32 const mapId = player->GetMapId();
-                WowPsParty::ClearPath(mapId);
-                ChatHandler(player->GetSession()).PSendSysMessage(
-                    "|cff66ccff[WowPsParty]|r Cleared dungeon path for map {}.", mapId);
+                uint32 const mapId   = player->GetMapId();
+                uint32 const removed = WowPsParty::ClearPath(mapId, player);
+                if (removed)
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cff66ccff[WowPsParty]|r Cleared this wing's path ({} waypoints).", removed);
+                else
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cffff5555[WowPsParty]|r No recorded path here to clear.");
             }
             else
             {

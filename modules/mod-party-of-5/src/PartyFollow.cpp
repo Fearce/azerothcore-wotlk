@@ -3562,10 +3562,12 @@ namespace WowPsParty
             // humanize tick disabled for it (eligible already false).
             if (isLeadTank)
             {
-                // If the dungeon has a recorded path, the path-follow ticker
-                // drives the tank's motion. Skip MoveFollow so the two systems
-                // don't fight each other on every tick.
-                if (WowPsParty::GetPathWaypointCount(leader->GetMapId()) >= 2)
+                // If THIS WING has a recorded path, the path-follow ticker drives
+                // the tank's motion — skip MoveFollow so the two don't fight. Must
+                // be leader-WING-aware (not just "any path on the map"): in an
+                // un-recorded wing of a multi-wing dungeon the path ticker bails, so
+                // MoveFollow has to run or the tank is stranded.
+                if (WowPsParty::HasPathForLeader(leader->GetMapId(), leader))
                     return true;
                 // MoveFollow's angle is relative to the leader's facing: 0 =
                 // directly in front, M_PI = directly behind. The lead tank must

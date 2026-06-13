@@ -6,7 +6,10 @@
  * walks that path automatically — so they actually navigate the corridor
  * the way you taught them, not just stand 12y in front of you.
  *
- * Storage:  dungeon_path(map_id, sequence, x, y, z, orientation)
+ * Storage:  dungeon_path(map_id, area_id, sequence, x, y, z, orientation)
+ *   area_id keys the recording to a WING: multi-wing dungeons (Scarlet Monastery
+ *   x4, Dire Maul x3) share one map id, so each wing stores its own path under
+ *   the recorder's area, and playback picks the wing nearest the leader.
  *
  * Recording lifecycle:
  *   1) User presses WOWPS_PARTY_RECORD_PATH while inside a dungeon.
@@ -19,11 +22,13 @@
  *      GM-mode and resets speed.
  *
  * Playback (PartyFollow already calls into this every second):
- *   - When the assigned tank is in a dungeon with a stored path AND the
- *     leader is not currently fighting, the tank walks toward the
- *     "leader-cursor + 3" waypoint. Leader cursor = nearest waypoint to
- *     the leader's current position.
- *   - 30-yard leash from the leader — if exceeded, tank stops and waits.
+ *   - When the assigned tank is in a dungeon with a stored path for the wing the
+ *     leader is in AND the leader is not currently fighting, the tank walks a
+ *     lookahead point LEAD_DISTANCE further ALONG that path than the leader's
+ *     nearest waypoint (the cursor).
+ *   - The wing is chosen by proximity (SelectPathForLeader); if no recorded path
+ *     is near the leader, the tank just MoveFollows instead of leading.
+ *   - 45-yard leash from the leader — if exceeded, tank stops and waits.
  *   - In combat the tank engages normally (AssistTarget / rotation rules).
  */
 
@@ -54,18 +59,23 @@ namespace WowPsParty
     // position-sample buffer.
     void TickPathRecording(uint32 diffMs);
 
-    // Drop all stored waypoints for the given map. Used by the addon's
-    // "Clear path" action when the user wants to re-record from scratch.
-    void ClearPath(uint32 mapId);
+    // Drop the stored path for the WING the clearer is standing in (the recording
+    // nearest them), leaving the other wings of a shared-map dungeon intact.
+    // Returns waypoints removed (0 = nothing recorded near them).
+    uint32 ClearPath(uint32 mapId, Player* clearer);
 
     // Tank-side playback. Called each AI tick (from the patched
     // PlayerbotAI::UpdateAI). Walks the assigned tank toward the
     // next path waypoint when not engaged.
     void TankFollowPath(Player* bot);
 
-    // Count of stored waypoints for the given map. Used by the addon
-    // to show "Deadmines — 47 waypoints" status.
+    // Total stored waypoints for the map (all wings). Coarse "anything recorded
+    // here" gate + the addon's "Deadmines — 47 waypoints" status display.
     uint32 GetPathWaypointCount(uint32 mapId);
+
+    // True if a recorded path exists for the WING the leader is in (proximity, the
+    // same test playback uses) — so the lead-tank gate matches TankFollowPath.
+    bool HasPathForLeader(uint32 mapId, Player* leader);
 }
 
 #endif
