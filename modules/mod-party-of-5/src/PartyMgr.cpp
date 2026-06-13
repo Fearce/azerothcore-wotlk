@@ -1720,16 +1720,48 @@ namespace WowPsParty
         }
     }
 
+    // Wipe a dismissed HENCHMAN's saved loadout (rotation / target mode / lead /
+    // wait-threat / safe-pull / talents) so the next player to hire that random-pool
+    // bot gets the impersonal DEFAULT, not the previous hirer's manual tweaks.
+    // Henchmen aren't personal — their customisations must not stick between hires.
+    //
+    // SAFETY — this must NEVER touch a hero/alt's loadout, so it is DOUBLE-guarded:
+    //   (1) the directive must mark the guid a henchman (heroes are henchman=false);
+    //   (2) the guid must NOT be an enrolled account_party alt — a hero is ALWAYS
+    //       enrolled and a henchman (a random-pool bot) NEVER is, so a row in
+    //       account_party means "this is a hero, abort and keep its rotation".
+    // If EITHER guard fails, nothing is deleted. Call BEFORE RemoveFollower so the
+    // directive (guard 1) still exists.
+    void ClearHenchmanLoadout(ObjectGuid henchGuid)
+    {
+        if (!WowPsParty::IsHenchman(henchGuid)) return;          // guard 1: directive
+        uint32 const guid = henchGuid.GetCounter();
+        if (CharacterDatabase.Query(
+                "SELECT 1 FROM `account_party` WHERE `guid` = {}", guid))
+        {
+            LOG_ERROR("module",
+                "[WowPsParty Henchmen] REFUSED to clear loadout for guid={}: it is an "
+                "enrolled party alt, not a henchman — keeping its rotation intact", guid);
+            return;                                              // guard 2: not enrolled
+        }
+        CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+        tx->Append("DELETE FROM `party_loadout` WHERE `guid` = {}", guid);
+        CharacterDatabase.DirectCommitTransaction(tx);   // sync: gone before any re-hire reads it
+        LOG_INFO("module",
+            "[WowPsParty Henchmen] cleared saved loadout for dismissed hench_guid={}", guid);
+    }
+
     void DismissHenchman(Player* requester, uint32 henchGuid)
     {
         if (!requester || !requester->GetSession()) return;
         ObjectGuid const g = ObjectGuid::Create<HighGuid::Player>(henchGuid);
         if (!WowPsParty::IsHenchman(g)) return;   // only dismiss henchmen
-        // Clear its bags (keep ammo/reagents/shards) BEFORE RemoveFollower drops
-        // the directive — ClearHenchmanInventory's own IsHenchman guard reads that
-        // directive, so it must still exist or the clear silently no-ops.
+        // Clear its bags (keep ammo/reagents/shards) AND its saved loadout BEFORE
+        // RemoveFollower drops the directive — both guards read that directive, so
+        // it must still exist or they silently no-op.
         if (Player* hen = ObjectAccessor::FindConnectedPlayer(g))
             ClearHenchmanInventory(hen);
+        ClearHenchmanLoadout(g);   // reset saved rotation/toggles so it never follows the guid to the next hirer
         WowPsParty::RemoveFollower(g);
         WowPsParty::RotationCacheClear(henchGuid);
         WowPsParty::TargetModeCacheSet(henchGuid, "master");   // drop tank "loose"
@@ -1759,6 +1791,7 @@ namespace WowPsParty
         // bag-item destruction; only the LOGOUT below needs the 200ms defer.
         if (Player* hen = ObjectAccessor::FindConnectedPlayer(henchGuid))
             ClearHenchmanInventory(hen);
+        ClearHenchmanLoadout(henchGuid);   // reset saved rotation/toggles (henchmen aren't personal)
         WowPsParty::RemoveFollower(henchGuid);
         WowPsParty::RotationCacheClear(henchGuid.GetCounter());
         WowPsParty::TargetModeCacheSet(henchGuid.GetCounter(), "master");
