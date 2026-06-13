@@ -75,10 +75,17 @@ namespace WowPsParty
         constexpr float  LEAD_DISTANCE      = 30.0f;   // aim this far ahead ALONG the path
         constexpr float  WAYPOINT_REACHED   = 3.5f;
         // Vertical step size that pathfinding can't handle (jumps, drops,
-        // dropdowns through holes). Checked over the IMMEDIATE next stride
-        // (~2y), so only a true cliff trips it — descending ramps (Deadmines)
-        // have small per-stride Z change and are walked, not teleported.
+        // dropdowns through holes). A genuine drop is a near-vertical PLUNGE: a
+        // big Z change over almost no horizontal ground. Because recording is
+        // 2D-distance based (a fall drops almost no points until the player lands
+        // and walks on), a real fall leaves one stride that's tall but barely
+        // horizontal, whereas a walked staircase or ramp ALWAYS covers real
+        // horizontal ground per stride. So a stride only blinks when its Z change
+        // exceeds VERTICAL_STEP_TP AND is steeper than DROP_SLOPE_RATIO (dz:horiz,
+        // ~63deg — well above any walkable WoW slope). That keeps steep stairs and
+        // ramps WALKED instead of teleported one waypoint at a time.
         constexpr float  VERTICAL_STEP_TP   = 6.0f;
+        constexpr float  DROP_SLOPE_RATIO   = 2.0f;
         // Path-playback stall->blink: if the tank moves less than this between
         // samples for STALL_LIMIT samples while it should be advancing, it's
         // wedged (door / baked geometry / gap) — blink forward BLINK_CLEAR_DIST
@@ -498,15 +505,25 @@ namespace WowPsParty
                 }
                 if (blinkIdx > tankNearest)
                 {
-                    // Only blink if the destination is in LINE OF SIGHT. An OPEN
-                    // door (or a navmesh-baked-closed-but-now-open passage) has
-                    // clear LoS, so we blink through; a CLOSED door or a real wall
-                    // blocks LoS, so we wait. This is what makes a boss-gated door
-                    // work: while it's shut the tank waits, and the instant it
-                    // opens (boss dead) the next stall cycle sees LoS and blinks
-                    // through — without ever teleporting past content still walled
-                    // off.
-                    if (!bot->IsWithinLOS(path[blinkIdx].x, path[blinkIdx].y, path[blinkIdx].z))
+                    // A tall vertical DROP to the blink target is a fall the navmesh
+                    // can't path (the tank wedged at the lip): blink unconditionally,
+                    // because LoS down to a landing below a ledge / through a hole is
+                    // often occluded by the lip itself — gating on LoS there would
+                    // strand the tank. This is the safety net for an angled run-off
+                    // drop that the eager cliff-blink below (slope-gated) doesn't
+                    // catch.
+                    bool const tallDrop =
+                        std::fabs(bot->GetPositionZ() - path[blinkIdx].z) > VERTICAL_STEP_TP;
+                    // Otherwise (a near-level wedge) only blink if the destination is
+                    // in LINE OF SIGHT. An OPEN door (or a navmesh-baked-closed-but-
+                    // now-open passage) has clear LoS, so we blink through; a CLOSED
+                    // door or a real wall blocks LoS, so we wait. This is what makes a
+                    // boss-gated door work: while it's shut the tank waits, and the
+                    // instant it opens (boss dead) the next stall cycle sees LoS and
+                    // blinks through — without ever teleporting past content still
+                    // walled off.
+                    if (!tallDrop &&
+                        !bot->IsWithinLOS(path[blinkIdx].x, path[blinkIdx].y, path[blinkIdx].z))
                     {
                         tlog("wedged but no LoS to blink target (closed door / wall) — waiting");
                         return;
@@ -521,17 +538,26 @@ namespace WowPsParty
             }
         }
 
-        // Vertical step too large for the navmesh? (jumps in BFD, dropdowns in
-        // Stockades, the giant fall in LBRS …) Teleport across — same blink.
-        // Checked over the tank's IMMEDIATE next stride so only a true cliff
-        // trips it; descending ramps (Deadmines) walk normally.
+        // Vertical step the navmesh can't path? (jumps in BFD, dropdowns in
+        // Stockades, the giant fall in LBRS …) Teleport across — but ONLY a
+        // genuine near-vertical plunge, judged by the recorded next stride's own
+        // geometry (dz vs horizontal run), so steep STAIRS and descending RAMPS
+        // are walked normally instead of hopped one waypoint per tick. See
+        // DROP_SLOPE_RATIO. Checked over the tank's immediate next recorded stride.
         uint32 const stepIdx = std::min(tankNearest + 1, uint32(path.size()) - 1);
-        float const dzStep = std::fabs(path[stepIdx].z - bot->GetPositionZ());
-        if (dzStep > VERTICAL_STEP_TP)
+        if (stepIdx > tankNearest)
         {
-            tlog("blink: cliff on next stride, NearTeleport across");
-            bot->NearTeleportTo(path[stepIdx].x, path[stepIdx].y, path[stepIdx].z, path[stepIdx].o);
-            return;
+            Vec3 const& from = path[tankNearest];
+            Vec3 const& to   = path[stepIdx];
+            float const dz    = to.z - from.z;
+            float const horiz = std::sqrt((to.x - from.x) * (to.x - from.x) +
+                                          (to.y - from.y) * (to.y - from.y));
+            if (std::fabs(dz) > VERTICAL_STEP_TP && std::fabs(dz) > horiz * DROP_SLOPE_RATIO)
+            {
+                tlog("blink: near-vertical drop on next stride, NearTeleport across");
+                bot->NearTeleportTo(to.x, to.y, to.z, to.o);
+                return;
+            }
         }
 
         // Avoid re-issuing MovePoint to the same waypoint every tick.
