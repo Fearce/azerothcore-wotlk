@@ -1069,6 +1069,25 @@ namespace WowPsParty
         return info;
     }
 
+    // Case-insensitive match of a casting spell against an editor-typed needle:
+    // a pure-digit needle matches the spell ID (locale- and rank-proof), anything
+    // else matches the spell's display name. Backs target_casting:<spell>.
+    static bool SpellNameOrIdMatches(SpellInfo const* info, std::string const& want)
+    {
+        if (!info || want.empty()) return false;
+        bool allDigits = true;
+        for (char c : want) if (c < '0' || c > '9') { allDigits = false; break; }
+        if (allDigits) return info->Id == uint32(std::atoi(want.c_str()));
+        char const* nm = info->SpellName[0];   // enUS slot — what the tooltip shows
+        if (!nm) return false;
+        size_t i = 0;
+        for (; i < want.size() && nm[i]; ++i)
+            if (std::tolower(static_cast<unsigned char>(nm[i])) !=
+                std::tolower(static_cast<unsigned char>(want[i])))
+                return false;
+        return i == want.size() && nm[i] == '\0';
+    }
+
     // ---- Shaman totem state -------------------------------------------------
     // The core dedicates one summon slot per element (SUMMON_SLOT_TOTEM_FIRE..
     // _AIR). A slot holds a live totem's GUID exactly while that totem exists —
@@ -1226,6 +1245,7 @@ namespace WowPsParty
     static bool EvalSingleCondition(std::string const& cond, Player* bot,
                                     Unit* tOverride);
     static uint32 FindKnownSpellByName(Player* bot, std::string const& name);
+    static uint32 ResolveUtilitySpell(Player* bot, bool wantStun);
 
     // `tOverride` substitutes "the target" for every target_* clause (null →
     // the bot's victim, the normal case). `skipTargetClauses` drops target_*
@@ -1456,6 +1476,22 @@ namespace WowPsParty
                 bool const active = slot ? TotemElementActive(bot, slot)   // element form
                                          : TotemNamedActive(bot, arg);      // totem-name form
                 return cname == "self_totem_active" ? active : !active;
+            }
+
+            // target_casting:<spell> / target_channeling:<spell> — fire only while
+            // the target is mid-cast of a SPECIFIC spell, by display name or by
+            // numeric id. Pair with cast_scan to stun/kick a dangerous off-target
+            // cast (e.g. a Shadowmoon Technician's "Throw Dynamite", stun-only).
+            // Empty arg = any cast (same as the bare target_casting condition).
+            if (cname == "target_casting" || cname == "target_channeling")
+            {
+                bool ch = false, ir = false;
+                SpellInfo const* casting = CurrentCastSpell(theTarget(), &ch, &ir);
+                if (!casting) return false;
+                if (cname == "target_casting"    &&  ch) return false;  // a channel isn't a cast bar
+                if (cname == "target_channeling" && !ch) return false;
+                if (arg.empty()) return true;
+                return SpellNameOrIdMatches(casting, arg);
             }
         }
         if (cond == "in_combat")     return bot->IsInCombat();
@@ -1859,6 +1895,12 @@ namespace WowPsParty
         needle.reserve(name.size());
         for (char c : name) needle.push_back(std::tolower(static_cast<unsigned char>(c)));
 
+        // Pseudo-spells: "available_stun" / "available_interrupt" resolve to the
+        // first stun / kick THIS class actually has ready — so one rule covers
+        // every class instead of duplicating it per ability.
+        if (needle == "available_stun")      return ResolveUtilitySpell(bot, /*wantStun=*/true);
+        if (needle == "available_interrupt") return ResolveUtilitySpell(bot, /*wantStun=*/false);
+
         uint32 bestId   = 0;
         uint8  bestRank = 0;
         for (auto const& kv : bot->GetSpellMap())
@@ -1882,6 +1924,62 @@ namespace WowPsParty
             }
         }
         return bestId;
+    }
+
+    // Pick the first STUN (wantStun) or INTERRUPT (!wantStun) ability this class
+    // knows and has READY, falling back to the first one it knows (so the cast
+    // gate skips it cleanly when everything's on cooldown, or the rule no-ops for
+    // a class with no such ability). Backs the "available_stun" /
+    // "available_interrupt" pseudo-spells. Names are highest-relevance first;
+    // off-target picks that need setup the class won't have (rogue combo/stealth
+    // stuns on a mob it isn't on) simply fail the later canFireSpellOn gate.
+    static uint32 ResolveUtilitySpell(Player* bot, bool wantStun)
+    {
+        if (!bot) return 0;
+        std::vector<char const*> names;
+        switch (bot->getClass())
+        {
+            case CLASS_WARRIOR:
+                if (wantStun) names = { "Concussion Blow", "Intercept" };
+                else          names = { "Pummel", "Shield Bash" };
+                break;
+            case CLASS_PALADIN:
+                if (wantStun) names = { "Hammer of Justice" };
+                break;
+            case CLASS_HUNTER:
+                if (wantStun) names = { "Intimidation" };
+                else          names = { "Silencing Shot" };
+                break;
+            case CLASS_ROGUE:
+                if (wantStun) names = { "Kidney Shot", "Cheap Shot" };
+                else          names = { "Kick" };
+                break;
+            case CLASS_PRIEST:
+                if (!wantStun) names = { "Silence" };
+                break;
+            case CLASS_SHAMAN:
+                if (!wantStun) names = { "Wind Shear", "Earth Shock" };
+                break;
+            case CLASS_MAGE:
+                if (!wantStun) names = { "Counterspell" };
+                break;
+            case CLASS_DRUID:
+                if (wantStun) names = { "Bash", "Maim" };
+                break;
+            case CLASS_DEATH_KNIGHT:
+                if (!wantStun) names = { "Mind Freeze", "Strangulate" };
+                break;
+            default: break;
+        }
+        uint32 firstKnown = 0;
+        for (char const* n : names)
+        {
+            uint32 const id = FindKnownSpellByName(bot, n);
+            if (!id) continue;
+            if (!firstKnown) firstKnown = id;
+            if (!bot->HasSpellCooldown(id)) return id;   // ready → use this one
+        }
+        return firstKnown;
     }
 
     // The lead tank's RANGED pull ability, or 0 if it has none. Lets a tank with
@@ -3013,6 +3111,49 @@ namespace WowPsParty
             return fired;
         }
 
+        // "cast_scan:<spell>" — look at EVERY enemy the party is in combat with
+        // (not just our own victim) and cast <spell> on the FIRST one that
+        // satisfies this rule's condition, WITHOUT retargeting. Built for
+        // off-target interrupts/stuns: a henchman stuns a Shadowmoon Technician
+        // mid "Throw Dynamite" even while tab-locked on another mob. <spell> may be
+        // a real ability or the pseudo names "available_stun"/"available_interrupt"
+        // (whatever stun/kick the class has ready). Pair with target_casting:<spell>
+        // etc.; like cast_spread the rule's target_* clauses are re-checked per
+        // enemy here (TickRotation skips them at rule level). Casts without
+        // abandoning the assist target, so normal DPS resumes next tick.
+        if (verb == "cast_scan")
+        {
+            uint32 const spellId = FindKnownSpellByName(bot, arg);
+            if (!spellId) return false;
+            std::vector<Player*> party;
+            GatherPartyPlayers(bot, party, /*includeDead=*/false);
+            auto eligible = [&](Unit* u) -> bool
+            {
+                return u && u->IsAlive() && bot->IsValidAttackTarget(u)
+                    && MobEngagedByParty(bot, u, party)   // never a neutral → no accidental pull
+                    && canFireSpellOn(spellId, u)         // in range / LoS / affordable / off CD
+                    && EvalCondition(cond, bot, u);       // rule's target_* gates vs THIS enemy
+            };
+            Unit* pick = nullptr;
+            if (Unit* v = bot->GetVictim())
+                if (eligible(v)) pick = v;                // our own target first if it matches
+            if (!pick)
+            {
+                std::list<Unit*> hostiles;
+                GatherHostilesAround(bot, 41.0f, hostiles);
+                for (Unit* a : hostiles)
+                    if (eligible(a)) { pick = a; break; } // first matching enemy = the threat
+            }
+            if (!pick) return false;
+            if (!channelClipOk()) return false;
+            bool const fired = faceAndCast(pick, spellId);
+            if (fired)
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] {} scan-cast {} -> {}",
+                    bot->GetName(), arg, pick->GetName());
+            return fired;
+        }
+
         // "cast_combo_spread:<builder>:<finisher>" — feral/rogue MULTI-DOT with a
         // combo-point FINISHER. Plain cast_spread can't apply Rip: a finisher needs
         // ≥1 combo point built ON that specific target first, so the dots must go on
@@ -4029,7 +4170,8 @@ namespace WowPsParty
             // (a dying CURRENT target would otherwise veto a spread to a
             // perfectly fresh add, and vice versa).
             bool const isSpread = r.action.rfind("cast_spread", 0) == 0
-                               || r.action.rfind("cast_combo_spread", 0) == 0;
+                               || r.action.rfind("cast_combo_spread", 0) == 0
+                               || r.action.rfind("cast_scan", 0) == 0;
             // For a friendly-target action, evaluate target_* conditions against
             // the unit we'll actually heal/buff (the heal target), not the enemy
             // victim — so "target_missing_my_aura:Rejuvenation" gates on the
