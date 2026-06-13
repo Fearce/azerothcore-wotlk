@@ -1088,6 +1088,36 @@ namespace WowPsParty
         return i == want.size() && nm[i] == '\0';
     }
 
+    // ---- Curated "known dangerous cast" registries --------------------------
+    // Hand-maintained lists of enemy casts worth answering, grown over time as we
+    // meet more of them. Two buckets by how you STOP the cast:
+    //   * UNINTERRUPTIBLE — silence-immune (a kick does nothing); only a STUN
+    //     stops it. Pair with cast_scan:available_stun.
+    //   * INTERRUPTIBLE — a kick/Counterspell/etc. stops it. Pair with
+    //     cast_scan:available_interrupt.
+    // Entries are matched by SpellNameOrIdMatches, so each may be a display NAME
+    // (catches every rank) or a numeric spell id. The condition keywords
+    // "known_dangerous" / "known_dangerous_uninterruptible" test the live cast
+    // against the matching bucket.
+    static std::vector<char const*> const& DangerousCastList(bool uninterruptibleOnly)
+    {
+        static std::vector<char const*> const interruptible = {
+            // (add interruptible dangerous enemy casts here, by name or id)
+        };
+        static std::vector<char const*> const uninterruptible = {
+            "Throw Dynamite",   // Blood Furnace Shadowmoon Technician (40062) — big AoE, stun-only
+        };
+        return uninterruptibleOnly ? uninterruptible : interruptible;
+    }
+
+    static bool IsKnownDangerousCast(SpellInfo const* casting, bool uninterruptibleOnly)
+    {
+        if (!casting) return false;
+        for (char const* e : DangerousCastList(uninterruptibleOnly))
+            if (SpellNameOrIdMatches(casting, e)) return true;
+        return false;
+    }
+
     // ---- Shaman totem state -------------------------------------------------
     // The core dedicates one summon slot per element (SUMMON_SLOT_TOTEM_FIRE..
     // _AIR). A slot holds a live totem's GUID exactly while that totem exists —
@@ -1491,6 +1521,9 @@ namespace WowPsParty
                 if (cname == "target_casting"    &&  ch) return false;  // a channel isn't a cast bar
                 if (cname == "target_channeling" && !ch) return false;
                 if (arg.empty()) return true;
+                // Curated registries (grown over time) vs a single spell name/id.
+                if (arg == "known_dangerous")                 return IsKnownDangerousCast(casting, false);
+                if (arg == "known_dangerous_uninterruptible") return IsKnownDangerousCast(casting, true);
                 return SpellNameOrIdMatches(casting, arg);
             }
         }

@@ -419,14 +419,16 @@ namespace WowPsParty
             rules.emplace_back(std::move(rule));
         };
 
-        // Off-target emergency, every class/role: STUN any party-engaged enemy
-        // mid-cast of a deadly, kick-immune spell even if it ISN'T our current
-        // target. Seeded for the Blood Furnace Shadowmoon Technician's "Throw
-        // Dynamite" (only a stun stops it — it's not interruptible). No-op for a
-        // class with no stun (available_stun resolves to nothing). Priority sits
-        // below emergency heals / survival CDs (95-98) but above normal DPS, and
-        // rules are priority-sorted so its position here doesn't matter.
-        add("target_casting:Throw Dynamite", "cast_scan:available_stun", 94);
+        // Off-target emergency, every class/role: answer a deadly enemy cast even
+        // if it ISN'T our current target. STUN the silence-immune ones (only a stun
+        // stops them, e.g. the Blood Furnace Shadowmoon Technician's Throw Dynamite)
+        // and KICK the interruptible ones — both keyed off the curated registries in
+        // PartyRotation's DangerousCastList, which grow over time. No-op for a class
+        // with no stun/kick (available_* resolves to nothing). Priority sits below
+        // emergency heals / survival CDs (95-98) but above normal DPS; rules are
+        // priority-sorted so position here doesn't matter.
+        add("target_casting:known_dangerous_uninterruptible", "cast_scan:available_stun", 94);
+        add("target_casting:known_dangerous",                 "cast_scan:available_interrupt", 93);
 
         switch (cls)
         {
