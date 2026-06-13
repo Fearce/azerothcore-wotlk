@@ -1009,23 +1009,6 @@ namespace WowPsParty
         g_lastSpreadMs[guidLow] = nowMs;
     }
 
-    // Human-tank wait-gate timeout: a DPS bot holds off a mob (one on itself from
-    // an out-of-combat wander, or on a non-tank ally) until the tank takes it, but
-    // for at most this long PER MOB — so a mob the tank can't reach (a ranged
-    // caster on the healer) is eventually peeled instead of ignored. Generous so
-    // the human reliably establishes threat first; a low-HP escape (see the
-    // throttle) still lets a bot defend itself before dying. Resets per held mob.
-    static constexpr uint32 TANK_LEAD_WAIT_MAX_MS = 8000;
-    static std::unordered_map<uint32, std::pair<uint32, uint32>> g_tankLeadWait;  // botLow -> (mobLow, sinceMs)
-    static std::mutex g_tankLeadWaitMutex;
-    static bool TankLeadWaitStillHolding(uint32 botLow, uint32 mobLow, uint32 nowMs)
-    {
-        std::lock_guard<std::mutex> lock(g_tankLeadWaitMutex);
-        auto& w = g_tankLeadWait[botLow];
-        if (w.first != mobLow) { w.first = mobLow; w.second = nowMs; return true; }
-        return (nowMs - w.second) < TANK_LEAD_WAIT_MAX_MS;
-    }
-
     // Threat-cap throttle (replaces a fixed timer): even once the tank HAS the
     // mob, a DPS keeps DPSing only while its own threat stays below this fraction
     // of the tank's threat ON THAT MOB. The instant it climbs past, it drops the
@@ -2359,26 +2342,34 @@ namespace WowPsParty
                         return a;
                 return nullptr;
             };
-            // Members = our directive roster (reliable for our own account even
-            // when the WoW group formed incompletely) PLUS the WoW group, so a bot
-            // also peels a mob off a SECOND HUMAN — or their bots — grouped with us.
-            std::vector<Player*> members;
-            auto addMember = [&](Player* m) {
-                if (m && m->IsInWorld() && m != bot && m->GetMapId() == bot->GetMapId()
-                    && std::find(members.begin(), members.end(), m) == members.end())
-                    members.push_back(m);
-            };
-            std::vector<ObjectGuid> party;
-            GetPartyGuidsFor(bot->GetGUID(), party);
-            for (ObjectGuid const& gg : party) addMember(ObjectAccessor::FindConnectedPlayer(gg));
-            if (Group* grp = bot->GetGroup())
-                for (GroupReference* itr = grp->GetFirstMember(); itr; itr = itr->next())
-                    addMember(itr->GetSource());
-            for (Player* m : members)
+            // Party-defense (peel a mob off an ALLY) applies ONLY when we're a TANK
+            // (it wants aggro on everything) or we're OUT OF COMBAT. Its sole purpose
+            // was to pull an IDLE dps back into a fight the party was already in
+            // ("dps standing out of range, not re-engaging"). An IN-COMBAT dps must
+            // NOT peel — that engages mobs the tank hasn't grabbed; it sticks to the
+            // tank's target (self-defence above still covers a mob actually on us).
+            // Members = our directive roster PLUS the WoW group, so a bot also peels
+            // a mob off a SECOND HUMAN — or their bots — grouped with us.
+            if (RoleForGuid(bot->GetGUID()) == "tank" || !bot->IsInCombat())
             {
-                if (Unit* a = scanAttackers(m)) return a;
-                for (Unit* ctrl : m->m_Controlled)
-                    if (Unit* a = scanAttackers(ctrl)) return a;
+                std::vector<Player*> members;
+                auto addMember = [&](Player* m) {
+                    if (m && m->IsInWorld() && m != bot && m->GetMapId() == bot->GetMapId()
+                        && std::find(members.begin(), members.end(), m) == members.end())
+                        members.push_back(m);
+                };
+                std::vector<ObjectGuid> party;
+                GetPartyGuidsFor(bot->GetGUID(), party);
+                for (ObjectGuid const& gg : party) addMember(ObjectAccessor::FindConnectedPlayer(gg));
+                if (Group* grp = bot->GetGroup())
+                    for (GroupReference* itr = grp->GetFirstMember(); itr; itr = itr->next())
+                        addMember(itr->GetSource());
+                for (Player* m : members)
+                {
+                    if (Unit* a = scanAttackers(m)) return a;
+                    for (Unit* ctrl : m->m_Controlled)
+                        if (Unit* a = scanAttackers(ctrl)) return a;
+                }
             }
             return nullptr;
         };
@@ -2452,40 +2443,27 @@ namespace WowPsParty
         if (desired && (!desired->IsAlive() || !bot->IsValidAttackTarget(desired)))
             desired = nullptr;
 
-        // ---- Threat-cap: don't out-threat a real-player TANK (dungeons only) --
-        // In a dungeon led by a human tank, a DPS bot DPSes only while its threat
-        // on the mob stays under THREAT_CAP_RATIO of the tank's — the instant it
-        // climbs past, it drops the target (auto-attack AND rotation idle, since
-        // the rotation casts on GetVictim()) so the tank can rebuild a lead, then
-        // resumes. This auto-scales (no fixed timer) and protects the tank the
-        // WHOLE fight, not just the opening (Kevin: "base it on the actual threat").
-        //   * mob on the TANK        -> throttle on the threat ratio above;
-        //   * mob on the bot ITSELF or a non-tank ally / nobody -> HOLD so the human
-        //                               can taunt it onto the tank first, for at most
-        //                               TANK_LEAD_WAIT_MAX_MS (a mob the tank can't
-        //                               reach still gets peeled), with a low-HP escape
-        //                               so a bot patiently holding never dies for it.
-        // Holding a mob that aggroed the bot out of combat is the fix for "an enemy
-        // wanders in and the bot engages before I have threat".
-        // Tanks/healers are unaffected.
+        // ---- Pure threat gate: a DPS only fights what the human TANK holds -----
+        // In a dungeon led by a human tank, a DPS bot DPSes a mob ONLY while the
+        // tank actually has aggro on it AND the bot is under THREAT_CAP_RATIO of the
+        // tank's threat (so it never rips it off). Anything the tank HASN'T grabbed
+        // — a mob that wandered onto the bot, one on an ally — is simply HELD, never
+        // fought, until the tank takes it. No timer: it works purely off live threat
+        // ("tank has it -> engage", bulletproof). AoE pulls can't be perfectly gated
+        // this way and that's accepted — a normal player can't either. Tanks (want
+        // aggro on everything) and healers are unaffected.
         {
             std::string const myRole = RoleForGuid(bot->GetGUID());
             if (desired && myRole != "tank" && myRole != "healer"
                 && HumanTankLeadActive(bot, leader)
                 && GetWaitTankThreat(bot->GetGUID()))   // editor toggle: OFF -> blast like before
             {
-                bool release;
-                if (MobOnTank(bot, desired, leader))
-                    release = !BotOverThreatVsTank(bot, desired);   // tank has it -> hold only if we're near its threat
-                else if (desired->GetVictim() == bot && bot->GetHealthPct() < 40.0f)
-                    release = true;                                 // it's on us AND we're getting low -> defend self
-                else
-                    release = !TankLeadWaitStillHolding(
-                        gLow, desired->GetGUID().GetCounter(), getMSTime());  // hold for the tank, peel after the cap
+                bool const release = MobOnTank(bot, desired, leader)
+                                  && !BotOverThreatVsTank(bot, desired);
                 if (!release)
                 {
                     if (bot->GetVictim()) bot->AttackStop();
-                    AssistLog(gLow, "human-tank dungeon: throttling to stay under the tank's threat");
+                    AssistLog(gLow, "human-tank dungeon: holding — tank has no threat on this mob yet");
                     return;
                 }
             }
