@@ -2060,11 +2060,40 @@ namespace WowPsParty
         return nullptr;
     }
 
+    // A feral druid that BRIEFLY drops cat/bear form (cancel form → instant
+    // Rejuvenation → re-shift) must keep MELEE positioning for that window — it is
+    // NOT a caster just because it's momentarily humanoid. We can't read that off
+    // the talent tree (leveling / henchman ferals often don't register feral as
+    // the primary tree), so track when the bot was last actually IN a feral form;
+    // a resto / balance druid never enters one, so this never false-positives.
+    static std::mutex g_feralFormMutex;
+    static std::unordered_map<uint32, uint32> g_lastFeralFormMs;   // guidLow -> getMSTime
+    static constexpr uint32 FERAL_FORM_GRACE_MS = 5000;
+
+    static void MarkFeralForm(Player* bot)
+    {
+        // DRUID only: IsInFeralForm() is also true for a shaman's Ghost Wolf, which
+        // every shaman spec (incl. resto) uses to reposition — stamping that would
+        // wrongly hold a ranged shaman in melee for the grace window. Enhancement
+        // shamans are already melee via the PrimaryTalentTree==1 check.
+        if (!bot || bot->getClass() != CLASS_DRUID || !bot->IsInFeralForm()) return;
+        std::lock_guard<std::mutex> lock(g_feralFormMutex);
+        g_lastFeralFormMs[bot->GetGUID().GetCounter()] = getMSTime();
+    }
+
+    static bool WasRecentlyFeral(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(g_feralFormMutex);
+        auto it = g_lastFeralFormMs.find(guid.GetCounter());
+        return it != g_lastFeralFormMs.end()
+            && (getMSTime() - it->second) < FERAL_FORM_GRACE_MS;
+    }
+
     // True if this bot fights in MELEE (anchors closer to the tank during a pull,
     // ready to engage). Mirrors AssistTarget's ranged/melee split: tanks and the
     // physical classes are melee; healers and the caster classes are ranged,
-    // EXCEPT an enhancement shaman / feral druid (talent tree 1) or one already
-    // shifted into a feral form, which melee.
+    // EXCEPT an enhancement shaman / feral druid (talent tree 1) or one in — or
+    // just out of (grace window) — a feral form, which melee.
     static bool FollowerIsMelee(Player* bot)
     {
         if (!bot) return false;
@@ -2078,7 +2107,7 @@ namespace WowPsParty
         if (!ranged) return true;   // warrior / rogue / death knight
         if ((acls == CLASS_DRUID || acls == CLASS_SHAMAN)
             && WowPsParty::PrimaryTalentTree(bot) == 1) return true;
-        if (bot->IsInFeralForm()) return true;
+        if (bot->IsInFeralForm() || WasRecentlyFeral(bot->GetGUID())) return true;
         return false;
     }
 
@@ -2177,6 +2206,9 @@ namespace WowPsParty
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
         uint32 const gLow = bot->GetGUID().GetCounter();
+        // Stamp feral-form presence every tick so a brief out-of-form cast keeps
+        // melee positioning for FERAL_FORM_GRACE_MS (see WasRecentlyFeral).
+        MarkFeralForm(bot);
 
         // User-controlled body: never touch its target/motion.
         if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) { AssistLog(gLow, "skip: possessed"); return; }
@@ -2663,7 +2695,7 @@ namespace WowPsParty
                 role == "tank" ||
                 ((acls == CLASS_DRUID || acls == CLASS_SHAMAN)
                     && WowPsParty::PrimaryTalentTree(bot) == 1) ||
-                bot->IsInFeralForm();
+                bot->IsInFeralForm() || WasRecentlyFeral(bot->GetGUID());
             if (melee) rangedCaster = false;
         }
 

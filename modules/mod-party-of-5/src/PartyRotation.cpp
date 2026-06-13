@@ -3163,10 +3163,11 @@ namespace WowPsParty
         //     finisher -> spend them: cast <finisher> on it (the combo target);
         //   * else BUILD: cast <builder> on the next party-engaged enemy missing
         //     our finisher (current victim first) — Rake also lands its own bleed.
-        // Across ticks: rake→rip→(next)→rake→rip… It never leaves the assist
-        // target's spot — it dots clustered adds IN PLACE, and canFireSpellOn keeps
-        // it to enemies actually in (melee) range. The aura checks are per-CASTER
-        // (our own Rip), so several ferals each keep their own up. Use "Rake:Rip",
+        // Across ticks: rake→rip→(next)→rake→rip… A cat moves fast, so it dots any
+        // engaged enemy within a quick STEP (melee + 8y), walking in when range is
+        // the only blocker rather than only hitting what's already in melee. The
+        // aura checks are per-CASTER (our own Rip), so several ferals each keep
+        // their own up. Use "Rake:Rip",
         // or "Claw:Rip" before Rake is learned. Returns false once every reachable
         // engaged enemy has our finisher, so the rotation drops to the single-
         // target filler. Like cast_spread, its target_* clauses are enforced per
@@ -3184,34 +3185,56 @@ namespace WowPsParty
             std::vector<Player*> party;
             GatherPartyPlayers(bot, party, /*includeDead=*/false);
 
+            // A cat is fast: it'll WALK to an add within a quick step (melee + 8y)
+            // to dot it, rather than only hitting what's already in melee range.
+            float const stepReach = 8.0f;
+            auto withinStep = [&](Unit* u) -> bool
+            {
+                return bot->IsWithinDistInMap(u, bot->GetMeleeRange(u) + stepReach);
+            };
+            // Cast if in range; else, if the ONLY blocker is range/LoS, walk in and
+            // dot next tick. A hard block (energy / cooldown / GCD) returns false so
+            // the caller can fall through.
+            auto fireOrApproach = [&](Unit* t, uint32 sid, char const* what) -> bool
+            {
+                if (canFireSpellOn(sid, t))
+                {
+                    if (!channelClipOk()) return false;
+                    bool const f = faceAndCast(t, sid);
+                    if (f)
+                        LOG_INFO("module", "[WowPsParty Rotation] {} {} {} -> {} (cp={})",
+                            bot->GetName(), what,
+                            sid == finisherId ? finisherName : builderName,
+                            t->GetName(), int(bot->GetComboPoints()));
+                    return f;
+                }
+                if (castBlock == CastBlock::Position && withinStep(t))
+                    return repositionToCast(t, sid);   // a short step away → close in
+                return false;
+            };
+
             // 1) SPEND: finish the combo target if it's a live, party-engaged enemy
-            //    in range that still lacks OUR finisher (per-caster aura check).
+            //    within a step that still lacks OUR finisher (per-caster aura check).
             if (Unit* combo = bot->GetComboTarget())
                 if (bot->GetComboPoints() > 0 && combo->IsAlive()
                     && bot->IsValidAttackTarget(combo)
                     && MobEngagedByParty(bot, combo, party)
+                    && withinStep(combo)
                     && !TargetHasNamedAura(combo, finisherName, me)
-                    && canFireSpellOn(finisherId, combo)
                     && EvalCondition(cond, bot, combo))
                 {
-                    if (!channelClipOk()) return false;
-                    bool const fired = faceAndCast(combo, finisherId);
-                    if (fired)
-                        LOG_INFO("module",
-                            "[WowPsParty Rotation] {} combo-finish {} -> {} (cp={})",
-                            bot->GetName(), finisherName, combo->GetName(),
-                            int(bot->GetComboPoints()));
-                    return fired;
+                    if (fireOrApproach(combo, finisherId, "combo-finish")) return true;
+                    // hard-blocked (no energy on the finisher) → fall through to BUILD
                 }
 
-            // 2) BUILD: a combo point on the next engaged enemy missing OUR
-            //    finisher (victim first, else beefiest in range), gated per enemy.
+            // 2) BUILD: a combo point on the next engaged enemy within a step that's
+            //    missing OUR finisher (victim first, else beefiest), gated per enemy.
             auto needsSetup = [&](Unit* u) -> bool
             {
                 return u && u->IsAlive() && bot->IsValidAttackTarget(u)
                     && !TargetHasNamedAura(u, finisherName, me)
                     && MobEngagedByParty(bot, u, party)
-                    && canFireSpellOn(builderId, u)
+                    && withinStep(u)
                     && EvalCondition(cond, bot, u);
             };
             Unit* pick = nullptr;
@@ -3230,14 +3253,7 @@ namespace WowPsParty
                     }
             }
             if (!pick) return false;
-            if (!channelClipOk()) return false;
-            bool const fired = faceAndCast(pick, builderId);
-            if (fired)
-                LOG_INFO("module",
-                    "[WowPsParty Rotation] {} combo-build {} -> {} (cp={})",
-                    bot->GetName(), builderName, pick->GetName(),
-                    int(bot->GetComboPoints()));
-            return fired;
+            return fireOrApproach(pick, builderId, "combo-build");
         }
 
         // "pull:<spell>" — initiate a RANGED pull. Picks the nearest hostile
