@@ -3326,9 +3326,14 @@ namespace WowPsParty
 
         if (verb == "rez_party")
         {
-            if (bot->IsInCombat()) return false;
             uint32 const spellId = FindKnownSpellByName(bot, arg);
             if (!spellId) return false;
+            // Skip a normal (peaceful-only) rez while fighting, but ALLOW a battle
+            // rez — Rebirth / Raise Ally are castable in combat (that's their whole
+            // point). The spell's own SPELL_ATTR0_NOT_IN_COMBAT_ONLY_PEACEFUL tells
+            // them apart; the old blanket IsInCombat guard wrongly suppressed Rebirth.
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            if (bot->IsInCombat() && (!info || !info->CanBeUsedInCombat())) return false;
             Player* target = FindDeadPartyMember(bot);
             if (!target) return false;
             return castOrApproach(target, spellId, /*friendlyApproach=*/true);
