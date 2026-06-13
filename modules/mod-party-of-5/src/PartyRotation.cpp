@@ -3518,6 +3518,27 @@ namespace WowPsParty
             return true;
         }
 
+        // "move_behind" — step around to the BACK of the current target so back-only
+        // attacks land (rogue Backstab / Ambush, feral Shred / Ravage). No spell —
+        // it only positions. Returns false (fall through to the back-attack rule)
+        // once we're already behind AND in melee; otherwise it MovePoints to a spot
+        // directly behind the target and briefly holds off the assist re-chase so it
+        // doesn't drag us back to the front. Place it ABOVE the back-attack ability.
+        if (verb == "move_behind")
+        {
+            Unit* v = bot->GetVictim();
+            if (!v || !v->IsAlive()) return false;
+            if (v->isInBack(bot) && bot->IsWithinMeleeRange(v))
+                return false;   // already behind + in melee -> let the back attack fire
+            float const back = v->GetOrientation() + 3.14159265f;   // opposite the target's facing
+            float x, y, z;
+            v->GetNearPoint(bot, x, y, z, 0.0f,
+                            std::max(v->GetCombatReach() + 1.0f, 2.0f), back);
+            WowPsParty::HoldFollower(bot->GetGUID(), 1500);
+            bot->GetMotionMaster()->MovePoint(0, x, y, z);
+            return true;
+        }
+
         // "wand" — the actual wand shooting (spell 5019 "Shoot", an auto-repeat) is
         // maintained as a BACKGROUND auto-attack in EnsureRangedAutoAttack so it's
         // never toggled and never counts as casting. This rule just reports whether
