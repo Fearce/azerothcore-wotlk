@@ -102,11 +102,15 @@ namespace WowPsParty
         };
 
         // Predicate for the grid searcher: a dead, skinnable-TYPE corpse within
-        // range that the party killed. We deliberately do NOT require the engine's
-        // UNIT_FLAG_SKINNABLE here — our bots leave corpse loot unfinished, so that
-        // flag is usually never set, and gating on it meant bots never skinned
-        // anything. A genuine party kill (loot recipient/group set) is force-flagged
-        // at harvest. The per-bot skill/level gate happens in the caller.
+        // range that the party killed AND hasn't been skinned yet. We deliberately
+        // do NOT require the engine's UNIT_FLAG_SKINNABLE here — our bots leave
+        // corpse loot unfinished, so that flag is usually never set, and gating on
+        // it meant bots never skinned anything. A genuine party kill (loot
+        // recipient/group set) is force-flagged at harvest. CRITICAL: once skinned,
+        // SkinCorpse stamps loot_type = LOOT_SKINNING — exclude those, or the
+        // recipient/group (which stay set) would re-detect the same corpse every
+        // tick and skin it 20-30 times (leather + skill dupe). The per-bot
+        // skill/level gate happens in the caller.
         struct NearbySkinnableCheck
         {
             NearbySkinnableCheck(WorldObject const* src, float range)
@@ -117,6 +121,7 @@ namespace WowPsParty
                     return false;
                 CreatureTemplate const* tmpl = c->GetCreatureTemplate();
                 if (!tmpl || tmpl->SkinLootId == 0) return false;   // not a skinnable beast
+                if (c->loot.loot_type == LOOT_SKINNING) return false;  // already skinned
                 return c->HasUnitFlag(UNIT_FLAG_SKINNABLE)
                     || c->GetLootRecipient() || c->GetLootRecipientGroup();
             }
@@ -1728,6 +1733,7 @@ namespace WowPsParty
         if (!c || c->IsAlive()) return false;
         CreatureTemplate const* tmpl = c->GetCreatureTemplate();
         if (!tmpl || tmpl->SkinLootId == 0) return false;   // not a skinnable beast
+        if (c->loot.loot_type == LOOT_SKINNING) return false;  // already skinned — never re-skin
         uint32 const skill = tmpl->GetRequiredLootSkill();
         if (!bot->HasSkill(skill)) return false;
         // Engine cast gate (Spell::CheckCast, skinning): the required value keys
