@@ -1805,9 +1805,13 @@ namespace WowPsParty
                     bot->GetPower(POWER_MANA), bot->GetMaxPower(POWER_MANA),
                     manaPct, op, threshold);
             }
-            // Original behaviour: only paladins/priests/mages/etc. with a
-            // primary mana pool. Warriors/rogues should never match this.
-            if (bot->getPowerType() != POWER_MANA) return false;
+            // Read the REAL mana pool, never the active/display power: a feral
+            // druid in cat form shows ENERGY but still has (and regenerates) full
+            // mana, so `self_mana>60` must see that mana and let it shift out to
+            // heal. A class with no mana pool (warrior/rogue/DK) has manaPct < 0 and
+            // never matches — so no getPowerType() gate is needed. That gate WAS the
+            // bug: it failed every shapeshifted / stance-swapped mana class (a cat
+            // druid's getPowerType() is ENERGY, so self_mana never fired).
             if (manaPct < 0) return false;
             return cmp(manaPct);
         }
@@ -1841,7 +1845,9 @@ namespace WowPsParty
         // Tank rule example:  healer_mana<75 | hold_position | 100
         auto pctOfMember = [&pct](Player* m) -> int
         {
-            if (!m || m->getPowerType() != POWER_MANA) return -1;
+            // Real mana POOL, not the active/display power — so a shifted druid
+            // (cat shows energy) still reports its true mana. No mana pool = -1.
+            if (!m || m->GetMaxPower(POWER_MANA) == 0) return -1;
             return pct(float(m->GetPower(POWER_MANA)), float(m->GetMaxPower(POWER_MANA)));
         };
         if (name == "healer_mana")
