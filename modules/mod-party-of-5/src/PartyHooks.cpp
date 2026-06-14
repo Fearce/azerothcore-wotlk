@@ -11,6 +11,7 @@
 
 #include "Chat.h"
 #include "Creature.h"
+#include "DBCStores.h"   // sLockStore — identify "key" items that open world objects
 #include "Group.h"
 #include "GroupMgr.h"
 #include "Bag.h"
@@ -35,6 +36,7 @@
 #include "PlayerbotMgr.h"
 
 #include <algorithm>
+#include <mutex>
 #include <unordered_set>
 
 namespace WowPsParty
@@ -72,6 +74,74 @@ namespace WowPsParty
     {
         if (!p || !p->GetSession()) return false;
         return GetAccountSettings(p->GetSession()->GetAccountId()).sharedInventory;
+    }
+
+    // ---- Party-wide KEY sharing ---------------------------------------------
+    // Every item id that some lock accepts as its KEY (LOCK_KEY_ITEM). Built once
+    // from Lock.dbc. Catches doors/chests that need the key sitting in the bags.
+    static std::unordered_set<uint32> const& LockKeyItemIds()
+    {
+        static std::unordered_set<uint32> ids;
+        static std::once_flag once;
+        std::call_once(once, []
+        {
+            for (uint32 i = 1; i < sLockStore.GetNumRows(); ++i)
+                if (LockEntry const* lock = sLockStore.LookupEntry(i))
+                    for (uint8 j = 0; j < MAX_LOCK_CASE; ++j)
+                        if (lock->Type[j] == LOCK_KEY_ITEM && lock->Index[j])
+                            ids.insert(lock->Index[j]);
+        });
+        return ids;
+    }
+
+    // "Key-like" = an item the WHOLE party needs its own copy of because it OPENS
+    // something in the world. Three signals, any of which qualifies:
+    //   1. an on-use OPEN_LOCK spell (e.g. the ZF Executioner's Key, spell 10738,
+    //      that opens the Troll Cage — note it is item-class CONSUMABLE, not KEY,
+    //      so a class check alone would miss it),
+    //   2. an explicit KEY-class item (most dungeon/door keys),
+    //   3. it is the item-key of some lock (doors that want the key in the bags).
+    static bool IsPartyKeyItem(ItemTemplate const* tmpl)
+    {
+        if (!tmpl) return false;
+        if (tmpl->Class == ITEM_CLASS_KEY) return true;
+        for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+            if (uint32 const sid = tmpl->Spells[i].SpellId)
+                if (SpellInfo const* si = sSpellMgr->GetSpellInfo(sid))
+                    for (uint8 e = 0; e < MAX_SPELL_EFFECTS; ++e)
+                        if (si->Effects[e].Effect == SPELL_EFFECT_OPEN_LOCK)
+                            return true;
+        return LockKeyItemIds().count(tmpl->ItemId) != 0;
+    }
+
+    // When any party member loots a key item, give every OTHER member their own
+    // copy — otherwise a bot that auto-looted the dungeon key (the ZF Executioner's
+    // Key report) leaves the human unable to open the gate. HasItemCount skips a
+    // member who already has it; CanStoreNewItem enforces unique / max-count / bag
+    // space, so this can never dupe or over-supply. Caller must have confirmed
+    // shared progression. Uses StoreNewItem (not StoreLootItem), so it does NOT
+    // re-fire OnPlayerLootItem — no recursion.
+    static void MirrorKeyItemToParty(Player* looter, uint32 itemId, uint32 count)
+    {
+        if (!looter) return;
+        ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(itemId);
+        if (!IsPartyKeyItem(tmpl)) return;
+        if (count == 0) count = 1;
+
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(looter->GetGUID(), party);
+        for (ObjectGuid const& g : party)
+        {
+            if (g == looter->GetGUID()) continue;
+            Player* p = ObjectAccessor::FindConnectedPlayer(g);
+            if (!p || !p->IsInWorld()) continue;
+            if (p->HasItemCount(itemId, count, true)) continue;   // already has enough
+            ItemPosCountVec dest;
+            if (p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, count) != EQUIP_ERR_OK) continue;
+            p->StoreNewItem(dest, itemId, /*update=*/true);
+            LOG_INFO("module", "[WowPsParty Key] gave {} (id={}) x{} to {} so the whole party can open it",
+                     tmpl->Name1, itemId, count, p->GetName());
+        }
     }
 
     // Teach every class-trainer spell `p` qualifies for at its level. Shared by
@@ -627,6 +697,10 @@ public:
                 if (newItem)
                 {
                     li.is_looted = true;
+                    // A KEY (e.g. the ZF Executioner's Key) that lands on one hero
+                    // leaves the human unable to open the gate — give the whole
+                    // party a copy. No-op for normal loot.
+                    WowPsParty::MirrorKeyItemToParty(taker, li.itemid, li.count);
                     // Loot announcement. Use named lvalues for the fmt args
                     // because Acore::StringFormat forwards via
                     // fmt::make_format_args which requires lvalue references.
@@ -652,6 +726,18 @@ public:
         }
         if (allTaken)
             killed->AllLootRemovedFromCorpse();
+    }
+
+    // KEY sharing for EVERY other loot path — a member looting through the normal
+    // loot window: the human manually looting a corpse/chest, a henchman's engine
+    // loot, a gameobject. The creature auto-loot above stores items directly (no
+    // OnPlayerLootItem), so the two paths are disjoint — no double-grant. Mirrors
+    // any key item to the whole party so nobody is ever locked out of a gate.
+    void OnPlayerLootItem(Player* player, Item* item, uint32 count, ObjectGuid /*lootguid*/) override
+    {
+        if (!WowPsParty::IsEnabled() || !player || !item) return;
+        if (!WowPsParty::ProgressionShared(player)) return;   // solo: own loot
+        WowPsParty::MirrorKeyItemToParty(player, item->GetEntry(), count);
     }
 
     // Shared gold pool: every delta applied to one party member is mirrored
