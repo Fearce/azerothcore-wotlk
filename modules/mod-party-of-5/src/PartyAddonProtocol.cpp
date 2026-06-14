@@ -3013,12 +3013,16 @@ public:
             // Reply with one record per character on the account:
             //   <guid>:<name>:<race>:<class>:<level>:<slot|-1>:<role>;...
             uint32 const accountId = player->GetSession()->GetAccountId();
+            // Role: account_party.role when enrolled, else the per-character
+            // party_loadout.role (solo / un-enrolled), else 'dps'. NULLIF turns the
+            // '' default into NULL so COALESCE falls through.
             QueryResult q = CharacterDatabase.Query(
                 "SELECT c.guid, c.name, c.race, c.class, c.level, "
                 "       COALESCE(ap.slot, 255) AS slot, "
-                "       COALESCE(ap.role, 'dps') AS role "
+                "       COALESCE(ap.role, NULLIF(pl.role, ''), 'dps') AS role "
                 "FROM `characters` c "
                 "LEFT JOIN `account_party` ap ON ap.guid = c.guid AND ap.account = c.account "
+                "LEFT JOIN `party_loadout` pl ON pl.guid = c.guid "
                 "WHERE c.account = {} AND (c.deleteInfos_Account IS NULL OR c.deleteInfos_Account = 0) "
                 "ORDER BY COALESCE(ap.slot, 255), c.name",
                 accountId);
@@ -3076,6 +3080,31 @@ public:
 
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Slot {} role set to |cffffffff{}|r.", slot, role);
+        }
+        else if (command == "MGMT_MY_ROLE")
+        {
+            // MGMT_MY_ROLE\t<role>  — set the CONTROLLED character's OWN role with no
+            // enrollment needed (solo mode). Stores to account_party.role if the char
+            // happens to be enrolled, else to its per-character party_loadout.role,
+            // then refreshes the leader-role cache so it takes effect immediately.
+            std::string role(payload);
+            if (role != "tank" && role != "healer" && role != "dps") return;
+            uint32 const accountId = player->GetSession()->GetAccountId();
+            uint32 const guidLow   = player->GetGUID().GetCounter();
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            if (sPartyMgr.GetSlotForGuid(guidLow))
+                tx->Append("UPDATE `account_party` SET `role` = '{}' WHERE `guid` = {}", role, guidLow);
+            else
+                tx->Append(
+                    "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
+                    "`gear_lock_json`, `priority_actions_json`, `role`) "
+                    "VALUES ({}, '', '', '', '', '', '{}') "
+                    "ON DUPLICATE KEY UPDATE `role` = VALUES(`role`)",
+                    guidLow, role);
+            CharacterDatabase.DirectCommitTransaction(tx);   // sync so the cache read below sees it
+            WowPsParty::SetLeaderRoleForChar(accountId, player->GetGUID());
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Your role is now |cffffffff{}|r.", role);
         }
         else if (command == "MGMT_KICK")
         {

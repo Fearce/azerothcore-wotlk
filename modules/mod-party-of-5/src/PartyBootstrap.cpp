@@ -174,6 +174,10 @@ public:
         WowPsParty::LearnAllClassSpells(player);
         WowPsParty::LearnAllWeaponSkills(player);   // every class-usable weapon proficiency — no weapon-master trip
 
+        // Cache the controlled character's party role (enrolled or solo/per-char) so
+        // the human-tank wait-gate reads it even for a non-enrolled solo character.
+        WowPsParty::SetLeaderRoleForChar(player->GetSession()->GetAccountId(), player->GetGUID());
+
         uint32 const guid = player->GetGUID().GetCounter();
         std::optional<uint8> const slot = sPartyMgr.GetSlotForGuid(guid);
 

@@ -66,6 +66,11 @@ namespace WowPsParty
     // editor's "Generate" button match the role the bot actually runs.
     std::string RoleForGuid(ObjectGuid botGuid);
 
+    // Refresh the cached leader role for an account from a character's stored role
+    // (account_party.role if enrolled, else party_loadout.role). Lets a solo /
+    // un-enrolled controlled character carry a tank/healer/dps role.
+    void SetLeaderRoleForChar(uint32 account, ObjectGuid guid);
+
     // Wires up the per-tick re-asserter. Called once from
     // PartyBootstrapWorldScript::OnStartup. Idempotent; subsequent
     // calls are no-ops.

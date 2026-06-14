@@ -355,6 +355,26 @@ namespace WowPsParty
         return it == g_leaderRole.end() ? std::string() : it->second;
     }
 
+    // Set the cached leader role for `guid`'s account from persistent storage:
+    // account_party.role if the character is enrolled, else its per-character
+    // party_loadout.role (the SOLO / un-enrollable case), else "dps". Called on the
+    // controlled character's login and whenever it changes its own role, so a solo
+    // player can tank/heal on a non-enrolled character and henchmen read it right.
+    void SetLeaderRoleForChar(uint32 account, ObjectGuid guid)
+    {
+        uint32 const low = guid.GetCounter();
+        std::string role;
+        if (QueryResult q = CharacterDatabase.Query(
+                "SELECT `role` FROM `account_party` WHERE `guid` = {}", low))
+            role = q->Fetch()[0].Get<std::string>();
+        else if (QueryResult q2 = CharacterDatabase.Query(
+                "SELECT `role` FROM `party_loadout` WHERE `guid` = {}", low))
+            role = q2->Fetch()[0].Get<std::string>();
+        if (role.empty()) role = "dps";
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_leaderRole[account] = role;
+    }
+
     // Pick a LEVEL- and RACE-appropriate mount for the bot, matching the
     // leader's GROUND-vs-FLYING type — instead of copying the leader's exact
     // mount (a level-20 alt riding the player's epic flyer looked absurd).
