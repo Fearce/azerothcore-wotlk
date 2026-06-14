@@ -287,6 +287,7 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
     extern void WowPsParty_TankLeadEngagement_Trampoline(Player* bot);
     extern void WowPsParty_TankFollowPath_Trampoline(Player* bot);
     extern void WowPsParty_TickGathering_Trampoline(Player* bot);
+    extern void WowPsParty_TickHenchmanLoot_Trampoline(Player* bot);
     bool const isPartyOfFiveBot = WowPsParty_BotHasActiveFollowDirective_Trampoline(bot->GetGUID());
     if (isPartyOfFiveBot)
     {
@@ -303,6 +304,10 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
         // Out-of-combat only: an alt trained in mining/herbalism harvests
         // nearby nodes while travelling with the party (self-gates on combat).
         WowPsParty_TickGathering_Trampoline(bot);
+        // Out-of-combat only: a hired henchman loots nearby party-killed corpses
+        // — gold to the leader (party-mirrored), trash into its own bags. Self-
+        // gates to henchmen; no-op for alts.
+        WowPsParty_TickHenchmanLoot_Trampoline(bot);
         return;
     }
 

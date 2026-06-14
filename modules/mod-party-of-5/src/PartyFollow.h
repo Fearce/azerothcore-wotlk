@@ -183,6 +183,14 @@ namespace WowPsParty
     // toggle. Called every AI tick; fast-exits for bots without a gather skill.
     void TickGathering(Player* bot);
 
+    // Out-of-combat corpse looting for HIRED HENCHMEN ONLY. An idle henchman
+    // walks to the nearest party-killed corpse and loots it — gold to the human
+    // leader (mirrored across the party), trash items into its own bags (wiped
+    // on dismiss). Money always loots (no bag slot needed); items the henchman
+    // can't hold are skipped. Enrolled alts and the human are untouched. Called
+    // every AI tick after TickGathering; fast-exits for non-henchmen.
+    void TickHenchmanLoot(Player* bot);
+
     // Dungeon tank-lead engagement. If `bot` is the assigned tank for
     // its account, the leader is in a dungeon and not already engaging
     // a target, and there's a hostile creature within 40 yards of the
