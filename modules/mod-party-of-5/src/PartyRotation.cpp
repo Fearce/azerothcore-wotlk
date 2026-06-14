@@ -3826,6 +3826,24 @@ namespace WowPsParty
         CharmInfo* charm = pet->GetCharmInfo();
         if (!charm) return;
 
+        // Keep a HUNTER pet permanently HAPPY = 125% pet damage (StatSystem scales
+        // BASE_ATTACK by happiness: Happy 125% / Content 100% / Unhappy 75%). Pet
+        // happiness ONLY decays — over time, faster in combat — and our bots can't
+        // shop for diet food or time Feed Pet, so an un-fed pet slides to Content
+        // then Unhappy and just feels broken; a freshly loaded one can even START
+        // Unhappy. Acting as the pet's auto-feeder, pin happiness to max whenever
+        // it dips below the HAPPY band. Recompute base damage only when the band
+        // actually changes — the damage stat is cached and isn't refreshed when
+        // happiness merely ticks down, so the 125% wouldn't land without this.
+        if (pet->IsHunterPet()
+            && pet->GetPower(POWER_HAPPINESS) < HAPPINESS_LEVEL_SIZE * 2)
+        {
+            bool const wasHappy = pet->GetHappinessState() == HAPPY;
+            pet->SetPower(POWER_HAPPINESS, pet->GetMaxPower(POWER_HAPPINESS));
+            if (!wasHappy)
+                pet->UpdateDamagePhysical(BASE_ATTACK);
+        }
+
         // Stance + autocast every tick rather than once-per-pet. The walk is
         // cheap (the pet's spell list is tiny) and idempotent — ToggleAutocast
         // only fires on a real mismatch, so steady state is just the scan. A
