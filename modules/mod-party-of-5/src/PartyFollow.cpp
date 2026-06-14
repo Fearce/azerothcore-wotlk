@@ -2082,13 +2082,24 @@ namespace WowPsParty
             hench->GetSession()->HandleLootMoneyOpcode(money);
         }
 
-        // Items: every slot, stored under the group's loot rules. StoreLootItem
-        // cleanly skips blocked / not-our-round-robin / full-bag slots.
-        size_t const slots = c->loot.items.size() + c->loot.quest_items.size();
-        for (size_t s = 0; s < slots; ++s)
+        // Items: OBEY group-loot round-robin. StoreLootItem does NOT enforce it
+        // (round-robin is normally a client-side restriction — the client greys out
+        // trash that isn't your turn), so a blind loop let the henchman grab the
+        // under-threshold cloth/greys the roll had assigned to the PLAYER. Take ONLY
+        // the under-threshold items of a corpse whose round-robin owner is THIS
+        // henchman; leave the player's (and every other member's) assigned trash,
+        // every roll-pending green (is_blocked), and FFA/quest items untouched. Gold
+        // above is unaffected — it's split across the group no matter who loots it.
+        if (c->loot.roundRobinPlayer == hench->GetGUID())
         {
-            InventoryResult msg = EQUIP_ERR_OK;
-            hench->StoreLootItem(uint8(s), &c->loot, msg);
+            for (size_t i = 0; i < c->loot.items.size(); ++i)
+            {
+                LootItem const& li = c->loot.items[i];
+                if (li.is_looted || li.freeforall || li.is_blocked || !li.is_underthreshold)
+                    continue;
+                InventoryResult msg = EQUIP_ERR_OK;
+                hench->StoreLootItem(uint8(i), &c->loot, msg);
+            }
         }
 
         // Close the window: clears LootGUID + UNIT_FLAG_LOOTING and, if the corpse
