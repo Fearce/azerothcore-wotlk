@@ -1142,7 +1142,13 @@ namespace WowPsParty
     // party's attacker lists so it needs no grid search.
     static Unit* PickLooseTarget(Player* bot)
     {
-        constexpr float LOOSE_MAX_RANGE = 30.0f;   // don't chase across the room
+        // Cap the grab to adds NEAR the party. AssistTarget melee-chases the
+        // picked add, and that chase is uncapped — at 30y the tank sprinted clear
+        // across the room to a far add and body-pulled every pack en route (the
+        // bear-tank "chain-pulls until we die" report). 18y still grabs adds on
+        // the healer/casters positioned behind the tank; FARTHER adds are pulled
+        // with a ranged taunt rule (cast_loose_enemy:Growl) instead of a sprint.
+        constexpr float LOOSE_MAX_RANGE = 18.0f;
         Unit* best = nullptr;
         float bestDist = 1e9f;
         auto consider = [&](Unit* a)
@@ -2552,7 +2558,14 @@ namespace WowPsParty
         // stands around" bug: only the leader's target made anything fire.
         auto pickPartyDefenseTarget = [&]() -> Unit*
         {
-            static constexpr float PARTY_DEFEND_RANGE = 30.0f;
+            // Ally-peel reach. Mobs ON US (the self-defense loops below) are
+            // uncapped — they're already in our melee. But peeling a mob off an
+            // ALLY makes AssistTarget MELEE-CHASE it, and that chase is uncapped:
+            // at 30y a tank sprinted across the room to a far peel and body-pulled
+            // every pack on the way ("chain-pulls until we die"). 18y still covers
+            // adds on a healer/caster positioned behind the tank; farther adds are
+            // grabbed with a ranged taunt rule (cast_loose_enemy:Growl), not a run.
+            static constexpr float PARTY_DEFEND_RANGE = 18.0f;
             // self-defense — anything swinging at US or OUR pet, always (it's
             // already on us / right next to us, no range cap).
             for (Unit* a : bot->getAttackers())

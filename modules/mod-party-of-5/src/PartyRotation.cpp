@@ -643,9 +643,13 @@ namespace WowPsParty
         return tree;
     }
 
-    // Find an enemy within `radius` of the bot whose current victim is a
-    // party member OTHER than the bot itself. Used by the tank's
-    // `cast_loose_enemy:Taunt` rule to pull aggro off the healer / casters.
+    // The NEAREST in-combat enemy within `radius` of the bot whose current
+    // victim is a party member OTHER than the bot itself — a loose add on the
+    // healer / casters. Used by the tank's `cast_loose_enemy:Growl` taunt rule.
+    // Gates on IsInCombat (a neutral/unpulled mob never qualifies — taunting one
+    // would START a fight) and returns the CLOSEST such add, not an arbitrary
+    // one, so a ranged taunt grabs the nearest threat instead of reaching for a
+    // far mob across the room.
     static Unit* FindLooseEnemy(Player* bot, float radius)
     {
         if (!bot) return nullptr;
@@ -658,9 +662,11 @@ namespace WowPsParty
         std::vector<ObjectGuid> partyGuids;
         WowPsParty::GetPartyGuidsFor(bot->GetGUID(), partyGuids);
 
+        Unit* best = nullptr;
+        float bestDist = 1e9f;
         for (Unit* enemy : targets)
         {
-            if (!enemy || !enemy->IsAlive()) continue;
+            if (!enemy || !enemy->IsAlive() || !enemy->IsInCombat()) continue;  // never an idle mob
             Unit* victim = enemy->GetVictim();
             if (!victim) continue;
             if (victim == bot) continue;          // already on us
@@ -669,9 +675,10 @@ namespace WowPsParty
                           victim->GetGUID()) == partyGuids.end())
                 continue;                          // victim isn't a party member
             if (!bot->IsValidAttackTarget(enemy)) continue;
-            return enemy;
+            float const d = bot->GetDistance(enemy);
+            if (d < bestDist) { bestDist = d; best = enemy; }
         }
-        return nullptr;
+        return best;
     }
 
     // ----- shared-inventory food/drink helpers -------------------------------
@@ -1561,6 +1568,20 @@ namespace WowPsParty
         {
             Unit* const v = theTarget();
             return v && v->GetVictim() == bot;
+        }
+        // "target_in_combat" / "target_out_of_combat" — is the bot's target
+        // actually fighting? Gate a taunt / pull / threat ability on
+        // target_in_combat so it never fires on an idle, unpulled mob (which
+        // would START a fight); pair target_out_of_combat with an opener.
+        if (cond == "target_in_combat")
+        {
+            Unit* const v = theTarget();
+            return v && v->IsInCombat();
+        }
+        if (cond == "target_out_of_combat")
+        {
+            Unit* const v = theTarget();
+            return v && !v->IsInCombat();
         }
         // Movement gate — pair "is_moving" with instant-only rules, or
         // "is_not_moving" so a cast-time spell only queues when planted.
@@ -3077,18 +3098,22 @@ namespace WowPsParty
             return castOrApproach(target, spellId, /*friendlyApproach=*/true);
         }
 
-        // "cast_loose_enemy:<spell>" — cast the spell on the nearest hostile
-        // that's currently attacking an ally instead of the bot. Pairs with
-        // the `enemy_loose_in_*` condition for tank taunt-the-loose-mob
-        // rules. The radius is 12y by default — long enough that the tank
-        // can catch a Defias archer shooting the healer from across a room.
+        // "cast_loose_enemy:<spell>" — cast the spell (a taunt: Growl, Taunt,
+        // Dark Command, Hand of Reckoning) on the NEAREST in-combat hostile that's
+        // attacking an ally instead of the bot. Pairs with the `enemy_loose_in_*`
+        // condition for tank peel-the-loose-mob rules. Searches 30y but does NOT
+        // chase (friendlyApproach=false): a taunt YANKS the mob to the tank, so we
+        // cast it from where we stand if it's in range and otherwise skip. Chasing
+        // a loose add across the room (the old behaviour) body-pulled every pack en
+        // route — the bear-tank "chain-pulls until we die" report. Out of taunt
+        // range this tick → the add is grabbed once the party advances into range.
         if (verb == "cast_loose_enemy")
         {
             uint32 const spellId = FindKnownSpellByName(bot, arg);
             if (!spellId) return false;
             Unit* target = FindLooseEnemy(bot, 30.0f);
             if (!target) return false;
-            return castOrApproach(target, spellId, /*friendlyApproach=*/true);
+            return castOrApproach(target, spellId, /*friendlyApproach=*/false);
         }
 
         // "cast_spread:<dot>" — MULTI-DOT. Apply <dot> to the current target if it's
