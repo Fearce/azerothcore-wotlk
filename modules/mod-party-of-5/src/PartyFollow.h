@@ -193,6 +193,14 @@ namespace WowPsParty
     // non-henchmen.
     void TickHenchmanLoot(Player* bot);
 
+    // Battleground entry for HIRED HENCHMEN + enrolled heroes. Their default AI
+    // is gated out, so when the human queues the party for a BG they never click
+    // "Enter Battle". This accepts a pending BG invite for the bot (ports it in)
+    // so the whole party enters the battleground with the human. Called every AI
+    // tick; fast-exits unless the bot has a live BG invite. Random fill bots use
+    // their own AI and are never managed party bots, so they don't come through here.
+    void TickAcceptBgInvite(Player* bot);
+
     // Dungeon tank-lead engagement. If `bot` is the assigned tank for
     // its account, the leader is in a dungeon and not already engaging
     // a target, and there's a hostile creature within 40 yards of the

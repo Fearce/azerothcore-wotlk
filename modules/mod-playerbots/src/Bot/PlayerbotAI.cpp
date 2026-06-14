@@ -288,9 +288,14 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
     extern void WowPsParty_TankFollowPath_Trampoline(Player* bot);
     extern void WowPsParty_TickGathering_Trampoline(Player* bot);
     extern void WowPsParty_TickHenchmanLoot_Trampoline(Player* bot);
+    extern void WowPsParty_TickAcceptBgInvite_Trampoline(Player* bot);
     bool const isPartyOfFiveBot = WowPsParty_BotHasActiveFollowDirective_Trampoline(bot->GetGUID());
     if (isPartyOfFiveBot)
     {
+        // Battleground: if the human queued the party for a BG, this gated bot
+        // would never click "Enter Battle" — auto-accept the invite so it ports
+        // in with the human. Self-gates: no-op unless it has a live BG invite.
+        WowPsParty_TickAcceptBgInvite_Trampoline(bot);
         // Both enrolled alts AND hired henchmen run our combat AI (rotation +
         // assist-target positioning + LoS approach + tank-lead), then hard
         // stop so the default strategy engine never runs. Henchmen get a

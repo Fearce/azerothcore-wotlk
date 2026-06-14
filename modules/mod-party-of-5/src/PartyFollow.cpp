@@ -63,6 +63,11 @@
 #include "WorldSessionMgr.h"
 #include "WorldPacket.h"
 #include "Opcodes.h"
+
+// Battleground entry for managed party bots (gated AI never clicks "Enter Battle").
+#include "Battleground.h"
+#include "BattlegroundMgr.h"
+#include "BattlegroundQueue.h"
 #include "Random.h"   // urand/frand for the movement-humanization jitter + wander
 
 #include <atomic>
@@ -2201,6 +2206,46 @@ namespace WowPsParty
         }
     }
 
+    // Managed party bots (heroes + henchmen) have their default AI gated out, so
+    // when the human queues the party for a battleground and the "Enter Battle"
+    // invite arrives they would never click it and would be left behind in the
+    // queue. Detect a pending BG invite on the bot's own AI tick and accept it
+    // (port in) exactly like a player clicking Enter Battle — mirrors mod-
+    // playerbots' BgInviteActiveTrigger + AcceptBgInvitationAction, but the port
+    // carries the REAL bgTypeId of the invited queue (the playerbot action
+    // hardcodes WSG). Random FILL bots are NOT party-of-5 bots, so they accept
+    // via their own AI and never reach here. Out-of-combat only — the port opcode
+    // refuses in combat.
+    void TickAcceptBgInvite(Player* bot)
+    {
+        if (!bot || !bot->GetSession()) return;
+        if (bot->InBattleground() || !bot->InBattlegroundQueue()) return;
+        if (bot->IsInCombat()) return;
+
+        for (uint8 i = 0; i < PLAYER_MAX_BATTLEGROUND_QUEUES; ++i)
+        {
+            BattlegroundQueueTypeId const queueTypeId = bot->GetBattlegroundQueueTypeId(i);
+            if (queueTypeId == BATTLEGROUND_QUEUE_NONE) continue;
+
+            BattlegroundQueue& bgQueue = sBattlegroundMgr->GetBattlegroundQueue(queueTypeId);
+            GroupQueueInfo ginfo;
+            if (!bgQueue.GetPlayerGroupInfoData(bot->GetGUID(), &ginfo)) continue;
+            if (!ginfo.IsInvitedToBGInstanceGUID || !ginfo.RemoveInviteTime) continue;
+
+            BattlegroundTypeId const bgTypeId = BattlegroundMgr::BGTemplateId(queueTypeId);
+            uint8 const arenaType = BattlegroundMgr::BGArenaType(queueTypeId);
+
+            // CMSG_BATTLEFIELD_PORT: arenaType, unk2, bgTypeId(u32), unk(0x1F90), action=1.
+            WorldPacket packet(CMSG_BATTLEFIELD_PORT, 20);
+            packet << uint8(arenaType) << uint8(0) << uint32(bgTypeId) << uint16(0x1F90) << uint8(1);
+            bot->GetSession()->HandleBattleFieldPortOpcode(packet);
+
+            LOG_INFO("module", "[WowPsParty BG] {} auto-accepted BG invite (bgType={})",
+                     bot->GetName(), uint32(bgTypeId));
+            return;   // one accept per tick
+        }
+    }
+
     // The party's main combat target — the lead TANK's victim, else any party
     // member's victim — for a bot that has nothing else to engage. Lets an idle /
     // too-far bot (party-defense is range-capped, the leader isn't attacking) GAP-
@@ -4163,6 +4208,13 @@ void WowPsParty_TickGathering_Trampoline(Player* bot)
 void WowPsParty_TickHenchmanLoot_Trampoline(Player* bot)
 {
     WowPsParty::TickHenchmanLoot(bot);
+}
+
+// Battleground-invite auto-accept trampoline — ports a managed party bot into a
+// BG the human queued, since the bot's gated AI never clicks "Enter Battle".
+void WowPsParty_TickAcceptBgInvite_Trampoline(Player* bot)
+{
+    WowPsParty::TickAcceptBgInvite(bot);
 }
 
 // Trampoline from the patched core LFGMgr::JoinLfg: our managed party bots
