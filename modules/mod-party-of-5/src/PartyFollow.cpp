@@ -54,6 +54,7 @@
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
 #include "LootMgr.h"
+#include "ObjectMgr.h"   // sObjectMgr->GetItemTemplate — henchman-loot under-threshold check
 
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
@@ -134,17 +135,40 @@ namespace WowPsParty
             float _range;
         };
 
+        // Does `self` (a henchman) actually have something to loot on this corpse?
+        // GOLD (split across the party no matter who loots it) OR an under-threshold
+        // item that round-robin assigned to THIS henchman. Items being ROLLED for
+        // (over-threshold greens) and other members' round-robin trash are NOT ours.
+        // Without this gate the henchman walks to a corpse it can take nothing from
+        // and, because the corpse keeps UNIT_DYNFLAG_LOOTABLE while the roll runs,
+        // re-targets it forever — the "stuck walking to a corpse being rolled" bug.
+        // Computed by item QUALITY vs the group loot threshold, NOT li.is_underthreshold
+        // — the latter is only set once a player opens the corpse (GroupLoot), which
+        // hasn't happened at grid-scan time.
+        static bool HenchClaimable(Creature const* c, ObjectGuid self, Group const* grp)
+        {
+            Loot const& loot = c->loot;
+            if (loot.gold > 0) return true;
+            if (loot.roundRobinPlayer != self) return false;   // trash assigned to another member
+            uint32 const threshold = grp ? uint32(grp->GetLootThreshold())
+                                         : uint32(ITEM_QUALITY_UNCOMMON);
+            for (LootItem const& li : loot.items)
+            {
+                if (li.is_looted || li.freeforall) continue;
+                ItemTemplate const* t = sObjectMgr->GetItemTemplate(li.itemid);
+                if (t && t->Quality < threshold) return true;  // under-threshold trash that's OURS
+            }
+            return false;
+        }
+
         // Predicate for the henchman corpse-loot grid search: a dead creature
-        // within range that the henchman's OWN WoW group killed and still carries
-        // loot — the native UNIT_DYNFLAG_LOOTABLE "sparkle" the engine sets at
-        // death and clears once the corpse is emptied. We loot through the real
-        // loot path (Player::SendLoot + the built-in handlers), so the flag is
-        // the only signal we need; gold/item accounting is left entirely to the
-        // engine. LOOT_SKINNING corpses are skipped — that's the alts' skinner.
+        // within range that the henchman's OWN WoW group killed, still carries the
+        // native UNIT_DYNFLAG_LOOTABLE "sparkle", and has loot THIS henchman may
+        // actually take (HenchClaimable). LOOT_SKINNING corpses are the alts' skinner.
         struct NearbyLootableCorpseCheck
         {
-            NearbyLootableCorpseCheck(WorldObject const* src, float range, Group* grp)
-                : _src(src), _range(range), _grp(grp) {}
+            NearbyLootableCorpseCheck(WorldObject const* src, float range, Group* grp, ObjectGuid self)
+                : _src(src), _range(range), _self(self), _grp(grp) {}
             bool operator()(Creature* c) const
             {
                 if (!c || c->IsAlive() || !_src->IsWithinDist(c, _range, false))
@@ -153,10 +177,13 @@ namespace WowPsParty
                     return false;                    // nothing lootable left
                 if (c->loot.loot_type == LOOT_SKINNING)
                     return false;                    // skin loot — not ours to take
-                return c->GetLootRecipientGroup() == _grp;  // only our group's kills
+                if (c->GetLootRecipientGroup() != _grp)
+                    return false;                    // only our group's kills
+                return HenchClaimable(c, _self, _grp);  // ignore rolls / other members' trash
             }
             WorldObject const* _src;
             float _range;
+            ObjectGuid _self;
             Group* _grp;
         };
 
@@ -2045,7 +2072,7 @@ namespace WowPsParty
                                                ObjectGuid avoid, Group* grp)
     {
         std::list<Creature*> crs;
-        NearbyLootableCorpseCheck check(bot, range, grp);
+        NearbyLootableCorpseCheck check(bot, range, grp, bot->GetGUID());
         Acore::CreatureListSearcher<NearbyLootableCorpseCheck> searcher(bot, crs, check);
         Cell::VisitObjects(bot, searcher, range);
 
@@ -2125,7 +2152,40 @@ namespace WowPsParty
         uint32 const gLow = bot->GetGUID().GetCounter();
         uint32 const now  = getMSTime();
 
-        if (bot->IsInCombat())                            { HenchLootLog(gLow, "skip: in combat"); return; }
+        // COMBAT ALWAYS BEATS LOOTING. Looting only the bot's OWN combat let a
+        // henchman whose fight just ended amble off to a corpse while the PLAYER was
+        // under attack ("they didn't help"). Check the WHOLE party (the bot, the
+        // human leader, every member): if anyone's fighting, abandon any loot-walk
+        // and yield so AssistTarget engages. We MUST clear the committed corpse and
+        // release the follow-hold the walk set — AssistTarget returns early while
+        // held, so otherwise the bot keeps walking to the corpse for ~2.5s.
+        bool partyInCombat = bot->IsInCombat();
+        if (!partyInCombat)
+        {
+            std::vector<ObjectGuid> party;
+            GetPartyGuidsFor(bot->GetGUID(), party);
+            for (ObjectGuid const& g : party)
+            {
+                Player* m = ObjectAccessor::FindConnectedPlayer(g);
+                if (m && m->IsInWorld() && m->IsAlive()
+                    && m->GetMapId() == bot->GetMapId() && m->IsInCombat())
+                { partyInCombat = true; break; }
+            }
+        }
+        if (partyInCombat)
+        {
+            bool hadNode = false;
+            {
+                std::lock_guard<std::mutex> lock(g_gatherMutex);
+                auto& st = g_gather[gLow];
+                hadNode = (bool)st.node;
+                st.node = ObjectGuid::Empty;
+                st.commitMs = 0;
+            }
+            if (hadNode) HoldFollower(bot->GetGUID(), 0);   // release loot-walk hold -> AssistTarget engages
+            HenchLootLog(gLow, "skip: party in combat — engaging instead of looting");
+            return;
+        }
         if (bot->IsNonMeleeSpellCast(false, false, true)) { HenchLootLog(gLow, "skip: casting"); return; }
         if (IsTankLeading(bot->GetGUID()))                { HenchLootLog(gLow, "skip: leading the dungeon"); return; }
 
@@ -2163,7 +2223,8 @@ namespace WowPsParty
         bool const valid = target && !target->IsAlive()
             && target->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE)
             && target->loot.loot_type != LOOT_SKINNING
-            && target->GetLootRecipientGroup() == grp;
+            && target->GetLootRecipientGroup() == grp
+            && HenchClaimable(target, bot->GetGUID(), grp);  // still something here FOR US?
 
         if (!valid)
         {
