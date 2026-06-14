@@ -130,33 +130,29 @@ namespace WowPsParty
         };
 
         // Predicate for the henchman corpse-loot grid search: a dead creature
-        // within range that a party member tagged/killed (loot recipient or
-        // recipient-group set) and still holds loot WE can take — GOLD always,
-        // plus non-FFA items when the henchman has a free bag slot. FFA items are
-        // left for the human; a corpse with only FFA / already-looted remnants is
-        // rejected so the henchman doesn't oscillate back to one it can't progress.
-        // (Loot is generated at kill time in Unit::Kill, so a henchman-killed
-        // corpse already has its gold + items populated here.)
+        // within range that the henchman's OWN WoW group killed and still carries
+        // loot — the native UNIT_DYNFLAG_LOOTABLE "sparkle" the engine sets at
+        // death and clears once the corpse is emptied. We loot through the real
+        // loot path (Player::SendLoot + the built-in handlers), so the flag is
+        // the only signal we need; gold/item accounting is left entirely to the
+        // engine. LOOT_SKINNING corpses are skipped — that's the alts' skinner.
         struct NearbyLootableCorpseCheck
         {
-            NearbyLootableCorpseCheck(WorldObject const* src, float range, bool wantItems)
-                : _src(src), _range(range), _wantItems(wantItems) {}
+            NearbyLootableCorpseCheck(WorldObject const* src, float range, Group* grp)
+                : _src(src), _range(range), _grp(grp) {}
             bool operator()(Creature* c) const
             {
                 if (!c || c->IsAlive() || !_src->IsWithinDist(c, _range, false))
                     return false;
-                if (!(c->GetLootRecipient() || c->GetLootRecipientGroup()))
-                    return false;                    // not a party kill — hands off
-                Loot const& loot = c->loot;
-                if (loot.gold > 0) return true;
-                if (!_wantItems) return false;       // bags full — only gold corpses
-                for (LootItem const& li : loot.items)
-                    if (!li.is_looted && !li.freeforall) return true;
-                return false;
+                if (!c->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE))
+                    return false;                    // nothing lootable left
+                if (c->loot.loot_type == LOOT_SKINNING)
+                    return false;                    // skin loot — not ours to take
+                return c->GetLootRecipientGroup() == _grp;  // only our group's kills
             }
             WorldObject const* _src;
             float _range;
-            bool  _wantItems;
+            Group* _grp;
         };
 
         struct Directive
@@ -2018,38 +2014,27 @@ namespace WowPsParty
     }
 
     // ----- Henchman corpse looting -----------------------------------------
-    // Hired henchmen default to GROUP_LOOT yet never ran the default playerbot
-    // loot AI (managed bots hard-return from UpdateAI), so party-killed corpses
-    // just sat there — "they never touch loot at all." This walks an idle
-    // henchman to the nearest party-killed corpse and loots it:
-    //   * GOLD -> the HUMAN LEADER, which OnPlayerMoneyChanged then mirrors
-    //     across the whole party (exactly like OnPlayerCreatureKill's auto-loot).
-    //     A henchman's OWN ModifyMoney would pocket it privately — henchmen live
-    //     outside account_party, so LoadedPartyPeers(henchAccount) is empty and
-    //     nothing would reach the party.
-    //   * ITEMS -> the henchman's OWN bags (trash, wiped on dismiss). Hoovering
-    //     them is the point: under a free-for-all policy it stops the human
-    //     cherry-picking every drop in the instance.
-    // Money never needs a bag slot, so a full-up henchman still recovers every
-    // copper and simply SKIPS items it can't hold (CanStoreNewItem != OK) — no
-    // assert, no stuck corpse, no bugged bot. HENCHMEN ONLY: enrolled alts and
-    // the human keep the normal loot path; the party-of-5 flow is untouched.
+    // Hired henchmen never ran the default playerbot loot AI (managed bots
+    // hard-return from UpdateAI), so party-killed corpses just sat there — "they
+    // never touch loot at all." This walks an idle henchman to the nearest
+    // corpse its OWN WoW group killed and loots it through the ENGINE'S real
+    // loot path — exactly like the player right-clicking the corpse:
+    //   * MONEY is handled entirely by the built-in HandleLootMoneyOpcode, which
+    //     splits it across the normal WoW party. We do NO manual ModifyMoney —
+    //     that is party-of-5-only behaviour and doing it here DUPLICATED the gold
+    //     on top of WoW's native group share.
+    //   * ITEMS go through StoreLootItem, which honours the group's loot rules
+    //     (round-robin / threshold / rolls) and bag space just like a real loot.
+    // HENCHMEN ONLY: enrolled alts and the human keep their own loot path; the
+    // party-of-5 flow is untouched.
 
-    static bool CorpseHasLootForHench(Creature* c, bool wantItems)
-    {
-        Loot const& loot = c->loot;
-        if (loot.gold > 0) return true;
-        if (!wantItems) return false;
-        for (LootItem const& li : loot.items)
-            if (!li.is_looted && !li.freeforall) return true;
-        return false;
-    }
+    static constexpr float HENCH_LOOT_REACH = 4.5f;   // inside INTERACTION_DISTANCE (5.5)
 
     static Creature* FindNearestLootableCorpse(Player* bot, float range,
-                                               ObjectGuid avoid, bool wantItems)
+                                               ObjectGuid avoid, Group* grp)
     {
         std::list<Creature*> crs;
-        NearbyLootableCorpseCheck check(bot, range, wantItems);
+        NearbyLootableCorpseCheck check(bot, range, grp);
         Acore::CreatureListSearcher<NearbyLootableCorpseCheck> searcher(bot, crs, check);
         Cell::VisitObjects(bot, searcher, range);
 
@@ -2064,50 +2049,40 @@ namespace WowPsParty
         return best;
     }
 
-    // Loot a reached corpse: gold to the human leader (party-mirrored), items to
-    // the henchman's own bags (skip-if-full — gold always lands first). Returns
-    // true if a non-FFA item was LEFT BEHIND because it wouldn't store (bags
-    // full, or a unique/unique-equipped item the henchman already holds even
-    // though a slot is free). The caller parks such a corpse in the avoid slot:
-    // gold is already taken, so without that it would be re-selected every tick
-    // (gold==0 + a still-unlooted item) and the henchman would oscillate back to
-    // a corpse it can never finish, never following the party again.
-    static bool LootCorpseForHenchman(Player* hench, Player* leader, Creature* c)
+    // Loot a reached corpse via the engine, like a player right-click + auto-loot:
+    // open it, let the built-in money handler split the gold across the party,
+    // then store each item slot under the group's loot rules, then release.
+    static void LootCorpseForHenchman(Player* hench, Creature* c)
     {
-        Loot* loot = &c->loot;
+        ObjectGuid const guid = c->GetGUID();
 
-        if (loot->gold > 0)
+        // Open the corpse. SendLoot sets our LootGUID + the group loot permission,
+        // and bails internally if we're out of range or not in the recipient
+        // group — in which case GetLootGUID stays unset and we stop.
+        hench->SendLoot(guid, LOOT_CORPSE);
+        if (hench->GetLootGUID() != guid)
+            return;
+
+        // Money: built-in group split (HandleLootMoneyOpcode reads our LootGUID).
+        // Empty packet — the handler ignores its payload for money loot.
+        if (c->loot.gold > 0)
         {
-            leader->ModifyMoney(int32(loot->gold));   // OnPlayerMoneyChanged -> party
-            loot->gold = 0;
+            WorldPacket money(CMSG_LOOT_MONEY, 0);
+            hench->GetSession()->HandleLootMoneyOpcode(money);
         }
 
-        bool leftUnstored = false;
-        for (size_t i = 0; i < loot->items.size(); ++i)
+        // Items: every slot, stored under the group's loot rules. StoreLootItem
+        // cleanly skips blocked / not-our-round-robin / full-bag slots.
+        size_t const slots = c->loot.items.size() + c->loot.quest_items.size();
+        for (size_t s = 0; s < slots; ++s)
         {
-            LootItem& li = loot->items[i];
-            if (li.is_looted || li.freeforall) continue;
-            ItemPosCountVec dest;
-            // Full bags / unstorable item -> leave it on the corpse. This is the
-            // inventory-full safety: money is already taken, the item just stays.
-            if (hench->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, li.itemid, li.count) != EQUIP_ERR_OK)
-            { leftUnstored = true; continue; }
-            // Preserve the corpse's random-property roll (don't reroll the suffix).
-            if (Item* stored = hench->StoreNewItem(dest, li.itemid, /*update=*/true, li.randomPropertyId))
-                li.is_looted = true;
-            else
-                leftUnstored = true;
+            InventoryResult msg = EQUIP_ERR_OK;
+            hench->StoreLootItem(uint8(s), &c->loot, msg);
         }
 
-        // Finalize only when nothing lootable remains. A left-behind FFA item
-        // keeps the corpse openable for the human — matches OnPlayerCreatureKill.
-        bool allTaken = (loot->gold == 0);
-        for (LootItem const& li : loot->items)
-            if (!li.is_looted) { allTaken = false; break; }
-        if (allTaken)
-            c->AllLootRemovedFromCorpse();
-
-        return leftUnstored;
+        // Close the window: clears LootGUID + UNIT_FLAG_LOOTING and, if the corpse
+        // is now empty, drops its UNIT_DYNFLAG_LOOTABLE so we stop detecting it.
+        hench->GetSession()->DoLootRelease(guid);
     }
 
     void TickHenchmanLoot(Player* bot)
@@ -2116,9 +2091,14 @@ namespace WowPsParty
         if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) return;   // the controlled body
 
         // HENCHMEN ONLY — the whole point of this feature. Enrolled alts and the
-        // human keep the normal loot path (OnPlayerCreatureKill). IsHenchman
-        // takes g_mutex, so call it once and bail early for everyone else.
+        // human keep their normal loot path. IsHenchman takes g_mutex, so call it
+        // once and bail early for everyone else.
         if (!IsHenchman(bot->GetGUID())) return;
+
+        // Must be in a WoW group to loot its kills (the native loot permission
+        // and money split both key off the group).
+        Group* grp = bot->GetGroup();
+        if (!grp) return;
 
         uint32 const gLow = bot->GetGUID().GetCounter();
         uint32 const now  = getMSTime();
@@ -2127,16 +2107,13 @@ namespace WowPsParty
         if (bot->IsNonMeleeSpellCast(false, false, true)) { HenchLootLog(gLow, "skip: casting"); return; }
         if (IsTankLeading(bot->GetGUID()))                { HenchLootLog(gLow, "skip: leading the dungeon"); return; }
 
+        // Leader is the leash anchor only (don't wander off to a far corpse) —
+        // NOT involved in money, which the engine distributes natively.
         ObjectGuid const leaderGuid = GetLeaderFor(bot->GetGUID());
         if (!leaderGuid) { HenchLootLog(gLow, "skip: no leader directive"); return; }
         Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
         if (!leader || !leader->IsInWorld())          { HenchLootLog(gLow, "skip: leader not in world"); return; }
         if (leader->GetMapId() != bot->GetMapId())    { HenchLootLog(gLow, "skip: leader other map"); return; }
-
-        // Bags full -> still chase GOLD corpses (money needs no slot), just not
-        // item-only ones. Recomputed each tick as the henchman fills / a peer
-        // clears its bags on dismiss.
-        bool const wantItems = bot->GetFreeInventorySpace() > 0;
 
         // Reuse the gather approach-state slot: a henchman NEVER gathers (Tick
         // Gathering bails at the henchman gate before touching g_gather), so its
@@ -2162,22 +2139,23 @@ namespace WowPsParty
 
         Creature* target = committed ? ObjectAccessor::GetCreature(*bot, committed) : nullptr;
         bool const valid = target && !target->IsAlive()
-            && (target->GetLootRecipient() || target->GetLootRecipientGroup())
-            && CorpseHasLootForHench(target, wantItems);
+            && target->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE)
+            && target->loot.loot_type != LOOT_SKINNING
+            && target->GetLootRecipientGroup() == grp;
 
         if (!valid)
         {
             // Lost / emptied committed corpse — pick the nearest valid one,
-            // skipping any we recently gave up reaching.
+            // skipping any we recently gave up reaching / just looted.
             target = FindNearestLootableCorpse(bot, GATHER_SCAN_RANGE,
-                (now < avoidUntil) ? avoid : ObjectGuid::Empty, wantItems);
+                (now < avoidUntil) ? avoid : ObjectGuid::Empty, grp);
             std::lock_guard<std::mutex> lock(g_gatherMutex);
             auto& st = g_gather[gLow];
             st.node     = target ? target->GetGUID() : ObjectGuid::Empty;
             st.commitMs = target ? now : 0;
         }
         else if (commitMs && (now - commitMs) > GATHER_APPROACH_TIMEOUT_MS &&
-                 !bot->IsWithinDistInMap(target, GATHER_REACH))
+                 !bot->IsWithinDistInMap(target, HENCH_LOOT_REACH))
         {
             // Committed but wedged on geometry — abandon it and avoid re-picking
             // it for a while; next tick re-scans for another.
@@ -2191,18 +2169,19 @@ namespace WowPsParty
         }
         if (!target) return;
 
-        if (bot->IsWithinDistInMap(target, GATHER_REACH))
+        if (bot->IsWithinDistInMap(target, HENCH_LOOT_REACH))
         {
-            bool const leftUnstored = LootCorpseForHenchman(bot, leader, target);
+            LootCorpseForHenchman(bot, target);
             ObjectGuid const tg = target->GetGUID();
             std::lock_guard<std::mutex> lock(g_gatherMutex);
             auto& st = g_gather[gLow];
             st.node = ObjectGuid::Empty;
             st.commitMs = 0;
-            // Couldn't take everything we wanted (a unique we already hold, or
-            // full bags) — park it so we don't re-pick this same corpse every
-            // tick and stop following the party. Gold's already in hand.
-            if (leftUnstored) { st.avoid = tg; st.avoidUntil = now + GATHER_AVOID_MS; }
+            // Park it: a partially-looted corpse keeps UNIT_DYNFLAG_LOOTABLE (its
+            // remaining loot belongs to other members / pending rolls), so without
+            // this we'd re-pick it every tick and stop following. We've taken our
+            // share; a fully-emptied corpse already lost the flag and won't recur.
+            st.avoid = tg; st.avoidUntil = now + GATHER_AVOID_MS;
         }
         else
         {
