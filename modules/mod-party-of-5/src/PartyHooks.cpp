@@ -388,8 +388,16 @@ public:
     {
         using namespace WowPsParty;
         if (!IsEnabled() || !player || !player->GetSession()) return;
-        if (!sPartyMgr.GetSlotForGuid(player->GetGUID().GetCounter()))
-            return;  // not one of this account's party characters
+        // Auto-train an ENROLLED party character (the user's hero alts, controlled or
+        // bot) OR the human's CONTROLLED character even when it isn't enrolled — a
+        // fresh 6th+ character levelled past a full party-of-5 still trains itself,
+        // matching the login backfill (which already learns for any human). Only a
+        // NON-enrolled BOT (a random-pool companion that isn't ours) is skipped, so
+        // we never touch foreign bots. (The bug: the old enrollment-only gate left a
+        // new, un-enrollable main missing every spell it dinged into.)
+        if (!sPartyMgr.GetSlotForGuid(player->GetGUID().GetCounter())
+            && sPlayerbotsMgr.GetPlayerbotAI(player))
+            return;
 
         // Snapshot the spell-chains already known so we can report only the
         // genuinely NEW abilities (not higher ranks of spells already in use —
