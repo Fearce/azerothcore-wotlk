@@ -1038,7 +1038,25 @@ uint32 WowPsParty_PartyReagentCount(Player* crafter, uint32 itemId)
     if (!WowPsParty::IsEnabled() || !WowPsParty::InventoryShared(crafter))
         return total;   // solo: own bags only == vanilla HasItemCount predicate
     for (Player* p : LoadedPartyPeers(crafter->GetSession()->GetAccountId(), crafter))
+    {
+        // Only peers sharing the crafter's Map* are eligible. A Map is updated by a
+        // single MapUpdater worker thread, so consuming a same-map peer's reagent
+        // (in WowPsParty_TakeReagent) is serialized with that peer's own save. A
+        // peer on another map updates on another thread — mutating its inventory
+        // from the crafter's thread races its save and can free an Item still queued
+        // in it, the use-after-free seen as the _SaveInventory ACCESS_VIOLATION.
+        // Counting must use the SAME predicate as consuming so the two stay
+        // symmetric (never allow a craft we can't fully pay for). Compare Map* not
+        // map id: two instances of one map are distinct update contexts.
+        if (p->GetMap() != crafter->GetMap())
+        {
+            if (uint32 const elsewhere = UsableReagentCount(p, itemId))
+                LOG_DEBUG("module", "[WowPsParty Reagent] {}x reagent {} held by party-mate {} is on another map ({} vs {}); not counted for {}'s craft.",
+                          elsewhere, itemId, p->GetName(), p->GetMapId(), crafter->GetMapId(), crafter->GetName());
+            continue;
+        }
         total += UsableReagentCount(p, itemId);
+    }
     return total;
 }
 
@@ -1063,13 +1081,27 @@ void WowPsParty_TakeReagent(Player* crafter, uint32 itemId, uint32 count)
     for (Player* p : LoadedPartyPeers(crafter->GetSession()->GetAccountId(), crafter))
     {
         if (remaining == 0) break;
+        // Same-Map* peers only — mutating an off-map peer's inventory from the
+        // crafter's thread races that peer's save thread (use-after-free crash).
+        // Matches the predicate in WowPsParty_PartyReagentCount; see it for detail.
+        if (p->GetMap() != crafter->GetMap())
+            continue;
         uint32 const take = std::min(UsableReagentCount(p, itemId), remaining);
         if (take)
         {
             p->DestroyItemCount(itemId, take, true);
             remaining -= take;
+            LOG_INFO("module", "[WowPsParty Reagent] {} used {}x reagent {} from party-mate {}'s bags (shared inventory).",
+                     crafter->GetName(), take, itemId, p->GetName());
         }
     }
+
+    // CheckItems already approved this craft against the same same-map predicate, so
+    // a shortfall here means a peer moved maps or dropped the reagent mid-cast. Log
+    // it (rare) so a craft that silently consumed less than expected is diagnosable.
+    if (remaining)
+        LOG_WARN("module", "[WowPsParty Reagent] {}'s craft is still {}x short of reagent {} after the shared inventory — a holder likely left the crafter's map mid-cast.",
+                 crafter->GetName(), remaining, itemId);
 }
 
 // Trampoline called from the [WowPsParty PATCH] in Spell.cpp::CheckItems.
