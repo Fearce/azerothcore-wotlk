@@ -73,6 +73,8 @@
 //  see: https://github.com/azerothcore/azerothcore-wotlk/issues/9766
 #include "GridNotifiersImpl.h"
 
+#include <unordered_set>
+
 /*********************************************************/
 /***                    STORAGE SYSTEM                 ***/
 /*********************************************************/
@@ -7401,11 +7403,26 @@ void Player::_SaveInventory(CharacterDatabaseTransaction trans)
         return;
 
     ObjectGuid::LowType lowGuid = GetGUID().GetCounter();
+    // An Item* can legitimately appear in m_itemUpdateQueue more than once: SetState(ITEM_UNCHANGED)
+    // resets the item's uQueuePos to -1 WITHOUT nulling its queue slot (Item::SetState — "the item must
+    // be removed from the queue manually"), so a later SetState(ITEM_CHANGED/REMOVED) re-adds it while the
+    // stale earlier slot survives. Shared-party item moves + craft reagent consumption both drive those
+    // transitions. Processing an ITEM_REMOVED entry deletes the item (Item::SaveToDB), so reaching its
+    // duplicate is a use-after-free — the recurring _SaveInventory ACCESS_VIOLATION. Skip pointers already
+    // handled this pass; this compares ADDRESSES only and never dereferences a possibly-freed item.
+    std::unordered_set<Item*> seenItems;
+    seenItems.reserve(m_itemUpdateQueue.size());
     for (std::size_t i = 0; i < m_itemUpdateQueue.size(); ++i)
     {
         Item* item = m_itemUpdateQueue[i];
         if (!item)
             continue;
+        if (!seenItems.insert(item).second)
+        {
+            LOG_ERROR("entities.player", "Player(GUID: {} Name: {})::_SaveInventory - an item pointer is queued more than once; skipping the duplicate to prevent a use-after-free. Root: a stale queue slot left by SetState(ITEM_UNCHANGED) without dequeue, then re-added.",
+                      lowGuid, GetName());
+            continue;
+        }
 
         Bag* container = item->GetContainer();
         ObjectGuid::LowType bag_guid = container ? container->GetGUID().GetCounter() : 0;
