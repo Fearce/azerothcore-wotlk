@@ -74,6 +74,9 @@
 #include "GridNotifiersImpl.h"
 
 #include <unordered_set>
+#ifdef _WIN32
+#include <excpt.h>   // __try/__except — guard _SaveInventory against freed queue entries
+#endif
 
 /*********************************************************/
 /***                    STORAGE SYSTEM                 ***/
@@ -7337,6 +7340,32 @@ void Player::_SaveAuras(CharacterDatabaseTransaction trans, bool logout)
     }
 }
 
+#ifdef _WIN32
+// Probe a queued item pointer behind structured exception handling BEFORE _SaveInventory
+// trusts it. Upstream paths can orphan an Item* in m_itemUpdateQueue (an item deleted
+// while still queued, or one whose value array was freed), and dereferencing it aborts the
+// whole worldserver with the recurring Object::GetGuidValue ACCESS_VIOLATION. A guarded read
+// of the item's guid faults harmlessly on such memory so the caller can skip + log instead of
+// crash. Kept to POD locals only — mixing __try/__except with C++ object unwinding is illegal
+// (C2712), so the real per-item work stays in the caller. MSVC-only; other platforms rely on
+// the dedupe guard plus fixing the upstream orphan sources.
+static bool WowPsQueuedItemReadable(Item* item)
+{
+    __try
+    {
+        volatile uint32 probe = item->GetGUID().GetCounter();
+        (void)probe;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+#else
+static bool WowPsQueuedItemReadable(Item* /*item*/) { return true; }
+#endif
+
 void Player::_SaveInventory(CharacterDatabaseTransaction trans)
 {
     CharacterDatabasePreparedStatement* stmt = nullptr;
@@ -7420,6 +7449,17 @@ void Player::_SaveInventory(CharacterDatabaseTransaction trans)
         if (!seenItems.insert(item).second)
         {
             LOG_ERROR("entities.player", "Player(GUID: {} Name: {})::_SaveInventory - an item pointer is queued more than once; skipping the duplicate to prevent a use-after-free. Root: a stale queue slot left by SetState(ITEM_UNCHANGED) without dequeue, then re-added.",
+                      lowGuid, GetName());
+            continue;
+        }
+        // Last line of defence: an Item* can be orphaned in the queue by an upstream path that
+        // deletes/frees it without dequeuing (seen as a freed item with state ITEM_REMOVED, or a
+        // null value array). Dereferencing it below would abort the worldserver. Probe it first;
+        // skip + log the bad entry instead of crashing, so the server survives and the offender is
+        // traceable. NOT a duplicate (handled above) — this is a single dangling entry.
+        if (!WowPsQueuedItemReadable(item))
+        {
+            LOG_ERROR("entities.player", "Player(GUID: {} Name: {})::_SaveInventory - a freed/dangling item pointer survived in the update queue; skipping it to keep the worldserver alive (item deleted while still queued upstream).",
                       lowGuid, GetName());
             continue;
         }
