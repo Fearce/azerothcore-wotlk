@@ -1123,19 +1123,21 @@ namespace WowPsParty
     // the actual threat, not a timer"). Auto-scales to any tank/DPS/gear.
     static constexpr float THREAT_CAP_RATIO = 0.80f;
 
-    // ---- Human-tank GATHER WINDOW --------------------------------------------
-    // Give a human tank-leader an uncontested head-start to pull + build threat
-    // before DPS assist OR the healer heals — both rip a fresh pull off the tank
-    // (Kevin: "they don't give me any chance to grab threat... they attack before
-    // i even did anything to the mob", and "if i receive any heal the healer rips
-    // aggro"). The pure threat-cap alone released DPS the instant the tank had a
-    // sliver of threat, so a fresh/proximity pull had no real window. This timed
-    // window RE-ARMS every time the tank grabs a NEW mob (its attacker count
-    // climbs) so it covers chain-gathering a whole pack, not just the first mob.
-    static constexpr uint32 TANK_GATHER_WINDOW_MS = 3000;
-    // ...but END it early if the tank drops this low — a dying tank needs DPS to
-    // burn the mob and the healer to top it off NOW, window or not.
-    static constexpr float  TANK_GATHER_LOW_PCT   = 55.0f;
+    // ---- Human-tank ENGAGE LEAD (pure threat, NO timer) ----------------------
+    // A mob only counts as "properly engaged" by the tank once the tank holds at
+    // least this fraction of the mob's MAX HEALTH in threat on it. Below it, DPS
+    // hold and the healer holds heals — so a bare right-click, a passive patrol
+    // that wandered onto the tank, or any other near-zero "light" aggro never
+    // releases the party (Kevin: "they attack before i even did anything", "an
+    // enemy patrol sneaks up"). Above it the existing THREAT_CAP_RATIO governs.
+    // A fraction of max-HP AUTO-SCALES with level/content with no timer: ~1 GCD of
+    // tank threat on trash, a couple seconds on a high-HP boss — and it's PER MOB,
+    // so pulling one extra mob onto an already-locked pack only gates DPS on that
+    // ONE fresh mob, never the whole party (the timer's fatal flaw).
+    static constexpr float ENGAGE_THREAT_HEALTH_FRAC = 0.03f;
+    // Emergency release: a tank/member at or below this HP gets DPS + heals NOW,
+    // engage-lead or not — nobody dies waiting for threat.
+    static constexpr float TANK_GATHER_LOW_PCT = 55.0f;
 
     // True if a party member that's ALSO standing off (>8y from the shared
     // victim, i.e. another caster/hunter rather than a melee at the mob) is
@@ -2596,39 +2598,31 @@ namespace WowPsParty
         return tm.GetThreat(bot) >= tankThreat * THREAT_CAP_RATIO;
     }
 
-    // True while the human tank-leader's GATHER WINDOW is open — DPS hold fire and
-    // the healer holds heals so the tank gets a real head-start. Re-arms whenever
-    // the tank's attacker count climbs (a new mob pulled), so it spans gathering a
-    // whole pack. Closes when the tank leaves combat, the window elapses with no
-    // new pull, or the tank drops to TANK_GATHER_LOW_PCT (needs help now).
-    // map-update thread owns this party, so thread_local is race-free (mirrors
-    // g_pullAnchor / wasAlive). guidLow -> {lastNewPullMs, lastAttackerCount}.
-    static bool TankGatherWindowOpen(Player* tank)
+    // PURE-THREAT engage gate: has the tank built a real lead on THIS mob — enough
+    // that it's "properly engaged", not just lightly aggroed (a right-click, a
+    // passive patrol, a mob the tank merely auto-selected / that wandered in)? The
+    // tank must hold threat >= ENGAGE_THREAT_HEALTH_FRAC of the mob's max health.
+    // No timer: it tracks live threat, so deliberately pulling one extra mob onto a
+    // locked pack only gates that ONE mob, and an accidental patrol-aggro just sits
+    // unengaged instead of freezing the party. Caller has already confirmed the tank
+    // is the mob's top-threat (MobOnTank), so GetVictim() IS the tank.
+    static bool TankHasEngageLead(Unit* mob)
     {
-        if (!tank || !tank->IsInWorld()) return false;
-        static thread_local std::unordered_map<uint32, std::pair<uint32, uint32>> st;
-        uint32 const id  = tank->GetGUID().GetCounter();
-        uint32 const now = getMSTime();
-        if (!tank->IsInCombat()) { st.erase(id); return false; }
-        // Count ALL mobs in combat with the tank (the PvE combat refs) — not just
-        // getAttackers(), which is melee-only and would miss a ranged add or a mob
-        // still closing the gap from a ranged tag, exactly the chain-gather case the
-        // window is meant to extend.
-        uint32 const engaged = uint32(tank->GetCombatManager().GetPvECombatRefs().size());
-        auto& s = st[id];                                   // {lastNewPullMs, lastCount}
-        if (s.first == 0 || engaged > s.second) s.first = now;   // combat start / new mob
-        s.second = engaged;
-        if (tank->GetHealthPct() <= TANK_GATHER_LOW_PCT) return false;   // tank in trouble
-        return now - s.first < TANK_GATHER_WINDOW_MS;
+        if (!mob) return false;
+        Unit* const tank = mob->GetVictim();
+        if (!tank) return false;
+        float const floor = float(mob->GetMaxHealth()) * ENGAGE_THREAT_HEALTH_FRAC;
+        return mob->GetThreatMgr().GetThreat(tank) >= floor;
     }
 
-    // Healer threat-hold: should this healer SKIP its heals right now because the
-    // human tank-leader is still gathering a pull? Heal threat is split across
-    // every mob in combat and rips a fresh pull straight off the tank. Gated
-    // behind the per-bot wait-tank-threat toggle (toggle off -> heal normally);
-    // the window itself ends if the tank drops low, so a dying tank still gets
-    // healed. Cleanse/rez are never suppressed (the rotation gate only skips the
-    // direct-heal verbs). Consulted from TickRotation.
+    // Healer threat-hold: should this healer SKIP its heals right now? Heal threat
+    // is split across every mob the healer is in combat with and rips any mob the
+    // tank hasn't yet locked down. So HOLD while the tank still has a mob it's the
+    // top-threat on but hasn't built an engage lead on — i.e. it's still locking the
+    // pack. Resumes the instant every such mob is locked (pure threat, no timer).
+    // Gated behind the per-bot wait-tank-threat toggle (off -> heal normally);
+    // emergency-overridden if anyone drops low. Cleanse/rez are never suppressed
+    // (the rotation gate only skips the direct-heal verbs). Consulted from TickRotation.
     bool HealerShouldHoldHeal(Player* bot)
     {
         if (!bot) return false;
@@ -2638,18 +2632,28 @@ namespace WowPsParty
         Player* leader = ObjectAccessor::FindConnectedPlayer(lg);
         if (!leader || !HumanTankLeadActive(bot, leader)) return false;
         if (!WaitForHumanTank(bot->GetGUID())) return false;   // toggle off -> heal normally
-        if (!TankGatherWindowOpen(leader)) return false;
-        // Emergency override: never hold heals while ANY party member is already in
-        // real danger. TankGatherWindowOpen only watches the TANK's HP, but the held
-        // verb heals whoever is lowest — a caster mob beelining a cloth DPS could
-        // kill it inside the window while the tank sits high. The window exists to
-        // let the tank build threat, not to let a squishy die waiting.
+        if (!leader->IsInCombat()) return false;
+
+        // Is the tank still locking the pack? Any mob the tank is the top-threat on
+        // that lacks an engage lead = a fresh pull heal-threat would rip off it.
+        bool tankStillLocking = false;
+        for (auto const& [refGuid, ref] : leader->GetCombatManager().GetPvECombatRefs())
+        {
+            Unit* const mob = ref->GetOther(leader);
+            if (!mob || !mob->IsAlive()) continue;
+            if (mob->GetVictim() != leader) continue;        // not the tank's to lock
+            if (!TankHasEngageLead(mob)) { tankStillLocking = true; break; }
+        }
+        if (!tankStillLocking) return false;                 // pack locked -> heal normally
+
+        // Emergency override: heal NOW if the tank or any member is in real danger
+        // — the hold is to let the tank build threat, not to let anyone die waiting.
         std::vector<ObjectGuid> party;
         GetPartyGuidsFor(bot->GetGUID(), party);
         for (ObjectGuid const& g : party)
             if (Player* m = ObjectAccessor::FindConnectedPlayer(g))
                 if (m->IsAlive() && m->GetHealthPct() <= TANK_GATHER_LOW_PCT)
-                    return false;   // someone needs a heal now — don't hold
+                    return false;
         return true;
     }
 
@@ -2925,25 +2929,19 @@ namespace WowPsParty
             if (isDps && HumanTankLeadActive(bot, leader)
                 && WaitForHumanTank(bot->GetGUID()))   // default WAIT under a human tank; '0' opts out
             {
-                // 1) Gather window: hold UNCONDITIONALLY so the tank gets a real,
-                //    timed head-start to pull + build threat — even on a mob that
-                //    merely aggroed onto it (the threat-cap alone released DPS the
-                //    instant the tank had any threat at all). Re-arms per new pull;
-                //    ends early if the tank drops low (then DPS help burn it down).
-                if (TankGatherWindowOpen(leader))
-                {
-                    if (bot->GetVictim()) bot->AttackStop();
-                    AssistLog(gLow, "human-tank: holding — tank's gather window (let it pull + build threat)");
-                    return;
-                }
-                // 2) Window elapsed: fall to live threat — DPS only what the tank
-                //    HOLDS, backing off near its threat cap so it never rips it off.
+                // Release ONLY once the tank both holds the mob (top-threat) AND has
+                // built a real engage lead on it (ENGAGE_THREAT_HEALTH_FRAC of its
+                // max HP) — so a bare right-click / a passive patrol-aggro / any
+                // near-zero "light" threat keeps the bot held. After that the
+                // THREAT_CAP_RATIO governs so it never rips it off. Pure threat, no
+                // timer: this gates only the under-threat mob, not the whole party.
                 bool const release = MobOnTank(bot, desired, leader)
+                                  && TankHasEngageLead(desired)
                                   && !BotOverThreatVsTank(bot, desired);
                 if (!release)
                 {
                     if (bot->GetVictim()) bot->AttackStop();
-                    AssistLog(gLow, "human-tank dungeon: holding — tank lacks solid threat on this mob");
+                    AssistLog(gLow, "human-tank dungeon: holding — tank lacks a solid engage lead on this mob");
                     return;
                 }
             }
