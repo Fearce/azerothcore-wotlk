@@ -32,6 +32,7 @@
 #include "Pet.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "Spell.h"
 #include "StringFormat.h"
 
 #include "PlayerbotAI.h"
@@ -1791,39 +1792,46 @@ static bool OpenLootableContainer(Player* requester, Player* srcChar, Item* srcI
     // expected, not a bug.)
     srcChar->SendLoot(srcItem->GetGUID(), LOOT_CORPSE);
     Loot& loot = srcItem->loot;
-    if (loot.gold)
-    {
-        srcChar->ModifyMoney(int32(loot.gold));   // shared-gold mirror runs off the money hook
-        loot.gold = 0;
-    }
-    uint32 stored = 0;
+    std::string const ownerName = srcChar->GetName();
+    std::string const satchelName = t->Name1;
+
+    // ALL-OR-NOTHING. Store every loot item; if any doesn't fit, roll back the ones
+    // that did and leave the container intact for a retry. Storing only SOME while
+    // keeping the container let you re-open it to re-roll the rest — an infinite
+    // dupe. Gold is credited only on full success. (CanStoreNewItem is checked
+    // immediately before each store, so slots consumed by earlier items count.)
+    std::vector<Item*> created;
+    bool allStored = true;
     for (LootItem& li : loot.items)
     {
         if (li.is_looted) continue;
         ItemPosCountVec dst;
         if (srcChar->CanStoreNewItem(NULL_BAG, NULL_SLOT, dst, li.itemid, li.count) != EQUIP_ERR_OK)
-            continue;   // owner bag full for this one — leave it in the satchel
-        if (srcChar->StoreNewItem(dst, li.itemid, true, li.randomPropertyId))
-        {
-            li.is_looted = true;
-            ++stored;
-        }
+        { allStored = false; break; }
+        Item* it = srcChar->StoreNewItem(dst, li.itemid, true, li.randomPropertyId);
+        if (!it) { allStored = false; break; }
+        li.is_looted = true;
+        created.push_back(it);
     }
-    srcChar->SendLootRelease(srcItem->GetGUID());   // clear the owner's loot state
-    bool emptied = (loot.gold == 0);
-    for (LootItem const& li : loot.items)
-        if (!li.is_looted) { emptied = false; break; }
-    if (emptied)
-        srcChar->DestroyItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
-    std::string const ownerName = srcChar->GetName();
-    std::string const satchelName = t->Name1;
-    if (stored == 0 && !emptied)
+    if (!allStored)
+    {
+        for (Item* it : created)   // undo the partial loot so nothing can be re-rolled
+            srcChar->DestroyItem(it->GetBagSlot(), it->GetSlot(), true);
+        srcChar->SendLootRelease(srcItem->GetGUID());
         ChatHandler(requester->GetSession()).PSendSysMessage(
-            "|cffff5555[WowPsParty]|r {}'s bags are full — couldn't take |cffffffff{}|r's contents.",
+            "|cffff5555[WowPsParty]|r {}'s bags are full — free a slot, then open |cffffffff{}|r again.",
             ownerName, satchelName);
-    else
-        ChatHandler(requester->GetSession()).PSendSysMessage(
-            "|cff66ccff[WowPsParty]|r Opened |cffffffff{}|r on {} (+{} item(s)).", satchelName, ownerName, stored);
+        WowPsParty::SendInventoryTo(requester);
+        return true;
+    }
+    if (loot.gold) { srcChar->ModifyMoney(int32(loot.gold)); loot.gold = 0; }
+    srcChar->SendLootRelease(srcItem->GetGUID());
+    // Fully looted -> the container is consumed on open, so it can never be
+    // re-opened to dupe its contents.
+    srcChar->DestroyItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+    ChatHandler(requester->GetSession()).PSendSysMessage(
+        "|cff66ccff[WowPsParty]|r Opened |cffffffff{}|r on {} (+{} item(s)).",
+        satchelName, ownerName, uint32(created.size()));
     WowPsParty::SendInventoryTo(requester);
     return true;
 }
@@ -1882,10 +1890,50 @@ static void ApplyGlyphFromItem(Player* target, Player* itemOwner, Item* glyphIte
     WowPsParty::SendInventoryTo(target);
 }
 
-// USE\t<srcPartySlot>\t<srcItemGuidLow> — use a bag consumable. The item's
-// ON_USE spell fires on the requesting (controlled) character; a consumable
-// loses one charge from its owner. Lets you right-click food/potions/quest
-// items in the shared bag like a normal bag.
+// Move one item from a party member's bags onto the requester, preserving it on
+// failure (bounce back, never stranded). Returns the item now in the requester's
+// inventory (possibly a merged stack), or nullptr if the requester had no room.
+// Mirrors the cross-character transfer used by PULL_REAGENT / MOVE / EQUIP.
+static Item* PullItemToRequester(Player* requester, Player* srcChar, Item* item)
+{
+    if (!requester || !srcChar || !item) return nullptr;
+    if (srcChar == requester) return item;   // already the requester's
+
+    srcChar->MoveItemFromInventory(item->GetBagSlot(), item->GetSlot(), true);
+    item->SetOwnerGUID(requester->GetGUID());
+    item->FSetState(ITEM_CHANGED);
+    {
+        CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+        item->SaveToDB(tx);
+        CharacterDatabase.CommitTransaction(tx);
+    }
+    ItemPosCountVec dest;
+    if (requester->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false) == EQUIP_ERR_OK)
+    {
+        ObjectGuid const movedGuid = item->GetGUID();   // MoveItemToInventory returns void
+        requester->MoveItemToInventory(dest, item, true);
+        return requester->GetItemByGuid(movedGuid);      // count-1 items don't merge; pointer stays valid
+    }
+
+    // Requester's bags are full — hand it straight back so it never strands.
+    item->SetOwnerGUID(srcChar->GetGUID());
+    item->FSetState(ITEM_CHANGED);
+    ItemPosCountVec back;
+    if (srcChar->CanStoreItem(NULL_BAG, NULL_SLOT, back, item, false) == EQUIP_ERR_OK)
+        srcChar->MoveItemToInventory(back, item, true);
+    CharacterDatabaseTransaction tx2 = CharacterDatabase.BeginTransaction();
+    item->SaveToDB(tx2);
+    CharacterDatabase.CommitTransaction(tx2);
+    return nullptr;
+}
+
+// USE\t<srcPartySlot>\t<srcItemGuidLow> — use a bag item. CONSUMABLES (food/
+// potions) fire their on-use on the requester and lose a charge from the owner.
+// NON-consumables (recipes to learn, essences/shards that CONVERT via reagents,
+// clickies, clams) are pulled onto the requester and used through the engine's
+// real item-use path, so the input is consumed exactly as a normal use — a bare
+// triggered CastSpell skips reagent/charge/recipe consumption, which let you
+// create the output without destroying the input (the infinite-dupe bug).
 static void HandleUse(Player* requester, std::string_view payload)
 {
     if (!requester || !requester->GetSession()) return;
@@ -1923,8 +1971,34 @@ static void HandleUse(Player* requester, std::string_view payload)
         // matter which action the client picked.
         if (OpenLootableContainer(requester, srcChar, srcItem))
             return;
+
+        // Quest-STARTER item (e.g. Shattered Necklace): right-clicking opens its
+        // quest. It lives in a mate's bags, so the client can't drive the quest
+        // dialog — pull it onto the requester and send the quest-giver details
+        // sourced from the item, so the HUMAN accepts (and the engine consumes the
+        // starter item from the requester on accept), exactly like clicking it in
+        // a normal bag. Without this, a quest item just reported "isn't usable".
+        if (t->StartQuest)
+        {
+            if (Quest const* quest = sObjectMgr->GetQuestTemplate(t->StartQuest))
+            {
+                Item* pulled = PullItemToRequester(requester, srcChar, srcItem);
+                if (!pulled)
+                {
+                    ChatHandler(requester->GetSession()).PSendSysMessage(
+                        "|cffff5555[WowPsParty]|r Your bags are full — free a slot to start |cffffffff{}|r's quest.", t->Name1);
+                    return;
+                }
+                if (requester->CanTakeQuest(quest, true))
+                    requester->PlayerTalkClass->SendQuestGiverQuestDetails(quest, pulled->GetGUID(), true);
+                WowPsParty::SendInventoryTo(requester);
+                if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
+                return;
+            }
+        }
+
         LOG_INFO("module",
-            "[WowPsParty Use] {} clicked non-usable entry={} '{}' class={} flags={} (no on-use spell, not lootable)",
+            "[WowPsParty Use] {} clicked non-usable entry={} '{}' class={} flags={} (no on-use spell, not lootable, no startquest)",
             requester->GetName(), t->ItemId, t->Name1, uint32(t->Class), t->Flags);
         ChatHandler(requester->GetSession()).PSendSysMessage(
             "|cffff5555[WowPsParty]|r |cffffffff{}|r isn't usable.", t->Name1);
@@ -1941,9 +2015,11 @@ static void HandleUse(Player* requester, std::string_view payload)
                 return;
             }
 
-    requester->CastSpell(requester, useSpell, true);
+    // CONSUMABLE (food/potion): fire the effect on the requester and decrement the
+    // owner's stack. This path has no dupe — the engine isn't relied on to consume.
     if (t->Class == ITEM_CLASS_CONSUMABLE)
     {
+        requester->CastSpell(requester, useSpell, true);
         if (srcItem->GetCount() > 1)
         {
             srcItem->SetCount(srcItem->GetCount() - 1);
@@ -1951,8 +2027,41 @@ static void HandleUse(Player* requester, std::string_view payload)
         }
         else
             srcChar->DestroyItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
+        WowPsParty::SendInventoryTo(requester);
+        if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
+        return;
+    }
+
+    // A RECIPE (learns a spell) must be used by the REQUESTER so THEY learn it: pull
+    // it over (recipes are count-1, so no stack merge) and use it via the real
+    // item-use pipeline, which consumes the recipe. Everything else (essence/shard
+    // CONVERSIONS, clams, clickies) is used by its OWNER through the same pipeline —
+    // no cross-character pull — and the engine consumes the input (reagents / the
+    // item) exactly as a normal use. The old bare triggered cast skipped that
+    // consumption, creating the output while leaving the input = the infinite dupe.
+    bool isLearn = false;
+    if (SpellInfo const* si2 = sSpellMgr->GetSpellInfo(useSpell))
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            if (si2->Effects[i].Effect == SPELL_EFFECT_LEARN_SPELL) { isLearn = true; break; }
+
+    SpellCastTargets targets;   // default-constructed = self-cast
+    if (isLearn && srcChar != requester)
+    {
+        Item* pulled = PullItemToRequester(requester, srcChar, srcItem);
+        if (!pulled)
+        {
+            ChatHandler(requester->GetSession()).PSendSysMessage(
+                "|cffff5555[WowPsParty]|r Your bags are full — free a slot to learn |cffffffff{}|r.", t->Name1);
+            return;
+        }
+        requester->CastItemUseSpell(pulled, targets, 0, 0);
+    }
+    else
+    {
+        srcChar->CastItemUseSpell(srcItem, targets, 0, 0);
     }
     WowPsParty::SendInventoryTo(requester);
+    if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
 }
 
 // SPLIT\t<srcPartySlot>\t<srcItemGuidLow>\t<count> — split `count` off a stack

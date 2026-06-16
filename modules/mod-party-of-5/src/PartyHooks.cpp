@@ -319,20 +319,20 @@ namespace
         uint32 count = 0;
         for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_ITEM_END; ++i)
             if (Item* it = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
-                if (WowPsItemReadable(it) && it->GetEntry() == itemId && !it->IsInTrade())
+                if (WowPsParty::WowPsItemReadable(it) && it->GetEntry() == itemId && !it->IsInTrade())
                     count += it->GetCount();
         for (uint8 i = KEYRING_SLOT_START; i < CURRENCYTOKEN_SLOT_END; ++i)
             if (Item* it = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
-                if (WowPsItemReadable(it) && it->GetEntry() == itemId && !it->IsInTrade())
+                if (WowPsParty::WowPsItemReadable(it) && it->GetEntry() == itemId && !it->IsInTrade())
                     count += it->GetCount();
         for (uint8 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_END; ++i)
             if (Bag* bag = p->GetBagByPos(i))
             {
-                if (!WowPsItemReadable(bag))   // a freed bag in the slot would crash GetBagSize()
+                if (!WowPsParty::WowPsItemReadable(bag))   // a freed bag in the slot would crash GetBagSize()
                     continue;
                 for (uint32 j = 0; j < bag->GetBagSize(); ++j)
                     if (Item* it = bag->GetItemByPos(j))
-                        if (WowPsItemReadable(it) && it->GetEntry() == itemId && !it->IsInTrade())
+                        if (WowPsParty::WowPsItemReadable(it) && it->GetEntry() == itemId && !it->IsInTrade())
                             count += it->GetCount();
             }
         return count;
@@ -1189,6 +1189,30 @@ bool WowPsParty_ForceSkinReady(Player* skinner, Creature* creature)
     // recipient's WoW group" gate failed because the human isn't necessarily in
     // the same Group object as the bot that tapped the kill.
     if (!recipient && !rgroup) return false;
+
+    // MASTER-LOOT PRIORITY: while the corpse is still lootable and a HUMAN party
+    // member is close enough to loot it, do NOT strip the loot to skin. The
+    // loot.clear() below destroys quest items the player hasn't grabbed yet — the
+    // "I had to kick my skinner to loot the quest item" bug. Give the human first
+    // dibs; once they've looted it (the lootable flag clears) or moved off, the
+    // skinner finishes it. Only HUMANS gate (bot AI absent) — bots looting into the
+    // shared bag never block skinning.
+    if (creature->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE))
+    {
+        constexpr float MASTER_LOOT_PRIORITY_RANGE = 25.0f;
+        if (Group* sg = skinner->GetGroup())
+            for (GroupReference* itr = sg->GetFirstMember(); itr != nullptr; itr = itr->next())
+                if (Player* m = itr->GetSource())
+                    if (m->IsInWorld() && m->IsAlive()
+                        && !sPlayerbotsMgr.GetPlayerbotAI(m)
+                        && m->IsWithinDistInMap(creature, MASTER_LOOT_PRIORITY_RANGE))
+                    {
+                        LOG_INFO("module",
+                            "[WowPsParty Skin] defer skin of guid={}: human {} within {}y of still-lootable corpse",
+                            creature->GetGUID().GetCounter(), m->GetName(), MASTER_LOOT_PRIORITY_RANGE);
+                        return false;
+                    }
+    }
 
     creature->loot.clear();                              // empty the normal loot
     creature->RemoveDynamicFlag(UNIT_DYNFLAG_LOOTABLE);  // clear the sparkle/lootable state
