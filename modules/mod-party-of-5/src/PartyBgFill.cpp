@@ -217,6 +217,15 @@ namespace
 
     void RetireFillBot(uint32 botLow, Player* bot /*may be null*/)
     {
+        // NEVER log a fill bot out while it's TRANSITIONAL (mid-teleport / not fully
+        // in world / mid-cast) — e.g. just leaving a BG. LogoutPlayer then tears down
+        // its items + removes it from the world while a map-worker thread is still
+        // touching that map, racing Item::GetOwner -> FindPlayer (the recurring crash
+        // the capture pinned to a fill-bot retire during a dungeon). Leave it TRACKED
+        // and retry next world tick once it's stable.
+        if (bot && (bot->IsBeingTeleported() || !bot->IsInWorld()
+                    || bot->IsNonMeleeSpellCast(false, false, true)))
+            return;
         uint32 leaderLow = 0;
         bool stillHasSiblings = false;
         {

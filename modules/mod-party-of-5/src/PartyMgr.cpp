@@ -1510,38 +1510,38 @@ namespace WowPsParty
         // account random-pool char in.
         WowPsParty::AddHenchmanDirective(account, henchGuid, requester->GetGUID(), useRole);
 
-        // Restore this henchman's persisted loadout. party_loadout is keyed by
-        // character guid, so a henchman the player edited in a PRIOR hire keeps
-        // those changes when re-invited (Kevin's "next time I invite this guy he
-        // still has my rotation"). Falls back to sensible defaults when the bot
-        // has never been customised:
-        //   rotation  : saved priority_actions_json, else class default — so the
-        //               henchman runs OUR combat AI (LoS approach, no melee-
-        //               stacking) with sensible spells, same engine as heroes.
+        // Restore this henchman's persisted NON-rotation loadout (targetmode / lead /
+        // wait / safe-pull). The ROTATION is deliberately NOT persisted for henchmen
+        // (Kevin): every hire starts from the class default — the SAME rotation the
+        // editor's "Generate" hands back (both call DefaultRotationForClass with the
+        // directive role) — so a henchman never carries a rotation from a prior run.
+        // We also WIPE any stored priority_actions_json on hire so it can't linger.
+        // (Enrolled ALT bots keep their saved rotation — this is HireHenchman only.)
         //   targetmode: saved strategies_csv, else tank -> "loose" / "master".
         //   lead       : saved glyphs_csv ("0" = off), else ON.
         //   waitthreat : saved wait_tank_threat ('1'/'0'), else unset -> a
         //                henchman's per-type default is to WAIT for tank threat.
-        bool hadCustomRotation = false;   // gates the post-relevel rebuild below
+        bool const hadCustomRotation = false;   // henchmen NEVER keep a custom rotation
         {
             QueryResult lq = CharacterDatabase.Query(
-                "SELECT `priority_actions_json`,`strategies_csv`,`glyphs_csv`,`wait_tank_threat`,`safe_pull` "
+                "SELECT `strategies_csv`,`glyphs_csv`,`wait_tank_threat`,`safe_pull` "
                 "FROM `party_loadout` WHERE `guid` = {}", candidateGuid);
-            std::string savedRot, savedMode, savedLead, savedWait, savedSafePull;
+            std::string savedMode, savedLead, savedWait, savedSafePull;
             if (lq)
             {
                 Field* lf = lq->Fetch();
-                savedRot      = lf[0].Get<std::string>();
-                savedMode     = lf[1].Get<std::string>();
-                savedLead     = lf[2].Get<std::string>();
-                savedWait     = lf[3].Get<std::string>();
-                savedSafePull = lf[4].Get<std::string>();
+                savedMode     = lf[0].Get<std::string>();
+                savedLead     = lf[1].Get<std::string>();
+                savedWait     = lf[2].Get<std::string>();
+                savedSafePull = lf[3].Get<std::string>();
             }
-            hadCustomRotation = !savedRot.empty();
 
+            // Always the class default rotation (identical to "Generate"); never the
+            // saved one. Then wipe any persisted rotation so it can't survive the run.
             WowPsParty::RotationCacheSet(candidateGuid,
-                WowPsParty::ParseRotationString(
-                    savedRot.empty() ? DefaultRotationForClass(cls, useRole) : savedRot));
+                WowPsParty::ParseRotationString(DefaultRotationForClass(cls, useRole)));
+            CharacterDatabase.Execute(
+                "UPDATE `party_loadout` SET `priority_actions_json` = '' WHERE `guid` = {}", candidateGuid);
 
             WowPsParty::TargetModeCacheSet(candidateGuid,
                 !savedMode.empty() ? savedMode
