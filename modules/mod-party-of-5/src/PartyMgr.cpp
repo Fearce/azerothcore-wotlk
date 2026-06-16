@@ -956,7 +956,13 @@ namespace WowPsParty
                 else
                 {
                     add("party_lowest_health<30", "cast_party_lowest:Healing Touch", 84);
-                    add("always", "cast_party_missing:Mark of the Wild", 60);
+                    // Mark of the Wild can't be cast in Cat/Bear form — casting it
+                    // would drop the combat form, and with party bots perpetually
+                    // "missing" the buff an `always` rule re-broke the form every tick
+                    // (the balance/feral druid "spazzing through forms, never fighting").
+                    // Only buff it when genuinely idle (out of combat AND no target),
+                    // the same moment the cancel_form rules below drop to caster form.
+                    add("out_of_combat&no_target", "cast_party_missing:Mark of the Wild", 60);
                     // FERAL CAT (talent tree 1): melee combo build/spend, like a
                     // rogue. The follow layer treats tree-1 druids as melee. Shift
                     // to Cat Form only in combat (has_target) so it can still mount
@@ -974,7 +980,7 @@ namespace WowPsParty
                     add("primary_tree:1&has_target", "cast:Claw", 48);   // pre-Mangle fallback
                     // Leave the form out of combat so the cat can drink/mount/buff
                     // (above eat/drink at 12-14 so it drops form FIRST).
-                    add("primary_tree:1&out_of_combat&self_has_aura:Cat Form", "cancel_form", 16);
+                    add("primary_tree:1&out_of_combat&no_target&self_has_aura:Cat Form", "cancel_form", 16);
                     // BALANCE — and the universal NON-feral fallback (!tree 1),
                     // so a no-talent low-level druid OR one a user manually flips
                     // to dps while Resto-specced still nukes instead of standing
@@ -986,7 +992,7 @@ namespace WowPsParty
                     add("!primary_tree:1&enemies_clustered:8>2", "cast:Hurricane", 58);
                     add("!primary_tree:1&has_target", "cast:Starfire", 46);
                     add("!primary_tree:1&has_target", "cast:Wrath", 44);
-                    add("!primary_tree:1&out_of_combat&self_has_aura:Moonkin Form", "cancel_form", 16);
+                    add("!primary_tree:1&out_of_combat&no_target&self_has_aura:Moonkin Form", "cancel_form", 16);
                 }
                 break;
 
