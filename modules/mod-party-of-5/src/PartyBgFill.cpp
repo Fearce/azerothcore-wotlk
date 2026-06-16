@@ -401,8 +401,38 @@ private:
     uint32 _accum = 0;
 };
 
+// Catches the case OnPlayerJoinBG (queue time) misses: the human queued before its
+// heroes were in the party (e.g. queued solo, or the BG reformed the group on entry
+// and the party-of-5 system re-grouped the heroes only AFTER the human was already
+// inside). On ENTRY we track the human regardless of current party size — scoped to
+// party-of-5 users (companions enabled) — so the world tick backfills the heroes into
+// THIS bg the moment they appear in the party. Without this they sat in Dalaran,
+// never queued, and the human played the BG short-handed (the 6v10 Kevin saw).
+class PartyBgFillBgScript : public AllBattlegroundScript
+{
+public:
+    PartyBgFillBgScript() : AllBattlegroundScript("PartyBgFillBgScript", {
+        ALLBATTLEGROUNDHOOK_ON_BATTLEGROUND_ADD_PLAYER
+    }) { }
+
+    void OnBattlegroundAddPlayer(Battleground* bg, Player* player) override
+    {
+        if (!WowPsParty::IsEnabled() || !bg || !player || !player->GetSession()) return;
+        if (sPlayerbotsMgr.GetPlayerbotAI(player)) return;   // a bot entered; only the human leader
+        if (bg->isArena()) return;
+        // Track even with no heroes grouped YET — they may group after entry; the
+        // world tick brings them in once they're in the party. Scoped to managed
+        // (companions-enabled) accounts so we don't track unrelated real players.
+        if (!WowPsParty::GetAccountSettings(player->GetSession()->GetAccountId()).spawnCompanions)
+            return;
+        std::lock_guard<std::mutex> lk(g_mutex);
+        g_activeLeaders[player->GetGUID().GetCounter()] = uint32(bg->GetBgTypeID());
+    }
+};
+
 void AddPartyBgFillScripts()
 {
     new PartyBgFillPlayerScript();
     new PartyBgFillWorldScript();
+    new PartyBgFillBgScript();
 }
