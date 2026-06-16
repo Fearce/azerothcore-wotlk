@@ -3912,13 +3912,21 @@ namespace WowPsParty
             if (pet->AI())
                 pet->AI()->AttackStart(victim);
         }
-        else if (!bot->IsInCombat() && (pet->GetVictim() || charm->IsCommandAttack()))
+        else if ((!bot->IsInCombat() || WowPsParty::BotWaitsForHumanTank(bot))
+                 && (pet->GetVictim() || charm->IsCommandAttack()))
         {
-            // Hunter is genuinely out of combat — call the pet off so it heels
-            // instead of chasing the last mob into the next pack. (While the
-            // hunter is in combat but hasn't picked a victim yet, we leave the
-            // pet on whatever it's defensively engaging — don't yank it off a
-            // mob that's beating on it or the hunter.)
+            // Heel the pet (call it off, follow the owner) when EITHER:
+            //  - the owner is genuinely out of combat (don't chase the last mob into
+            //    the next pack), OR
+            //  - the owner is WAITING for a human tank to take threat and hasn't been
+            //    handed a victim yet (BotWaitsForHumanTank + no victim above). Without
+            //    this a hunter/warlock pet charged the pull immediately and ripped
+            //    aggro while the owner itself correctly held (Kevin). Once the tank
+            //    has the engage lead the owner gets a victim and the branch above
+            //    re-commands the pet onto it.
+            // (Outside the tank-lead regime, an in-combat owner with no victim still
+            // leaves the pet on whatever it's defensively engaging — don't yank it
+            // off a mob beating on it or the owner.)
             pet->AttackStop();
             charm->SetIsCommandAttack(false);
             charm->SetCommandState(COMMAND_FOLLOW);

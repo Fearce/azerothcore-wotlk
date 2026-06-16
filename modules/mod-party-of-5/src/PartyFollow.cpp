@@ -2688,6 +2688,23 @@ namespace WowPsParty
         return true;
     }
 
+    // True when `bot` is a non-tank under a human tank-lead with the wait toggle on
+    // — the regime where it (and its PET) wait for the tank to take threat. Pairs
+    // with the bot's victim: AssistTarget only hands it a victim once the tank has
+    // the engage lead on a mob, so "regime active AND the bot has no victim" means
+    // the bot is HOLDING, and its hunter/warlock pet should heel instead of charging
+    // in on the pull. Consulted by MaintainBotPet.
+    bool BotWaitsForHumanTank(Player* bot)
+    {
+        if (!bot) return false;
+        if (RoleForGuid(bot->GetGUID()) == "tank") return false;
+        ObjectGuid const lg = GetLeaderFor(bot->GetGUID());
+        if (!lg) return false;
+        Player* leader = ObjectAccessor::FindConnectedPlayer(lg);
+        if (!leader || !HumanTankLeadActive(bot, leader)) return false;
+        return WaitForHumanTank(bot->GetGUID());
+    }
+
     void AssistTarget(Player* bot)
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
