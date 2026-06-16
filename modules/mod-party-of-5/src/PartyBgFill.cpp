@@ -219,22 +219,29 @@ namespace
         }
     }
 
-    // The first fillable BG the human is queued for that we aren't already filling:
-    // a normal (non-arena, non-random) battleground. Returns 0 (BATTLEGROUND_TYPE_NONE)
-    // if none.
-    uint32 PickFillableBg(Player* human)
+    // Can this BG type be FILLED with bots — a normal, specific battleground? NOT
+    // Random BG (real BG unknown until pop) and NOT an arena.
+    bool IsFillableBg(uint32 bgTypeId)
+    {
+        if (bgTypeId == BATTLEGROUND_RB) return false;
+        Battleground* tpl = sBattlegroundMgr->GetBattlegroundTemplate(BattlegroundTypeId(bgTypeId));
+        return tpl && !tpl->isArena() && tpl->GetMaxPlayersPerTeam() > 0;
+    }
+
+    // The (non-arena) battleground the human just queued — INCLUDING Random BG. We
+    // TRACK the leader for ANY such queue so the world tick drives the human's heroes
+    // to accept the pop — that doesn't need the specific BG, and the heroes were
+    // getting a no-show Deserter debuff on Random-BG queues because the old code only
+    // tracked fillable BGs. Spawning enemy fills is gated separately on IsFillableBg.
+    // Returns 0 if the human isn't in a normal BG queue (e.g. arena only).
+    uint32 PickQueuedBg(Player* human)
     {
         for (uint8 i = 0; i < PLAYER_MAX_BATTLEGROUND_QUEUES; ++i)
         {
             BattlegroundQueueTypeId const qt = human->GetBattlegroundQueueTypeId(i);
             if (qt == BATTLEGROUND_QUEUE_NONE) continue;
-            BattlegroundTypeId const bgTypeId = BattlegroundMgr::BGTemplateId(qt);
-            if (bgTypeId == BATTLEGROUND_RB) continue;            // random — BG unknown until pop
-            Battleground* tpl = sBattlegroundMgr->GetBattlegroundTemplate(bgTypeId);
-            if (!tpl || tpl->isArena() || tpl->GetMaxPlayersPerTeam() == 0) continue;
-            std::lock_guard<std::mutex> lk(g_mutex);
-            if (g_activeLeaders.count(human->GetGUID().GetCounter())) return 0;  // already filling one
-            return uint32(bgTypeId);
+            if (BattlegroundMgr::BGArenaType(qt) != 0) continue;   // skip arenas (rated/separate flow)
+            return uint32(BattlegroundMgr::BGTemplateId(qt));      // a normal BG or Random BG
         }
         return 0;
     }
@@ -258,7 +265,7 @@ public:
         WowPsParty::GetPartyGuidsFor(player->GetGUID(), party);
         if (party.size() < 2) return;
 
-        uint32 const bgTypeId = PickFillableBg(player);
+        uint32 const bgTypeId = PickQueuedBg(player);
         if (!bgTypeId) return;
 
         {
@@ -266,7 +273,15 @@ public:
             if (g_activeLeaders.count(player->GetGUID().GetCounter())) return;
             g_activeLeaders[player->GetGUID().GetCounter()] = bgTypeId;
         }
-        StartFill(player, bgTypeId);
+        // Always drive the heroes to accept (the world tick handles that via
+        // g_activeLeaders). Only spawn enemy fills for a specific, fillable BG —
+        // Random BG resolves its real BG at pop, so it can't be pre-filled.
+        if (IsFillableBg(bgTypeId))
+            StartFill(player, bgTypeId);
+        else
+            LOG_INFO("module",
+                "[WowPsParty BGFill] {} queued bg {} (random/unfillable) — driving heroes to accept the pop, no enemy fill",
+                player->GetName(), bgTypeId);
     }
     // NB: deliberately NO OnPlayerRemoveFromBattleground. Retiring (logging out) a
     // fill bot synchronously inside the BG-removal hook — for every fill bot when a
