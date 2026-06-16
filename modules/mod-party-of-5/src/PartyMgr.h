@@ -69,6 +69,7 @@ namespace WowPsParty
         bool sharedProgression = true;  // SERVER: mirror XP / gold / loot / quests
         uint32 questXpRate     = 200;   // % XP from quest turn-ins (clamped 100-500, default x2)
         uint32 killXpRate      = 200;   // % XP from kills           (clamped 100-500, default x2)
+        bool lfgAutofillOptOut = false; // player chose "Don't ask again" to the LFG party-fill offer
     };
 
     // Allowed bounds for the per-account XP multipliers (percent).
@@ -130,8 +131,11 @@ namespace WowPsParty
 
     // Hire `candidateGuid` for `requester`. Validates gold + party space,
     // deducts the fee, spawns the bot and registers the follow directive.
+    // `skipCharge` skips the per-hire gold check + deduct AND the no-show/full
+    // refund (the caller has already charged a single summed price — used by the
+    // LFG party-fill, which charges the discounted total once up front).
     bool HireHenchman(Player* requester, uint32 candidateGuid, std::string const& role,
-                      std::string& outMsg);
+                      std::string& outMsg, bool skipCharge = false);
 
     // Release one henchman (or all of the account's). Logs the bot out so it
     // returns to the random pool.
@@ -197,6 +201,15 @@ namespace WowPsParty
     // (HasSpell-gated). Returns the number newly learned. Called from the bot tick,
     // the on-ding hook, .party learnall, and active-char login.
     uint32 LearnClassQuestSkills(Player* p);
+
+    // Module on/off + the LFG party-fill offer toggle (defined in PartyBootstrap.cpp).
+    bool IsEnabled();
+    bool IsLfgAutofillEnabled();
+
+    // Drop any pending LFG party-fill offer for a player (gossip awaiting a choice)
+    // and despawn its recruiter NPC. Called from the logout hook so a disconnect
+    // mid-offer leaks nothing. Defined in PartyLfgFill.cpp.
+    void LfgFill_OnLogout(ObjectGuid guid);
 }
 
 #define sPartyMgr WowPsParty::PartyMgr::Instance()

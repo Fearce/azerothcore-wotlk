@@ -94,6 +94,7 @@ public:
             { "status",       HandleStatusCommand,       SEC_PLAYER, Console::Yes },
             { "reset",        HandleResetCommand,        SEC_PLAYER, Console::Yes },
             { "xp",           HandleXpRateCommand,       SEC_PLAYER, Console::Yes },
+            { "lfgfill",      HandleLfgFillCommand,      SEC_PLAYER, Console::Yes },
         };
         // Admin/test commands. Console::Yes lets them be driven from the
         // worldserver console or SOAP without a player session. SEC_CONSOLE
@@ -245,6 +246,36 @@ public:
                 "|cffffcc55[WowPsParty]|r '{}' wasn't enrolled in a party.",
                 requestor->GetName());
         }
+        return true;
+    }
+
+    // .party lfgfill [on|off]
+    // Escape hatch for the LFG party-fill popup's "Don't ask again" choice (there's
+    // no addon settings panel without the client addon). No args: show state.
+    static bool HandleLfgFillCommand(ChatHandler* handler, Optional<std::string> arg)
+    {
+        Player* requestor = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        if (!requestor)
+            return false;
+        uint32 const account = requestor->GetSession()->GetAccountId();
+
+        std::string mode = arg ? *arg : "";
+        std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
+
+        if (mode == "on" || mode == "off")
+        {
+            bool const optOut = (mode == "off");
+            WowPsParty::SetAccountSetting(account, "lfg_autofill_optout", optOut);
+            handler->PSendSysMessage(optOut
+                ? "|cff66ccff[WowPsParty]|r LFG party-fill offers are now |cffff5555OFF|r. Turn back on with |cffffff00.party lfgfill on|r."
+                : "|cff66ccff[WowPsParty]|r LFG party-fill offers are now |cff55ff55ON|r. You'll be offered a filled party when you queue solo.");
+            return true;
+        }
+
+        bool const optedOut = WowPsParty::GetAccountSettings(account).lfgAutofillOptOut;
+        handler->PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r LFG party-fill offers are currently {}. Usage: |cffffff00.party lfgfill on|off|r",
+            optedOut ? "|cffff5555OFF|r" : "|cff55ff55ON|r");
         return true;
     }
 

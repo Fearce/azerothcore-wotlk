@@ -39,20 +39,23 @@ namespace WowPsParty
 {
     struct ModuleConfig
     {
-        bool enabled     = true;
-        bool log_verbose = true;
+        bool enabled       = true;
+        bool log_verbose   = true;
+        bool lfg_autofill  = true;   // offer the "fill my party" popup on a sub-5 LFG queue
 
         void Load()
         {
-            enabled     = sConfigMgr->GetOption<bool>("WowPsParty.Enable",     true);
-            log_verbose = sConfigMgr->GetOption<bool>("WowPsParty.LogVerbose", true);
+            enabled      = sConfigMgr->GetOption<bool>("WowPsParty.Enable",            true);
+            log_verbose  = sConfigMgr->GetOption<bool>("WowPsParty.LogVerbose",        true);
+            lfg_autofill = sConfigMgr->GetOption<bool>("WowPsParty.LfgAutofill.Enable", true);
         }
     };
 
     static ModuleConfig g_config;
 
-    bool IsEnabled()     { return g_config.enabled; }
-    bool IsLogVerbose()  { return g_config.log_verbose; }
+    bool IsEnabled()          { return g_config.enabled; }
+    bool IsLogVerbose()       { return g_config.log_verbose; }
+    bool IsLfgAutofillEnabled() { return g_config.lfg_autofill; }
 }
 
 class PartyBootstrapWorldScript : public WorldScript
@@ -147,6 +150,10 @@ public:
         // Henchmen are temporary — release them (log the random-pool bots out
         // + drop their follow directives) when the leader logs out.
         WowPsParty::DismissAllHenchmen(player);
+
+        // Drop any pending LFG party-fill offer + despawn its recruiter NPC so a
+        // disconnect mid-popup leaks no state.
+        WowPsParty::LfgFill_OnLogout(player->GetGUID());
     }
 
     void OnPlayerLogin(Player* player) override

@@ -76,7 +76,8 @@ namespace WowPsParty
             "`shared_gear` TINYINT NOT NULL DEFAULT 1, "
             "`shared_progression` TINYINT NOT NULL DEFAULT 1, "
             "`quest_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 200, "
-            "`kill_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 200)");
+            "`kill_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 200, "
+            "`lfg_autofill_optout` TINYINT NOT NULL DEFAULT 0)");
         // Migrate installs that predate the XP-rate columns. The DB server is
         // MySQL, which — unlike MariaDB — has no `ADD COLUMN IF NOT EXISTS`; that
         // syntax errors 1064 and AC aborts the worldserver on any SQL error. So
@@ -97,6 +98,10 @@ namespace WowPsParty
             CharacterDatabase.DirectExecute(
                 "ALTER TABLE `party_account_settings` "
                 "ADD COLUMN `kill_xp_rate` SMALLINT UNSIGNED NOT NULL DEFAULT 200");
+        if (columnMissing("lfg_autofill_optout"))
+            CharacterDatabase.DirectExecute(
+                "ALTER TABLE `party_account_settings` "
+                "ADD COLUMN `lfg_autofill_optout` TINYINT NOT NULL DEFAULT 0");
         // New accounts default to x2 XP. Installs whose columns were first added
         // with the old DEFAULT 100 get their new-row default switched to 200.
         // Only ALTER when a default actually isn't 200 yet, so we're not running
@@ -120,7 +125,7 @@ namespace WowPsParty
         PartySettings s;  // all-ON default
         QueryResult q = CharacterDatabase.Query(
             "SELECT `spawn_companions`,`shared_inventory`,`shared_gear`,"
-            "`shared_progression`,`quest_xp_rate`,`kill_xp_rate` "
+            "`shared_progression`,`quest_xp_rate`,`kill_xp_rate`,`lfg_autofill_optout` "
             "FROM `party_account_settings` WHERE `account` = {}",
             account);
         if (q)
@@ -132,6 +137,7 @@ namespace WowPsParty
             s.sharedProgression = f[3].Get<uint8>() != 0;
             s.questXpRate       = std::clamp<uint32>(f[4].Get<uint16>(), XP_RATE_MIN, XP_RATE_MAX);
             s.killXpRate        = std::clamp<uint32>(f[5].Get<uint16>(), XP_RATE_MIN, XP_RATE_MAX);
+            s.lfgAutofillOptOut = f[6].Get<uint8>() != 0;
         }
         std::lock_guard<std::mutex> lock(g_settingsMutex);
         g_accountSettings[account] = s;
@@ -153,7 +159,8 @@ namespace WowPsParty
     {
         static const std::unordered_map<std::string, int> cols = {
             {"spawn_companions", 0}, {"shared_inventory", 1},
-            {"shared_gear", 2}, {"shared_progression", 3} };
+            {"shared_gear", 2}, {"shared_progression", 3},
+            {"lfg_autofill_optout", 4} };
         if (cols.find(key) == cols.end()) return;
         uint8 const v = value ? 1 : 0;
         // Upsert the single column; unspecified columns keep their table
@@ -165,10 +172,11 @@ namespace WowPsParty
         // Refresh the cached struct field.
         std::lock_guard<std::mutex> lock(g_settingsMutex);
         PartySettings& s = g_accountSettings[account];
-        if      (key == "spawn_companions")   s.spawnCompanions   = value;
-        else if (key == "shared_inventory")   s.sharedInventory   = value;
-        else if (key == "shared_gear")        s.sharedGear        = value;
-        else if (key == "shared_progression") s.sharedProgression = value;
+        if      (key == "spawn_companions")    s.spawnCompanions   = value;
+        else if (key == "shared_inventory")    s.sharedInventory   = value;
+        else if (key == "shared_gear")         s.sharedGear        = value;
+        else if (key == "shared_progression")  s.sharedProgression = value;
+        else if (key == "lfg_autofill_optout") s.lfgAutofillOptOut = value;
     }
 
     void SetAccountXpRate(uint32 account, bool quest, uint32 rate)
@@ -1408,7 +1416,7 @@ namespace WowPsParty
     }
 
     bool HireHenchman(Player* requester, uint32 candidateGuid,
-                      std::string const& role, std::string& outMsg)
+                      std::string const& role, std::string& outMsg, bool skipCharge)
     {
         if (!requester || !requester->GetSession())
         { outMsg = "No session."; return false; }
@@ -1467,13 +1475,17 @@ namespace WowPsParty
         bool const outOfBand = lvlDiff > 4 || lvlDiff < -4;
         uint8 const effLevel = outOfBand ? uint8(requester->GetLevel()) : level;
         uint32 const cost = HenchmanHireCost(effLevel);
-        if (requester->GetMoney() < cost)
+        if (!skipCharge && requester->GetMoney() < cost)
         {
             outMsg = "Not enough gold to hire.";
             LOG_INFO("module", "[WowPsParty Henchmen] hire REFUSED guid={}: gold {} < cost {}",
                      candidateGuid, requester->GetMoney(), cost);
             return false;
         }
+        // When skipCharge is set the caller already charged a single summed price
+        // (the LFG party-fill's discounted total) — this hire neither deducts nor,
+        // on a no-show/full group, refunds. refundAmt flows into the deferred lambda.
+        uint32 const refundAmt = skipCharge ? 0u : cost;
 
         PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
         if (!mgr)
@@ -1483,7 +1495,8 @@ namespace WowPsParty
             return false;
         }
 
-        requester->ModifyMoney(-int32(cost));
+        if (!skipCharge)
+            requester->ModifyMoney(-int32(cost));
 
         ObjectGuid const henchGuid = ObjectGuid::Create<HighGuid::Player>(candidateGuid);
         // The client sends the class-default role; override it with the bot's
@@ -1550,7 +1563,7 @@ namespace WowPsParty
         // (drop the directive, refund the gold) so we never leak a directive or
         // charge the player for a no-show.
         ObjectGuid const leaderGuid = requester->GetGUID();
-        requester->m_Events.AddEventAtOffset([leaderGuid, henchGuid, cost, cls, hadCustomRotation]()
+        requester->m_Events.AddEventAtOffset([leaderGuid, henchGuid, cost, refundAmt, cls, hadCustomRotation]()
         {
             Player* lead = ObjectAccessor::FindConnectedPlayer(leaderGuid);
             Player* hen  = ObjectAccessor::FindConnectedPlayer(henchGuid);
@@ -1559,7 +1572,8 @@ namespace WowPsParty
                 WowPsParty::RemoveFollower(henchGuid);
                 if (lead)
                 {
-                    lead->ModifyMoney(int32(cost));   // refund the no-show
+                    if (refundAmt)
+                        lead->ModifyMoney(int32(refundAmt));   // refund the no-show
                     UpdateGroupLootForHenchmen(lead);
                     if (lead->GetSession())
                         ChatHandler(lead->GetSession()).PSendSysMessage(
@@ -1647,7 +1661,8 @@ namespace WowPsParty
                     // never converted to a raid) — never leave a spawned henchman
                     // orphaned outside the group. Undo the hire: despawn + refund.
                     WowPsParty::DismissHenchmanByGuid(henchGuid);
-                    lead->ModifyMoney(int32(cost));
+                    if (refundAmt)
+                        lead->ModifyMoney(int32(refundAmt));
                     if (lead->GetSession())
                         ChatHandler(lead->GetSession()).PSendSysMessage(
                             "|cffff5555[WowPsParty]|r Group is full — couldn't add the henchman. Refunded.");

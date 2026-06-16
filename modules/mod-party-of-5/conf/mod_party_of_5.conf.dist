@@ -28,3 +28,17 @@ WowPsParty.Enable = 1
 #
 
 WowPsParty.LogVerbose = 1
+
+#
+#    WowPsParty.LfgAutofill.Enable
+#        Description: When a SOLO player queues the Dungeon Finder, offer (via a popup)
+#                     to instantly fill their party to 1 tank / 1 healer / 3 dps with
+#                     hired bots for the summed henchman cost, discounted 15%. The
+#                     player's slot is set by the LFG role they queued as. Optional —
+#                     declining queues them with random players as normal. Players can
+#                     opt out per-account ("Don't ask again" / .party lfgfill off).
+#        Default:     1 - Offer enabled
+#                     0 - Never offer
+#
+
+WowPsParty.LfgAutofill.Enable = 1

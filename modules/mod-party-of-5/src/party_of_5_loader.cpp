@@ -13,6 +13,7 @@ void AddPartyCommandScripts();
 void AddPartyHooksScripts();
 void AddPartyAddonProtocolScripts();
 void AddPartyFollowScripts();
+void AddPartyLfgFillScripts();
 
 void Addmod_party_of_5Scripts()
 {
@@ -21,4 +22,5 @@ void Addmod_party_of_5Scripts()
     AddPartyHooksScripts();
     AddPartyAddonProtocolScripts();
     AddPartyFollowScripts();
+    AddPartyLfgFillScripts();
 }
