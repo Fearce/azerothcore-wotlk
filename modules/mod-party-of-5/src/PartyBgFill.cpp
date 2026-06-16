@@ -56,7 +56,7 @@
 
 namespace
 {
-    struct FillEntry { uint32 leaderLow; uint32 bgTypeId; uint32 spawnMs; };
+    struct FillEntry { uint32 leaderLow; uint32 bgTypeId; uint32 spawnMs; bool entered; };
 
     // A fill bot that never finishes its async login is retired after this so it
     // can't pin the leader's session (g_activeLeaders) forever.
@@ -117,7 +117,7 @@ namespace
             uint32 const g = q->Fetch()[0].Get<uint32>();
             ObjectGuid const botGuid = ObjectGuid::Create<HighGuid::Player>(g);
             mgr->AddPlayerBot(botGuid, 0);   // master 0 -> isRndbot bypass, no group/follow
-            { std::lock_guard<std::mutex> lk(g_mutex); g_fillBots[g] = { leaderLow, bgTypeId, getMSTime() }; }
+            { std::lock_guard<std::mutex> lk(g_mutex); g_fillBots[g] = { leaderLow, bgTypeId, getMSTime(), false }; }
             ++spawned;
         } while (q->NextRow());
 
@@ -244,8 +244,7 @@ class PartyBgFillPlayerScript : public PlayerScript
 {
 public:
     PartyBgFillPlayerScript() : PlayerScript("PartyBgFillPlayerScript", {
-        PLAYERHOOK_ON_PLAYER_JOIN_BG,
-        PLAYERHOOK_ON_REMOVE_FROM_BATTLEGROUND
+        PLAYERHOOK_ON_PLAYER_JOIN_BG
     }) { }
 
     void OnPlayerJoinBG(Player* player) override
@@ -269,12 +268,10 @@ public:
         }
         StartFill(player, bgTypeId);
     }
-
-    void OnPlayerRemoveFromBattleground(Player* player, Battleground* /*bg*/) override
-    {
-        if (!player) return;
-        RetireFillBot(player->GetGUID().GetCounter(), player);
-    }
+    // NB: deliberately NO OnPlayerRemoveFromBattleground. Retiring (logging out) a
+    // fill bot synchronously inside the BG-removal hook — for every fill bot when a
+    // 10v10/40v40 ends — is a re-entrant teardown crash risk. The world tick retires
+    // them safely instead (it watches each fill bot leave its match via `entered`).
 };
 
 class PartyBgFillWorldScript : public WorldScript
@@ -322,13 +319,26 @@ public:
                 continue;
             }
 
-            Player* leader = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(fe.leaderLow));
-            if (!leaderStillIn(leader, fe.bgTypeId) && !bot->InBattleground())
+            if (bot->InBattleground())
             {
-                RetireFillBot(botLow, bot);   // leader bailed the queue -> logout dequeues the bot
+                // In the match; its AI plays it. Remember it made it in, so when the
+                // match ENDS (below) we retire it from HERE — never from the BG-removal
+                // hook, where a synchronous LogoutPlayer mid-teardown (×10-40 bots on a
+                // BG end) is a crash risk.
+                if (!fe.entered)
+                {
+                    std::lock_guard<std::mutex> lk(g_mutex);
+                    auto it = g_fillBots.find(botLow);
+                    if (it != g_fillBots.end()) it->second.entered = true;
+                }
                 continue;
             }
-            if (bot->InBattleground()) continue;                 // in the match; its AI plays it
+            // Out of the BG. If it had ENTERED, its match is over -> retire safely here.
+            if (fe.entered) { RetireFillBot(botLow, bot); continue; }
+
+            // Pre-pop: if the leader bailed the queue, the fill bots leave too.
+            Player* leader = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(fe.leaderLow));
+            if (!leaderStillIn(leader, fe.bgTypeId)) { RetireFillBot(botLow, bot); continue; }
             if (!bot->InBattlegroundQueue()) QueueFillBot(bot, fe.bgTypeId);
             else                             AcceptBgInvite(bot);
         }
