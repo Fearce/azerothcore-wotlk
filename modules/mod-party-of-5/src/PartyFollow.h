@@ -137,6 +137,13 @@ namespace WowPsParty
     void WaitTankThreatRefreshFromDB(uint32 guidLow);
     bool GetWaitTankThreat(ObjectGuid guid);
 
+    // Healer threat-hold. True while a healer should SKIP its direct heals because
+    // its human tank-leader is still gathering a pull (heal threat rips a fresh
+    // pull off the tank). Gated behind the per-bot wait-tank-threat toggle; the
+    // underlying gather window ends if the tank drops low, so a dying tank is still
+    // healed. Consulted by TickRotation to suppress the cast_party_lowest verbs.
+    bool HealerShouldHoldHeal(Player* bot);
+
     // Per-TANK "safe pull" toggle. Default ON for every tank (the ranged
     // tag-and-step-back opener); an explicit Rotation-Editor choice can switch a
     // tank to barging straight into melee instead.

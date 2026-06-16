@@ -222,11 +222,17 @@ public:
         if (_accum < 1000) return;
         _accum = 0;
 
+        // Snapshot BOTH sets under one lock. The leader's-own-alts drive loop
+        // below must run even when there are zero fill bots (SpawnFillBots can
+        // abort with none found for the enemy bracket, yet the leader is still in
+        // g_activeLeaders and queued) — otherwise the human enters WSG alone.
         std::vector<std::pair<uint32, uint32>> snapshot;
+        std::vector<uint32> leaders;
         {
             std::lock_guard<std::mutex> lk(g_mutex);
-            if (g_fillBots.empty()) return;
+            if (g_fillBots.empty() && g_activeLeaders.empty()) return;
             snapshot.assign(g_fillBots.begin(), g_fillBots.end());
+            leaders.assign(g_activeLeaders.begin(), g_activeLeaders.end());
         }
 
         for (auto const& [botLow, leaderLow] : snapshot)
@@ -253,6 +259,37 @@ public:
                 QueueFillBotForWsg(bot);     // freshly logged in -> queue it
             else
                 AcceptFillBotInvite(bot);    // queued -> accept the pop when invited
+        }
+
+        // The LEADER's own party-of-5 bots must enter the BG too. Phase-1
+        // (TickAcceptBgInvite, per-bot AI tick) proved unreliable in the ~40s invite
+        // window for managed bots — the human entered WSG alone (1v5) while the alts
+        // stayed in the world. Drive them from this reliable world-thread tick:
+        // queue any the group-queue missed (Alliance, same team as the human), and
+        // accept the pop. NB: party bots are the user's ALTS — never logged out here
+        // (only fill bots are, via RetireFillBot), so they're not added to g_fillBots.
+        for (uint32 leaderLow : leaders)
+        {
+            Player* leader = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(leaderLow));
+            if (!leader || (!leader->InBattleground()
+                            && !leader->InBattlegroundQueueForBattlegroundQueueType(WsgQueueType())))
+                continue;
+            std::vector<ObjectGuid> party;
+            WowPsParty::GetPartyGuidsFor(leader->GetGUID(), party);
+            for (ObjectGuid const& g : party)
+            {
+                if (g == leader->GetGUID()) continue;
+                Player* pb = ObjectAccessor::FindConnectedPlayer(g);
+                if (!pb || !sPlayerbotsMgr.GetPlayerbotAI(pb)) continue;   // managed alts only
+                if (pb->InBattleground()) continue;                        // already in
+                if (!pb->InBattlegroundQueue())
+                {
+                    LOG_INFO("module", "[WowPsParty BGFill] party bot {} wasn't in the BG queue — queuing it", pb->GetName());
+                    QueueFillBotForWsg(pb);     // Alliance -> joins the human's team
+                }
+                else
+                    AcceptFillBotInvite(pb);    // accept the pop so it ports in with the human
+            }
         }
     }
 

@@ -4310,6 +4310,26 @@ namespace WowPsParty
                         r.priority, r.condition, r.action);
                 continue;
             }
+            // Healer threat-hold: while the human tank-leader is still gathering a
+            // pull, SKIP the direct-heal verbs (heal threat is split across every
+            // mob in combat and rips a fresh pull off the tank — "if i receive any
+            // heal the healer rips aggro"). Buffs/shields/cleanse/rez still fire,
+            // and the hold ends if the tank drops low (see HealerShouldHoldHeal),
+            // so the tank never dies waiting. Gated behind the wait-tank-threat
+            // toggle. Falls through to lower-priority rules (none of which heal).
+            {
+                std::string const verb = r.action.substr(0, r.action.find(':'));
+                if ((verb == "cast_party_lowest" || verb == "cast_party_lowest_hot")
+                    && WowPsParty::HealerShouldHoldHeal(bot))
+                {
+                    if (trace)
+                        LOG_INFO("module",
+                            "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> HEAL_HOLD (tank gather window)",
+                            r.priority, r.condition, r.action);
+                    continue;
+                }
+            }
+
             // The highest-priority rule that matched this tick wants a reactive
             // heal/cleanse/rez while we're mid offensive filler — drop the nuke
             // NOW so the heal lands this tick, not 1-2s later when the cast bar
