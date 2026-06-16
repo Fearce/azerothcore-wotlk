@@ -29,6 +29,8 @@
 #include "CharmInfo.h"
 #include "Group.h"
 #include "GroupMgr.h"
+#include "Guild.h"
+#include "GuildMgr.h"
 #include "Pet.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
@@ -1997,6 +1999,109 @@ static Item* PullItemToRequester(Player* requester, Player* srcChar, Item* item)
     return nullptr;
 }
 
+// Deposit one party-inventory item into the requester's GUILD bank. Re-owns the
+// item onto the requester (a guild member), then auto-places it in the first tab
+// the requester may deposit to — SwapItemsWithInventory with NULL_SLOT scans that
+// tab for a free/stackable slot. Bounces back to the source char on failure so an
+// item is never stranded. (Mirrors HandleBankDeposit, but the guild bank has no
+// player-side auto-store, so it routes through the Guild API.)
+static void HandleGuildBankDeposit(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const srcSlot        = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+    if (!srcItemGuidLow) return;
+
+    Guild* guild = sGuildMgr->GetGuildById(requester->GetGuildId());
+    if (!guild)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r You're not in a guild.");
+        return;
+    }
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    QueryResult q = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, srcSlot);
+    if (!q) return;
+    Player* srcChar = ObjectAccessor::FindConnectedPlayer(
+        ObjectGuid::Create<HighGuid::Player>(q->Fetch()[0].Get<uint32>()));
+    if (!srcChar) return;
+    Item* item = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!item) return;
+    ItemTemplate const* t = item->GetTemplate();
+    std::string const itemName = t ? t->Name1 : "item";
+
+    // Bring it onto the requester (the guild member) so the deposit is from THEIR
+    // bags. Caveat: PullItemToRequester returns null both when the requester's bags
+    // are full AND when a STACKABLE merged into an existing stack the requester
+    // already held (its guid is gone). The latter is uncommon for a deposit (you're
+    // usually moving a hero's item you don't also hold) and never loses the item —
+    // it's safe in the requester's bags — but it isn't deposited; re-deposit from
+    // the requester. Not auto-handled here to avoid over-depositing the requester's
+    // own merged-in items.
+    Item* mine = PullItemToRequester(requester, srcChar, item);
+    if (!mine)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Couldn't stage |cffffffff{}|r to deposit (your bags are full, "
+            "or it stacked onto one you're carrying — deposit that one).", itemName);
+        WowPsParty::SendInventoryTo(requester);
+        if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
+        return;
+    }
+    ObjectGuid const movedGuid = mine->GetGUID();
+
+    bool deposited = false;
+    for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS && !deposited; ++tabId)
+    {
+        if (!guild->MemberHasTabRights(requester->GetGUID(), tabId, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
+            continue;
+        Item* cur = requester->GetItemByGuid(movedGuid);
+        if (!cur) { deposited = true; break; }
+        // NULL_SLOT → auto-place in the first free/stackable slot of this tab.
+        guild->SwapItemsWithInventory(requester, /*toChar*/ false, tabId, NULL_SLOT,
+                                      cur->GetBagSlot(), cur->GetSlot(), 0);
+        if (!requester->GetItemByGuid(movedGuid))
+            deposited = true;   // it left our bags -> stored in the guild bank
+    }
+
+    if (deposited)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r Deposited |cffffffff{}|r to the guild bank.", itemName);
+    }
+    else
+    {
+        // No deposit rights anywhere / guild bank full — hand it back to the source
+        // char, but ONLY if that char can actually hold it. If not, LEAVE it in the
+        // requester's bags (still safe + visible) rather than detaching it into a
+        // slotless DB limbo. (CanStoreItem is a capacity check; the item's current
+        // owner doesn't matter, so it's valid to test before detaching.)
+        if (Item* cur = requester->GetItemByGuid(movedGuid))
+            if (srcChar != requester)
+            {
+                ItemPosCountVec back;
+                if (srcChar->CanStoreItem(NULL_BAG, NULL_SLOT, back, cur, false) == EQUIP_ERR_OK)
+                {
+                    requester->MoveItemFromInventory(cur->GetBagSlot(), cur->GetSlot(), true);
+                    cur->SetOwnerGUID(srcChar->GetGUID());
+                    cur->FSetState(ITEM_CHANGED);
+                    srcChar->MoveItemToInventory(back, cur, true);
+                    CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+                    cur->SaveToDB(tx);
+                    CharacterDatabase.CommitTransaction(tx);
+                }
+            }
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Couldn't deposit |cffffffff{}|r — no guild-bank deposit rights or the bank is full.", itemName);
+    }
+    WowPsParty::SendInventoryTo(requester);
+    if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
+}
+
 // USE\t<srcPartySlot>\t<srcItemGuidLow> — use a bag item. CONSUMABLES (food/
 // potions) fire their on-use on the requester and lose a charge from the owner.
 // NON-consumables (recipes to learn, essences/shards that CONVERT via reagents,
@@ -2935,6 +3040,10 @@ public:
         else if (command == "BANK")
         {
             HandleBankDeposit(player, payload);
+        }
+        else if (command == "GBANK")
+        {
+            HandleGuildBankDeposit(player, payload);
         }
         else if (command == "SORT_BAGS")
         {
