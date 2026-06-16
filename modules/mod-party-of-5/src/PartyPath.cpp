@@ -67,14 +67,17 @@ namespace WowPsParty
         static std::unordered_map<uint32, TankStall>               g_tankStall;
 
         // Recording is DISTANCE + TURN based, NOT time based — so waypoint
-        // density is independent of the 5x ghost speed (time sampling left ~5y
+        // density is independent of the ghost speed (time sampling left ~5y
         // gaps at speed that cut corners and stalled the tank). Drop a point at
         // least every REC_SEGMENT_MAX yards on a straight, and an EXTRA one
         // whenever the heading turns by REC_TURN_RAD so tight corridors stay
         // crisp. REC_MIN_STEP suppresses points while standing still / jittering.
-        constexpr float  REC_MIN_STEP       = 0.8f;
-        constexpr float  REC_SEGMENT_MAX    = 3.0f;
-        constexpr float  REC_TURN_RAD       = 0.26f;   // ~15 degrees
+        // Tuned dense (1.5y straights / ~10° corners) so the tank never has to
+        // span a long gap to the next point — a sparse corner used to read as the
+        // nearest waypoint being BEHIND it, making it briefly turn back.
+        constexpr float  REC_MIN_STEP       = 0.5f;
+        constexpr float  REC_SEGMENT_MAX    = 1.5f;
+        constexpr float  REC_TURN_RAD       = 0.17f;   // ~10 degrees
         constexpr float  REC_PI             = 3.14159265f;
         constexpr float  TANK_LEASH         = 45.0f;   // stop & wait past this from leader
         constexpr float  LEAD_DISTANCE      = 30.0f;   // aim this far ahead ALONG the path
@@ -197,10 +200,11 @@ namespace WowPsParty
             if (!p) return;
             // SetGameMaster makes the player invisible/untargetable to hostiles
             // and ignores aggro. SetSpeed takes a multiplier (m_speed_rate),
-            // so passing 5.0 = 5× normal, 1.0 = baseline.
+            // so passing 3.0 = 3× normal, 1.0 = baseline. 3x (down from 5x) is
+            // still brisk but slow enough to trace corners precisely on foot.
             p->SetGameMaster(on);
             p->SetGMVisible(!on);
-            float const rate = on ? 5.0f : 1.0f;
+            float const rate = on ? 3.0f : 1.0f;
             // forced=true so the speed-change packet is actually sent to the
             // controlling client (without it the player's own speed often
             // doesn't update).
@@ -246,7 +250,7 @@ namespace WowPsParty
 
         static void OpenNearbyDoorsForRecorder(Player* p)
         {
-            constexpr float DOOR_OPEN_RANGE = 12.0f;   // open with lead at 5x ghost speed
+            constexpr float DOOR_OPEN_RANGE = 12.0f;   // open with lead at ghost speed
             std::list<GameObject*> doors;
             NearbyClosedDoorCheck check(p, DOOR_OPEN_RANGE);
             Acore::GameObjectListSearcher<NearbyClosedDoorCheck> searcher(p, doors, check);
@@ -290,7 +294,7 @@ namespace WowPsParty
             ApplyGhostMode(player, true);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Path recording |cff66ff66ON|r — ghost mode "
-                "+ 5x speed. Run the route through the dungeon (down ramps and all), "
+                "+ 3x speed. Run the route through the dungeon (down ramps and all), "
                 "then press the bound key again to save.");
             return true;
         }
@@ -317,7 +321,7 @@ namespace WowPsParty
         return g_recording.find(playerGuid.GetCounter()) != g_recording.end();
     }
 
-    // Logging out mid-recording would otherwise persist ghost mode (GM + 5x
+    // Logging out mid-recording would otherwise persist ghost mode (GM + 3x
     // speed) onto the character — they'd relog with broken movement. Drop the
     // recording (without saving the partial buffer) and reset movement state on
     // the way out.
@@ -340,7 +344,7 @@ namespace WowPsParty
     void TickPathRecording(uint32 /*diffMs*/)
     {
         // Sample EVERY tick — density is decided by DISTANCE + TURN, not time,
-        // so the route stays crisp at 5x ghost speed (per-tick work is a few
+        // so the route stays crisp at 3x ghost speed (per-tick work is a few
         // float ops for the lone recorder).
         std::vector<uint32> recorders;
         {
