@@ -240,7 +240,20 @@ namespace
         if (bot && bot->GetSession())
         {
             LOG_INFO("module", "[WowPsParty BGFill] retiring fill bot {} (match/queue over)", bot->GetName());
-            bot->GetSession()->LogoutPlayer(true);
+            // Use the playerbots-native logout, NOT a raw WorldSession::LogoutPlayer.
+            // LogoutPlayerBot queues the group/teardown cleanup onto the WORLD thread
+            // and guards double-logout, so it doesn't tear the bot's items down from
+            // here (the world-tick) while a map-worker thread races Item::GetOwner ->
+            // FindPlayer — the recurring crash when ~15 fill bots retired at once on a
+            // BG join. The fill bot was spawned on the leader's holder
+            // (mgr->AddPlayerBot(guid,0)), so route through it.
+            Player* const leader = ObjectAccessor::FindConnectedPlayer(
+                ObjectGuid::Create<HighGuid::Player>(leaderLow));
+            PlayerbotMgr* const mgr = leader ? sPlayerbotsMgr.GetPlayerbotMgr(leader) : nullptr;
+            if (mgr)
+                mgr->LogoutPlayerBot(bot->GetGUID());
+            else
+                bot->GetSession()->LogoutPlayer(true);   // leader gone — raw fallback
         }
     }
 
