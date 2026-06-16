@@ -1144,16 +1144,11 @@ namespace WowPsParty
     // engage-lead or not — nobody dies waiting for threat.
     static constexpr float TANK_GATHER_LOW_PCT = 55.0f;
 
-    // While HOLDING for the tank to build threat, bots STAGE near the tank so they
-    // can pile in the instant it has aggro (instead of standing wherever the pull
-    // found them). Melee stage just behind the formation; ranged (incl. ranged
-    // healers) hold medium range, but CLOSE IN to HOLD_RANGED_LOS_IN if they've
-    // lost line of sight to the tank (else they sit behind a wall / in the next
-    // room and can't act once threat is built). Only during the hold — once the
-    // tank has the engage lead they leave staging and blast/heal normally.
-    static constexpr float HOLD_MELEE_DIST    = 8.0f;    // a bit beyond normal formation
-    static constexpr float HOLD_RANGED_DIST   = 18.0f;   // medium, within cast range
-    static constexpr float HOLD_RANGED_LOS_IN = 6.0f;    // no LoS to tank -> close to here
+    // While HOLDING for the tank to build threat, a bot just LOOSELY LEASHES near the
+    // tank — NOT a formation spot (Kevin: "they don't need to stay in a certain spot
+    // relative to me, just stay within a distance"). It only moves to catch up when it
+    // drifts past HOLD_LEASH; within that it stands where it is.
+    static constexpr float HOLD_LEASH = 15.0f;
 
     // True if a party member that's ALSO standing off (>8y from the shared
     // victim, i.e. another caster/hunter rather than a melee at the mob) is
@@ -2645,6 +2640,30 @@ namespace WowPsParty
         return mob->GetThreatMgr().GetThreat(tank) >= floor;
     }
 
+    // While a DPS/healer is waiting for the human tank, don't keep idling just because
+    // the mob it happened to pick isn't tank-held yet — find ANY mob the tank ALREADY
+    // holds (top-threat + engage lead) that this bot can hit and isn't over the cap on,
+    // and return the NEAREST one so it engages that instead (Kevin: "abort the wait as
+    // soon as I have threat on one mob, even if a far mob isn't aggroed"). nullptr if
+    // the tank holds nothing engageable yet → the caller keeps waiting.
+    static Unit* PickTankEngagedTarget(Player* bot, Player* leader)
+    {
+        if (!bot || !leader) return nullptr;
+        Unit* best = nullptr;
+        float bestDist = 1e9f;
+        for (auto const& [refGuid, ref] : leader->GetCombatManager().GetPvECombatRefs())
+        {
+            Unit* const m = ref->GetOther(leader);
+            if (!m || !m->IsAlive() || !bot->IsValidAttackTarget(m)) continue;
+            if (!MobOnTank(bot, m, leader)) continue;        // tank must be its top-threat
+            if (!TankHasEngageLead(m)) continue;             // ...with a real engage lead
+            if (BotOverThreatVsTank(bot, m)) continue;       // we're at the cap on it → leave it
+            float const d = bot->GetDistance(m);
+            if (d < bestDist) { bestDist = d; best = m; }
+        }
+        return best;
+    }
+
     // Healer threat-hold: should this healer SKIP its heals right now? Heal threat
     // is split across every mob the healer is in combat with and rips any mob the
     // tank hasn't yet locked down. So HOLD while the tank still has a mob it's the
@@ -2987,30 +3006,35 @@ namespace WowPsParty
                                   && !BotOverThreatVsTank(bot, desired);
                 if (!release)
                 {
-                    if (bot->GetVictim()) bot->AttackStop();
-                    // Don't just stand there — STAGE near the tank so we can pile in
-                    // the instant it has aggro. Melee close (a bit behind formation),
-                    // ranged at medium range, but ranged CLOSE IN when they've lost
-                    // line of sight to the tank (so they aren't stuck behind a wall,
-                    // unable to act once threat is built). Re-issue only when not
-                    // following or meaningfully out of position (no per-tick thrash,
-                    // and it self-corrects if the follow ticker yanked us closer).
-                    bool  const melee    = FollowerIsMelee(bot);
-                    bool  const losTank  = melee
-                                        || bot->IsWithinLOSInMap(leader, VMAP::ModelIgnoreFlags::M2);
-                    float const holdDist = melee ? HOLD_MELEE_DIST
-                                                 : (losTank ? HOLD_RANGED_DIST : HOLD_RANGED_LOS_IN);
-                    MovementGeneratorType const mg2 =
-                        bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
-                    float const cur = bot->GetDistance(leader);
-                    if (mg2 != FOLLOW_MOTION_TYPE
-                        || cur > holdDist + 3.0f || cur < holdDist - 3.0f)
-                        bot->GetMotionMaster()->MoveFollow(leader, holdDist, bot->GetFollowAngle());
-                    AssistLog(gLow, melee
-                        ? "human-tank: holding — melee staged behind the tank"
-                        : (losTank ? "human-tank: holding — ranged at medium range"
-                                   : "human-tank: holding — ranged lost LoS, closing to tank"));
-                    return;
+                    // The mob we picked isn't tank-held yet — but if the tank ALREADY
+                    // holds OTHER mobs (it's mid-fight on a pack), engage the nearest
+                    // of THOSE instead of waiting on a far un-aggroed straggler.
+                    if (Unit* const alt = PickTankEngagedTarget(bot, leader))
+                    {
+                        desired = alt;   // fall through and attack the tank-held mob
+                    }
+                    else
+                    {
+                        // Tank holds nothing engageable yet → wait. Loose leash only:
+                        // catch up if we've drifted past HOLD_LEASH, otherwise stand
+                        // put — no formation spot.
+                        if (bot->GetVictim()) bot->AttackStop();
+                        MovementGeneratorType const mg2 =
+                            bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
+                        if (bot->GetDistance(leader) > HOLD_LEASH)
+                        {
+                            if (mg2 != FOLLOW_MOTION_TYPE)
+                                bot->GetMotionMaster()->MoveFollow(leader, HOLD_LEASH - 5.0f, bot->GetFollowAngle());
+                        }
+                        else if (mg2 != IDLE_MOTION_TYPE)
+                        {
+                            bot->StopMoving();
+                            bot->GetMotionMaster()->Clear();
+                            bot->GetMotionMaster()->MoveIdle();
+                        }
+                        AssistLog(gLow, "human-tank: waiting — tank has no engageable threat yet (loose leash)");
+                        return;
+                    }
                 }
             }
             // Diagnostic for the "bots still rip threat" report: a non-tank in a
