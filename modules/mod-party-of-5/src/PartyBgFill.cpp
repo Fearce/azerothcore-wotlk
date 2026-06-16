@@ -170,6 +170,7 @@ namespace
 
     void QueueFillBot(Player* bot, uint32 bgTypeId)
     {
+        if (!bot || !bot->IsInWorld() || !bot->GetSession()) return;
         WorldPacket* p = new WorldPacket(CMSG_BATTLEMASTER_JOIN, 20);
         *p << bot->GetGUID() << uint32(bgTypeId) << uint32(0) /*instanceId: first available*/ << uint8(0) /*joinAsGroup*/;
         bot->GetSession()->QueuePacket(p);   // patched handler lets a bot queue without a battlemaster
@@ -180,6 +181,8 @@ namespace
     // clicking "Enter Battle"). General — used for both fill bots and the heroes.
     void AcceptBgInvite(Player* bot)
     {
+        if (!bot || !bot->IsInWorld() || !bot->GetSession()) return;
+        if (bot->InBattleground() || bot->IsBeingTeleported()) return;   // already going in
         for (uint8 i = 0; i < PLAYER_MAX_BATTLEGROUND_QUEUES; ++i)
         {
             BattlegroundQueueTypeId const qt = bot->GetBattlegroundQueueTypeId(i);
@@ -191,10 +194,16 @@ namespace
 
             BattlegroundTypeId const bgTypeId = BattlegroundMgr::BGTemplateId(qt);
             uint8 const arenaType = BattlegroundMgr::BGArenaType(qt);
-            WorldPacket packet(CMSG_BATTLEFIELD_PORT, 20);
-            packet << uint8(arenaType) << uint8(0) << uint32(bgTypeId) << uint16(0x1F90) << uint8(1);
-            bot->GetSession()->HandleBattleFieldPortOpcode(packet);
-            LOG_INFO("module", "[WowPsParty BGFill] {} accepted bg {} invite", bot->GetName(), uint32(bgTypeId));
+            // DEFER the port: QUEUE the CMSG_BATTLEFIELD_PORT so the core processes it
+            // in the bot's normal session update — do NOT call HandleBattleFieldPortOpcode
+            // synchronously here. This runs inside the world OnUpdate tick, and porting a
+            // player across maps mid-world-update (×many bots + the heroes at once on a
+            // full-fill BG join) crashed the worldserver (Kevin: immediate crash joining
+            // WSG). Mirrors QueueFillBot's deferred join, which is stable.
+            WorldPacket* p = new WorldPacket(CMSG_BATTLEFIELD_PORT, 20);
+            *p << uint8(arenaType) << uint8(0) << uint32(bgTypeId) << uint16(0x1F90) << uint8(1);
+            bot->GetSession()->QueuePacket(p);
+            LOG_INFO("module", "[WowPsParty BGFill] {} queued PORT-accept for bg {}", bot->GetName(), uint32(bgTypeId));
             return;
         }
     }
