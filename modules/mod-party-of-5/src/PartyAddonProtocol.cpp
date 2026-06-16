@@ -1415,18 +1415,37 @@ static void HandleDisenchant(Player* requester, std::string_view payload)
     }
 
     // A party member whose Enchanting skill covers this item's required level.
+    // Record a per-slot diagnostic as we go so a FAILURE is explainable from the
+    // log — the common transient cause is a member momentarily not connected (zoning/
+    // loading) or skills not yet loaded, which reads as "no enchanter skilled enough"
+    // even when the player IS over the requirement (Kevin's mum, 2026-06-16: needed
+    // 25, was 100+, failed once then worked). Without this, that path logged nothing.
     Player* disenchanter = nullptr;
-    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE && !disenchanter; ++partySlot)
+    std::ostringstream diag;
+    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
     {
         uint32 const g = WowPsParty::GuidForAccountSlot(account, partySlot);
-        if (!g) continue;
+        if (!g) { diag << " [slot" << uint32(partySlot) << ":empty]"; continue; }
         Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g));
-        if (p && p->HasSkill(SKILL_ENCHANTING)
-            && p->GetSkillValue(SKILL_ENCHANTING) >= tmpl->RequiredDisenchantSkill)
+        if (!p)
+        {
+            diag << " [slot" << uint32(partySlot) << ":guid" << g << ":NOT-CONNECTED]";
+            continue;
+        }
+        bool const hasSkill = p->HasSkill(SKILL_ENCHANTING);
+        uint16 const skill  = hasSkill ? p->GetSkillValue(SKILL_ENCHANTING) : 0;
+        diag << " [slot" << uint32(partySlot) << ":" << p->GetName()
+             << ":ench=" << (hasSkill ? std::to_string(skill) : std::string("none")) << "]";
+        if (!disenchanter && hasSkill && skill >= tmpl->RequiredDisenchantSkill)
             disenchanter = p;
     }
     if (!disenchanter)
     {
+        LOG_WARN("module",
+            "[WowPsParty Disenchant] FAILED 'no enchanter skilled enough' — requester={} account={} "
+            "item='{}'(entry={}) requiredSkill={} | party:{}",
+            requester->GetName(), account, tmpl->Name1, tmpl->ItemId,
+            tmpl->RequiredDisenchantSkill, diag.str());
         ch.PSendSysMessage(
             "|cffff5555[WowPsParty]|r No party enchanter skilled enough to disenchant "
             "|cffffffff{}|r (needs Enchanting {}).", tmpl->Name1, tmpl->RequiredDisenchantSkill);
