@@ -146,26 +146,31 @@ namespace
         std::string const acctCsv = RndbotAccountCsv();
         if (acctCsv.empty()) { LOG_INFO("module", "[WowPsParty BGFill] no rndbot pool — abort"); return; }
 
-        // The human's team already contributes the human + heroes (all same faction).
+        // ENEMY-FACTION FILL ONLY. We must NOT spawn same-faction ally fills: with a
+        // low MinPlayersPerTeam the ally fills gave the matchmaker enough to form a
+        // whole match from BOTS ALONE (both factions queued), entering a WSG without
+        // the human — leaving the player stuck at "queue unavailable" (Kevin: bots on
+        // map 489 while he + heroes sat in the world). With NO ally bots, the human's
+        // own party is the ONLY source for its faction, so the match CANNOT pop
+        // without them — the human + heroes always get in, and the enemy team is
+        // filled. (Full same-side fill would need the ally bots to join the human's
+        // raid group so they can't self-match; a separate follow-up.)
         std::vector<ObjectGuid> party;
         WowPsParty::GetPartyGuidsFor(human->GetGUID(), party);
-        uint32 const ownSide  = uint32(party.size());                       // human + heroes
-        uint32 const allyNeed = maxPerTeam > ownSide ? maxPerTeam - ownSide : 0;
+        uint32 const ownSide   = uint32(party.size());   // human + heroes (the ally side)
         uint32 const enemyNeed = maxPerTeam;
 
         bool const allianceLeader = human->GetTeamId() == TEAM_ALLIANCE;
         uint32 const leaderLow = human->GetGUID().GetCounter();
 
-        uint32 const allies  = SpawnFillTeam(mgr, leaderLow, bgTypeId, acctCsv,
-                                             RaceCsv(allianceLeader),  bmin, bmax, allyNeed,  "ally");
         uint32 const enemies = SpawnFillTeam(mgr, leaderLow, bgTypeId, acctCsv,
                                              RaceCsv(!allianceLeader), bmin, bmax, enemyNeed, "enemy");
 
         LOG_INFO("module",
-            "[WowPsParty BGFill] {} queued bg {} ({}v{} bracket {}-{}): own={} +{} ally fills, +{} enemy fills",
-            human->GetName(), bgTypeId, maxPerTeam, maxPerTeam, bmin, bmax, ownSide, allies, enemies);
+            "[WowPsParty BGFill] {} queued bg {} (bracket {}-{}): own ally side={}, +{} enemy fills (no ally fills — keeps the human in the match)",
+            human->GetName(), bgTypeId, bmin, bmax, ownSide, enemies);
         ChatHandler(human->GetSession()).PSendSysMessage(
-            "|cff66ccff[WowPsParty]|r Filling your battleground: +{} allies, +{} opponents…", allies, enemies);
+            "|cff66ccff[WowPsParty]|r Filling the enemy team: +{} opponents…", enemies);
     }
 
     void QueueFillBot(Player* bot, uint32 bgTypeId)
