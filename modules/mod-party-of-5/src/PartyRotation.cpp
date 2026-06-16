@@ -535,11 +535,13 @@ namespace WowPsParty
         uint32 best = 0;
         for (Unit* a : hostiles)
         {
-            if (!a || !a->IsAlive() || !bot->IsValidAttackTarget(a)) continue;
+            // IN-COMBAT only: an idle, un-pulled pack must NOT trigger an AoE rule
+            // (a mage Flamestrike'd packs it walked past, out of combat — Kevin).
+            if (!a || !a->IsAlive() || !a->IsInCombat() || !bot->IsValidAttackTarget(a)) continue;
             uint32 c = 0;
             for (Unit* b : hostiles)
             {
-                if (!b || !b->IsAlive() || !bot->IsValidAttackTarget(b)) continue;
+                if (!b || !b->IsAlive() || !b->IsInCombat() || !bot->IsValidAttackTarget(b)) continue;
                 if (a->GetDistance(b) <= radius) ++c;   // counts a itself too
             }
             if (c > best) best = c;
@@ -558,10 +560,12 @@ namespace WowPsParty
         uint32 bestCount = 0;
         for (Unit* a : hostiles)
         {
-            if (!a || !a->IsAlive() || !bot->IsValidAttackTarget(a)) continue;
+            // IN-COMBAT only (see MaxEnemyCluster) — never anchor an AoE on an idle,
+            // un-pulled mob, which would cast (and pull) out of combat.
+            if (!a || !a->IsAlive() || !a->IsInCombat() || !bot->IsValidAttackTarget(a)) continue;
             uint32 c = 0;
             for (Unit* b : hostiles)
-                if (b && b->IsAlive() && bot->IsValidAttackTarget(b)
+                if (b && b->IsAlive() && b->IsInCombat() && bot->IsValidAttackTarget(b)
                     && a->GetDistance(b) <= radius)
                     ++c;
             if (c > bestCount) { bestCount = c; best = a; }

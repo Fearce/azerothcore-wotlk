@@ -1135,10 +1135,11 @@ namespace WowPsParty
     // on that ONE fresh mob, never the whole party (the timer's fatal flaw).
     // Threat ≈ damage dealt (×modifiers), and damage-to-kill ≈ HP, so this fraction
     // is really "how many tank GCDs of lead": 0.03 was ~ONE paladin swing (RF
-    // doubles threat) so the bots piled on a single tag — set to give the tank a
-    // genuine head of ~several actions before anyone assists. Tune here if a pull
-    // feels too eager (raise) or too sluggish (lower).
-    static constexpr float ENGAGE_THREAT_HEALTH_FRAC = 0.15f;
+    // doubles threat) so the bots piled on a single tag; 0.15 was too sluggish.
+    // 0.07 gives the tank a few actions' head start before anyone assists. Bosses
+    // are exempt (IsBossUnit). Tune here if a pull feels too eager (raise) or too
+    // sluggish (lower).
+    static constexpr float ENGAGE_THREAT_HEALTH_FRAC = 0.07f;
     // Emergency release: a tank/member at or below this HP gets DPS + heals NOW,
     // engage-lead or not — nobody dies waiting for threat.
     static constexpr float TANK_GATHER_LOW_PCT = 55.0f;
@@ -2605,6 +2606,17 @@ namespace WowPsParty
         return tm.GetThreat(bot) >= tankThreat * THREAT_CAP_RATIO;
     }
 
+    // A dungeon/world boss — exempt from the engage-lead throttle entirely. A boss
+    // is tank-and-spank: the tank holds it reliably and DPS uptime matters, so the
+    // bots blast/heal from the pull (Kevin: "bosses should be exempt, they can just
+    // immediately dps/heal"). Also 7%-of-HP threat on a huge boss pool would be a
+    // long wait for no benefit.
+    static bool IsBossUnit(Unit* u)
+    {
+        Creature* const c = u ? u->ToCreature() : nullptr;
+        return c && (c->IsDungeonBoss() || c->isWorldBoss());
+    }
+
     // PURE-THREAT engage gate: has the tank built a real lead on THIS mob — enough
     // that it's "properly engaged", not just lightly aggroed (a right-click, a
     // passive patrol, a mob the tank merely auto-selected / that wandered in)? The
@@ -2648,6 +2660,7 @@ namespace WowPsParty
         {
             Unit* const mob = ref->GetOther(leader);
             if (!mob || !mob->IsAlive()) continue;
+            if (IsBossUnit(mob)) continue;                   // bosses: heal freely
             if (mob->GetVictim() != leader) continue;        // not the tank's to lock
             if (!TankHasEngageLead(mob)) { tankStillLocking = true; break; }
         }
@@ -2921,27 +2934,26 @@ namespace WowPsParty
         if (desired && (!desired->IsAlive() || !bot->IsValidAttackTarget(desired)))
             desired = nullptr;
 
-        // ---- Pure threat gate: a DPS only fights what the human TANK holds -----
-        // In a dungeon led by a human tank, a DPS bot DPSes a mob ONLY while the
-        // tank actually has aggro on it AND the bot is under THREAT_CAP_RATIO of the
-        // tank's threat (so it never rips it off). Anything the tank HASN'T grabbed
-        // — a mob that wandered onto the bot, one on an ally — is simply HELD, never
-        // fought, until the tank takes it. No timer: it works purely off live threat
-        // ("tank has it -> engage", bulletproof). AoE pulls can't be perfectly gated
-        // this way and that's accepted — a normal player can't either. Tanks (want
-        // aggro on everything) and healers are unaffected.
+        // ---- Pure threat gate: a non-tank only fights what the human TANK holds --
+        // In a dungeon led by a human tank, a DPS *or healer* bot attacks a mob ONLY
+        // once the tank has a real engage lead on it AND the bot is under
+        // THREAT_CAP_RATIO of the tank's threat (so it never rips it off). Anything
+        // the tank HASN'T grabbed is simply HELD. No timer: pure live threat. The
+        // healer is gated too (its offensive filler — Moonfire/wand — rips just like
+        // DPS; its HEALS are gated separately in TickRotation). BOSSES are exempt —
+        // a boss is tank-and-spank, the tank holds it reliably, so DPS/heal blast
+        // immediately. AoE pulls still can't be perfectly gated (accepted).
         {
             std::string const myRole = RoleForGuid(bot->GetGUID());
-            bool const isDps = desired && myRole != "tank" && myRole != "healer";
-            if (isDps && HumanTankLeadActive(bot, leader)
-                && WaitForHumanTank(bot->GetGUID()))   // default WAIT under a human tank; '0' opts out
+            bool const gated = desired && myRole != "tank";   // DPS AND healer; tank engages freely
+            if (gated && HumanTankLeadActive(bot, leader)
+                && WaitForHumanTank(bot->GetGUID())            // default WAIT under a human tank; '0' opts out
+                && !IsBossUnit(desired))                       // bosses: no throttle, blast on
             {
-                // Release ONLY once the tank both holds the mob (top-threat) AND has
-                // built a real engage lead on it (ENGAGE_THREAT_HEALTH_FRAC of its
-                // max HP) — so a bare right-click / a passive patrol-aggro / any
-                // near-zero "light" threat keeps the bot held. After that the
-                // THREAT_CAP_RATIO governs so it never rips it off. Pure threat, no
-                // timer: this gates only the under-threat mob, not the whole party.
+                // Release ONLY once the tank holds the mob (top-threat) AND has built
+                // a real engage lead on it (ENGAGE_THREAT_HEALTH_FRAC of its max HP) —
+                // so a bare right-click / a passive patrol-aggro / Retribution-Aura
+                // chip threat keeps the bot held. After that THREAT_CAP_RATIO governs.
                 bool const release = MobOnTank(bot, desired, leader)
                                   && TankHasEngageLead(desired)
                                   && !BotOverThreatVsTank(bot, desired);
@@ -2952,14 +2964,14 @@ namespace WowPsParty
                     return;
                 }
             }
-            // Diagnostic for the "DPS still rip threat" report: a DPS in a human-led
-            // dungeon whose wait-gate did NOT engage because the human leader's party
-            // role isn't "tank" (so HumanTankLeadActive is false). Reveals the need to
-            // set the active character's role to tank. (AssistLog self-throttles.)
-            else if (isDps && leader->GetSession() && !sPlayerbotsMgr.GetPlayerbotAI(leader)
+            // Diagnostic for the "bots still rip threat" report: a non-tank in a
+            // human-led dungeon whose wait-gate did NOT engage because the human
+            // leader's party role isn't "tank" (so HumanTankLeadActive is false).
+            // Reveals the need to set the active character's role to tank.
+            else if (gated && leader->GetSession() && !sPlayerbotsMgr.GetPlayerbotAI(leader)
                      && bot->GetMap() && bot->GetMap()->IsDungeon()
                      && !HumanTankLeadActive(bot, leader))
-                AssistLog(gLow, "no wait-gate: human leader's party role isn't 'tank' (LeaderRole) — DPS won't hold");
+                AssistLog(gLow, "no wait-gate: human leader's party role isn't 'tank' (LeaderRole) — bots won't hold");
         }
 
         // Retarget throttle. If we're already on a live, valid victim, don't
