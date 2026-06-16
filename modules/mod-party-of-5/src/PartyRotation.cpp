@@ -3952,8 +3952,19 @@ namespace WowPsParty
     // never counts as "casting" because every gate passes skipAutorepeat=true, so
     // abilities/nukes still fire on top. Cast 3018 (warrior/rogue Shoot) is the
     // WRONG spell for a wand and never establishes the repeat.
-    static void EnsureRangedAutoAttack(Player* bot)
+    static void EnsureRangedAutoAttack(Player* bot, bool holdOffense)
     {
+        // Wait-for-tank: while this non-tank is holding for a human tank to take
+        // threat, the ranged auto-repeat must stand down (a hunter Auto Shot the
+        // pull before the tank had aggro). Interrupt any live repeat and don't start
+        // one; it resumes the moment the bot is released (gets a victim).
+        if (holdOffense)
+        {
+            if (bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+                bot->InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
+            return;
+        }
+
         Item* const ranged = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
         if (!ranged) return;
         uint8 const sub = ranged->GetTemplate()->SubClass;
@@ -4168,11 +4179,22 @@ namespace WowPsParty
         // rogue stays poisoned — playerbots' own upkeep is gated out for us.
         WowPsParty::MaintainBotConsumables(bot);
 
+        // No-offense-until-released: under a human tank-lead, a NON-TANK of ANY class
+        // produces no offense until AssistTarget hands it a victim — which it only
+        // does once the tank has the engage lead on the target. bot->GetVictim() is
+        // that release signal. This catch-all closes every offensive bypass the
+        // per-victim gate misses: the hunter's Auto Shot / a wand repeat (here), and
+        // spread/scan/pull/shoot/wand rotation verbs (the rule loop below). Once
+        // released the rotation runs normally (AoE spilling onto the pack is accepted
+        // — a player can't gate that perfectly either).
+        bool const offenseHold = WowPsParty::BotWaitsForHumanTank(bot)
+                              && bot->GetVictim() == nullptr;
+
         // Keep the hunter's auto-shot running between ability casts, its pet
         // summoned, and EVERY bot's pet defending + on-target (all bypassed by our
         // UpdateAI gate). MaintainBotPet covers all pet classes — without it a
         // freshly-summoned warlock imp / mage elemental sits on passive.
-        EnsureRangedAutoAttack(bot);
+        EnsureRangedAutoAttack(bot, offenseHold);
         EnsureHunterPet(bot);
         MaintainBotPet(bot);
 
@@ -4296,8 +4318,8 @@ namespace WowPsParty
                 castingHarmfulFiller = !gi->IsPositive();
 
         // Healer threat-hold, computed once per tick (it scans the tank's combat
-        // refs). While true, the healer holds BOTH heals and offense — see the
-        // per-rule skip below. Non-healers return false cheaply.
+        // refs). While true, the healer holds its HEALS. Non-healers return false.
+        // (offenseHold for all classes is computed earlier, before the auto-attack.)
         bool const healerHold = WowPsParty::HealerShouldHoldHeal(bot);
 
         for (RotationRule const& r : rules)
@@ -4344,24 +4366,25 @@ namespace WowPsParty
                         r.priority, r.condition, r.action);
                 continue;
             }
-            // Healer threat-hold: while the human tank-leader is still locking a
-            // pull, SKIP both the direct-heal verbs AND offensive enemy verbs. Heal
-            // threat is split across every mob and rips a fresh pull; offense (esp.
-            // cast_spread / cast_scan, which pick their OWN enemy targets and so slip
-            // past AssistTarget's victim gate) does the same — this is why the healer
-            // still Moonfired mobs the tank hadn't aggroed. Buffs/cleanse/rez/self
-            // still fire; the hold ends when the pack is locked or the tank/a member
-            // drops low (HealerShouldHoldHeal). Gated behind the wait-tank-threat
-            // toggle. Falls through to lower-priority rules.
-            if (healerHold)
+            // Threat-hold for the human tank-lead. Skip:
+            //  - HEAL verbs while the healer is holding (heal threat rips a fresh
+            //    pull off the tank);
+            //  - OFFENSIVE enemy verbs (any class) until this bot is released, so
+            //    nothing — melee, nuke, spread/scan, pull, shoot, wand — lands on a
+            //    mob before the tank has threat.
+            // Buffs/cleanse/rez/self/movement still fire; both holds release the
+            // instant the tank has the lead (or, for heals, the pack is locked /
+            // someone drops low). Gated behind the wait-tank-threat toggle.
             {
                 std::string const verb = r.action.substr(0, r.action.find(':'));
-                if (verb == "cast_party_lowest" || verb == "cast_party_lowest_hot"
-                    || IsOffensiveEnemyVerb(verb))
+                bool const skip =
+                    (healerHold  && (verb == "cast_party_lowest" || verb == "cast_party_lowest_hot"))
+                 || (offenseHold && IsOffensiveEnemyVerb(verb));
+                if (skip)
                 {
                     if (trace)
                         LOG_INFO("module",
-                            "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> HEALER_HOLD (tank still locking pull)",
+                            "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> TANK_THREAT_HOLD",
                             r.priority, r.condition, r.action);
                     continue;
                 }
