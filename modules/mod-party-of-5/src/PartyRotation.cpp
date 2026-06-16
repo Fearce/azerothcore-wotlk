@@ -4075,6 +4075,23 @@ namespace WowPsParty
             || verb == "rez_party";
     }
 
+    // Verbs that deal damage to / pull an ENEMY (generate threat). Used to hold a
+    // healer's offense while the human tank is still locking a pull — the single-
+    // target gate in AssistTarget only governs the bot's VICTIM, but these (spread/
+    // scan/pull/auto-shot/wand) pick their own enemy targets and bypass it, which is
+    // how the healer still Moonfired mobs the tank hadn't aggroed.
+    static bool IsOffensiveEnemyVerb(std::string const& verb)
+    {
+        return verb == "cast"               // single-target nuke on the victim (e.g. Moonfire)
+            || verb == "cast_spread"
+            || verb == "cast_combo_spread"
+            || verb == "cast_scan"
+            || verb == "cast_loose_enemy"
+            || verb == "pull"
+            || verb == "shoot"
+            || verb == "wand";
+    }
+
     // When a rule's ACTION targets a FRIENDLY unit (a heal/HoT/buff on the
     // lowest party member, the tank, or self), that friendly unit — not the
     // bot's enemy victim — is what its target_* conditions should evaluate
@@ -4270,6 +4287,11 @@ namespace WowPsParty
             if (SpellInfo const* gi = gen->GetSpellInfo())
                 castingHarmfulFiller = !gi->IsPositive();
 
+        // Healer threat-hold, computed once per tick (it scans the tank's combat
+        // refs). While true, the healer holds BOTH heals and offense — see the
+        // per-rule skip below. Non-healers return false cheaply.
+        bool const healerHold = WowPsParty::HealerShouldHoldHeal(bot);
+
         for (RotationRule const& r : rules)
         {
             // A rule disabled in the editor (checkbox off) carries the
@@ -4314,21 +4336,24 @@ namespace WowPsParty
                         r.priority, r.condition, r.action);
                 continue;
             }
-            // Healer threat-hold: while the human tank-leader is still gathering a
-            // pull, SKIP the direct-heal verbs (heal threat is split across every
-            // mob in combat and rips a fresh pull off the tank — "if i receive any
-            // heal the healer rips aggro"). Buffs/shields/cleanse/rez still fire,
-            // and the hold ends if the tank drops low (see HealerShouldHoldHeal),
-            // so the tank never dies waiting. Gated behind the wait-tank-threat
-            // toggle. Falls through to lower-priority rules (none of which heal).
+            // Healer threat-hold: while the human tank-leader is still locking a
+            // pull, SKIP both the direct-heal verbs AND offensive enemy verbs. Heal
+            // threat is split across every mob and rips a fresh pull; offense (esp.
+            // cast_spread / cast_scan, which pick their OWN enemy targets and so slip
+            // past AssistTarget's victim gate) does the same — this is why the healer
+            // still Moonfired mobs the tank hadn't aggroed. Buffs/cleanse/rez/self
+            // still fire; the hold ends when the pack is locked or the tank/a member
+            // drops low (HealerShouldHoldHeal). Gated behind the wait-tank-threat
+            // toggle. Falls through to lower-priority rules.
+            if (healerHold)
             {
                 std::string const verb = r.action.substr(0, r.action.find(':'));
-                if ((verb == "cast_party_lowest" || verb == "cast_party_lowest_hot")
-                    && WowPsParty::HealerShouldHoldHeal(bot))
+                if (verb == "cast_party_lowest" || verb == "cast_party_lowest_hot"
+                    || IsOffensiveEnemyVerb(verb))
                 {
                     if (trace)
                         LOG_INFO("module",
-                            "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> HEAL_HOLD (tank gather window)",
+                            "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> HEALER_HOLD (tank still locking pull)",
                             r.priority, r.condition, r.action);
                     continue;
                 }
