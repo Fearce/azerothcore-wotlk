@@ -1130,11 +1130,15 @@ namespace WowPsParty
     // that wandered onto the tank, or any other near-zero "light" aggro never
     // releases the party (Kevin: "they attack before i even did anything", "an
     // enemy patrol sneaks up"). Above it the existing THREAT_CAP_RATIO governs.
-    // A fraction of max-HP AUTO-SCALES with level/content with no timer: ~1 GCD of
-    // tank threat on trash, a couple seconds on a high-HP boss — and it's PER MOB,
-    // so pulling one extra mob onto an already-locked pack only gates DPS on that
-    // ONE fresh mob, never the whole party (the timer's fatal flaw).
-    static constexpr float ENGAGE_THREAT_HEALTH_FRAC = 0.03f;
+    // A fraction of max-HP AUTO-SCALES with level/content with no timer, and it's
+    // PER MOB, so pulling one extra mob onto an already-locked pack only gates DPS
+    // on that ONE fresh mob, never the whole party (the timer's fatal flaw).
+    // Threat ≈ damage dealt (×modifiers), and damage-to-kill ≈ HP, so this fraction
+    // is really "how many tank GCDs of lead": 0.03 was ~ONE paladin swing (RF
+    // doubles threat) so the bots piled on a single tag — set to give the tank a
+    // genuine head of ~several actions before anyone assists. Tune here if a pull
+    // feels too eager (raise) or too sluggish (lower).
+    static constexpr float ENGAGE_THREAT_HEALTH_FRAC = 0.15f;
     // Emergency release: a tank/member at or below this HP gets DPS + heals NOW,
     // engage-lead or not — nobody dies waiting for threat.
     static constexpr float TANK_GATHER_LOW_PCT = 55.0f;
@@ -1964,6 +1968,10 @@ namespace WowPsParty
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld() || !bot->GetSession()) return;
         if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) return; // the controlled body
+        // Henchmen never gather (by design) — exit SILENTLY before the diagnostic
+        // gate below, or a gather-skilled rndbot henchman spams "skip: henchman"
+        // every few seconds and drowns the combat-assist log.
+        if (IsHenchman(bot->GetGUID())) return;
 
         // Skill gate FIRST — most bots have no gather profession, exit silently.
         // Past this point the bot CAN gather, so every other skip is logged
@@ -1977,7 +1985,6 @@ namespace WowPsParty
 
         if (bot->IsInCombat())                            { GatherLog(gLow, "skip: in combat"); return; }
         if (bot->IsNonMeleeSpellCast(false, false, true)) { GatherLog(gLow, "skip: casting"); return; }
-        if (IsHenchman(bot->GetGUID()))                   { GatherLog(gLow, "skip: henchman (only the player's alts gather)"); return; }
         if (IsTankLeading(bot->GetGUID()))                { GatherLog(gLow, "skip: leading the dungeon"); return; }
 
         // Nowhere to put the mats — don't harvest (AutoStoreLoot silently drops
