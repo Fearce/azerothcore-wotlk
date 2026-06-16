@@ -38,9 +38,27 @@
 #include <algorithm>
 #include <mutex>
 #include <unordered_set>
+#ifdef _WIN32
+#include <excpt.h>   // __try/__except — guard reagent scans against freed item pointers
+#endif
 
 namespace WowPsParty
 {
+    // Probe an item behind structured exception handling before a reagent scan trusts it.
+    // The shared-inventory item mover can leave a freed item referenced in a bag slot;
+    // reading it (GetEntry/GetCount/GetBagSize) would abort the worldserver with a null
+    // value-array ACCESS_VIOLATION. A guarded read of its entry faults harmlessly so the
+    // scan skips it. POD-only locals (C2712); MSVC-only, a no-op elsewhere.
+#ifdef _WIN32
+    static bool WowPsItemReadable(Item const* it)
+    {
+        __try { volatile uint32 e = it->GetEntry(); (void)e; return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+#else
+    static bool WowPsItemReadable(Item const* /*it*/) { return true; }
+#endif
+
     // Re-entrance guard. Set by the originating hook, checked by the mirror
     // path before propagating to peers. thread_local is fine — AC dispatches
     // PlayerScript hooks on the world thread.
@@ -301,18 +319,22 @@ namespace
         uint32 count = 0;
         for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_ITEM_END; ++i)
             if (Item* it = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
-                if (it->GetEntry() == itemId && !it->IsInTrade())
+                if (WowPsItemReadable(it) && it->GetEntry() == itemId && !it->IsInTrade())
                     count += it->GetCount();
         for (uint8 i = KEYRING_SLOT_START; i < CURRENCYTOKEN_SLOT_END; ++i)
             if (Item* it = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
-                if (it->GetEntry() == itemId && !it->IsInTrade())
+                if (WowPsItemReadable(it) && it->GetEntry() == itemId && !it->IsInTrade())
                     count += it->GetCount();
         for (uint8 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_END; ++i)
             if (Bag* bag = p->GetBagByPos(i))
+            {
+                if (!WowPsItemReadable(bag))   // a freed bag in the slot would crash GetBagSize()
+                    continue;
                 for (uint32 j = 0; j < bag->GetBagSize(); ++j)
                     if (Item* it = bag->GetItemByPos(j))
-                        if (it->GetEntry() == itemId && !it->IsInTrade())
+                        if (WowPsItemReadable(it) && it->GetEntry() == itemId && !it->IsInTrade())
                             count += it->GetCount();
+            }
         return count;
     }
 

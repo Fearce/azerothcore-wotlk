@@ -75,7 +75,32 @@
 
 #include <unordered_set>
 #ifdef _WIN32
-#include <excpt.h>   // __try/__except — guard _SaveInventory against freed queue entries
+#include <excpt.h>   // __try/__except — guard inventory scans against freed item pointers
+#endif
+
+// Probe an item pointer behind structured exception handling before code trusts it.
+// Upstream paths (notably mod-party-of-5's cross-character item moves) can leave a freed
+// item referenced in a bag/inventory/queue slot; dereferencing it aborts the whole
+// worldserver with an Object::GetGuidValue/GetUInt32Value ACCESS_VIOLATION (null value
+// array). A guarded read of the item's guid faults harmlessly on such memory so callers
+// can skip + log instead of crash. POD-only locals — mixing __try/__except with C++ object
+// unwinding is illegal (C2712). MSVC-only; elsewhere it is a no-op.
+#ifdef _WIN32
+static bool WowPsQueuedItemReadable(Item const* item)
+{
+    __try
+    {
+        volatile uint32 probe = item->GetGUID().GetCounter();
+        (void)probe;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+#else
+static bool WowPsQueuedItemReadable(Item const* /*item*/) { return true; }
 #endif
 
 /*********************************************************/
@@ -3220,7 +3245,7 @@ void Player::DestroyItemCount(uint32 itemEntry, uint32 count, bool update, bool 
     {
         if (Item* item = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
         {
-            if (item->GetEntry() == itemEntry && !item->IsInTrade())
+            if (WowPsQueuedItemReadable(item) && item->GetEntry() == itemEntry && !item->IsInTrade())
             {
                 if (item->GetCount() + remcount <= count)
                 {
@@ -3248,7 +3273,7 @@ void Player::DestroyItemCount(uint32 itemEntry, uint32 count, bool update, bool 
     {
         if (Item* item = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
         {
-            if (item->GetEntry() == itemEntry && !item->IsInTrade())
+            if (WowPsQueuedItemReadable(item) && item->GetEntry() == itemEntry && !item->IsInTrade())
             {
                 if (item->GetCount() + remcount <= count)
                 {
@@ -3281,7 +3306,7 @@ void Player::DestroyItemCount(uint32 itemEntry, uint32 count, bool update, bool 
             {
                 if (Item* item = bag->GetItemByPos(j))
                 {
-                    if (item->GetEntry() == itemEntry && !item->IsInTrade())
+                    if (WowPsQueuedItemReadable(item) && item->GetEntry() == itemEntry && !item->IsInTrade())
                     {
                         // all items in bags can be unequipped
                         if (item->GetCount() + remcount <= count)
@@ -3312,7 +3337,7 @@ void Player::DestroyItemCount(uint32 itemEntry, uint32 count, bool update, bool 
     {
         if (Item* item = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
         {
-            if (item && item->GetEntry() == itemEntry && !item->IsInTrade())
+            if (item && WowPsQueuedItemReadable(item) && item->GetEntry() == itemEntry && !item->IsInTrade())
             {
                 if (item->GetCount() + remcount <= count)
                 {
@@ -3343,7 +3368,7 @@ void Player::DestroyItemCount(uint32 itemEntry, uint32 count, bool update, bool 
     {
         if (Item* item = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
         {
-            if (item->GetEntry() == itemEntry && !item->IsInTrade())
+            if (WowPsQueuedItemReadable(item) && item->GetEntry() == itemEntry && !item->IsInTrade())
             {
                 if (item->GetCount() + remcount <= count)
                 {
@@ -3374,7 +3399,7 @@ void Player::DestroyItemCount(uint32 itemEntry, uint32 count, bool update, bool 
             {
                 if (Item* item = bag->GetItemByPos(j))
                 {
-                    if (item->GetEntry() == itemEntry && !item->IsInTrade())
+                    if (WowPsQueuedItemReadable(item) && item->GetEntry() == itemEntry && !item->IsInTrade())
                     {
                         // all items in bags can be unequipped
                         if (item->GetCount() + remcount <= count)
@@ -7339,32 +7364,6 @@ void Player::_SaveAuras(CharacterDatabaseTransaction trans, bool logout)
         trans->Append(stmt);
     }
 }
-
-#ifdef _WIN32
-// Probe a queued item pointer behind structured exception handling BEFORE _SaveInventory
-// trusts it. Upstream paths can orphan an Item* in m_itemUpdateQueue (an item deleted
-// while still queued, or one whose value array was freed), and dereferencing it aborts the
-// whole worldserver with the recurring Object::GetGuidValue ACCESS_VIOLATION. A guarded read
-// of the item's guid faults harmlessly on such memory so the caller can skip + log instead of
-// crash. Kept to POD locals only — mixing __try/__except with C++ object unwinding is illegal
-// (C2712), so the real per-item work stays in the caller. MSVC-only; other platforms rely on
-// the dedupe guard plus fixing the upstream orphan sources.
-static bool WowPsQueuedItemReadable(Item* item)
-{
-    __try
-    {
-        volatile uint32 probe = item->GetGUID().GetCounter();
-        (void)probe;
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-}
-#else
-static bool WowPsQueuedItemReadable(Item* /*item*/) { return true; }
-#endif
 
 void Player::_SaveInventory(CharacterDatabaseTransaction trans)
 {
