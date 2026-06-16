@@ -1144,6 +1144,17 @@ namespace WowPsParty
     // engage-lead or not — nobody dies waiting for threat.
     static constexpr float TANK_GATHER_LOW_PCT = 55.0f;
 
+    // While HOLDING for the tank to build threat, bots STAGE near the tank so they
+    // can pile in the instant it has aggro (instead of standing wherever the pull
+    // found them). Melee stage just behind the formation; ranged (incl. ranged
+    // healers) hold medium range, but CLOSE IN to HOLD_RANGED_LOS_IN if they've
+    // lost line of sight to the tank (else they sit behind a wall / in the next
+    // room and can't act once threat is built). Only during the hold — once the
+    // tank has the engage lead they leave staging and blast/heal normally.
+    static constexpr float HOLD_MELEE_DIST    = 8.0f;    // a bit beyond normal formation
+    static constexpr float HOLD_RANGED_DIST   = 18.0f;   // medium, within cast range
+    static constexpr float HOLD_RANGED_LOS_IN = 6.0f;    // no LoS to tank -> close to here
+
     // True if a party member that's ALSO standing off (>8y from the shared
     // victim, i.e. another caster/hunter rather than a melee at the mob) is
     // stacked within `radius` of `bot`.
@@ -2960,7 +2971,28 @@ namespace WowPsParty
                 if (!release)
                 {
                     if (bot->GetVictim()) bot->AttackStop();
-                    AssistLog(gLow, "human-tank dungeon: holding — tank lacks a solid engage lead on this mob");
+                    // Don't just stand there — STAGE near the tank so we can pile in
+                    // the instant it has aggro. Melee close (a bit behind formation),
+                    // ranged at medium range, but ranged CLOSE IN when they've lost
+                    // line of sight to the tank (so they aren't stuck behind a wall,
+                    // unable to act once threat is built). Re-issue only when not
+                    // following or meaningfully out of position (no per-tick thrash,
+                    // and it self-corrects if the follow ticker yanked us closer).
+                    bool  const melee    = FollowerIsMelee(bot);
+                    bool  const losTank  = melee
+                                        || bot->IsWithinLOSInMap(leader, VMAP::ModelIgnoreFlags::M2);
+                    float const holdDist = melee ? HOLD_MELEE_DIST
+                                                 : (losTank ? HOLD_RANGED_DIST : HOLD_RANGED_LOS_IN);
+                    MovementGeneratorType const mg2 =
+                        bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
+                    float const cur = bot->GetDistance(leader);
+                    if (mg2 != FOLLOW_MOTION_TYPE
+                        || cur > holdDist + 3.0f || cur < holdDist - 3.0f)
+                        bot->GetMotionMaster()->MoveFollow(leader, holdDist, bot->GetFollowAngle());
+                    AssistLog(gLow, melee
+                        ? "human-tank: holding — melee staged behind the tank"
+                        : (losTank ? "human-tank: holding — ranged at medium range"
+                                   : "human-tank: holding — ranged lost LoS, closing to tank"));
                     return;
                 }
             }
