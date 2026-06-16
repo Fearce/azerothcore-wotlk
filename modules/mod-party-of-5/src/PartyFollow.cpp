@@ -2021,6 +2021,17 @@ namespace WowPsParty
         {
             // Committed but can't reach it (wedged on geometry). Abandon it and
             // avoid re-picking it for a while; next tick re-scans for another.
+            // DIAGNOSTIC (mining-hang report): name the node's skill + distance so
+            // the log shows whether MINING nodes time out more than herbs.
+            {
+                uint32 dbgSkill = 0, dbgReq = 0;
+                char const* dbgName = "corpse/other";
+                if (GameObject* dgo = target->ToGameObject())
+                    if (NodeGatherSkill(dgo, dbgSkill, dbgReq)) dbgName = GatherSkillName(dbgSkill);
+                GatherLog(gLow, Acore::StringFormat(
+                    "ABANDON {} node: unreachable after {}ms (dist={:.1f}) — re-scanning",
+                    dbgName, GATHER_APPROACH_TIMEOUT_MS, bot->GetDistance(target)));
+            }
             std::lock_guard<std::mutex> lock(g_gatherMutex);
             auto& st = g_gather[gLow];
             st.avoid      = target->GetGUID();

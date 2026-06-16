@@ -14,6 +14,7 @@ void AddPartyHooksScripts();
 void AddPartyAddonProtocolScripts();
 void AddPartyFollowScripts();
 void AddPartyLfgFillScripts();
+void AddPartyBgFillScripts();
 
 void Addmod_party_of_5Scripts()
 {
@@ -23,4 +24,5 @@ void Addmod_party_of_5Scripts()
     AddPartyAddonProtocolScripts();
     AddPartyFollowScripts();
     AddPartyLfgFillScripts();
+    AddPartyBgFillScripts();
 }

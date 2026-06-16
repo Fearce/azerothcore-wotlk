@@ -1275,6 +1275,13 @@ static void HandleReqEnchants(Player* requester, std::string_view payload)
         }
     }
 
+    // DIAGNOSTIC ("can't enchant" report): how many applicable enchants the party
+    // knows for this item. 0 here = the picker is empty because NO party member is an
+    // enchanter (or none fit the item) — that's the usual "can't enchant", not a bug.
+    LOG_INFO("module",
+        "[WowPsParty Enchant] REQ_ENCHANTS by {} for item entry={} -> {} applicable enchant(s) across the party",
+        requester->GetName(), tgtItem->GetTemplate() ? tgtItem->GetTemplate()->ItemId : 0u, uint32(spellIds.size()));
+
     std::ostringstream out;
     out << "ENCHANTS\t" << tgtSlot << '\t' << tgtItemGuidLow << '\t';
     for (size_t i = 0; i < spellIds.size(); ++i)
@@ -1888,6 +1895,69 @@ static void ApplyGlyphFromItem(Player* target, Player* itemOwner, Item* glyphIte
     ChatHandler(target->GetSession()).PSendSysMessage(
         "|cff66ccff[WowPsParty]|r Applied |cffffffff{}|r to glyph slot {}.", glyphName, slot + 1);
     WowPsParty::SendInventoryTo(target);
+}
+
+// BANK\t<srcPartySlot>\t<srcItemGuidLow> — deposit a shared-bag item into the
+// REQUESTER's own bank. The item may live in a mate's bags, so re-own it to the
+// requester first, then bank it (CanBankItem/BankItem) — the same primitives the
+// core's auto-bank uses. No banker NPC is required: the shared grid is already a
+// non-physical convenience. Bounces the item back to its owner if the bank is full.
+static void HandleBankDeposit(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const srcSlot        = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+    if (!srcItemGuidLow) return;
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    QueryResult q = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, srcSlot);
+    if (!q) return;
+    Player* srcChar = ObjectAccessor::FindConnectedPlayer(
+        ObjectGuid::Create<HighGuid::Player>(q->Fetch()[0].Get<uint32>()));
+    if (!srcChar) return;
+    Item* item = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!item) return;
+    ItemTemplate const* t = item->GetTemplate();
+    std::string const itemName = t ? t->Name1 : "item";
+
+    if (srcChar != requester)   // re-own to the requester so the bank store is on THEIR item
+    {
+        srcChar->MoveItemFromInventory(item->GetBagSlot(), item->GetSlot(), true);
+        item->SetOwnerGUID(requester->GetGUID());
+        item->FSetState(ITEM_CHANGED);
+        CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+        item->SaveToDB(tx);
+        CharacterDatabase.CommitTransaction(tx);
+    }
+
+    ItemPosCountVec dest;
+    if (requester->CanBankItem(NULL_BAG, NULL_SLOT, dest, item, false) == EQUIP_ERR_OK)
+    {
+        requester->BankItem(dest, item, true);
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r Banked |cffffffff{}|r.", itemName);
+    }
+    else
+    {
+        if (srcChar != requester)   // bank full — hand it back so it never strands
+        {
+            item->SetOwnerGUID(srcChar->GetGUID());
+            item->FSetState(ITEM_CHANGED);
+            ItemPosCountVec back;
+            if (srcChar->CanStoreItem(NULL_BAG, NULL_SLOT, back, item, false) == EQUIP_ERR_OK)
+                srcChar->MoveItemToInventory(back, item, true);
+            CharacterDatabaseTransaction tx2 = CharacterDatabase.BeginTransaction();
+            item->SaveToDB(tx2);
+            CharacterDatabase.CommitTransaction(tx2);
+        }
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Your bank is full — couldn't deposit |cffffffff{}|r.", itemName);
+    }
+    WowPsParty::SendInventoryTo(requester);
+    if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
 }
 
 // Move one item from a party member's bags onto the requester, preserving it on
@@ -2861,6 +2931,10 @@ public:
         else if (command == "SPLIT")
         {
             HandleSplit(player, payload);
+        }
+        else if (command == "BANK")
+        {
+            HandleBankDeposit(player, payload);
         }
         else if (command == "SORT_BAGS")
         {
