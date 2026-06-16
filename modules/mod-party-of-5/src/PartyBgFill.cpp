@@ -171,6 +171,13 @@ namespace
     void QueueFillBot(Player* bot, uint32 bgTypeId)
     {
         if (!bot || !bot->IsInWorld() || !bot->GetSession()) return;
+        // Strip the Deserter debuff (spell 26013) first — CanJoinToBattleground
+        // refuses the queue while it's up. The heroes accumulated it from prior
+        // attempts where they couldn't enter (no-show Deserter), a vicious cycle
+        // that left them re-queuing every tick and never getting in. These are the
+        // player's own managed bots filling for them, not real players gaming the
+        // system, so clearing it is correct.
+        if (bot->HasAura(26013)) bot->RemoveAura(26013);
         WorldPacket* p = new WorldPacket(CMSG_BATTLEMASTER_JOIN, 20);
         *p << bot->GetGUID() << uint32(bgTypeId) << uint32(0) /*instanceId: first available*/ << uint8(0) /*joinAsGroup*/;
         bot->GetSession()->QueuePacket(p);   // patched handler lets a bot queue without a battlemaster
