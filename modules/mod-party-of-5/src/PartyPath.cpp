@@ -57,6 +57,12 @@ namespace WowPsParty
         // toward. Avoids thrashing MovePoint every tick.
         static std::mutex                                           g_tankProgressMutex;
         static std::unordered_map<uint32, uint32>                   g_tankCursor;
+        // Per-bot LEADER cursor: the leader's nearest waypoint last tick. The
+        // per-tick nearest scan starts here so it only ever moves FORWARD along the
+        // route — a path that doubles back near itself otherwise let the raw argmin
+        // snap to a waypoint BEHIND us and the tank oscillated between two of them.
+        // Guarded by g_tankProgressMutex (same cadence, same bot key).
+        static std::unordered_map<uint32, uint32>                   g_leaderCursor;
 
         // Per-bot stall tracker for the path-playback blink. If the tank should
         // be walking toward its lookahead but isn't making ground, a door / baked
@@ -504,15 +510,43 @@ namespace WowPsParty
         // tick; expires shortly after we stop leading (combat / beyond leash).
         WowPsParty::MarkTankLeading(bot->GetGUID(), 2500);
 
-        // Find leader's nearest waypoint (the "cursor"). Linear scan — typical
-        // dungeon path is ~50-200 points, this runs once per tick per bot.
-        uint32 nearestIdx = 0;
-        float  nearestD   = std::numeric_limits<float>::max();
-        for (uint32 i = 0; i < path.size(); ++i)
+        // Find the leader's nearest waypoint (the "cursor") — but FORWARD-ONLY.
+        // Scan from where the leader was last tick onward so the cursor can only
+        // advance; this is what stops the tank ping-ponging between two waypoints
+        // where the recorded route doubles back near itself (Kevin: "always pick
+        // the NEXT waypoint, never the one it just came from"). A full re-scan runs
+        // ONLY when the forward scan finds nothing close (wing change / teleport /
+        // a real backtrack after a wipe), so we resync instead of stranding.
+        auto nearestFrom = [&](uint32 from, uint32& outIdx) -> float
         {
-            float const d = Dist3D(leader->GetPositionX(), leader->GetPositionY(), leader->GetPositionZ(),
-                                   path[i].x, path[i].y, path[i].z);
-            if (d < nearestD) { nearestD = d; nearestIdx = i; }
+            outIdx = from < path.size() ? from : 0;
+            float best = std::numeric_limits<float>::max();
+            for (uint32 i = outIdx; i < path.size(); ++i)
+            {
+                float const d = Dist3D(leader->GetPositionX(), leader->GetPositionY(),
+                                       leader->GetPositionZ(), path[i].x, path[i].y, path[i].z);
+                if (d < best) { best = d; outIdx = i; }
+            }
+            return best;
+        };
+        uint32 scanStart = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_tankProgressMutex);
+            auto it = g_leaderCursor.find(bot->GetGUID().GetCounter());
+            if (it != g_leaderCursor.end() && it->second < path.size())
+                scanStart = it->second;
+        }
+        uint32 nearestIdx = scanStart;
+        float  nearestD   = nearestFrom(scanStart, nearestIdx);
+        if (nearestD > LEAD_DISTANCE)            // lost the leader ahead of the cursor — resync
+        {
+            uint32 gIdx = 0;
+            float const gD = nearestFrom(0, gIdx);
+            if (gD + 1.0f < nearestD) { nearestIdx = gIdx; nearestD = gD; }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_tankProgressMutex);
+            g_leaderCursor[bot->GetGUID().GetCounter()] = nearestIdx;
         }
 
         // Target = walk FORWARD along the path from the leader's cursor until

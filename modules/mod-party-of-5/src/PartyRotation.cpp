@@ -2548,17 +2548,19 @@ namespace WowPsParty
                 if (isChannel && info->GetDuration() > holdMs)
                     holdMs = info->GetDuration();
             }
-            // A CHANNEL cancels the instant the caster's position changes — and that
-            // includes the TAIL of a stop-spline. The bot may be mid-MoveChase
-            // (closing to range) or still decelerating from a prior stop when the
-            // rotation picks Mind Flay; casting then starts the channel while it's
-            // technically still moving, so it dies on the next motion update — zero
-            // damage, re-cast, mana drain (the live Mind Flay bug, with HP steady so
-            // it isn't melee pushback). So if we want a channel but we're still
-            // moving, HALT now and DEFER one tick — it fires next tick once truly
-            // planted. Instant/cast-time spells don't need this (an instant doesn't
-            // care, and a cast-time spell's own plant below covers it).
-            if (isChannel && bot->isMoving())
+            // A cast-time spell OR a channel cancels the instant the caster's
+            // position changes — and that includes the TAIL of a stop-spline. The
+            // bot may be mid-MoveChase (closing to range) or still decelerating from
+            // a prior stop when the rotation picks the spell; casting THIS tick
+            // starts it while still gliding, so it dies on the next motion update —
+            // re-cast, mana drain, and the cast bar looks frozen at ~1%. The plant
+            // below issues StopMoving but casts the SAME tick, so the stop-tail still
+            // clips it (the live elemental-shaman Chain Lightning bug: it fires the
+            // moment it chases into cluster range, still moving). So if we want any
+            // spell with a stationary window but we're still moving, HALT now and
+            // DEFER one tick — it fires next tick once truly planted. Instants
+            // (holdMs==0) don't care (no cast bar / channel to break).
+            if (holdMs > 0 && bot->isMoving())
             {
                 bot->StopMoving();
                 bot->GetMotionMaster()->Clear();
@@ -2666,10 +2668,11 @@ namespace WowPsParty
             // stands at range to cast these, so a hostile within 8y of IT (not the
             // target cluster downrange) means a mob has reached the caster.
             if (isChannel && CountHostilesWithin(bot, 8.0f) > 0) return false;
-            // A channel cancels if the caster moves — including the tail of a stop.
-            // If we're still moving, halt and DEFER one tick so the channel starts
-            // from a truly planted position (else it dies instantly, 0 ticks).
-            if (isChannel && bot->isMoving())
+            // A cast-time AoE or channel cancels if the caster moves — including the
+            // tail of a stop. If we're still moving, halt and DEFER one tick so the
+            // cast starts from a truly planted position (else it dies instantly and
+            // the rotation just re-fires it — frozen cast bar). Instants don't care.
+            if (holdMs > 0 && bot->isMoving())
             {
                 bot->StopMoving();
                 bot->GetMotionMaster()->Clear();
@@ -2682,15 +2685,12 @@ namespace WowPsParty
                 bot->GetMotionMaster()->Clear();
                 WowPsParty::HoldFollower(bot->GetGUID(), uint32(holdMs) + 500);
             }
-            // Face the cluster. For a CHANNEL set orientation directly — a
-            // SetFacingToObject facing-spline triggers the channel's TURNING
-            // interrupt and kills it instantly. Cast-time AoE (Flamestrike) keeps
-            // the smooth spline-turn.
+            // Face the cluster SYNCHRONOUSLY. SetFacingToObject only launches a
+            // facing move-spline (and no-ops while moving); that spline is movement,
+            // which interrupts a cast-time AoE (Flamestrike) the same way it breaks a
+            // channel. SetOrientation aims with no spline left in flight.
             if (aimAt)
-            {
-                if (isChannel) bot->SetOrientation(bot->GetAngle(aimAt));
-                else           bot->SetFacingToObject(aimAt);
-            }
+                bot->SetOrientation(bot->GetAngle(aimAt));
             float x, y, z;
             aimAt->GetPosition(x, y, z);
             // Predictive placement: a mob group charging the casters walks out of a
