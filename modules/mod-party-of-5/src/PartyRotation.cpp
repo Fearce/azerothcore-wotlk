@@ -2572,22 +2572,35 @@ namespace WowPsParty
                     holdMs = info->GetDuration();
             }
             // A cast-time spell OR a channel cancels the instant the caster's
-            // position changes — and that includes the TAIL of a stop-spline. The
-            // bot may be mid-MoveChase (closing to range) or still decelerating from
-            // a prior stop when the rotation picks the spell; casting THIS tick
-            // starts it while still gliding, so it dies on the next motion update —
-            // re-cast, mana drain, and the cast bar looks frozen at ~1%. The plant
-            // below issues StopMoving but casts the SAME tick, so the stop-tail still
-            // clips it (the live elemental-shaman Chain Lightning bug: it fires the
-            // moment it chases into cluster range, still moving). So if we want any
-            // spell with a stationary window but we're still moving, HALT now and
-            // DEFER one tick — it fires next tick once truly planted. Instants
+            // position changes — and that includes a still-running MoveChase spline
+            // or the TAIL of a stop-spline. Casting THIS tick while a spline is live
+            // means the next motion update clears UNIT_STATE_CASTING and the cast
+            // dies ~instantly (the bar never leaves ~1%; the rotation just re-fires
+            // it). CRUCIAL: a server-driven bot moves by SPLINE, which does NOT set
+            // the MOVEMENTFLAG_MASK_MOVING bits — so bot->isMoving() reads FALSE the
+            // whole time it's gliding via MoveChase/MovePoint. movespline->Finalized()
+            // is the real "am I physically still moving" test (the same one Smart/
+            // Escort AI use). So: if a spline is live, HALT and DEFER one tick — the
+            // cast fires next tick once the spline has actually finalized (the plant
+            // below then no-ops StopMoving, leaving nothing to interrupt). Instants
             // (holdMs==0) don't care (no cast bar / channel to break).
-            if (holdMs > 0 && bot->isMoving())
+            if (holdMs > 0 && (bot->isMoving() || !bot->movespline->Finalized()))
             {
                 bot->StopMoving();
                 bot->GetMotionMaster()->Clear();
                 WowPsParty::HoldFollower(bot->GetGUID(), 800);
+                static thread_local std::unordered_map<uint64, uint32> deferMs;
+                uint64 const dk = (uint64(bot->GetGUID().GetCounter()) << 32) | spellId;
+                uint32 const dn = getMSTime();
+                uint32& dl = deferMs[dk];
+                if (dn - dl > 3000)
+                {
+                    dl = dn;
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation] faceAndCast: defer {} on guid={} — spline live "
+                        "(isMoving={} finalized={})", spellId, bot->GetGUID().GetCounter(),
+                        bot->isMoving() ? 1 : 0, bot->movespline->Finalized() ? 1 : 0);
+                }
                 return false;
             }
             // Plant ONLY for spells with a stationary window (cast time or
@@ -2691,11 +2704,14 @@ namespace WowPsParty
             // stands at range to cast these, so a hostile within 8y of IT (not the
             // target cluster downrange) means a mob has reached the caster.
             if (isChannel && CountHostilesWithin(bot, 8.0f) > 0) return false;
-            // A cast-time AoE or channel cancels if the caster moves — including the
-            // tail of a stop. If we're still moving, halt and DEFER one tick so the
-            // cast starts from a truly planted position (else it dies instantly and
-            // the rotation just re-fires it — frozen cast bar). Instants don't care.
-            if (holdMs > 0 && bot->isMoving())
+            // A cast-time AoE or channel cancels if the caster moves — including a
+            // live MoveChase spline or the tail of a stop. A bot moves by SPLINE,
+            // which leaves bot->isMoving() FALSE, so test movespline->Finalized()
+            // (the real spline-state check). If a spline is live, halt and DEFER one
+            // tick so the cast starts from a truly planted position (else it dies
+            // instantly and the rotation re-fires it — frozen cast bar). Instants
+            // don't care.
+            if (holdMs > 0 && (bot->isMoving() || !bot->movespline->Finalized()))
             {
                 bot->StopMoving();
                 bot->GetMotionMaster()->Clear();
