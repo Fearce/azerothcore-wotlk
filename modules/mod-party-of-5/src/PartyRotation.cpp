@@ -2582,15 +2582,24 @@ namespace WowPsParty
             }
             if (target && target != bot)
             {
-                // A channel interrupts on TURNING, and SetFacingToObject launches a
-                // facing MOVE-SPLINE — starting the channel mid-spline kills it
-                // instantly (0 damage; THIS is why Mind Flay/Drain Life never landed
-                // while every non-channel spell did — cast-time spells interrupt on
-                // MOVE only, not turning, and the spline has no displacement). Set
-                // orientation directly (no spline, no turn event) for channels; keep
-                // the smooth spline-turn for cast-time/instant spells.
-                if (isChannel) bot->SetOrientation(bot->GetAngle(target));
-                else           bot->SetFacingToObject(target);
+                // Aim at the target SYNCHRONOUSLY, then cast. SetFacingToObject is
+                // the wrong primitive here: it no-ops entirely while the bot is
+                // moving (its first line is `if (!IsStopped()) return;`) and even
+                // when stopped it only LAUNCHES a facing move-spline — m_orientation
+                // is not updated until that spline plays out over later ticks. So
+                // the CastSpell below ran against the OLD orientation: it failed
+                // SPELL_FAILED_UNIT_NOT_INFRONT (result=134) whenever the bot wasn't
+                // already aimed, and a cast that did slip through was interrupted at
+                // ~1% by the still-animating facing spline (a spline counts as
+                // movement, which clears UNIT_STATE_CASTING). Casters kept aimed by
+                // AssistTarget's chase (a mage holding its firing band) hid the bug;
+                // a caster whose chase-facing is suppressed by its own rotation
+                // holds (the elemental shaman: kite + totem holds) self-interrupted
+                // nearly every cast. SetOrientation aims it this instant with no
+                // spline — HasInArc passes and nothing is left in flight to break
+                // the cast. This is the same primitive the channel path already
+                // relied on; it just now covers cast-time and instant spells too.
+                bot->SetOrientation(bot->GetAngle(target));
             }
             SpellCastResult const r = bot->CastSpell(target, spellId, false);
             lastCastResult = r;
