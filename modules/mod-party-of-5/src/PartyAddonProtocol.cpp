@@ -375,6 +375,32 @@ namespace WowPsParty
             if (!p) p = ObjectAccessor::FindPlayer(og);
             if (!p) continue;
 
+            // Skip a member whose item storage is in flux — not in world, being
+            // removed from world, or mid-logout. GetItemByPos on a tearing-down
+            // player can hand back a FREED Item* (the slot isn't nulled until the
+            // teardown finishes), and dereferencing it for GetEntry() faulted the
+            // world thread: HandleSell -> SendInventoryTo -> emitItem ACCESS_VIOLATION
+            // (2026-06-17, right after an LFG-dungeon henchman was dismissed). A bot
+            // logged out after a dungeon is the usual trigger — its bags are unstable
+            // for a tick. The "odd session state after an LFG dungeon" the lookup
+            // fallback above was added for is the SAME hazard; this makes it safe.
+            WorldSession* psess = p->GetSession();
+            if (!p->IsInWorld() || p->IsDuringRemoveFromWorld()
+                || (psess && psess->isLogingOut()))
+            {
+                LOG_INFO("module",
+                    "[WowPsParty] SendInventoryTo: skip member guid={} slot={} — tearing down "
+                    "(inWorld={} removing={} logout={})",
+                    guid, uint32(partySlot), p->IsInWorld() ? 1 : 0,
+                    p->IsDuringRemoveFromWorld() ? 1 : 0,
+                    (psess && psess->isLogingOut()) ? 1 : 0);
+                continue;
+            }
+            // Pins the culprit if a dangling item ever slips past the guard above:
+            // this is the LAST line in the log before such a crash, naming the member.
+            LOG_DEBUG("module", "[WowPsParty] SendInventoryTo: scanning member guid={} slot={}",
+                      guid, uint32(partySlot));
+
             // Main backpack (16 slots): bag=255 (INVENTORY_SLOT_BAG_0), pos=23..38
             totalSlots += INVENTORY_SLOT_ITEM_END - INVENTORY_SLOT_ITEM_START;
             for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
@@ -1136,6 +1162,13 @@ static void SendBuybackTo(Player* requester)
         Player* p = ObjectAccessor::FindConnectedPlayer(og);
         if (!p) p = ObjectAccessor::FindPlayer(og);
         if (!p) continue;
+        // Same teardown guard as SendInventoryTo — a member mid-logout/removal hands
+        // back freed Item*s and faults the world thread (this is called on the same
+        // sell path right after SendInventoryTo, so it shares the hazard).
+        WorldSession* psess = p->GetSession();
+        if (!p->IsInWorld() || p->IsDuringRemoveFromWorld()
+            || (psess && psess->isLogingOut()))
+            continue;
 
         for (uint8 s = BUYBACK_SLOT_START; s < BUYBACK_SLOT_END; ++s)
         {
