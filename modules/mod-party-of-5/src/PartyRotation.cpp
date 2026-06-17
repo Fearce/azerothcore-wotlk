@@ -1424,6 +1424,29 @@ namespace WowPsParty
                 int const stacks = u ? int(NamedAuraStacks(u, n, auraCaster)) : 0;
                 return op == '<' ? (stacks < want) : (stacks > want);
             }
+            // Tank-scoped stacks / remaining, so a healer can MAINTAIN a stacking
+            // per-caster HoT on the tank — the canonical case is a druid keeping
+            // Lifebloom at 3 stacks: gate the refresh on
+            // `tank_my_aura_stacks:Lifebloom<3` (its OWN stacks) and re-bloom timing
+            // on `tank_my_aura_remain:Lifebloom<2`. No live tank → the rule sits out
+            // (stacks read 0; remain reads absent), same as tank_has_aura.
+            if (cname == "tank_aura_stacks")
+            {
+                std::string n; char op; int want;
+                if (!unpackNameOpVal(n, op, want)) return false;
+                Player* tank = FindPartyMemberByRole(bot, "tank");
+                int const stacks = tank ? int(NamedAuraStacks(tank, n, auraCaster)) : 0;
+                return op == '<' ? (stacks < want) : (stacks > want);
+            }
+            if (cname == "tank_aura_remain")
+            {
+                std::string n; char op; int sec;
+                if (!unpackNameOpVal(n, op, sec)) return false;
+                Player* tank = FindPartyMemberByRole(bot, "tank");
+                if (!tank) return op == '<';   // no tank → "expiring/absent" true
+                int const remSec = NamedAuraRemainingMs(tank, n, auraCaster) / 1000;
+                return op == '<' ? (remSec < sec) : (remSec > sec);
+            }
             // "spell_cd_remain:Mortal Strike<2" — TRUE when MS will be off
             // cooldown within 2s (or already is). ">N" = still has more than
             // N seconds to go. Unknown spell → treated as "not ready" (never
