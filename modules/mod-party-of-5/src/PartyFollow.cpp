@@ -1140,18 +1140,6 @@ namespace WowPsParty
     // are exempt (IsBossUnit). Tune here if a pull feels too eager (raise) or too
     // sluggish (lower).
     static constexpr float ENGAGE_THREAT_HEALTH_FRAC = 0.07f;
-    // RANGED casters/healers need a BIGGER lead than melee before they open. A melee
-    // bot has a built-in buffer: it must MoveChase into melee range (travel time lets
-    // the tank pull ahead) and its opener is a low-threat white swing. A ranged nuke
-    // (Moonfire/Shadow Bolt/Lightning Bolt) lands INSTANTLY from its current spot and
-    // a single cast's threat can dwarf a 7%-of-HP lead → it rips the mob the instant
-    // it's released (Kevin, Millmypal run: "moonfire + aggro ripped before I even
-    // attacked"; the healer-druid Selanira and dps-druid Bollad both ranged). So a
-    // ranged non-tank waits until the tank holds ~3x the lead — enough that one nuke
-    // stays under the ~110% rip line. The 0.15 that felt "too sluggish" as a GLOBAL
-    // floor (it delayed melee too) is fine applied to ranged only; a prot tank crosses
-    // 0.20 in a couple of GCDs. Tune here if ranged opens too eagerly (raise)/late (lower).
-    static constexpr float RANGED_ENGAGE_THREAT_HEALTH_FRAC = 0.20f;
     // Emergency release: a tank/member at or below this HP gets DPS + heals NOW,
     // engage-lead or not — nobody dies waiting for threat.
     static constexpr float TANK_GATHER_LOW_PCT = 55.0f;
@@ -2661,10 +2649,6 @@ namespace WowPsParty
     static Unit* PickTankEngagedTarget(Player* bot, Player* leader)
     {
         if (!bot || !leader) return nullptr;
-        // Same ranged cushion as the primary gate: a ranged bot joining a mob the tank
-        // only lightly holds would rip it with its first nuke, so require a bigger lead.
-        float const leadFrac = FollowerIsMelee(bot) ? ENGAGE_THREAT_HEALTH_FRAC
-                                                    : RANGED_ENGAGE_THREAT_HEALTH_FRAC;
         Unit* best = nullptr;
         float bestDist = 1e9f;
         for (auto const& [refGuid, ref] : leader->GetCombatManager().GetPvECombatRefs())
@@ -2672,7 +2656,7 @@ namespace WowPsParty
             Unit* const m = ref->GetOther(leader);
             if (!m || !m->IsAlive() || !bot->IsValidAttackTarget(m)) continue;
             if (!MobOnTank(bot, m, leader)) continue;        // tank must be its top-threat
-            if (!TankHasEngageLead(m, leadFrac)) continue;   // ...with a real engage lead
+            if (!TankHasEngageLead(m)) continue;             // ...with a real engage lead
             if (BotOverThreatVsTank(bot, m)) continue;       // we're at the cap on it → leave it
             float const d = bot->GetDistance(m);
             if (d < bestDist) { bestDist = d; best = m; }
@@ -3017,10 +3001,10 @@ namespace WowPsParty
                 // a real engage lead on it (ENGAGE_THREAT_HEALTH_FRAC of its max HP) —
                 // so a bare right-click / a passive patrol-aggro / Retribution-Aura
                 // chip threat keeps the bot held. After that THREAT_CAP_RATIO governs.
-                // Ranged casters/healers need a bigger tank lead (their instant nuke
-                // opener rips a thin lead; melee's travel time + weak white-swing don't).
-                float const leadFrac = FollowerIsMelee(bot) ? ENGAGE_THREAT_HEALTH_FRAC
-                                                            : RANGED_ENGAGE_THREAT_HEALTH_FRAC;
+                // Same 7% floor for ranged and melee: a bigger ranged lead was tried
+                // but gutted ranged DPS (Kevin), so we keep it tight and instead trace
+                // the release below to pin down the actual rip.
+                float const leadFrac = ENGAGE_THREAT_HEALTH_FRAC;
                 bool const release = MobOnTank(bot, desired, leader)
                                   && TankHasEngageLead(desired, leadFrac)
                                   && !BotOverThreatVsTank(bot, desired);
