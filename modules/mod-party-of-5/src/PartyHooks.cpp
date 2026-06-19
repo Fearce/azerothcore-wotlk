@@ -1190,16 +1190,40 @@ bool WowPsParty_ForceSkinReady(Player* skinner, Creature* creature)
     // the same Group object as the bot that tapped the kill.
     if (!recipient && !rgroup) return false;
 
+    // QUEST LOOT IS SACRED: never strip a corpse that still has an UNLOOTED quest
+    // item — the loot.clear() below would destroy it, and a quest drop only exists
+    // because a party member HAS that quest, so it WILL be wanted (Viv: "I have to
+    // kick my skinner to get the quest loot"). Defer regardless of who's nearby
+    // until the quest item is looted (or the corpse despawns) — leather is a bonus,
+    // quest loot is irreplaceable. Covers both the dedicated quest_items list and
+    // normal-slot conditional (needs_quest) drops.
+    for (LootItem const& li : creature->loot.quest_items)
+        if (!li.is_looted)
+        {
+            LOG_INFO("module",
+                "[WowPsParty Skin] defer skin of guid={}: unlooted quest item present",
+                creature->GetGUID().GetCounter());
+            return false;
+        }
+    for (LootItem const& li : creature->loot.items)
+        if (li.needs_quest && !li.is_looted)
+        {
+            LOG_INFO("module",
+                "[WowPsParty Skin] defer skin of guid={}: unlooted conditional quest drop",
+                creature->GetGUID().GetCounter());
+            return false;
+        }
+
     // MASTER-LOOT PRIORITY: while the corpse is still lootable and a HUMAN party
     // member is close enough to loot it, do NOT strip the loot to skin. The
-    // loot.clear() below destroys quest items the player hasn't grabbed yet — the
-    // "I had to kick my skinner to loot the quest item" bug. Give the human first
-    // dibs; once they've looted it (the lootable flag clears) or moved off, the
-    // skinner finishes it. Only HUMANS gate (bot AI absent) — bots looting into the
-    // shared bag never block skinning.
+    // loot.clear() below destroys items the player hasn't grabbed yet. Give the
+    // human first dibs; once they've looted it (the lootable flag clears) or moved
+    // off, the skinner finishes it. Only HUMANS gate (bot AI absent) — bots looting
+    // into the shared bag never block skinning. Range widened so a human walking up
+    // to the kill isn't beaten to it by a fast skinner.
     if (creature->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE))
     {
-        constexpr float MASTER_LOOT_PRIORITY_RANGE = 25.0f;
+        constexpr float MASTER_LOOT_PRIORITY_RANGE = 40.0f;
         if (Group* sg = skinner->GetGroup())
             for (GroupReference* itr = sg->GetFirstMember(); itr != nullptr; itr = itr->next())
                 if (Player* m = itr->GetSource())
