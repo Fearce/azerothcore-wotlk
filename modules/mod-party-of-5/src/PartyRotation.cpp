@@ -22,6 +22,7 @@
 #include "ObjectAccessor.h"
 #include "Pet.h"
 #include "Player.h"
+#include "Random.h"
 #include "Spell.h"
 #include "SpellAuras.h"
 #include "SpellInfo.h"
@@ -370,6 +371,26 @@ namespace WowPsParty
             consider(bot);
     }
 
+    // A unit under a FULL invulnerability that also blocks FRIENDLY spells — Ice
+    // Block, Divine Shield, Hand/Blessing of Protection, Cyclone, Divine
+    // Intervention. Healing, HoTing, buffing or cleansing such a unit is a wasted
+    // GCD (the spell is blocked outright), so it must be excluded from EVERY
+    // friendly target pick — the "resto druid spam-Rejuvs the ice-blocked mage" bug.
+    static bool IsInvulnerable(Unit* u)
+    {
+        if (!u) return false;
+        static uint32 const kInvuln[] = {
+            45438,             // Ice Block
+            642,               // Divine Shield
+            1022, 5599, 10278, // Hand/Blessing of Protection (ranks)
+            33786,             // Cyclone
+            19752,             // Divine Intervention
+        };
+        for (uint32 id : kInvuln)
+            if (u->HasAura(id)) return true;
+        return false;
+    }
+
     static Player* GetLowestHpPartyMember(Player* bot)
     {
         std::vector<Player*> party;
@@ -378,6 +399,7 @@ namespace WowPsParty
         float bestPct = 200.0f;
         for (Player* m : party)
         {
+            if (IsInvulnerable(m)) continue;   // can't be healed — skip
             float const maxHp = float(m->GetMaxHealth());
             if (maxHp <= 0) continue;
             float const pct = (float(m->GetHealth()) / maxHp) * 100.0f;
@@ -2313,6 +2335,7 @@ namespace WowPsParty
             char const* kw = ClassKeyword(m->getClass());
             if (!*kw) continue;
             if (!CsvContains(csv, kw)) continue;
+            if (IsInvulnerable(m)) continue;   // buff blocked by Ice Block/BoP/etc.
             if (HasAuraFromSpell(m, spellId)) continue;
             return m;
         }
@@ -2361,6 +2384,7 @@ namespace WowPsParty
                 if (pr.first == m->GetGUID().GetCounter()) { memberRole = pr.second; break; }
             bool const matches = (memberRole == wantedRole);
             if (negate ? matches : !matches) continue;
+            if (IsInvulnerable(m)) continue;   // buff blocked by Ice Block/BoP/etc.
             if (HasAuraFromSpell(m, spellId)) continue;
             return m;   // GatherPartyPlayers already filtered to alive / in-world / same map
         }
@@ -2375,7 +2399,7 @@ namespace WowPsParty
         std::vector<Player*> party;
         GatherPartyPlayers(bot, party, /*includeDead=*/false);
         for (Player* m : party)
-            if (!HasAuraFromSpell(m, spellId)) return m;
+            if (!IsInvulnerable(m) && !HasAuraFromSpell(m, spellId)) return m;
         return nullptr;
     }
 
@@ -2601,6 +2625,13 @@ namespace WowPsParty
                 if (isChannel && info->GetDuration() > holdMs)
                     holdMs = info->GetDuration();
             }
+            // Mid "Come Hither" recall: keep RUNNING to the leader. A cast-time spell
+            // or channel would StopMoving/plant here and abandon the recall, so skip
+            // it and let the rotation fall through to an INSTANT (instants don't plant
+            // — they fire fine while moving). This is what lets a recalled bot keep
+            // DPSing/healing with instants instead of going silent.
+            if (holdMs > 0 && WowPsParty::IsBeingRecalled(bot->GetGUID()))
+                return false;
             // A cast-time spell OR a channel cancels the instant the caster's
             // position changes — and that includes a still-running MoveChase spline
             // or the TAIL of a stop-spline. Casting THIS tick while a spline is live
@@ -2730,6 +2761,10 @@ namespace WowPsParty
                 if (isChannel && info->GetDuration() > holdMs)
                     holdMs = info->GetDuration();
             }
+            // Mid "Come Hither" recall: don't plant for a ground cast/channel — keep
+            // running to the leader (see faceAndCast).
+            if (holdMs > 0 && WowPsParty::IsBeingRecalled(bot->GetGUID()))
+                return false;
             // Don't START a ground channel (Blizzard / Rain of Fire / Volley)
             // while the caster itself is being meleed — pushback would shred it in
             // ~1s. Fall through to instants / a peel / kite first. The caster
@@ -3005,6 +3040,17 @@ namespace WowPsParty
         // so the rule loop falls through cleanly instead of logging "unknown verb".
         if (verb == "focus") return false;
 
+        // Mid "Come Hither" recall the recall owns movement — suppress any verb that
+        // would issue its OWN movement, so the bot runs to the leader instead of
+        // kiting/repositioning/pulling away. Instant CASTS still flow (cast-time is
+        // gated in faceAndCast), so a recalled bot keeps DPSing/healing as it runs in.
+        if (WowPsParty::IsBeingRecalled(bot->GetGUID())
+            && (verb == "keep_distance_enemy" || verb == "keep_distance_healer"
+                || verb == "close_to_enemy"   || verb == "move_behind"
+                || verb == "hold_position"    || verb == "pull"
+                || verb == "reposition_random"))
+            return false;
+
         if (verb == "cast" || verb == "cast_self")
         {
             uint32 const spellId = FindKnownSpellByName(bot, arg);
@@ -3142,6 +3188,7 @@ namespace WowPsParty
             if (!spellId) return false;
             Player* tank = FindPartyMemberByRole(bot, "tank");
             if (!tank) return false;
+            if (IsInvulnerable(tank)) return false;   // BoP/Ice Block etc. blocks it
             return castOrApproach(tank, spellId, /*friendlyApproach=*/true);
         }
 
@@ -3483,6 +3530,7 @@ namespace WowPsParty
                 target = FindPartyMemberWithDispelType(bot, dt);
             }
             if (!target) return false;
+            if (IsInvulnerable(target)) return false;   // can't cleanse an invuln unit
             return castOrApproach(target, spellId, /*friendlyApproach=*/true);
         }
 
@@ -3819,6 +3867,39 @@ namespace WowPsParty
                                                   /*forceDestination=*/false);
             }
             return true;
+        }
+
+        // "reposition_random:N" — hop ~N yards in a random navmesh-reachable
+        // direction. For "keep moving or you get frozen" mechanics — Keristrasza's
+        // Intense Cold in the Nexus, Hodir's biting cold, dodge-the-fire — gate it
+        // with a `self_aura_stacks:<debuff>>K` (or self_has_aura) condition so the
+        // bot sidesteps to shed stacks / step out. Discrete hop, not a per-tick
+        // stutter: it doesn't re-issue while a hop is still running. Lowest-priority
+        // like the other movement verbs, so casts fire between hops.
+        if (verb == "reposition_random")
+        {
+            float dist = float(std::atof(arg.c_str()));
+            if (dist <= 0.0f) dist = 4.0f;            // sane default if no number given
+            // Already mid-hop? let it finish before issuing another.
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE
+                && bot->isMoving())
+                return true;
+            // Try a few random directions so a wall on one side doesn't stop the hop;
+            // forceDestination=false means an unreachable pick simply isn't taken.
+            for (int i = 0; i < 5; ++i)
+            {
+                float const ang = frand(0.0f, 2.0f * 3.14159265f);
+                float x, y, z;
+                bot->GetNearPoint(bot, x, y, z, 0.0f, dist, ang);
+                if (bot->IsWithinLOS(x, y, z))   // don't aim through a wall
+                {
+                    bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                                                      0.0f, 0.0f, /*generatePath=*/true,
+                                                      /*forceDestination=*/false);
+                    return true;
+                }
+            }
+            return true;   // consumed the tick even if every pick was walled — retry next tick
         }
 
         return false;
@@ -4210,11 +4291,13 @@ namespace WowPsParty
         std::string const verb = action.substr(0, colon);
         if (verb == "cast_self" || verb == "buff_self")
             return bot;
+        Unit* t = nullptr;
         if (verb == "cast_party_lowest" || verb == "cast_party_lowest_hot")
-            return GetLowestHpPartyMember(bot);
-        if (verb == "cast_tank")
-            return FindPartyMemberByRole(bot, "tank");
-        return nullptr;
+            t = GetLowestHpPartyMember(bot);   // already invuln-filtered
+        else if (verb == "cast_tank")
+            t = FindPartyMemberByRole(bot, "tank");
+        if (t && IsInvulnerable(t)) return nullptr;   // wasted on an invuln target
+        return t;
     }
 
     bool TickRotation(Player* bot)
@@ -4230,11 +4313,14 @@ namespace WowPsParty
         // bot and fight the flight, so do nothing until it lands.
         if (bot->IsInFlight()) return false;
 
-        // "Come Hither" recall in progress: pause the rotation entirely so the bot
-        // RUNS to the leader (MovePoint) instead of hard-casting in place — a ranged
-        // DPS's faceAndCast would otherwise re-plant it every tick and ignore the
-        // recall. Resumes the instant the recall hold expires (~2s).
-        if (WowPsParty::IsBeingRecalled(bot->GetGUID())) return false;
+        // "Come Hither" recall in progress: the bot must keep RUNNING to the leader.
+        // We no longer pause the WHOLE rotation — only the things that fight movement
+        // are suppressed (cast-time spells/channels skip the plant in faceAndCast, and
+        // the movement verbs early-return) while INSTANT spells still fire. So a bot
+        // recalled mid-fight keeps DPSing/healing with instants as it runs in, instead
+        // of going silent. Cast-time casting in place is what re-planted the bot and
+        // ignored the recall; that specific case is gated, not all casting.
+        // (The per-verb / faceAndCast guards all read WowPsParty::IsBeingRecalled.)
 
         // Mounted while traveling with the leader: do NOTHING out of combat. An
         // out_of_combat rule — a rogue's Stealth, a hunter's Call Pet, a self-buff,
