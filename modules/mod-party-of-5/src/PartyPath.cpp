@@ -109,6 +109,12 @@ namespace WowPsParty
         constexpr uint32 STALL_LIMIT        = 3;      // ~1.2 s wedged before blinking
         constexpr float  STALL_MIN_MOVE     = 1.0f;   // moved less than this between samples = wedged
         constexpr float  BLINK_CLEAR_DIST   = 9.0f;   // teleport this far along the path past the wedge
+        // Max path-length a single leader-cursor scan may advance ahead of last
+        // tick. Far larger than any one-tick leader move (~7y), but small enough
+        // that a route doubling back on the same ground (up a ramp to a boss, back
+        // down the same ramp) can't snap the cursor to the post-boss leg. A genuine
+        // long jump (teleport / recorded drop) still resyncs via the unbounded scan.
+        constexpr float  CURSOR_ADVANCE_WINDOW = 40.0f;
 
         static float Dist3D(float ax, float ay, float az, float bx, float by, float bz)
         {
@@ -546,19 +552,33 @@ namespace WowPsParty
         // tick; expires shortly after we stop leading (combat / beyond leash).
         WowPsParty::MarkTankLeading(bot->GetGUID(), 2500);
 
-        // Find the leader's nearest waypoint (the "cursor") — but FORWARD-ONLY.
-        // Scan from where the leader was last tick onward so the cursor can only
-        // advance; this is what stops the tank ping-ponging between two waypoints
-        // where the recorded route doubles back near itself (Kevin: "always pick
-        // the NEXT waypoint, never the one it just came from"). A full re-scan runs
-        // ONLY when the forward scan finds nothing close (wing change / teleport /
-        // a real backtrack after a wipe), so we resync instead of stranding.
-        auto nearestFrom = [&](uint32 from, uint32& outIdx) -> float
+        // Find the leader's nearest waypoint (the "cursor") — FORWARD-ONLY and
+        // WINDOWED. Scan from where the leader was last tick onward so the cursor
+        // can only advance (no ping-ponging where the route doubles back). The
+        // window caps how far AHEAD (by path length) a single scan may reach: a
+        // route that doubles back on the SAME physical ground (walk UP a ramp to a
+        // boss, then back DOWN the identical ramp) puts a far-ahead post-boss
+        // waypoint at the leader's exact feet, and an unbounded nearest-scan would
+        // jump the cursor to it on position jitter — the tank then skipped the
+        // whole boss and walked off toward the next one (Kevin: Anomalus in the
+        // Nexus). With the window the cursor advances contiguously; only a genuine
+        // long jump (teleport / wing change / the recorded drop) falls through to
+        // the unbounded resync below. The window (>> any single-tick leader move)
+        // never blocks normal walking.
+        auto nearestFrom = [&](uint32 from, uint32& outIdx, float window) -> float
         {
-            outIdx = from < path.size() ? from : 0;
+            uint32 const start = from < path.size() ? from : 0;
+            outIdx = start;
             float best = std::numeric_limits<float>::max();
-            for (uint32 i = outIdx; i < path.size(); ++i)
+            float acc  = 0.0f;
+            for (uint32 i = start; i < path.size(); ++i)
             {
+                if (i > start)
+                {
+                    acc += Dist3D(path[i - 1].x, path[i - 1].y, path[i - 1].z,
+                                  path[i].x, path[i].y, path[i].z);
+                    if (window > 0.0f && acc > window) break;
+                }
                 float const d = Dist3D(leader->GetPositionX(), leader->GetPositionY(),
                                        leader->GetPositionZ(), path[i].x, path[i].y, path[i].z);
                 if (d < best) { best = d; outIdx = i; }
@@ -573,11 +593,11 @@ namespace WowPsParty
                 scanStart = it->second;
         }
         uint32 nearestIdx = scanStart;
-        float  nearestD   = nearestFrom(scanStart, nearestIdx);
+        float  nearestD   = nearestFrom(scanStart, nearestIdx, CURSOR_ADVANCE_WINDOW);
         if (nearestD > LEAD_DISTANCE)            // lost the leader ahead of the cursor — resync
         {
             uint32 gIdx = 0;
-            float const gD = nearestFrom(0, gIdx);
+            float const gD = nearestFrom(0, gIdx, 0.0f);   // unbounded re-scan
             if (gD + 1.0f < nearestD) { nearestIdx = gIdx; nearestD = gD; }
         }
         {
