@@ -371,6 +371,22 @@ namespace WowPsParty
             consider(bot);
     }
 
+    // Count OTHER party members within `radius` of the bot (excludes self). Backs
+    // the allies_within condition + the keep_distance_party action — for proximity
+    // mechanics that punish clumping (Krystallus's Shatter: damage scales with how
+    // close other players are).
+    static uint32 CountAlliesWithin(Player* bot, float radius)
+    {
+        if (!bot) return 0;
+        std::vector<Player*> party;
+        GatherPartyPlayers(bot, party, /*includeDead=*/false);
+        uint32 n = 0;
+        for (Player* m : party)
+            if (m && m != bot && bot->IsWithinDist(m, radius, false))
+                ++n;
+        return n;
+    }
+
     // --- Movement settle gate -------------------------------------------------
     // Last tick (per bot) the bot's spline was live. A bot that micro-moves while
     // following (a healer trailing a moving leader) would, on every brief stop,
@@ -1575,6 +1591,21 @@ namespace WowPsParty
                 char const opA = arg[opPosA];
                 int const countN = std::atoi(arg.substr(opPosA + 1).c_str());
                 int const found  = int(CountHostilesWithin(bot, radius));
+                return opA == '<' ? (found < countN) : (found > countN);
+            }
+            // "allies_within:<radius><op><count>" — OTHER party members within
+            // radius (excludes self). For clump-punishing mechanics: pair
+            // "allies_within:10>0" with the keep_distance_party action to spread
+            // out of Krystallus's Shatter.
+            if (cname == "allies_within")
+            {
+                auto opPosA = arg.find_first_of("<>");
+                if (opPosA == std::string::npos) return false;
+                float const radius = float(std::atof(arg.substr(0, opPosA).c_str()));
+                if (radius <= 0.0f) return false;
+                char const opA = arg[opPosA];
+                int const countN = std::atoi(arg.substr(opPosA + 1).c_str());
+                int const found  = int(CountAlliesWithin(bot, radius));
                 return opA == '<' ? (found < countN) : (found > countN);
             }
             // Clustering gate for placed AoE (Blizzard / Flamestrike):
@@ -3118,9 +3149,9 @@ namespace WowPsParty
         // gated in faceAndCast), so a recalled bot keeps DPSing/healing as it runs in.
         if (WowPsParty::IsBeingRecalled(bot->GetGUID())
             && (verb == "keep_distance_enemy" || verb == "keep_distance_healer"
-                || verb == "close_to_enemy"   || verb == "move_behind"
-                || verb == "hold_position"    || verb == "pull"
-                || verb == "reposition_random"))
+                || verb == "keep_distance_party" || verb == "close_to_enemy"
+                || verb == "move_behind"      || verb == "hold_position"
+                || verb == "pull"             || verb == "reposition_random"))
             return false;
 
         if (verb == "cast" || verb == "cast_self")
@@ -3920,6 +3951,44 @@ namespace WowPsParty
                 bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
                                                   0.0f, 0.0f, /*generatePath=*/true,
                                                   /*forceDestination=*/false);
+            }
+            return true;
+        }
+
+        // "keep_distance_party:N" — SPREAD OUT: step away from the nearest other
+        // party member until no ally is within N yards. For clump-punishing
+        // mechanics (Krystallus's Shatter scales with proximity) — gate it with
+        // "allies_within:N>0" (optionally AND target_casting:Ground Slam). Unlike
+        // the kite verbs it fires WITH a tank up (spreading is independent of
+        // threat); it HoldFollower's briefly so AssistTarget/the follow ticker yield
+        // during the hop. Discrete (only re-issues when not already moving) and
+        // never breaks an in-flight cast.
+        if (verb == "keep_distance_party")
+        {
+            if (bot->IsNonMeleeSpellCast(false, false, true)) return false;
+            float const want = float(std::atof(arg.c_str()));
+            if (want <= 0.0f) return false;
+            std::vector<Player*> party;
+            GatherPartyPlayers(bot, party, /*includeDead=*/false);
+            Player* nearest = nullptr;
+            float   nd = want;
+            for (Player* m : party)
+            {
+                if (!m || m == bot) continue;
+                float const d = bot->GetDistance(m);
+                if (d < nd) { nd = d; nearest = m; }
+            }
+            if (!nearest) return false;   // already > N from every ally — spread
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+            {
+                // A point want+4 from the nearest ally, in the direction AWAY from
+                // it (the ally->bot bearing), so the bot moves further out.
+                float x, y, z;
+                nearest->GetNearPoint(bot, x, y, z, 0.0f, want + 4.0f, nearest->GetAngle(bot));
+                bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                                                  0.0f, 0.0f, /*generatePath=*/true,
+                                                  /*forceDestination=*/false);
+                WowPsParty::HoldFollower(bot->GetGUID(), 1500);   // yield AssistTarget/follow during the hop
             }
             return true;
         }
