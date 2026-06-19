@@ -371,6 +371,31 @@ namespace WowPsParty
             consider(bot);
     }
 
+    // --- Movement settle gate -------------------------------------------------
+    // Last tick (per bot) the bot's spline was live. A bot that micro-moves while
+    // following (a healer trailing a moving leader) would, on every brief stop,
+    // start a cast-time filler (Smite) the next move instantly breaks, and restart
+    // the wand auto-repeat — the "Oluf keeps interrupting his own Smite / the wand
+    // spams noise" report. So a CAST-TIME spell and the wand only (re)start after
+    // the bot has been STATIONARY for CAST_SETTLE_MS, and we do NOT force a stop to
+    // get there (a traveling bot keeps following instead of stuttering). Instants
+    // are never gated — they fire fine while moving. Sampled once/tick in
+    // TickRotation; thread_local because a bot is only ever updated on its map's
+    // thread (same domain as the other thread_local trackers here).
+    static constexpr uint32 CAST_SETTLE_MS = 400;
+    static thread_local std::unordered_map<uint32, uint32> g_lastMovingMs;
+    static void SampleMovement(Player* bot)
+    {
+        if (bot->isMoving() || !bot->movespline->Finalized())
+            g_lastMovingMs[bot->GetGUID().GetCounter()] = getMSTime();
+    }
+    static bool RecentlyMoved(Player* bot)
+    {
+        auto it = g_lastMovingMs.find(bot->GetGUID().GetCounter());
+        if (it == g_lastMovingMs.end()) return false;
+        return getMSTime() - it->second < CAST_SETTLE_MS;
+    }
+
     // A unit under a FULL invulnerability that also blocks FRIENDLY spells — Ice
     // Block, Divine Shield, Hand/Blessing of Protection, Cyclone, Divine
     // Intervention. Healing, HoTing, buffing or cleansing such a unit is a wasted
@@ -1864,6 +1889,22 @@ namespace WowPsParty
             return op == '<' ? (v < threshold) : (v > threshold);
         };
 
+        // target_cast_remain<N / >N — whole SECONDS left on the target's current
+        // cast or channel. For interrupt TIMING from the editor: "kick only once
+        // there's less than 2s left" => target_cast_remain<2. Pair with
+        // cast_scan:available_interrupt so it scans EVERY enemy and kicks the first
+        // whose cast is in that window — interrupts aren't limited to the current
+        // target. Returns false when the target isn't casting (implies "is casting").
+        if (name == "target_cast_remain")
+        {
+            Unit* const u = theTarget();
+            if (!u) return false;
+            Spell* s = u->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
+            if (!s) s = u->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+            if (!s) return false;
+            return cmp(int(s->GetCastTimeRemaining()) / 1000);
+        }
+
         if (name == "self_health")
             return cmp(pct(float(bot->GetHealth()), float(bot->GetMaxHealth())));
         // Class-specific power pools — warriors don't have mana, so
@@ -2631,6 +2672,15 @@ namespace WowPsParty
             // — they fire fine while moving). This is what lets a recalled bot keep
             // DPSing/healing with instants instead of going silent.
             if (holdMs > 0 && WowPsParty::IsBeingRecalled(bot->GetGUID()))
+                return false;
+            // Settle gate: a cast-time spell/channel only starts once the bot has been
+            // stationary CAST_SETTLE_MS. A bot that micro-moves while following (a
+            // healer trailing a moving leader) would otherwise start the cast on each
+            // brief stop and have the next step break it — the "Oluf interrupts his own
+            // Smite over and over" report. We DON'T force a stop here (no StopMoving):
+            // a still-moving bot just declines the cast-time spell and keeps following;
+            // instants (holdMs==0) are unaffected and keep firing.
+            if (holdMs > 0 && RecentlyMoved(bot))
                 return false;
             // A cast-time spell OR a channel cancels the instant the caster's
             // position changes — and that includes a still-running MoveChase spline
@@ -4195,6 +4245,11 @@ namespace WowPsParty
 
         if (!victim || !victim->IsAlive()) return;
         if (bot->isMoving()) return;                           // can't start a shot mid-move
+        // Settle gate: don't (re)start the wand/auto-shot until stationary a moment.
+        // Movement breaks the auto-repeat; a bot that micro-moves while following
+        // would restart it on every brief stop — the "wand spams a lot of noise"
+        // report. Waiting out CAST_SETTLE_MS makes it start once, when actually set.
+        if (RecentlyMoved(bot)) return;
         if (needAmmo && bot->GetUInt32Value(PLAYER_AMMO_ID) == 0) return;
         if (bot->GetDistance(victim) > maxRange) return;       // out of ranged range
         if (!bot->IsWithinLOSInMap(victim, VMAP::ModelIgnoreFlags::M2)) return;  // M2: match Spell::CheckCast
@@ -4344,6 +4399,12 @@ namespace WowPsParty
                 return false;   // idle travel, or a mounted fly-by — stay mounted
             bot->Dismount();    // the party is fighting on foot — get off and engage
         }
+
+        // Sample movement for the cast-settle gate (faceAndCast cast-time / wand):
+        // record the tick if the bot's spline is live, so a cast/wand only starts
+        // once it's been stationary CAST_SETTLE_MS. Must run every tick before the
+        // auto-attack + rotation below.
+        SampleMovement(bot);
 
         // Keep ammo/poisons topped up (self-throttled). Runs before the rotation
         // so a freshly-spawned hunter has arrows on its first idle tick and a
