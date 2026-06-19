@@ -2576,11 +2576,13 @@ namespace WowPsParty
             // or the TAIL of a stop-spline. Casting THIS tick while a spline is live
             // means the next motion update clears UNIT_STATE_CASTING and the cast
             // dies ~instantly (the bar never leaves ~1%; the rotation just re-fires
-            // it). CRUCIAL: a server-driven bot moves by SPLINE, which does NOT set
-            // the MOVEMENTFLAG_MASK_MOVING bits — so bot->isMoving() reads FALSE the
-            // whole time it's gliding via MoveChase/MovePoint. movespline->Finalized()
-            // is the real "am I physically still moving" test (the same one Smart/
-            // Escort AI use). So: if a spline is live, HALT and DEFER one tick — the
+            // it). Test BOTH isMoving() and movespline->Finalized(): a launched
+            // spline sets MOVEMENTFLAG_FORWARD (MoveSplineInit::Launch) so isMoving()
+            // is true while gliding, but right after StopMoving() clears the flags
+            // the stop-spline still has a one-tick TAIL where isMoving() reads FALSE
+            // yet movespline->Finalized() is still FALSE — movespline is the real
+            // "am I physically still moving" test (the same one Smart/Escort AI
+            // use), so we need both. So: if a spline is live, HALT and DEFER one tick — the
             // cast fires next tick once the spline has actually finalized (the plant
             // below then no-ops StopMoving, leaving nothing to interrupt). Instants
             // (holdMs==0) don't care (no cast bar / channel to break).
@@ -4361,9 +4363,22 @@ namespace WowPsParty
         // heal with SPELL_IN_PROGRESS). Instant fillers leave no generic cast in
         // flight, so this is naturally a no-op for them.
         bool castingHarmfulFiller = false;
+        // A cast-BAR spell (Chain Lightning, Lightning Bolt, Greater Heal) is
+        // mid-flight. The core cancels a Player's cast the instant it reads
+        // isMoving() while SPELL_STATE_PREPARING (Spell.cpp checkMovement), and a
+        // launched spline DOES set MOVEMENTFLAG_FORWARD (MoveSplineInit::Launch) —
+        // i.e. isMoving() goes true — so ANY movement the rotation issues this tick
+        // self-interrupts the cast at ~1%. We must not re-cast or reposition while
+        // it's in flight; see the loop guard below. Instant generic spells that
+        // briefly occupy the slot on their own cast tick have CalcCastTime 0 and
+        // are not movement-cancellable, so they don't arm the guard.
+        bool castTimeInFlight = false;
         if (Spell* gen = bot->GetCurrentSpell(CURRENT_GENERIC_SPELL))
             if (SpellInfo const* gi = gen->GetSpellInfo())
+            {
                 castingHarmfulFiller = !gi->IsPositive();
+                castTimeInFlight     = gi->CalcCastTime() > 0;
+            }
 
         // Healer threat-hold, computed once per tick (it scans the tank's combat
         // refs). While true, the healer holds its HEALS. Non-healers return false.
@@ -4389,6 +4404,30 @@ namespace WowPsParty
                 if (trace)
                     LOG_INFO("module",
                         "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> CHANNELING",
+                        r.priority, r.condition, r.action);
+                continue;
+            }
+
+            // Cast-time spell mid-flight: the cast-time analogue of the channel
+            // commit-lock above. While a cast bar is up, suppress EVERY rule except
+            // a reactive heal (which aborts the cast further down so the heal lands
+            // now) or an explicit "clip" opt-in. Without this, the in-flight rule's
+            // own re-cast fails SPELL_IN_PROGRESS and the rotation falls THROUGH to
+            // a lower-priority movement/reposition rule (repositionToCast, a melee
+            // closer); that rule's spline sets MOVEMENTFLAG_FORWARD, so on the next
+            // tick the core's checkMovement cancels our OWN cast at ~1% — the
+            // "shaman interrupts its own Chain Lightning" bug. The kite/close rules
+            // already self-skip while casting, but the fall-through paths that don't
+            // made it rare-but-real; gating the whole loop here is the single robust
+            // fix (no need to audit every movement caller for an IsNonMeleeSpellCast
+            // guard).
+            if (castTimeInFlight
+                && !IsReactiveHealVerb(r.action.substr(0, r.action.find(':')))
+                && !CsvContains(Lower(r.flags), "clip"))
+            {
+                if (trace)
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> CASTING",
                         r.priority, r.condition, r.action);
                 continue;
             }
