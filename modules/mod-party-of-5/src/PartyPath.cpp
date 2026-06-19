@@ -621,6 +621,26 @@ namespace WowPsParty
         }
         Vec3 const& wp = path[targetIdx];
 
+        // Leader has walked PAST the end of the recorded route — into an un-recorded
+        // side area like The Singing Grove (Ormorok) in the Nexus. The cursor pins
+        // at the last waypoint and the lookahead can't advance, so the tank would
+        // idle at the route's end while the leader walks off; meanwhile the follow
+        // ticker still defers to us (HasPathForLeader is true within 250y), so the
+        // tank just stands there and has to be dragged. Hand off to plain following:
+        // walk WITH the leader until the recorded route resumes (or it's extended).
+        if (targetIdx + 1 >= path.size())
+        {
+            float const leaderToEnd = Dist3D(leader->GetPositionX(), leader->GetPositionY(),
+                                             leader->GetPositionZ(), wp.x, wp.y, wp.z);
+            if (leaderToEnd > LEAD_DISTANCE)
+            {
+                tlog("leader past route end (off-route area) — following leader directly");
+                if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != FOLLOW_MOTION_TYPE)
+                    bot->GetMotionMaster()->MoveFollow(leader, 8.0f, 0.0f);
+                return;
+            }
+        }
+
         // Already at the target waypoint? nothing to do.
         float const distToWp = Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
                                        wp.x, wp.y, wp.z);
