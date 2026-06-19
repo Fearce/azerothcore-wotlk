@@ -36,14 +36,19 @@ columns (+ their aligned values) against the live schema; the committed SQL is
 already filtered. The pedestal NPC (900001 "Font of Power") has `ScriptName=''`
 — it's hooked via Eluna `RegisterCreatureGossipEvent`, not a C++ script.
 
-## Client (your step — needs your WoW client + assets)
+## Client (WowPs HD client)
 
-1. **AIO addon** — `deploy.ps1` already copies `AIO_Client` into your client
-   `Interface/AddOns/`. Required for the GUI to receive server-pushed code.
-2. **MPQ texture/sound/DBC patch** — build per `Data/Client/README.md`
-   (Ladik's MPQ Editor; WDBXEditor for the optional keystone icon DBCs).
-   Without it the system still works but custom textures are missing and the
-   keystone shows a `?` icon.
+On WowPs both client pieces are automated by
+`D:\WowPs\tools\mpqbuild\make-patch.ps1` — it packs the `Interface` assets into
+`Patch-Y.MPQ`, installs that + the `AIO_Client` addon into the HD client, and
+emits `D:\WowPs\MythicPlus-ClientPatch.zip` for other players. Re-run it whenever
+the textures/sounds or the addon change. See `tools/mpqbuild/README.md` for the
+`Patch-Y.MPQ` naming rationale and why the optional keystone-icon DBC step
+(`Data/Client/README.md`) is deliberately skipped (it would clobber the HD
+client's custom item DBCs; cost is a cosmetic `?` icon on the keystone).
+
+Generic (non-WowPs) setup: `deploy.ps1` copies `AIO_Client` to a client
+`Interface/AddOns/`, and you build the MPQ by hand per `Data/Client/README.md`.
 
 ## How it works in-game
 
