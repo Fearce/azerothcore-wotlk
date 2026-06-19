@@ -537,6 +537,32 @@ namespace WowPsParty
         return false;
     }
 
+    // The party's LIVE healer (human leader set to healer, or a healer-role
+    // follower), or nullptr if there isn't one. Used to pace the lead tank's
+    // pulls on the healer's mana. Mirrors PartyHasLiveTank's directive walk.
+    Player* FindPartyHealer(ObjectGuid memberGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        uint32 account = 0;
+        ObjectGuid leaderGuid;
+        for (auto const& d : g_directives)
+            if (d.followerGuid == memberGuid)
+                { account = d.account; leaderGuid = d.leaderGuid; break; }
+        if (!account) return nullptr;
+        auto alive = [](ObjectGuid g) -> Player*
+        {
+            Player* p = ObjectAccessor::FindConnectedPlayer(g);
+            return (p && p->IsAlive() && p->IsInWorld()) ? p : nullptr;
+        };
+        auto lr = g_leaderRole.find(account);
+        if (lr != g_leaderRole.end() && lr->second == "healer")
+            if (Player* p = alive(leaderGuid)) return p;
+        for (auto const& d : g_directives)
+            if (d.account == account && d.role == "healer")
+                if (Player* p = alive(d.followerGuid)) return p;
+        return nullptr;
+    }
+
     // Stable 0-based ordinal of `follower` among all of `leaderGuid`'s
     // companions (sorted by guid). Drives formation spread — distinct per
     // companion regardless of account_party slot, so HENCHMEN (which have no
@@ -1486,6 +1512,41 @@ namespace WowPsParty
         Unit* nearest = leader->SelectNearbyTarget(nullptr, 28.0f);
         if (!nearest || !nearest->IsAlive()) return;
         if (!bot->IsValidAttackTarget(nearest)) return;
+
+        // Pull pacing — don't yank the next out-of-combat pack until mana is
+        // topped off, so the party never chain-pulls on fumes. A PALADIN tank
+        // waits on its OWN mana (it's the mana-using tank and self-sustains);
+        // every other tank waits on the PARTY HEALER's mana (a warrior/DK/bear's
+        // own bar is rage/runic, so the healer is the real limiter on starting the
+        // next fight). No healer in the party -> nothing to gate on, pull normally.
+        // Only reached when the whole party is already out of combat (checked
+        // above), so this gates exactly the proactive next-pull, never a defensive
+        // in-combat engage. Mana refills out of combat, so the hold always clears.
+        {
+            Player* const manaUnit = (bot->getClass() == CLASS_PALADIN)
+                                   ? bot : FindPartyHealer(bot->GetGUID());
+            if (manaUnit)
+            {
+                uint32 const maxMana = manaUnit->GetMaxPower(POWER_MANA);
+                if (maxMana > 0 &&
+                    uint64(manaUnit->GetPower(POWER_MANA)) * 100 < uint64(maxMana) * 99)
+                {
+                    static thread_local std::unordered_map<uint32, uint32> manaLogMs;
+                    uint32 const now = getMSTime();
+                    uint32& ml = manaLogMs[bot->GetGUID().GetCounter()];
+                    if (now - ml > 5000)
+                    {
+                        ml = now;
+                        LOG_INFO("module",
+                            "[WowPsParty TankLead] guid={} holding next pull — {} mana {}/{} (<99%)",
+                            bot->GetGUID().GetCounter(),
+                            (bot->getClass() == CLASS_PALADIN) ? "own" : "healer",
+                            manaUnit->GetPower(POWER_MANA), maxMana);
+                    }
+                    return;
+                }
+            }
+        }
 
         bool const ok = bot->Attack(nearest, true);
         if (!ok)
