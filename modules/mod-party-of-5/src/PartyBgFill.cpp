@@ -4,22 +4,44 @@
  * A managed party (a human + heroes/henchmen) can't pop a BG on its own and,
  * even if it did, would face an empty/half-empty enemy. When such a human queues
  * ANY normal battleground, fill BOTH teams up to the BG's MaxPlayersPerTeam with
- * parked RNDBOT-pool chars at the human's bracket:
+ * parked RNDBOT-pool chars re-leveled to the human's bracket:
  *   - the human's team: enough SAME-faction bots to top up (human + heroes + fills
  *     = MaxPerTeam),
  *   - the enemy team: MaxPerTeam OPPOSITE-faction bots.
- * so the match pops as a full N-v-N (WSG 10v10, AB 15v15, AV 40v40, EotS/SotA 15v15,
- * IoC 40v40, …). Fill bots play via mod-playerbots' BattleGroundTactics; they (and
+ * so the match aims to pop as a full N-v-N (WSG 10v10, AB 15v15, AV 40v40, EotS/SotA
+ * 15v15, IoC 40v40, …). Fill bots play via mod-playerbots' BattleGroundTactics; they (and
  * the human's heroes) are driven to queue + accept the pop from the world tick,
  * since gated party bots never click "Enter Battle". When the match/queue ends the
  * fill bots are logged out (the human's own heroes are NOT — they're real alts).
+ * NB: a full N-v-N is best-effort, not guaranteed — out-of-bracket fills re-level one per
+ * world tick (below), and CheckNormalMatch pops as soon as both sides reach MinPlayers, so
+ * a big draw can start partially filled and the rest backfill as they queue. A sub-cap pop
+ * (e.g. 14v20) is staggered fill, not a regression; the human is always in it.
+ *
+ * How the human is NEVER locked out of their own match (the bug the earlier
+ * enemy-only revert was avoiding): EVERY participant — human, heroes and all fills —
+ * lands in the NORMAL queue, so CheckNormalMatch forms ONE match FIFO and the human
+ * (who queued first, before the async fill logins) is always selected; FillPlayersToBG
+ * then tops both sides up to MaxPerTeam from the remaining normal-queue fills. The one
+ * BG whose MinPlayersPerTeam is <= a full 5-party — WSG — would otherwise flag the
+ * human's group as a PREMADE (isPremade = members >= MinPlayersPerTeam) and strand it in
+ * the premade queue while the solo fills self-matched in the normal queue; a migration
+ * raises WSG min to 6 so any party of <=5 is always normal (its stock min is below 6:
+ * the AzerothCore seed is 5, this server's live value is 2 — both trip a full party).
+ * Every other BG's min is already >5. See data/sql/db-world/updates/
+ * 2026_06_19_00_party_bgfill_wsg_minplayers.sql. With no premade anywhere, there is no
+ * same-faction self-match: ally fills can only ever backfill the human's own match.
  *
  * Design notes (see memory wowps-battleground-ondemand-fill):
  *  - Capacity + bracket are read from the BG TEMPLATE at queue time
  *    (GetBattlegroundTemplate + GetBattlegroundBracketByLevel) so this works for
  *    every BG and level bracket with no hardcoding.
- *  - Fill bots are INDEPENDENT (master 0 -> isRndbot bypass): an opposite-faction
- *    bot can't join the human's group, and same-faction fills don't need to.
+ *  - Fill bots are INDEPENDENT (master 0 -> isRndbot bypass): they queue solo and
+ *    backfill the human's match; none join the human's group.
+ *  - A small flat pool covers every bracket: in-bracket parked chars are drawn first
+ *    (no re-level); any shortfall is backfilled from out-of-bracket chars re-leveled
+ *    to the bracket via PlayerbotFactory on the world tick — at most one re-level per
+ *    tick so a 40v40 spin-up never stalls the world thread.
  *  - OnPlayerJoinBG fires at QUEUE time (BattleGroundHandler), per group member, so
  *    we react when the human queues — not after the (empty) match already formed.
  *  - Random BG (BATTLEGROUND_RB) and arenas are skipped: the real BG isn't known
@@ -47,6 +69,7 @@
 #include "WorldSession.h"
 
 #include "PlayerbotAI.h"
+#include "PlayerbotFactory.h"   // re-level a pool fill bot to the BG bracket on spawn
 #include "PlayerbotMgr.h"
 
 #include <mutex>
@@ -56,7 +79,17 @@
 
 namespace
 {
-    struct FillEntry { uint32 leaderLow; uint32 bgTypeId; uint32 spawnMs; bool entered; };
+    struct FillEntry
+    {
+        uint32 leaderLow;
+        uint32 bgTypeId;
+        uint32 spawnMs;
+        bool   entered;     // made it into the BG (retire from the world tick on exit)
+        bool   ally;        // same faction as the human (true) or enemy fill (false)
+        uint8  bmin;        // bracket min level — re-level target floor
+        uint8  bmax;        // bracket max level — re-level target (top of bracket)
+        bool   releveled;   // re-level done, or unnecessary (in-bracket pool char)
+    };
 
     // A fill bot that never finishes its async login is retired after this so it
     // can't pin the leader's session (g_activeLeaders) forever.
@@ -94,32 +127,75 @@ namespace
                         : "2,5,6,8,10";  // Orc, Undead, Tauren, Troll, Blood Elf
     }
 
-    // Spawn up to `count` parked rndbot chars of the given races within [bmin,bmax]
-    // as independent bots (master 0) and register them as fill bots for this leader's
-    // BG. Returns how many were actually spawned (pool may be short — logged).
+    // CSV of the fill-bot guids already spawned for ANY leader, so a second concurrent
+    // fill (or the in-bracket vs out-of-bracket halves of the same draw) can't pick the
+    // same parked char twice. "0" is a never-a-guid placeholder so the NOT IN is valid
+    // even when nothing is active yet.
+    std::string ActiveFillCsv()
+    {
+        std::string csv = "0";
+        std::lock_guard<std::mutex> lk(g_mutex);
+        for (auto const& kv : g_fillBots) { csv += ','; csv += std::to_string(kv.first); }
+        return csv;
+    }
+
+    // Spawn up to `count` parked rndbot chars of the given races as independent bots
+    // (master 0) and register them as fill bots for this leader's BG. Draws IN-BRACKET
+    // chars first (no re-level needed); any shortfall is backfilled from out-of-bracket
+    // chars (closest level first) flagged for a re-level to the bracket on the world
+    // tick — so a small flat pool serves every bracket. Returns how many were spawned
+    // (pool may be short — logged, never silently capped).
     uint32 SpawnFillTeam(PlayerbotMgr* mgr, uint32 leaderLow, uint32 bgTypeId,
                          std::string const& acctCsv, char const* races,
-                         uint8 bmin, uint8 bmax, uint32 count, char const* sideLabel)
+                         uint8 bmin, uint8 bmax, uint32 count, bool ally, char const* sideLabel)
     {
         if (count == 0) return 0;
-        QueryResult q = CharacterDatabase.Query(
-            "SELECT `guid` FROM `characters` WHERE `account` IN ({}) AND `online` = 0 "
-            "AND `race` IN ({}) AND `level` BETWEEN {} AND {} ORDER BY RAND() LIMIT {}",
-            acctCsv, races, uint32(bmin), uint32(bmax), count);
-        if (!q)
+
+        std::string const exclude = ActiveFillCsv();
+        std::vector<std::pair<uint32, bool>> picks;   // {guid, needsRelevel}
+
+        // 1) In-bracket parked chars — usable as-is, no re-level.
+        if (QueryResult q = CharacterDatabase.Query(
+                "SELECT `guid` FROM `characters` WHERE `account` IN ({}) AND `online` = 0 "
+                "AND `race` IN ({}) AND `level` BETWEEN {} AND {} AND `guid` NOT IN ({}) "
+                "ORDER BY RAND() LIMIT {}",
+                acctCsv, races, uint32(bmin), uint32(bmax), exclude, count))
+            do { picks.emplace_back(q->Fetch()[0].Get<uint32>(), false); } while (q->NextRow());
+
+        // 2) Out-of-bracket backfill, re-leveled on spawn. Exclude the in-bracket picks
+        //    too, and prefer the closest levels (smallest re-level jump).
+        if (picks.size() < count)
         {
-            LOG_INFO("module", "[WowPsParty BGFill] no parked {} rndbot ({}-{}) available — {} side short by {}",
-                     sideLabel, bmin, bmax, sideLabel, count);
+            uint32 const remaining = count - uint32(picks.size());
+            std::string ex2 = exclude;
+            for (auto const& p : picks) { ex2 += ','; ex2 += std::to_string(p.first); }
+            if (QueryResult q2 = CharacterDatabase.Query(
+                    "SELECT `guid` FROM `characters` WHERE `account` IN ({}) AND `online` = 0 "
+                    "AND `race` IN ({}) AND (`level` < {} OR `level` > {}) AND `guid` NOT IN ({}) "
+                    "ORDER BY ABS(CAST(`level` AS SIGNED) - {}) ASC, RAND() LIMIT {}",
+                    acctCsv, races, uint32(bmin), uint32(bmax), ex2, uint32(bmax), remaining))
+                do { picks.emplace_back(q2->Fetch()[0].Get<uint32>(), true); } while (q2->NextRow());
+        }
+
+        if (picks.empty())
+        {
+            LOG_INFO("module", "[WowPsParty BGFill] no parked {} rndbot pool available — {} side short by {}",
+                     sideLabel, sideLabel, count);
             return 0;
         }
+
         uint32 spawned = 0;
-        do {
-            uint32 const g = q->Fetch()[0].Get<uint32>();
+        for (auto const& [g, needsRelevel] : picks)
+        {
             ObjectGuid const botGuid = ObjectGuid::Create<HighGuid::Player>(g);
             mgr->AddPlayerBot(botGuid, 0);   // master 0 -> isRndbot bypass, no group/follow
-            { std::lock_guard<std::mutex> lk(g_mutex); g_fillBots[g] = { leaderLow, bgTypeId, getMSTime(), false }; }
+            {
+                std::lock_guard<std::mutex> lk(g_mutex);
+                g_fillBots[g] = { leaderLow, bgTypeId, getMSTime(), false, ally,
+                                  bmin, bmax, !needsRelevel };
+            }
             ++spawned;
-        } while (q->NextRow());
+        }
 
         if (spawned < count)
             LOG_INFO("module", "[WowPsParty BGFill] {} side: pool gave {}/{} — filling short (no silent cap)",
@@ -146,31 +222,47 @@ namespace
         std::string const acctCsv = RndbotAccountCsv();
         if (acctCsv.empty()) { LOG_INFO("module", "[WowPsParty BGFill] no rndbot pool — abort"); return; }
 
-        // ENEMY-FACTION FILL ONLY. We must NOT spawn same-faction ally fills: with a
-        // low MinPlayersPerTeam the ally fills gave the matchmaker enough to form a
-        // whole match from BOTS ALONE (both factions queued), entering a WSG without
-        // the human — leaving the player stuck at "queue unavailable" (Kevin: bots on
-        // map 489 while he + heroes sat in the world). With NO ally bots, the human's
-        // own party is the ONLY source for its faction, so the match CANNOT pop
-        // without them — the human + heroes always get in, and the enemy team is
-        // filled. (Full same-side fill would need the ally bots to join the human's
-        // raid group so they can't self-match; a separate follow-up.)
+        // Fill BOTH teams. (The earlier enemy-only revert was pre-WSG-min-fix: back then
+        // same-faction ally fills could give the matchmaker a whole bot-vs-bot match in a
+        // premade WSG and enter without the human, stranding the player.) That can't happen
+        // now: every participant is in the NORMAL queue, the human's group queued FIRST
+        // (synchronously at click time, before these async fill logins), so CheckNormalMatch's
+        // FIFO scan always selects it; and no fillable BG flags a <=5 party as a PREMADE —
+        // WSG's min is raised to 6 by migration 2026_06_19_00_party_bgfill_wsg_minplayers.sql
+        // (its stock min trips a full party: AC seed 5, this server 2) and every other BG's
+        // min is already >5. With no premade anywhere there is no same-faction self-match:
+        // an ally fill can only ever backfill the human's own match.
         std::vector<ObjectGuid> party;
         WowPsParty::GetPartyGuidsFor(human->GetGUID(), party);
-        uint32 const ownSide   = uint32(party.size());   // human + heroes (the ally side)
+        uint32 const ownSide   = uint32(party.size());                       // human + heroes
+        uint32 const allyNeed  = maxPerTeam > ownSide ? maxPerTeam - ownSide : 0;
         uint32 const enemyNeed = maxPerTeam;
 
         bool const allianceLeader = human->GetTeamId() == TEAM_ALLIANCE;
         uint32 const leaderLow = human->GetGUID().GetCounter();
 
+        uint32 const allies  = SpawnFillTeam(mgr, leaderLow, bgTypeId, acctCsv,
+                                             RaceCsv(allianceLeader), bmin, bmax, allyNeed, true, "ally");
         uint32 const enemies = SpawnFillTeam(mgr, leaderLow, bgTypeId, acctCsv,
-                                             RaceCsv(!allianceLeader), bmin, bmax, enemyNeed, "enemy");
+                                             RaceCsv(!allianceLeader), bmin, bmax, enemyNeed, false, "enemy");
 
         LOG_INFO("module",
-            "[WowPsParty BGFill] {} queued bg {} (bracket {}-{}): own ally side={}, +{} enemy fills (no ally fills — keeps the human in the match)",
-            human->GetName(), bgTypeId, bmin, bmax, ownSide, enemies);
+            "[WowPsParty BGFill] {} queued bg {} (bracket {}-{}): ally {}+{} fills, enemy +{} fills -> {}v{}",
+            human->GetName(), bgTypeId, bmin, bmax, ownSide, allies, enemies, ownSide + allies, enemies);
         ChatHandler(human->GetSession()).PSendSysMessage(
-            "|cff66ccff[WowPsParty]|r Filling the enemy team: +{} opponents…", enemies);
+            "|cff66ccff[WowPsParty]|r Forming a full match: +{} allies, +{} opponents…", allies, enemies);
+    }
+
+    // Re-level an out-of-bracket pool fill bot to the top of the BG bracket so a small
+    // flat pool serves every bracket. PlayerbotFactory::Randomize(false) is the same full
+    // re-roll mod-playerbots uses for its random bots (level + gear + talents + spells);
+    // it is HEAVY, so the world tick runs at most ONE per tick (see OnUpdate).
+    void RelevelFillBot(Player* bot, uint8 level)
+    {
+        if (!bot || !bot->IsInWorld() || !sPlayerbotsMgr.GetPlayerbotAI(bot)) return;
+        PlayerbotFactory factory(bot, level);
+        factory.Randomize(false);
+        LOG_INFO("module", "[WowPsParty BGFill] re-leveled fill bot {} to {} for the bracket", bot->GetName(), uint32(level));
     }
 
     void QueueFillBot(Player* bot, uint32 bgTypeId)
@@ -359,7 +451,9 @@ public:
                     || leader->InBattlegroundQueueForBattlegroundQueueType(QueueTypeFor(bgTypeId)));
         };
 
-        // 1) Drive each fill bot: queue -> accept the pop -> retire when it's over.
+        // 1) Drive each fill bot: re-level (if needed) -> queue -> accept -> retire. Only
+        //    one heavy re-level runs per tick so a 40v40 spin-up never stalls the world.
+        bool releveledThisTick = false;
         for (auto const& [botLow, fe] : fills)
         {
             Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(botLow));
@@ -397,6 +491,22 @@ public:
             // Pre-pop: if the leader bailed the queue, the fill bots leave too.
             Player* leader = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(fe.leaderLow));
             if (!leaderStillIn(leader, fe.bgTypeId)) { RetireFillBot(botLow, bot); continue; }
+
+            // Out-of-bracket pool bot: re-level it to the bracket BEFORE it queues (a bot
+            // queues into its CURRENT level's bracket, so queuing first would land it in the
+            // wrong one). The re-roll is heavy -> at most one per tick; the rest wait their
+            // turn. In-bracket bots are flagged releveled at spawn and skip straight to queue.
+            if (!fe.releveled)
+            {
+                if (releveledThisTick) continue;
+                releveledThisTick = true;
+                RelevelFillBot(bot, fe.bmax);
+                std::lock_guard<std::mutex> lk(g_mutex);
+                auto it = g_fillBots.find(botLow);
+                if (it != g_fillBots.end()) it->second.releveled = true;
+                continue;
+            }
+
             if (!bot->InBattlegroundQueue()) QueueFillBot(bot, fe.bgTypeId);
             else                             AcceptBgInvite(bot);
         }

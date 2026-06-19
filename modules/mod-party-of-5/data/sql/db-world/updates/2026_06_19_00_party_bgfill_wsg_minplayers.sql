@@ -1,0 +1,16 @@
+-- WowPsParty BGFill: raise Warsong Gulch's MinPlayersPerTeam to 6.
+--
+-- A queued group is flagged PREMADE when its size >= the BG's MinPlayersPerTeam
+-- (BattleGroundHandler.cpp: isPremade = grp->GetMembersCount() >= bg->GetMinPlayersPerTeam()).
+-- A managed party is a human + up to 4 heroes (<=5 members). WSG's stock min is at or below
+-- a full party (the AzerothCore seed is 5; this server's live value is 2), so a full party
+-- trips the premade flag. The BGFill mechanic (mod-party-of-5 PartyBgFill.cpp) queues the
+-- human's group AND all fill bots in the NORMAL queue; a premade human group is split off
+-- into the premade queue while the solo fills self-match in the normal queue, locking the
+-- human out of their own match. Raising WSG's min to 6 keeps any party of <=5 in the normal
+-- queue, where CheckNormalMatch's FIFO scan always selects the (first-queued) human and
+-- FillPlayersToBG tops both sides to MaxPlayersPerTeam. WSG is the only BG whose min is
+-- below 6 (AV/IoC=20, AB/EotS=8, SotA=7). MaxPlayersPerTeam (10) is unchanged: still 10v10.
+--
+-- Guarded so it's a no-op if already applied or hand-raised higher (fires for seed 5 and live 2).
+UPDATE `battleground_template` SET `MinPlayersPerTeam` = 6 WHERE `ID` = 2 AND `MinPlayersPerTeam` < 6;
