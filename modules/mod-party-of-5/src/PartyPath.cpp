@@ -13,6 +13,7 @@
 #include "Map.h"
 #include "MotionMaster.h"
 #include "ObjectAccessor.h"
+#include "PathGenerator.h"
 #include "Player.h"
 #include "WorldSession.h"
 
@@ -113,6 +114,30 @@ namespace WowPsParty
         {
             float dx = ax - bx, dy = ay - by, dz = az - bz;
             return std::sqrt(dx*dx + dy*dy + dz*dz);
+        }
+
+        // True if the tank can WALK to (x,y,z) by a reasonably direct navmesh route
+        // — a complete normal path no longer than ~2.5x (min +8y) the straight-line
+        // distance. This is the "if it could easily just walk there, walk" gate:
+        // before any blink/teleport we ask the navmesh, and only teleport when
+        // there's NO usable path (a real hole / jump / sheer drop the mmap can't
+        // connect) or the only route is a long detour around a recorded shortcut.
+        // A genuinely walkable slope or a long-but-clear stride returns NORMAL and
+        // gets walked instead of hopped. (No mmaps on the map -> SHORTCUT/NOT_USING
+        // -> returns false -> teleport, same as before.)
+        static bool NavWalkable(Player* bot, float x, float y, float z, float straight)
+        {
+            PathGenerator gen(bot);
+            bool const ok = gen.CalculatePath(x, y, z, false);
+            PathType const t = gen.GetPathType();
+            if (!ok)
+                return false;
+            if (t & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE | PATHFIND_SHORTCUT
+                     | PATHFIND_NOT_USING_PATH | PATHFIND_FARFROMPOLY))
+                return false;
+            if (!(t & PATHFIND_NORMAL))
+                return false;
+            return gen.getPathLength() <= std::max(straight * 2.5f, straight + 8.0f);
         }
 
         static std::vector<PathGroup> const& EnsureGroups(uint32 mapId)
@@ -495,11 +520,22 @@ namespace WowPsParty
         auto const& path = SelectPathForLeader(bot->GetMapId(), leader);
         if (path.size() < 2) { tlog("skip: no recorded path for this wing (<2 wp)"); return; }
 
-        // Leash check.
-        if (bot->GetDistance(leader) > TANK_LEASH)
+        // Leash check — HORIZONTAL distance only. A big VERTICAL gap (the leader
+        // just dropped down a hole / off a ledge on the recorded route — e.g. the
+        // plunge before Anub'arak in Azjol'Nerub) blows past a 3D leash even though
+        // the leader is right below us, which used to bail the whole path-follow
+        // BEFORE the drop-blink could run, stranding the tank up top until it was
+        // dragged with Come Hither. Gating on horizontal distance keeps us leading
+        // straight down the recorded drop (the blink logic below carries us across),
+        // while still stopping at range if the leader genuinely ran off sideways.
         {
-            tlog("skip: beyond tank leash (>30y from leader)");
-            return;
+            float const dxL = bot->GetPositionX() - leader->GetPositionX();
+            float const dyL = bot->GetPositionY() - leader->GetPositionY();
+            if (std::sqrt(dxL * dxL + dyL * dyL) > TANK_LEASH)
+            {
+                tlog("skip: beyond tank leash (>horiz from leader)");
+                return;
+            }
         }
 
         // Past the skip gates, we're committed to leading this tick. Tell the
@@ -626,6 +662,23 @@ namespace WowPsParty
                 }
                 if (blinkIdx > tankNearest)
                 {
+                    // If the navmesh can still WALK to the blink target by a direct
+                    // route, the tank isn't truly wedged — a transient block or a
+                    // MovePoint that didn't take. Re-kick the walk instead of
+                    // teleporting; only a genuine no-path wedge falls through to the
+                    // blink below. This is the main "stop teleporting when it could
+                    // just walk there" fix for the long-stride / sparse-waypoint case.
+                    float const blinkStraight =
+                        Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                               path[blinkIdx].x, path[blinkIdx].y, path[blinkIdx].z);
+                    if (NavWalkable(bot, path[blinkIdx].x, path[blinkIdx].y, path[blinkIdx].z,
+                                    blinkStraight))
+                    {
+                        tlog("stall but path is walkable — re-issuing MovePoint, not blinking");
+                        bot->GetMotionMaster()->Clear();
+                        bot->GetMotionMaster()->MovePoint(0, wp.x, wp.y, wp.z);
+                        return;
+                    }
                     // A tall vertical DROP to the blink target is a fall the navmesh
                     // can't path (the tank wedged at the lip): blink unconditionally,
                     // because LoS down to a landing below a ledge / through a hole is
@@ -675,9 +728,22 @@ namespace WowPsParty
                                           (to.y - from.y) * (to.y - from.y));
             if (std::fabs(dz) > VERTICAL_STEP_TP && std::fabs(dz) > horiz * DROP_SLOPE_RATIO)
             {
-                tlog("blink: near-vertical drop on next stride, NearTeleport across");
-                bot->NearTeleportTo(to.x, to.y, to.z, to.o);
-                return;
+                // Even a steep recorded stride gets WALKED if the navmesh has a
+                // direct path (a sparsely-recorded ramp can look near-vertical by
+                // the dz:horiz ratio yet be perfectly walkable). Only teleport a
+                // genuine plunge the mmap can't connect (a real hole/jump).
+                // Measure the straight-line budget from the BOT's own position
+                // (where NavWalkable starts its path), not the recorded stride, so
+                // the length comparison uses a consistent baseline.
+                float const strideDist = Dist3D(bot->GetPositionX(), bot->GetPositionY(),
+                                                bot->GetPositionZ(), to.x, to.y, to.z);
+                if (!NavWalkable(bot, to.x, to.y, to.z, strideDist))
+                {
+                    tlog("blink: near-vertical drop on next stride (no walk path), NearTeleport across");
+                    bot->NearTeleportTo(to.x, to.y, to.z, to.o);
+                    return;
+                }
+                tlog("steep recorded stride but navmesh can walk it — walking, not blinking");
             }
         }
 
