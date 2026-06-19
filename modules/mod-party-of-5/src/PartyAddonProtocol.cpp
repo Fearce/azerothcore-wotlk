@@ -62,7 +62,9 @@
 #include "WorldSession.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <iomanip>
 #include <sstream>
 #include <unordered_set>
 #include <vector>
@@ -293,6 +295,7 @@ namespace WowPsParty
 
     // forward decls — definitions follow below
     void SendGearTo(Player* requester, uint32 slot);
+    void SendStatsTo(Player* requester, uint32 slot);
     void SendInventoryTo(Player* requester);
     void SendQuestProgressTo(Player* requester);
 
@@ -303,6 +306,7 @@ namespace WowPsParty
         if (!requester || slot < 0) return;
         SendSpellbookTo(requester, uint32(slot));
         SendGearTo(requester, uint32(slot));
+        SendStatsTo(requester, uint32(slot));
         SendInventoryTo(requester);
     }
 
@@ -332,6 +336,178 @@ namespace WowPsParty
             out << uint32(i) << ':' << item->GetEntry() << ':' << item->GetGUID().GetCounter()
                 << ':' << item->GetItemRandomPropertyId() << ':' << item->GetItemSuffixFactor();
         }
+        SendWPSP(requester, out.str());
+    }
+
+    // ------------------------------------------------------------------------
+    // GearScore — canonical GearScoreLite (3x04) algorithm, mirrored server-side
+    // so the number matches what players already recognise from the addon. It's
+    // a pure function of item level, quality and inventory type; gems/enchants
+    // don't factor in (same as the addon). See GS_Formula / GS_ItemTypes in the
+    // GearScoreLite source.
+    // ------------------------------------------------------------------------
+    static float GS_SlotMod(uint32 invType)
+    {
+        switch (invType)
+        {
+            case INVTYPE_HEAD: case INVTYPE_CHEST: case INVTYPE_ROBE:
+            case INVTYPE_LEGS: case INVTYPE_SHIELD: case INVTYPE_WEAPON:
+            case INVTYPE_WEAPONMAINHAND: case INVTYPE_WEAPONOFFHAND:
+            case INVTYPE_HOLDABLE:
+                return 1.0000f;
+            case INVTYPE_2HWEAPON:
+                return 2.0000f;
+            case INVTYPE_SHOULDERS: case INVTYPE_WAIST:
+            case INVTYPE_FEET: case INVTYPE_HANDS:
+                return 0.7500f;
+            case INVTYPE_NECK: case INVTYPE_WRISTS: case INVTYPE_FINGER:
+            case INVTYPE_TRINKET: case INVTYPE_CLOAK:
+                return 0.5625f;
+            case INVTYPE_RANGED: case INVTYPE_THROWN:
+            case INVTYPE_RANGEDRIGHT: case INVTYPE_RELIC:
+                return 0.3164f;
+            default:
+                return 0.0f;   // shirt, tabard, bags, ammo — no score
+        }
+    }
+
+    // Base per-item GearScore, before the class/Titan's-Grip slot adjustments.
+    static uint32 GearScoreForItem(ItemTemplate const* proto)
+    {
+        if (!proto) return 0;
+        float const slotMod = GS_SlotMod(proto->InventoryType);
+        if (slotMod <= 0.0f) return 0;
+
+        float ilvl = float(proto->ItemLevel);
+        uint32 quality = proto->Quality;
+        float qualityScale = 1.0f;
+        if (quality == ITEM_QUALITY_LEGENDARY) { qualityScale = 1.3f;   quality = ITEM_QUALITY_EPIC; }
+        else if (quality == ITEM_QUALITY_NORMAL) { qualityScale = 0.005f; quality = ITEM_QUALITY_UNCOMMON; }
+        else if (quality == ITEM_QUALITY_POOR)   { qualityScale = 0.005f; quality = ITEM_QUALITY_UNCOMMON; }
+        if (quality == ITEM_QUALITY_HEIRLOOM)    { quality = ITEM_QUALITY_RARE; ilvl = 187.05f; }
+        if (quality < ITEM_QUALITY_UNCOMMON || quality > ITEM_QUALITY_EPIC)
+            return 0;   // artifact / unhandled
+
+        bool const hi = ilvl > 120.0f;   // GS_Formula["A"] vs ["B"] brackets
+        float A, B;
+        switch (quality)
+        {
+            case ITEM_QUALITY_EPIC:     A = hi ? 91.4500f : 26.0000f; B = hi ? 0.6500f : 1.2000f; break;
+            case ITEM_QUALITY_RARE:     A = hi ? 81.3750f :  0.7500f; B = hi ? 0.8125f : 1.8000f; break;
+            case ITEM_QUALITY_UNCOMMON: A = hi ? 73.0000f :  8.0000f; B = hi ? 1.0000f : 2.0000f; break;
+            default: return 0;
+        }
+        float const score = std::floor(((ilvl - A) / B) * slotMod * 1.8618f * qualityScale);
+        return score > 0.0f ? uint32(score) : 0;
+    }
+
+    // Whole-character GearScore (sum of equipped slots, hunter + Titan's-Grip
+    // weighting as the addon applies it). Skips shirt + tabard.
+    static uint32 ComputeGearScore(Player* p)
+    {
+        if (!p) return 0;
+        bool const isHunter = p->getClass() == CLASS_HUNTER;
+
+        float titanGrip = 1.0f;   // a 2H in main OR off hand halves both weapons
+        {
+            Item* mh = p->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+            Item* oh = p->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
+            ItemTemplate const* mhp = mh ? mh->GetTemplate() : nullptr;
+            ItemTemplate const* ohp = oh ? oh->GetTemplate() : nullptr;
+            if ((mhp && mhp->InventoryType == INVTYPE_2HWEAPON) ||
+                (ohp && ohp->InventoryType == INVTYPE_2HWEAPON))
+                titanGrip = 0.5f;
+        }
+
+        float total = 0.0f;
+        for (uint8 i = EQUIPMENT_SLOT_START; i < EQUIPMENT_SLOT_END; ++i)
+        {
+            if (i == EQUIPMENT_SLOT_BODY || i == EQUIPMENT_SLOT_TABARD) continue;
+            Item* item = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
+            if (!item) continue;
+            float s = float(GearScoreForItem(item->GetTemplate()));
+            if (isHunter && (i == EQUIPMENT_SLOT_MAINHAND || i == EQUIPMENT_SLOT_OFFHAND))
+                s *= 0.3164f;
+            if (isHunter && i == EQUIPMENT_SLOT_RANGED)
+                s *= 5.3224f;
+            // NB: faithful to GearScoreLite — its TitanGrip multiply is NOT
+            // class-gated, so a hunter wielding a 2H (polearm/staff stat-stick)
+            // gets BOTH ×0.3164 and ×0.5 here, exactly as the addon does. Keep
+            // it that way so our number matches the player's GearScore addon.
+            if (i == EQUIPMENT_SLOT_MAINHAND || i == EQUIPMENT_SLOT_OFFHAND)
+                s *= titanGrip;
+            total += s;
+        }
+        return uint32(std::floor(total));
+    }
+
+    // STATS\t<slot>\t<key>:<val>;...  — GearScore, avg item level and the live
+    // computed stats for the VIEWED member (the real Player object, so talents,
+    // gems, enchants and buffs are all reflected — the client can't compute these
+    // for anyone but itself). Rendered by CharacterSheet.lua's stat panel.
+    void SendStatsTo(Player* requester, uint32 slot)
+    {
+        if (!requester || !requester->GetSession()) return;
+        uint32 const account = requester->GetSession()->GetAccountId();
+        uint32 const guid = GuidForAccountSlot(account, slot);
+        if (!guid) return;
+        ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
+        Player* p = ObjectAccessor::FindConnectedPlayer(og);
+        if (!p) p = ObjectAccessor::FindPlayer(og);
+        if (!p) return;
+
+        // Average item level over equipped gear (excl. shirt + tabard).
+        uint32 ilvlSum = 0, ilvlCount = 0;
+        for (uint8 i = EQUIPMENT_SLOT_START; i < EQUIPMENT_SLOT_END; ++i)
+        {
+            if (i == EQUIPMENT_SLOT_BODY || i == EQUIPMENT_SLOT_TABARD) continue;
+            Item* item = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
+            ItemTemplate const* proto = item ? item->GetTemplate() : nullptr;
+            if (!proto) continue;
+            ilvlSum += proto->ItemLevel;
+            ++ilvlCount;
+        }
+        uint32 const avgIlvl = ilvlCount ? (ilvlSum / ilvlCount) : 0;
+
+        // Spell power / spell crit are reported as the highest school (matches the
+        // sheet's "Spell Power" headline for a hybrid).
+        int32 spellPower = 0;
+        float spellCrit = 0.0f;
+        for (int s = SPELL_SCHOOL_HOLY; s < MAX_SPELL_SCHOOL; ++s)
+        {
+            spellPower = std::max(spellPower, p->SpellBaseDamageBonusDone(SpellSchoolMask(1 << s)));
+            spellCrit  = std::max(spellCrit, p->GetFloatValue(PLAYER_SPELL_CRIT_PERCENTAGE1 + s));
+        }
+
+        std::ostringstream out;
+        out << "STATS\t" << slot
+            << "\tgs:"  << ComputeGearScore(p)
+            << ";il:"   << avgIlvl
+            << ";str:"  << uint32(p->GetStat(STAT_STRENGTH))
+            << ";agi:"  << uint32(p->GetStat(STAT_AGILITY))
+            << ";sta:"  << uint32(p->GetStat(STAT_STAMINA))
+            << ";int:"  << uint32(p->GetStat(STAT_INTELLECT))
+            << ";spi:"  << uint32(p->GetStat(STAT_SPIRIT))
+            << ";arm:"  << p->GetArmor()
+            << ";hp:"   << p->GetMaxHealth()
+            << ";man:"  << p->GetMaxPower(POWER_MANA)
+            << ";ap:"   << int32(p->GetTotalAttackPowerValue(BASE_ATTACK))
+            << ";rap:"  << int32(p->GetTotalAttackPowerValue(RANGED_ATTACK))
+            << ";sp:"   << spellPower
+            << ";exp:"  << p->GetUInt32Value(PLAYER_EXPERTISE)
+            << ";def:"  << p->GetDefenseSkillValue();
+        out << std::fixed << std::setprecision(1)
+            << ";mcr:"  << p->GetFloatValue(PLAYER_CRIT_PERCENTAGE)
+            << ";rcr:"  << p->GetFloatValue(PLAYER_RANGED_CRIT_PERCENTAGE)
+            << ";scr:"  << spellCrit
+            << ";mht:"  << p->GetRatingBonusValue(CR_HIT_MELEE)
+            << ";sht:"  << p->GetRatingBonusValue(CR_HIT_SPELL)
+            << ";mhs:"  << p->GetRatingBonusValue(CR_HASTE_MELEE)
+            << ";shs:"  << p->GetRatingBonusValue(CR_HASTE_SPELL)
+            << ";dge:"  << p->GetFloatValue(PLAYER_DODGE_PERCENTAGE)
+            << ";par:"  << p->GetFloatValue(PLAYER_PARRY_PERCENTAGE)
+            << ";blk:"  << p->GetFloatValue(PLAYER_BLOCK_PERCENTAGE)
+            << ";res:"  << p->GetRatingBonusValue(CR_CRIT_TAKEN_MELEE);
         SendWPSP(requester, out.str());
     }
 
@@ -683,6 +859,7 @@ static void HandleUnequip(Player* requester, std::string_view payload)
     p->StoreItem(dest, item, true);
 
     WowPsParty::SendGearTo(requester, partySlot);
+    WowPsParty::SendStatsTo(requester, partySlot);
     WowPsParty::SendInventoryTo(requester);
 }
 
@@ -1046,9 +1223,15 @@ static void HandleEquip(Player* requester, std::string_view payload)
     // Refresh client UI on both sides
     WowPsParty::SendInventoryTo(requester);
     if (auto srcS = sPartyMgr.GetSlotForGuid(srcCharGuid))
+    {
         WowPsParty::SendGearTo(requester, uint32(*srcS));
+        WowPsParty::SendStatsTo(requester, uint32(*srcS));
+    }
     if (auto dstS = sPartyMgr.GetSlotForGuid(dest->GetGUID().GetCounter()))
+    {
         WowPsParty::SendGearTo(requester, uint32(*dstS));
+        WowPsParty::SendStatsTo(requester, uint32(*dstS));
+    }
 }
 
 // =============================================================================
@@ -1407,6 +1590,7 @@ static void HandleEnchant(Player* requester, std::string_view payload)
         enchanter->GetName(), item->GetTemplate() ? item->GetTemplate()->Name1 : "item", owner->GetName());
 
     WowPsParty::SendGearTo(requester, tgtSlot);
+    WowPsParty::SendStatsTo(requester, tgtSlot);
     WowPsParty::SendInventoryTo(requester);
 }
 
@@ -2823,6 +3007,12 @@ public:
         {
             uint32 slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
             WowPsParty::SendGearTo(player, slot);
+        }
+        // REQ_STATS\t<slot>  →  STATS\t<slot>\t<key>:<val>;...
+        else if (command == "REQ_STATS")
+        {
+            uint32 slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            WowPsParty::SendStatsTo(player, slot);
         }
         // REQ_GENROT\t<token>  →  GENROT\t<token>\t<dsl>
         // "Generate rotation" button: hand back the class-default rotation for
