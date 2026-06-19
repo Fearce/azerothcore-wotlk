@@ -1483,6 +1483,32 @@ namespace WowPsParty
             if (cname == "self_has_aura")     return TargetHasNamedAura(bot, arg, auraCaster);
             if (cname == "self_missing_aura") return !TargetHasNamedAura(bot, arg, auraCaster);
 
+            // target_name:Krystallus,Other Boss — TRUE when the bot's current
+            // target's name matches any of the comma-separated names (case-
+            // insensitive, trimmed). Gates a rule to specific mobs/bosses, e.g.
+            // the Shatter "keep distance" spread only on Krystallus. Negate with
+            // a leading ! (handled by the AND-chain splitter) as usual.
+            if (cname == "target_name")
+            {
+                Unit* victim = theTarget();
+                if (!victim) return false;
+                std::string const have = Lower(victim->GetName());
+                size_t start = 0;
+                while (start <= arg.size())
+                {
+                    size_t const comma = arg.find(',', start);
+                    std::string token = arg.substr(
+                        start, comma == std::string::npos ? std::string::npos : comma - start);
+                    size_t const a = token.find_first_not_of(" \t");
+                    size_t const b = token.find_last_not_of(" \t");
+                    if (a != std::string::npos && Lower(token.substr(a, b - a + 1)) == have)
+                        return true;
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
+                return false;
+            }
+
             // tank_has_aura / tank_missing_aura — check the party's TANK (role from
             // the Party Roster), so a healer can keep Earth Shield / Beacon / a HoT
             // up on the tank. No live tank in world → the rule doesn't fire.
