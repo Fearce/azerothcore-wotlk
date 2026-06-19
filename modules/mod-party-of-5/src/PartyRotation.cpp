@@ -971,16 +971,60 @@ namespace WowPsParty
         return nullptr;
     }
 
+    static bool TargetHasNamedAura(Unit* target, std::string const& name,
+                                   ObjectGuid caster);  // fwd (defined below)
+
+    // Names from the cleanser's "protect_debuff:<a>,<b>,…" rule — debuffs the party
+    // must NOT cleanse off (e.g. Leech Poison on Hadronox, which the fight needs to
+    // stay applied). Mirrors BotFocusNames' parse.
+    static void ProtectedDebuffNames(ObjectGuid guid, std::vector<std::string>& out)
+    {
+        out.clear();
+        std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
+        auto it = g_rotationCache.find(guid.GetCounter());
+        if (it == g_rotationCache.end()) return;
+        for (RotationRule const& r : it->second)
+        {
+            if (r.action.rfind("protect_debuff:", 0) != 0) continue;
+            if (CsvContains(Lower(r.flags), "disabled")) continue;
+            std::string const list = r.action.substr(15);   // after "protect_debuff:"
+            size_t start = 0;
+            while (start <= list.size())
+            {
+                size_t const comma = list.find(',', start);
+                std::string token = list.substr(
+                    start, comma == std::string::npos ? std::string::npos : comma - start);
+                size_t const a = token.find_first_not_of(" \t");
+                size_t const b = token.find_last_not_of(" \t");
+                if (a != std::string::npos) out.push_back(token.substr(a, b - a + 1));
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+        }
+    }
+
     // Walk the bot's group and return the first member carrying a debuff
     // of the requested dispel type. Returns nullptr if no member is
-    // afflicted (or no group).
+    // afflicted (or no group). A member carrying a "protect_debuff" aura is
+    // SKIPPED — cleansing them risks stripping the protected debuff the fight
+    // needs to keep (Leech Poison on Hadronox), so they read as "nothing to
+    // cleanse" for both the cure_party target-pick AND the party_has_* gates.
     static Player* FindPartyMemberWithDispelType(Player* bot, DispelType type)
     {
         if (!bot) return nullptr;
+        std::vector<std::string> protectedNames;
+        ProtectedDebuffNames(bot->GetGUID(), protectedNames);
         std::vector<Player*> party;
         GatherPartyPlayers(bot, party, /*includeDead=*/false);
         for (Player* m : party)
-            if (HasDebuffOfType(m, type)) return m;
+        {
+            if (!HasDebuffOfType(m, type)) continue;
+            bool protectedHit = false;
+            for (std::string const& n : protectedNames)
+                if (TargetHasNamedAura(m, n, ObjectGuid::Empty)) { protectedHit = true; break; }
+            if (protectedHit) continue;   // keep the protected debuff — don't cleanse this member
+            return m;
+        }
         return nullptr;
     }
 
@@ -3089,6 +3133,10 @@ namespace WowPsParty
         // (BotFocusNames), not a per-tick cast — it never fires here. Recognise it
         // so the rule loop falls through cleanly instead of logging "unknown verb".
         if (verb == "focus") return false;
+
+        // "protect_debuff:<names>" is a config marker read by FindPartyMemberWithDispelType
+        // (don't cleanse these), not a per-tick cast — never fires here.
+        if (verb == "protect_debuff") return false;
 
         // Mid "Come Hither" recall the recall owns movement — suppress any verb that
         // would issue its OWN movement, so the bot runs to the leader instead of
