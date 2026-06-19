@@ -1455,39 +1455,41 @@ namespace WowPsParty
         if (leader->GetMapId() != bot->GetMapId()) return;
         if (!leader->GetMap() || !leader->GetMap()->IsDungeon()) return;
 
-        // Don't auto-pull the instant a fight ends. Track the tank's combat edge
-        // and hold off for a few seconds after it drops combat, so the party can
-        // loot/regroup/start drinking before the next pack is yanked in.
+        // Don't auto-pull the instant a fight ends — hold off until the WHOLE party
+        // has been out of combat for POST_COMBAT_PULL_DELAY, so it can loot / regroup
+        // / start drinking before the next pack is yanked in. CRUCIAL: the settle is
+        // measured from the last tick ANY member was in combat, NOT from the tank's
+        // own combat edge. The tank usually kills its mob and drops combat seconds
+        // before the dps finish, so a tank-only timer expired mid-fight and the tank
+        // pulled the instant the last dps dropped combat — "it pulls before the
+        // party's combat drops" (Kevin). A party-wide edge also absorbs the 1-2s lag
+        // before AC clears a member's combat flag. Skip too while anyone's
+        // drinking/eating (BotIsConsuming matches by aura TYPE, so it catches the
+        // human's higher-rank water/food, not just the bots' rank-1 Drink/Food).
         {
             // thread_local: TankLeadEngagement runs from the map-update thread pool,
-            // and a bot is always updated by the thread owning its map — so a per-
-            // thread map is race-free without a lock, matching wasAlive/stuckTracker
-            // below. (A plain static would data-race if MapUpdate.Threads > 1.)
-            static thread_local std::unordered_map<uint32, std::pair<bool, uint32>> combatState;  // gLow -> (wasInCombat, leftCombatMs)
-            bool const inCombat = bot->IsInCombat();
-            auto& cs = combatState[bot->GetGUID().GetCounter()];
-            if (cs.first && !inCombat) cs.second = getMSTime();   // just left combat
-            cs.first = inCombat;
-            if (!inCombat && cs.second != 0
-                && getMSTime() - cs.second < POST_COMBAT_PULL_DELAY_MS)
-                return;
-        }
+            // and a bot is always updated by the thread owning its map — race-free
+            // without a lock (matches wasAlive/stuckTracker below).
+            static thread_local std::unordered_map<uint32, uint32> lastPartyCombatMs;
+            uint32 const now = getMSTime();
+            uint32& lastCombat = lastPartyCombatMs[bot->GetGUID().GetCounter()];
 
-        // Don't pull while the party is recovering. Skip if ANY member (the human
-        // leader included) is seated drinking/eating or still in combat — nobody
-        // wants a fresh pack dragged onto a sitting mage mid-drink. BotIsConsuming
-        // matches the drink/food aura by TYPE, so it catches the leader's higher-
-        // rank water/food, not just the rank-1 Drink 430 / Food 433 the bots cast.
-        {
+            bool anyInCombat = bot->IsInCombat();
+            bool anyConsuming = false;
             std::vector<ObjectGuid> party;
             GetPartyGuidsFor(bot->GetGUID(), party);
             for (ObjectGuid const& g : party)
             {
                 Player* m = ObjectAccessor::FindConnectedPlayer(g);
                 if (!m || !m->IsInWorld() || m->GetMapId() != bot->GetMapId()) continue;
-                if (m->IsInCombat() || WowPsParty::BotIsConsuming(m))
-                    return;
+                if (m->IsInCombat())          anyInCombat = true;
+                if (WowPsParty::BotIsConsuming(m)) anyConsuming = true;
             }
+
+            if (anyInCombat) { lastCombat = now; return; }   // reset the settle timer
+            if (anyConsuming) return;                         // recovering — don't pull
+            if (lastCombat != 0 && now - lastCombat < POST_COMBAT_PULL_DELAY_MS)
+                return;                                       // settling after the party went quiet
         }
 
         // 30-yard leash. If we've drifted out of leash, let PartyFollow's
@@ -1623,6 +1625,7 @@ namespace WowPsParty
     static constexpr float GATHER_LEADER_LEASH = 75.0f; // only START a new gather within this of the leader
     static constexpr float GATHER_SCAN_RANGE   = GATHER_LEADER_LEASH; // node search radius == leash range
     static constexpr float GATHER_REACH        = 11.0f;  // interaction distance — long reach so bots harvest without walking on top of the node
+    static constexpr float GATHER_ARRIVED_REACH = 18.0f; // harvest-from-here cap once the navmesh can't get any closer (veins up rocks/ledges)
     static constexpr uint32 GATHER_APPROACH_TIMEOUT_MS = 6000; // give up if stuck
     static constexpr uint32 GATHER_AVOID_MS = 30000;   // ignore an unreachable node
 
@@ -2148,8 +2151,34 @@ namespace WowPsParty
         }
         if (!target) return;
 
-        if (bot->IsWithinDistInMap(target, GATHER_REACH))
+        // Re-read the commit time — the resolution block above may have just
+        // (re)committed this target, so the local copy from the top of the tick can
+        // be stale. Needed for the "arrived" grace below.
         {
+            std::lock_guard<std::mutex> lock(g_gatherMutex);
+            commitMs = g_gather[gLow].commitMs;
+        }
+
+        // Harvest when in normal reach, OR when the bot has ARRIVED as close as the
+        // navmesh can get it (stopped, after a moment of approaching) and the node
+        // is within a larger reach with line of sight. MINING veins commonly sit up
+        // on rocks/ledges/walls the navmesh can't path onto, so the bot stops at the
+        // base several yards short of GATHER_REACH; without this it just stood there
+        // until the 6s approach-timeout abandoned it, then re-picked it 30s later —
+        // the "miner stares at the vein for 30-60s, copper/herbs are fine" report
+        // (herbs sit on flat ground, always within reach). LoS (M2, matching the
+        // spell engine) stops harvesting through a wall.
+        bool const inReach = bot->IsWithinDistInMap(target, GATHER_REACH);
+        bool const arrivedShort =
+            !inReach
+            && !bot->isMoving()
+            && commitMs && (now - commitMs) > 1500
+            && bot->IsWithinDistInMap(target, GATHER_ARRIVED_REACH)
+            && bot->IsWithinLOSInMap(target, VMAP::ModelIgnoreFlags::M2);
+        if (inReach || arrivedShort)
+        {
+            if (arrivedShort)
+                GatherLog(gLow, "harvest: arrived as close as navmesh allows (elevated node) — gathering from extended reach");
             HarvestTarget(bot, target);
             std::lock_guard<std::mutex> lock(g_gatherMutex);
             auto& st = g_gather[gLow];
