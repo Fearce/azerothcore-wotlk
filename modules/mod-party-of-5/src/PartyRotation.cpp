@@ -4377,7 +4377,17 @@ namespace WowPsParty
             if (SpellInfo const* gi = gen->GetSpellInfo())
             {
                 castingHarmfulFiller = !gi->IsPositive();
-                castTimeInFlight     = gi->CalcCastTime() > 0;
+                // ONLY while the cast bar is actually up (SPELL_STATE_PREPARING).
+                // A projectile spell (Chain Lightning, Lava Burst, Lightning Bolt)
+                // lingers in the generic slot in SPELL_STATE_DELAYED while it
+                // TRAVELS to the target — but UNIT_STATE_CASTING is already cleared
+                // by then (Spell.cpp), so there is nothing left to self-interrupt
+                // and the rotation MUST be free to fire the next spell. Gating on
+                // PREPARING (not mere slot presence) avoids idling the rotation for
+                // the whole projectile travel time — a visible lull between every
+                // cast, single-target and AoE alike.
+                castTimeInFlight     = gi->CalcCastTime() > 0
+                                    && gen->getState() == SPELL_STATE_PREPARING;
             }
 
         // Healer threat-hold, computed once per tick (it scans the tank's combat
