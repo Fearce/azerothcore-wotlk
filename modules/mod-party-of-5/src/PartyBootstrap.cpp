@@ -161,6 +161,12 @@ public:
         if (!WowPsParty::IsEnabled() || !player)
             return;
 
+        // Self-heal a stuck ghost-mode "Transparency" aura left by a logout/crash
+        // mid path-recording (Kevin: "logged out while recording, now permanently
+        // transparent"). No-op unless the aura is actually present. Runs before the
+        // bot-skip below since the recorder is always the human.
+        WowPsParty::ClearStuckGhostMode(player);
+
         // Skip mod-playerbots spawned bots. OnPlayerLogin fires for every
         // login including bot spawns; we only want the real human session
         // player to trigger OnActiveLogin (which spawns the rest of the

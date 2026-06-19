@@ -54,6 +54,10 @@ namespace WowPsParty
     // who logs out mid-record doesn't relog stuck flying.
     void CancelPathRecording(Player* player);
 
+    // Login self-heal: strip a stuck ghost-mode "Transparency" aura (37800) from a
+    // player who isn't recording (logged out / crashed mid-record). No-op otherwise.
+    void ClearStuckGhostMode(Player* player);
+
     // Sample-tick hook called from PartyFollow's 1Hz ticker for every
     // recording player. Handles GM-mode reapplication, speed, and the
     // position-sample buffer.

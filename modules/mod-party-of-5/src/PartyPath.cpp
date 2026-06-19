@@ -379,6 +379,24 @@ namespace WowPsParty
             "(ghost mode cleared)", guidLow);
     }
 
+    // Belt-and-braces self-heal, called on LOGIN. If a player carries the ghost-mode
+    // visual aura (37800, the GM "Transparency" Player::SetGMVisible applies) but is
+    // NOT recording — a logout/crash/disconnect mid-record, or a save that persisted
+    // the aura before the logout cleanup ran — they're stuck permanently transparent
+    // (Kevin). Strip it and fully reset ghost state. Gated on the aura, so a normal
+    // player is never touched. (Recording is in-memory and cleared on logout, so at
+    // login no one is legitimately recording.)
+    static constexpr uint32 GHOST_VISUAL_AURA = 37800;   // Player::SetGMVisible's aura
+    void ClearStuckGhostMode(Player* player)
+    {
+        if (!player || !player->HasAura(GHOST_VISUAL_AURA)) return;
+        ApplyGhostMode(player, false);                 // SetGMVisible(true) removes 37800 + resets speed/fly
+        player->RemoveAurasDueToSpell(GHOST_VISUAL_AURA);   // explicit, in case GM state differed
+        LOG_INFO("module",
+            "[WowPsParty Path] cleared stuck ghost-mode aura (Transparency) on login for guid={}",
+            player->GetGUID().GetCounter());
+    }
+
     void TickPathRecording(uint32 /*diffMs*/)
     {
         // Sample EVERY tick — density is decided by DISTANCE + TURN, not time,
