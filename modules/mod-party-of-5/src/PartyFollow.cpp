@@ -839,6 +839,129 @@ namespace WowPsParty
     // a short one like Icy Touch from ~16y.)
     static constexpr float PULL_RETREAT_YDS = 12.0f;
 
+    // ===== Tank initial MULTI-PULL (pull_count:N) ===========================
+    //
+    // A lead tank can open on a CLUSTER of up to N mobs (default 3) instead of one,
+    // when the party is strong enough. Distinct from the single-mob ranged-pull-and-
+    // isolate flow (g_tankPull above): a multi-pull BODY-PULLS a tight cluster so the
+    // pack stacks on the tank's melee, and the party holds fire (IsPartyPullPending)
+    // until the whole set is gathered — giving the tank time to group them. Only an
+    // INITIAL pull triggers it (TankLeadEngagement already requires the whole party out
+    // of combat + rested AND the tank to have no live victim), so it never chain-pulls
+    // the dungeon: the party still eats/drinks between packs.
+    struct TankGatherState
+    {
+        uint32                  untilMs = 0;   // hard cap on the gather hold
+        std::vector<ObjectGuid> set;           // the mobs this opener means to gather
+    };
+    static std::unordered_map<uint32, TankGatherState> g_tankGather;   // tankLow -> state
+
+    static constexpr uint32 TANK_GATHER_MAX_MS = 6000;   // cap the party hold for a gather
+    static constexpr float  PULL_GATHER_RANGE  = 30.0f;  // scan radius for the pull pool
+    static constexpr float  MOB_CLUSTER_R      = 10.0f;  // mobs within this aggro/stack as one
+    static constexpr float  PULL_Z_TOLERANCE   = 6.0f;   // "similar Z-level" as the tank
+    static constexpr float  GATHER_STACK_R     = 9.0f;   // a set mob this near the tank = gathered
+
+    static void MarkTankGathering(uint32 tankLow, std::vector<ObjectGuid> set)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        uint32 const now = getMSTime();
+        // Opportunistic prune: a solo tank's gather entry is never read by
+        // IsPartyPullPending (no other members), so sweep expired entries here so the
+        // map can't slowly accumulate stale tank guids.
+        for (auto it = g_tankGather.begin(); it != g_tankGather.end(); )
+            it = (it->first != tankLow && now >= it->second.untilMs)
+                     ? g_tankGather.erase(it) : std::next(it);
+        TankGatherState& s = g_tankGather[tankLow];
+        s.untilMs = now + TANK_GATHER_MAX_MS;
+        s.set     = std::move(set);
+    }
+
+    // True while the tank is still gathering its multi-pull: the cap hasn't lapsed AND
+    // at least one alive set member hasn't stacked on the tank yet. Self-clears (returns
+    // false) at the cap so a mob that won't path can't freeze the party forever.
+    static bool IsTankGathering(Player* tank)
+    {
+        if (!tank) return false;
+        std::vector<ObjectGuid> set;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            auto it = g_tankGather.find(tank->GetGUID().GetCounter());
+            if (it == g_tankGather.end()) return false;
+            if (getMSTime() >= it->second.untilMs) { g_tankGather.erase(it); return false; }
+            set = it->second.set;
+        }
+        for (ObjectGuid const& g : set)
+        {
+            Creature* m = ObjectAccessor::GetCreature(*tank, g);
+            if (!m || !m->IsAlive()) continue;                        // dead/gone -> gathered
+            if (tank->GetDistance(m) > GATHER_STACK_R) return true;   // still inbound -> hold
+        }
+        return false;   // every alive member is stacked on the tank -> done
+    }
+
+    // Build the INITIAL multi-pull set: the connected proximity-cluster (edges within
+    // MOB_CLUSTER_R) that contains `anchor`, among UN-AGGROED hostiles near the tank
+    // that the tank can SEE (LoS) and that sit on a similar Z-level. Returns the most
+    // central member to body-pull (running to it sweeps the cluster's aggro radius) and
+    // fills `outSet`, ONLY when the cluster size is in [2, N] — it fills the pull target
+    // without overshooting. Returns nullptr (caller does a normal single pull) when the
+    // anchor is isolated (<2) OR its cluster is bigger than N (don't body-pull a whole
+    // big pack — the careful single pull is safer). This is the cluster-awareness: a mob
+    // that would drag the pack past N is simply never made into a multi-pull.
+    static Unit* SelectInitialPullCluster(Player* tank, Unit* anchor, uint32 N,
+                                          std::vector<ObjectGuid>& outSet)
+    {
+        outSet.clear();
+        if (!tank || !anchor || N < 2) return nullptr;
+
+        std::list<Unit*> nearby;
+        Acore::AnyUnfriendlyUnitInObjectRangeCheck check(tank, tank, PULL_GATHER_RANGE);
+        Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck>
+            searcher(tank, nearby, check);
+        Cell::VisitObjects(tank, searcher, PULL_GATHER_RANGE);
+
+        auto eligible = [&](Unit* u) -> bool
+        {
+            if (!u || !u->IsAlive() || u->IsInCombat()) return false;   // un-aggroed only
+            if (u->IsTotem()) return false;
+            if (!tank->IsValidAttackTarget(u)) return false;
+            if (std::fabs(u->GetPositionZ() - tank->GetPositionZ()) > PULL_Z_TOLERANCE) return false;
+            return tank->IsWithinLOSInMap(u, VMAP::ModelIgnoreFlags::M2);
+        };
+        // The anchor must itself be eligible to seed a clean cluster; if the tank can't
+        // even see it / it's already fighting, fall back to a normal single pull.
+        if (!eligible(anchor)) return nullptr;
+
+        std::vector<Unit*> elig{ anchor };
+        for (Unit* u : nearby)
+            if (u != anchor && eligible(u)) elig.push_back(u);
+        if (elig.size() < 2) return nullptr;
+
+        // Connected component of `anchor` (proximity graph, edge <= MOB_CLUSTER_R). BFS
+        // capped at N+1 — the moment it grows past N we know it's an overshoot pack.
+        std::vector<Unit*> comp{ elig[0] };
+        std::vector<bool>  used(elig.size(), false);
+        used[0] = true;
+        for (size_t head = 0; head < comp.size() && comp.size() <= N; ++head)
+            for (size_t i = 0; i < elig.size(); ++i)
+                if (!used[i] && comp[head]->GetDistance(elig[i]) <= MOB_CLUSTER_R)
+                { used[i] = true; comp.push_back(elig[i]); }
+        if (comp.size() < 2 || comp.size() > N) return nullptr;   // isolated or overshoot
+
+        // Body-pull from the most central member (most neighbours within MOB_CLUSTER_R).
+        Unit* seed = comp[0];
+        uint32 bestDeg = 0;
+        for (Unit* a : comp)
+        {
+            uint32 deg = 0;
+            for (Unit* b : comp) if (a != b && a->GetDistance(b) <= MOB_CLUSTER_R) ++deg;
+            if (deg > bestDeg) { bestDeg = deg; seed = a; }
+        }
+        for (Unit* u : comp) outSet.push_back(u->GetGUID());
+        return seed;
+    }
+
     // Henchmen currently being MOVED between groups during a (re-)hire. While a
     // guid is in here, the group-removal dismiss hook ignores it — otherwise
     // pulling a freshly-spawned henchman out of a STALE group (one left over in
@@ -1594,6 +1717,44 @@ namespace WowPsParty
             return;
         }
         bot->SetFacingToObject(nearest);
+
+        // Multi-pull (pull_count:N, default 3): on this INITIAL pull, try to open on a
+        // whole CLUSTER instead of one mob. If the nearest mob seeds a tight cluster of
+        // 2..N eligible (un-aggroed, in the tank's LoS, similar Z) mobs, BODY-PULL it —
+        // run into the cluster so the pack aggros and stacks on the tank — mark the
+        // gather (the party holds fire until they're stacked, via IsPartyPullPending),
+        // and skip the single-mob ranged-isolate flow below. A bigger-than-N pack or an
+        // isolated mob returns null and falls through to the normal single pull. Gated
+        // to a real initial pull by the no-live-victim + party-rested checks above, so
+        // it never chain-pulls; the party eats/drinks between packs as before.
+        // INTENTIONAL precedence over safe_pull: a found 2..N cluster is body-pulled even
+        // when safe_pull is ON (it's the whole point of pull_count). A LONE mob still
+        // falls through to the safe ranged pull below, so safe_pull keeps governing the
+        // common single-target case; set pull_count:1 to force single pulls everywhere.
+        uint32 const pullN = WowPsParty::BotInitialPullCount(bot->GetGUID());
+        if (pullN >= 2)
+        {
+            std::vector<ObjectGuid> set;
+            if (Unit* seed = SelectInitialPullCluster(bot, nearest, pullN, set))
+            {
+                // The seed may differ from `nearest`; (re)attack it. If it's evading or
+                // immune, Unit::Attack rejects it — abandon the multi-pull and fall
+                // through to the single pull on `nearest` (already attacked above), so we
+                // never charge + hold the party on a mob we can't actually engage
+                // (mirrors the single-pull CANT-ATTACK bail).
+                if (bot->GetVictim() == seed || bot->Attack(seed, true))
+                {
+                    MarkTankGathering(bot->GetGUID().GetCounter(), set);
+                    bot->SetFacingToObject(seed);
+                    bot->GetMotionMaster()->MoveChase(seed);   // body-pull into the cluster
+                    LOG_INFO("module",
+                        "[WowPsParty TankLead] guid={} MULTI-PULL {}/{} mobs seed_guid={} entry={} dist={:.1f}",
+                        bot->GetGUID().GetCounter(), uint32(set.size()), pullN,
+                        seed->GetGUID().GetCounter(), seed->GetEntry(), bot->GetDistance(seed));
+                    return;
+                }
+            }
+        }
 
         // Ranged pull: a tank that can open from range doesn't charge into the
         // pack. It closes only to ability range, then the rotation (Heroic Throw,
@@ -2645,10 +2806,17 @@ namespace WowPsParty
 
         Player* tank = PartyLeadTank(bot);
         if (!tank || tank == bot) return false;
+
+        // Multi-pull gather: hold until the whole cluster is stacked on the tank
+        // (bounded by TANK_GATHER_MAX_MS), so the tank can group the pack before DPS
+        // threat splits it across the not-yet-gathered mobs. Self-clears at the cap.
+        if (IsTankGathering(tank)) return true;
+
         if (!IsTankPulling(tank->GetGUID())) return false;
 
-        // Engaged the instant a hostile reaches the tank's melee (victim or any
-        // attacker) — that's "the tank has the pack", so the party is free to go.
+        // Single-mob pull: engaged the instant a hostile reaches the tank's melee
+        // (victim or any attacker) — that's "the tank has the pack", so the party is
+        // free to go.
         if (Unit* tv = tank->GetVictim())
             if (tank->IsWithinMeleeRange(tv)) return false;
         for (Unit* a : tank->getAttackers())

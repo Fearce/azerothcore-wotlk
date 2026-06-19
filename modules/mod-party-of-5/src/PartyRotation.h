@@ -23,6 +23,10 @@
  *     target_is_boss | target_is_elite | target_is_rare | target_is_normal
  *     target_type_{beast,dragonkin,demon,elemental,giant,undead,humanoid}
  *     target_casting | target_channeling | target_interruptible
+ *     target_casting:<spell> | target_channeling:<spell>   fire only while the target
+ *                                 is mid-cast of THAT spell (display name, any rank, or
+ *                                 numeric id) — e.g. target_casting:Dark Smash. Empty arg
+ *                                 = any cast. Pair with move_out_of_los or a kick/stun.
  *     self_casting | self_channeling     the bot's OWN cast/channel state
  *     target_ttd<N | target_ttd>N         estimated seconds-to-die
  *     target_has_aura:<spell> | target_missing_aura:<spell>
@@ -57,6 +61,11 @@
  *     cast_party_missing:<spell>   buff first member missing the spell's aura
  *     cast_class_missing / cast_role_missing / cure_party / rez_party /
  *     cast_loose_enemy / drink / eat / hold_position
+ *     move_out_of_los              run behind cover so the current target can't see
+ *                                  (or land its cast on) the bot; auto-returns to the
+ *                                  fight when the gating condition clears. Pair with
+ *                                  target_casting:<spell>, e.g.
+ *                                  "target_casting:Dark Smash | move_out_of_los | 200".
  *     use_item:<item name>         use a consumable/trinket from shared bags
  *     pull:<spell name>            ranged opener (Throw/Shoot) for the tank
  *     shoot                        fire the equipped physical ranged weapon
@@ -66,6 +75,12 @@
  *     wand                         fire the equipped wand (free caster filler)
  *  Ground-targeted AoE spells (Blizzard, Flamestrike, Rain of Fire) used via
  *  cast:<spell> auto-aim at the densest enemy cluster, not the current target.
+ *
+ * Tank pull config (read by the engagement layer, not fired per tick):
+ *     pull_count:N   lead tank opens on a cluster of up to N mobs (default 3, 1 = single).
+ *                    Only the INITIAL pull from a rested party; cluster-aware (won't drag
+ *                    a mob that brings the pack past N), LoS- and same-Z-gated. While the
+ *                    tank gathers, the party holds fire so it can stack them.
  *
  * Optional 4th field `flags` (comma-separated). Recognised:
  *     clip   — allow this cast to interrupt the bot's own cast/channel.
@@ -162,6 +177,12 @@ namespace WowPsParty
     // kill on sight (e.g. "Chaos Rift", "Frost Tomb"). Empty when none configured.
     // AssistTarget reads this to override target selection onto a matching enemy.
     void BotFocusNames(ObjectGuid guid, std::vector<std::string>& out);
+
+    // A lead tank's configured INITIAL-pull target size from a "pull_count:N"
+    // rotation directive (e.g. "always|pull_count:3|0"). Default 3, clamped [1,8].
+    // 1 = the classic single-mob pull. TankLeadEngagement reads this to body-pull a
+    // cluster of up to N mobs on the opener (cluster-aware, LoS- and Z-gated).
+    uint32 BotInitialPullCount(ObjectGuid guid);
 
     // Returns true if the bot has at least one cached rule (cheap check, called
     // every UpdateAI tick).

@@ -20,6 +20,7 @@
 #include "Log.h"
 #include "MotionMaster.h"
 #include "ObjectAccessor.h"
+#include "PathGenerator.h"   // reachability check for the move_out_of_los duck spot
 #include "Pet.h"
 #include "Player.h"
 #include "Random.h"
@@ -202,6 +203,26 @@ namespace WowPsParty
                 start = comma + 1;
             }
         }
+    }
+
+    uint32 BotInitialPullCount(ObjectGuid guid)
+    {
+        // Default 3: a lead tank opens on up to a 3-mob cluster unless the rotation
+        // says otherwise. "pull_count:1" restores the classic single-mob pull.
+        constexpr uint32 DEFAULT_PULL = 3;
+        std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
+        auto it = g_rotationCache.find(guid.GetCounter());
+        if (it == g_rotationCache.end()) return DEFAULT_PULL;
+        for (RotationRule const& r : it->second)
+        {
+            if (r.action.rfind("pull_count:", 0) != 0) continue;
+            if (CsvContains(Lower(r.flags), "disabled")) continue;
+            int const n = std::atoi(r.action.c_str() + 11);   // after "pull_count:"
+            if (n < 1) return 1;
+            if (n > 8) return 8;                                // sane upper bound
+            return uint32(n);
+        }
+        return DEFAULT_PULL;
     }
 
     void RotationCacheRefreshFromDB(uint32 guid)
@@ -614,6 +635,62 @@ namespace WowPsParty
             return true;
         }
         return false;   // no safe + in-LoS spot — caller skips the kite
+    }
+
+    // Can the bot actually WALK to (x,y,z)? Asks the navmesh. Rejects a spot the
+    // path can't reach (NOPATH) or only reaches partway (INCOMPLETE — clamped at a
+    // wall) or is off-mesh (FARFROMPOLY), and rejects a path that detours absurdly
+    // far. On a map with NO mmaps every query is a SHORTCUT/NOT_USING straight line,
+    // which we ACCEPT (MovePoint falls back to straight-line there anyway). This is
+    // what stops move_out_of_los from picking an out-of-LoS spot behind a solid wall
+    // it can never round.
+    static bool NavReachable(Player* bot, float x, float y, float z, float straight)
+    {
+        PathGenerator gen(bot);
+        if (!gen.CalculatePath(x, y, z, false)) return false;
+        PathType const t = gen.GetPathType();
+        if (t & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE | PATHFIND_FARFROMPOLY))
+            return false;
+        // A real navmesh path (NORMAL) that loops the long way around isn't worth it;
+        // bound the detour. SHORTCUT/NOT_USING (no mmap) reports the straight distance,
+        // which always passes this bound.
+        return gen.getPathLength() <= straight * 2.5f + 8.0f;
+    }
+
+    // Find the NEAREST reachable spot from which `enemy` has NO line of sight to the
+    // bot — i.e. a piece of cover to duck behind. Samples rings around the bot from
+    // close to far, fanning each ring from the away-from-enemy direction outward, and
+    // returns the first candidate that (a) breaks the enemy's LoS to the spot and
+    // (b) is on a reachable navmesh path. Nearest-first keeps the bot from sprinting
+    // across the room when a closer pillar would do. Returns false in open ground with
+    // no cover, so the caller skips (a duck that hides nothing must not reserve the tick).
+    static bool PickLosBreakPoint(Player* bot, Unit* enemy,
+                                  float& ox, float& oy, float& oz)
+    {
+        if (!bot || !enemy) return false;
+        float const awayAngle = enemy->GetAngle(bot);   // enemy -> bot, i.e. away from enemy
+        static float const radii[]   = { 8.0f, 12.0f, 16.0f, 20.0f, 25.0f };
+        static float const offsets[] = { 0.0f, 0.6f, -0.6f, 1.2f, -1.2f, 1.8f, -1.8f,
+                                         2.4f, -2.4f, 3.14159265f };   // away, fan out, finally toward-past
+        for (float r : radii)
+        {
+            for (float off : offsets)
+            {
+                float x, y, z;
+                bot->GetNearPoint(bot, x, y, z, 0.0f, r, awayAngle + off);
+                // Cheap VMAP ray first: must actually break the enemy's sight line.
+                // M2 so "out of LoS" here means the SAME thing the move_out_of_los gate
+                // (and Spell::CheckCast) mean — else a spot shadowed only by an M2 doodad
+                // passes here but the M2 gate still reads in-LoS, and the bot re-picks it
+                // every tick and never settles.
+                if (enemy->IsWithinLOS(x, y, z, VMAP::ModelIgnoreFlags::M2)) continue;
+                // Only then pay for the navmesh query (out-of-LoS candidates are few).
+                if (!NavReachable(bot, x, y, z, r)) continue;
+                ox = x; oy = y; oz = z;
+                return true;
+            }
+        }
+        return false;
     }
 
     // Size of the densest cluster of hostiles that are all within `radius` of
@@ -3169,6 +3246,10 @@ namespace WowPsParty
         // so the rule loop falls through cleanly instead of logging "unknown verb".
         if (verb == "focus") return false;
 
+        // "pull_count:N" is a tank CONFIG directive read by TankLeadEngagement
+        // (BotInitialPullCount), not a per-tick cast. Recognise + skip it the same way.
+        if (verb == "pull_count") return false;
+
         // Mid "Come Hither" recall the recall owns movement — suppress any verb that
         // would issue its OWN movement, so the bot runs to the leader instead of
         // kiting/repositioning/pulling away. Instant CASTS still flow (cast-time is
@@ -3177,7 +3258,8 @@ namespace WowPsParty
             && (verb == "keep_distance_enemy" || verb == "keep_distance_healer"
                 || verb == "keep_distance_party" || verb == "close_to_enemy"
                 || verb == "move_behind"      || verb == "hold_position"
-                || verb == "pull"             || verb == "reposition_random"))
+                || verb == "move_out_of_los"  || verb == "pull"
+                || verb == "reposition_random"))
             return false;
 
         if (verb == "cast" || verb == "cast_self")
@@ -3848,6 +3930,64 @@ namespace WowPsParty
                             std::max(v->GetCombatReach() + 1.0f, 2.0f), back);
             WowPsParty::HoldFollower(bot->GetGUID(), 1500);
             bot->GetMotionMaster()->MovePoint(0, x, y, z);
+            return true;
+        }
+
+        // "move_out_of_los" — duck behind cover so the target can't see (and so can't
+        // land) what it's casting. Pair with target_casting:<spell>, e.g.
+        //   "target_casting:Dark Smash | move_out_of_los | 200"
+        // The rule fires ONLY while that cast is up; the moment the target stops casting
+        // it the rule stops matching, the follow-hold lapses, and AssistTarget re-engages
+        // — the bot walks back into LoS and resumes the fight, no separate "move back in"
+        // action needed. While ducking we HoldFollower every tick so AssistTarget yields
+        // the feet (it returns early on IsFollowerHeld), the same way move_behind/kite do.
+        // No spell — pure positioning. Returns false (frees the tick for a lower rule) in
+        // open ground with no cover to reach, rather than freezing in place.
+        if (verb == "move_out_of_los")
+        {
+            Unit* enemy = bot->GetVictim();
+            if (!enemy || !enemy->IsAlive()) return false;
+
+            // M2 = ignore decorative doodads, matching Spell::CheckCast's own LoS — so
+            // "out of LoS" here means the same thing the cast engine will mean when the
+            // enemy's spell tries to land on us.
+            bool const inLoS = bot->IsWithinLOSInMap(enemy, VMAP::ModelIgnoreFlags::M2);
+
+            // Already hidden: hold here and wait the cast out. Keep AssistTarget off our
+            // feet so it doesn't drag us back into the open; don't re-issue movement (no
+            // churn) while a duck is still in flight.
+            if (!inLoS)
+            {
+                // Stop only an ACTIVE non-idle, non-duck generator (e.g. AssistTarget
+                // snuck a chase/follow back in) — let an in-flight duck (POINT) finish
+                // and sit quietly when already idle, so the hold doesn't churn per tick.
+                MovementGeneratorType const mg =
+                    bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
+                if (mg != POINT_MOTION_TYPE && mg != IDLE_MOTION_TYPE)
+                {
+                    bot->StopMoving();
+                    bot->GetMotionMaster()->Clear();
+                }
+                WowPsParty::HoldFollower(bot->GetGUID(), 1500);
+                return true;
+            }
+
+            // In LoS: run to the nearest reachable spot the enemy can't see us from.
+            // Re-issue only when not already moving to a point, so it's one decisive
+            // duck rather than a per-tick stutter.
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+            {
+                float x, y, z;
+                if (!PickLosBreakPoint(bot, enemy, x, y, z))
+                    return false;   // open ground, nowhere to hide — let a lower rule act
+                WowPsParty::HoldFollower(bot->GetGUID(), 2000);
+                // forceDestination=false: only take a spot the navmesh can REACH (the
+                // PickLosBreakPoint check already vetted this, but keep the wall-safe
+                // fallback so we never straight-line dive through geometry).
+                bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                                                  0.0f, 0.0f, /*generatePath=*/true,
+                                                  /*forceDestination=*/false);
+            }
             return true;
         }
 
