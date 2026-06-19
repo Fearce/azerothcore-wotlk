@@ -2536,8 +2536,17 @@ namespace lfg
             if (!dungeon || (dungeon->type != LFG_TYPE_RANDOM && !dungeon->seasonal))
             {
                 LOG_DEBUG("lfg", "LFGMgr::FinishDungeon: [{}] dungeon {} is not random or seasonal", guid.ToString(), rDungeonId);
+                // [WowPsParty] Diagnostic: the emblem reward hinges on the player's
+                // SELECTED dungeon being the random entry; a clobbered selection
+                // (see SetupGroupMember) lands here and silently skips emblems.
+                LOG_INFO("module",
+                    "[WowPsParty LFG] reward SKIP guid={} completed={} selected={} — selection not random (no emblems)",
+                    guid.ToString(), dungeonId, rDungeonId);
                 continue;
             }
+            LOG_INFO("module",
+                "[WowPsParty LFG] reward OK guid={} completed={} randomSelected={}",
+                guid.ToString(), dungeonId, rDungeonId);
 
             // Record dungeon cooldown for this player (the actual dungeon completed, not the random entry)
             AddDungeonCooldown(guid, dungeonId);
@@ -3073,9 +3082,23 @@ namespace lfg
 
     void LFGMgr::SetupGroupMember(ObjectGuid guid, ObjectGuid gguid)
     {
-        LfgDungeonSet dungeons;
-        dungeons.insert(GetDungeon(gguid));
-        SetSelectedDungeons(guid, dungeons);
+        // [WowPsParty] Do NOT clobber a player's RANDOM/seasonal dungeon
+        // selection with the group's resolved SPECIFIC dungeon. FinishDungeon
+        // reads the player's selected dungeon to decide the random-completion
+        // reward (Emblems of Triumph/Frost): a non-random selection there means
+        // "not random → no reward". A persistent party-of-5's group gets members
+        // (re-)added / re-synced AFTER it's bound to its specific dungeon (e.g.
+        // Azjol'Nerub 204), so the stock unconditional overwrite wiped the human's
+        // random tag (261/262) and silently dropped the end-of-run emblems. Stock
+        // 5-stranger groups dodge this only because members are added before the
+        // group's dungeon is set to the specific. Preserve an existing random
+        // selection; still sync everything else.
+        if (!selectedRandomLfgDungeon(guid))
+        {
+            LfgDungeonSet dungeons;
+            dungeons.insert(GetDungeon(gguid));
+            SetSelectedDungeons(guid, dungeons);
+        }
         SetState(guid, GetState(gguid));
         SetGroup(guid, gguid);
         AddPlayerToGroup(gguid, guid);
