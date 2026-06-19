@@ -14,6 +14,7 @@
 #include "MotionMaster.h"
 #include "ObjectAccessor.h"
 #include "PathGenerator.h"
+#include "StringFormat.h"
 #include "Player.h"
 #include "WorldSession.h"
 
@@ -491,6 +492,27 @@ namespace WowPsParty
         return SelectPathForLeader(mapId, leader).size() >= 2;
     }
 
+    // Diagnostic: the TRUE nearest-waypoint distance to the leader across ALL
+    // recorded groups on the map, IGNORING WING_SELECT_MAX_DIST. When the path
+    // ticker reports "no recorded path", this tells us whether the leader really
+    // is far from the route (a genuine gap) or the route is right there but the
+    // 250y wing cap (or a Z/cache issue) wrongly rejected it (a selection bug).
+    // Returns -1 if nothing is recorded on the map at all.
+    static float NearestWaypointDistDebug(uint32 mapId, Player* leader)
+    {
+        std::vector<PathGroup> const& groups = EnsureGroups(mapId);
+        if (!leader || groups.empty()) return -1.0f;
+        float best = std::numeric_limits<float>::max();
+        for (PathGroup const& g : groups)
+            for (Vec3 const& w : g.pts)
+            {
+                float const d = Dist3D(leader->GetPositionX(), leader->GetPositionY(),
+                                       leader->GetPositionZ(), w.x, w.y, w.z);
+                if (d < best) best = d;
+            }
+        return best;
+    }
+
     void TankFollowPath(Player* bot)
     {
         // Rate-limited diagnostic so we can see WHY the tank isn't leading.
@@ -524,7 +546,15 @@ namespace WowPsParty
         // dungeons share a map id). Empty -> no recording near the leader -> don't
         // lead (and never walk another wing's route).
         auto const& path = SelectPathForLeader(bot->GetMapId(), leader);
-        if (path.size() < 2) { tlog("skip: no recorded path for this wing (<2 wp)"); return; }
+        if (path.size() < 2)
+        {
+            // Include the TRUE nearest waypoint distance so we can tell a genuine
+            // off-route gap from a wing-cap/Z/cache selection bug (Singing Grove).
+            tlog(Acore::StringFormat(
+                "skip: no recorded path for this wing (<2 wp) — true nearest waypoint {:.0f}y (cap {:.0f})",
+                NearestWaypointDistDebug(bot->GetMapId(), leader), WING_SELECT_MAX_DIST).c_str());
+            return;
+        }
 
         // Leash check — HORIZONTAL distance only. A big VERTICAL gap (the leader
         // just dropped down a hole / off a ledge on the recorded route — e.g. the
