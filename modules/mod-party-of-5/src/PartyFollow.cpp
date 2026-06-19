@@ -3419,6 +3419,37 @@ namespace WowPsParty
                 return;
             }
 
+            // No line of sight (target up stairs / behind a pillar / around a
+            // corner): MoveChase below is the WRONG tool — it only maintains a
+            // DISTANCE band, with no concept of LoS. If the target is already
+            // within [15, hold] by straight-line distance the chase generator
+            // thinks we're in position and never moves, so the bot stands blind
+            // and the party clears the pack without it (Kevin, 2026-06-19: shadow
+            // priest froze at the bottom of the stairs). And if we're inside 15y
+            // the chase would back us AWAY, worsening LoS. Force a navmesh
+            // MovePoint toward the target until LoS clears — the same blind-kiter
+            // recovery the rotation's keep_distance_enemy rule uses. Sits ABOVE
+            // the <8y back-out so a too-close-but-blind bot closes to see rather
+            // than retreating out of LoS.
+            if (!los)
+            {
+                if (mg != POINT_MOTION_TYPE)
+                {
+                    float lx, ly, lz;
+                    desired->GetNearPoint(bot, lx, ly, lz, 0.0f,
+                                          std::min(hold, 10.0f), desired->GetAngle(bot));
+                    // generatePath rounds the corner / climbs the stairs;
+                    // forceDestination=false so an unreachable spot just isn't
+                    // taken (no straight-line dive through geometry).
+                    bot->GetMotionMaster()->MovePoint(0, lx, ly, lz, FORCED_MOVEMENT_NONE,
+                                                      0.0f, 0.0f, /*generatePath=*/true,
+                                                      /*forceDestination=*/false);
+                    AssistLog(gLow, "ranged: no LoS — closing to regain line of sight");
+                }
+                bot->SetFacingToObject(desired);
+                return;
+            }
+
             if (d < 8.0f)
             {
                 // Nothing on us but we're <8y (walked in, or the mob died / was
