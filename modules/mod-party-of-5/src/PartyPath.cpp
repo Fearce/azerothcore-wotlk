@@ -626,9 +626,37 @@ namespace WowPsParty
         float  nearestD   = nearestFrom(scanStart, nearestIdx, CURSOR_ADVANCE_WINDOW);
         if (nearestD > LEAD_DISTANCE)            // lost the leader ahead of the cursor — resync
         {
-            uint32 gIdx = 0;
-            float const gD = nearestFrom(0, gIdx, 0.0f);   // unbounded re-scan
-            if (gD + 1.0f < nearestD) { nearestIdx = gIdx; nearestD = gD; }
+            // FORWARD-FIRST resync. The leader is past the cursor's window — usually
+            // because the cursor froze during a boss fight and the leader then walked
+            // on. Re-acquire by the EARLIEST waypoint AHEAD of the cursor the leader
+            // is essentially standing on (≤10y), which follows the recorded SEQUENCE
+            // and therefore can't skip a leg. CRUCIAL in a HUB dungeon (Halls of
+            // Stone: every wing returns through the centre, so the centre waypoints of
+            // later passes sit on top of earlier ones — an unbounded global re-scan
+            // leapt the cursor to a later pass and skipped Hall of Repose + Tribunal
+            // of Ages). Only if no forward waypoint is near (genuine relocation —
+            // teleport / wipe corpse-run / wing change) fall back to the unbounded
+            // re-scan from 0.
+            constexpr float REACQUIRE_RADIUS = 10.0f;
+            uint32 fwdIdx = uint32(path.size());
+            for (uint32 i = scanStart; i < path.size(); ++i)
+            {
+                float const d = Dist3D(leader->GetPositionX(), leader->GetPositionY(),
+                                       leader->GetPositionZ(), path[i].x, path[i].y, path[i].z);
+                if (d <= REACQUIRE_RADIUS) { fwdIdx = i; break; }   // earliest = no leg skip
+            }
+            if (fwdIdx < path.size())
+            {
+                nearestIdx = fwdIdx;
+                nearestD   = Dist3D(leader->GetPositionX(), leader->GetPositionY(),
+                                    leader->GetPositionZ(), path[fwdIdx].x, path[fwdIdx].y, path[fwdIdx].z);
+            }
+            else
+            {
+                uint32 gIdx = 0;
+                float const gD = nearestFrom(0, gIdx, 0.0f);   // unbounded re-scan (relocation)
+                if (gD + 1.0f < nearestD) { nearestIdx = gIdx; nearestD = gD; }
+            }
         }
         {
             std::lock_guard<std::mutex> lock(g_tankProgressMutex);
@@ -825,7 +853,9 @@ namespace WowPsParty
             cur = targetIdx + 1;
         }
 
-        tlog("LEAD: MovePoint to lookahead waypoint");
+        tlog(Acore::StringFormat(
+            "LEAD: MovePoint to lookahead — cursor={} lookahead={}/{} leaderNearD={:.0f}",
+            nearestIdx, targetIdx, uint32(path.size()) - 1, nearestD).c_str());
         bot->GetMotionMaster()->Clear();
         bot->GetMotionMaster()->MovePoint(0, wp.x, wp.y, wp.z);
     }
