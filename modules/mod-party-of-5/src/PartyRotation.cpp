@@ -173,6 +173,36 @@ namespace WowPsParty
         return false;
     }
 
+    // Collect the comma-separated names from every enabled "focus:<a>,<b>,…" rule
+    // in the bot's cached rotation. These are must-kill adds (Chaos Rift on
+    // Anomalus, Frost Tomb in Utgarde Keep) the party should switch to on sight;
+    // AssistTarget overrides target selection onto the nearest match.
+    void BotFocusNames(ObjectGuid guid, std::vector<std::string>& out)
+    {
+        out.clear();
+        std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
+        auto it = g_rotationCache.find(guid.GetCounter());
+        if (it == g_rotationCache.end()) return;
+        for (RotationRule const& r : it->second)
+        {
+            if (r.action.rfind("focus:", 0) != 0) continue;
+            if (CsvContains(Lower(r.flags), "disabled")) continue;
+            std::string const list = r.action.substr(6);   // after "focus:"
+            size_t start = 0;
+            while (start <= list.size())
+            {
+                size_t const comma = list.find(',', start);
+                std::string token = list.substr(
+                    start, comma == std::string::npos ? std::string::npos : comma - start);
+                size_t const a = token.find_first_not_of(" \t");
+                size_t const b = token.find_last_not_of(" \t");
+                if (a != std::string::npos) out.push_back(token.substr(a, b - a + 1));
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+        }
+    }
+
     void RotationCacheRefreshFromDB(uint32 guid)
     {
         QueryResult q = CharacterDatabase.Query(
@@ -2969,6 +2999,11 @@ namespace WowPsParty
                 logFriendly(spellId, target, "hard block (cooldown/power/stance) -> not casting");
             return false;
         };
+
+        // "focus:<names>" is a TARGETING directive consumed by AssistTarget
+        // (BotFocusNames), not a per-tick cast — it never fires here. Recognise it
+        // so the rule loop falls through cleanly instead of logging "unknown verb".
+        if (verb == "focus") return false;
 
         if (verb == "cast" || verb == "cast_self")
         {

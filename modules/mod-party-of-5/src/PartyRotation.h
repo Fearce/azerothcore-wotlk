@@ -158,6 +158,11 @@ namespace WowPsParty
     // stops chasing and lets the rotation own movement.
     bool BotIsKiting(ObjectGuid guid);
 
+    // Names listed in the bot's rotation "focus:" rule(s) — adds the party must
+    // kill on sight (e.g. "Chaos Rift", "Frost Tomb"). Empty when none configured.
+    // AssistTarget reads this to override target selection onto a matching enemy.
+    void BotFocusNames(ObjectGuid guid, std::vector<std::string>& out);
+
     // Returns true if the bot has at least one cached rule (cheap check, called
     // every UpdateAI tick).
     bool HasRotation(uint32 guid);

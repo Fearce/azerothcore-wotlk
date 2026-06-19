@@ -188,6 +188,28 @@ namespace WowPsParty
             Group* _grp;
         };
 
+        // Matches a live, attackable enemy whose name is in the focus list (names
+        // pre-lowercased by the caller). Drives the rotation "focus:" override —
+        // a must-kill add (Chaos Rift on Anomalus, Frost Tomb in Utgarde Keep).
+        struct NearbyFocusEnemyCheck
+        {
+            NearbyFocusEnemyCheck(Player const* src, std::vector<std::string> const& lowNames, float range)
+                : _src(src), _names(lowNames), _range(range) {}
+            bool operator()(Creature* c) const
+            {
+                if (!c || !c->IsAlive()) return false;
+                if (!_src->IsWithinDist(c, _range, false)) return false;
+                if (!_src->IsValidAttackTarget(c)) return false;
+                std::string n = c->GetName();
+                for (char& ch : n) if (ch >= 'A' && ch <= 'Z') ch = char(ch + 32);
+                for (std::string const& fn : _names) if (n == fn) return true;
+                return false;
+            }
+            Player const* _src;
+            std::vector<std::string> const& _names;
+            float _range;
+        };
+
         struct Directive
         {
             uint32      account;       // for SetActiveFollowers clearing
@@ -2814,6 +2836,34 @@ namespace WowPsParty
         return WaitForHumanTank(bot->GetGUID());
     }
 
+    static constexpr float FOCUS_SCAN_RANGE = 50.0f;   // how far to look for a "focus:" add
+
+    // Nearest live, attackable enemy whose name is in `names` (the rotation
+    // "focus:" list) within `range`. Forces the whole party onto a must-kill add
+    // (Chaos Rift / Frost Tomb) the instant it appears.
+    static Unit* FindNearestFocusEnemy(Player* bot, std::vector<std::string> const& names, float range)
+    {
+        std::vector<std::string> low;
+        low.reserve(names.size());
+        for (std::string s : names)
+        {
+            for (char& ch : s) if (ch >= 'A' && ch <= 'Z') ch = char(ch + 32);
+            low.push_back(std::move(s));
+        }
+        std::list<Creature*> crs;
+        NearbyFocusEnemyCheck check(bot, low, range);
+        Acore::CreatureListSearcher<NearbyFocusEnemyCheck> searcher(bot, crs, check);
+        Cell::VisitObjects(bot, searcher, range);
+        Creature* best = nullptr;
+        float bestDist = range + 1.0f;
+        for (Creature* c : crs)
+        {
+            float const d = bot->GetDistance(c);
+            if (d < bestDist) { bestDist = d; best = c; }
+        }
+        return best;
+    }
+
     void AssistTarget(Player* bot)
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
@@ -3071,6 +3121,25 @@ namespace WowPsParty
         if (desired && (!desired->IsAlive() || !bot->IsValidAttackTarget(desired)))
             desired = nullptr;
 
+        // ---- FOCUS override -----------------------------------------------------
+        // A rotation "focus:<names>" rule marks must-kill adds (Chaos Rift on
+        // Anomalus, Frost Tomb in Utgarde Keep). When the bot is already in combat
+        // and a matching, attackable enemy is nearby, switch the WHOLE party onto
+        // it NOW — computed here so it bypasses the human-tank threat gate, the
+        // retarget throttle and the combo-point hold below (all gated on !focusMob).
+        // Only while in combat: these adds spawn mid-fight, so this never starts a
+        // pull. The tank taunts/holds it and dps pile on, killing it fast.
+        Unit* focusMob = nullptr;
+        if (bot->IsInCombat())
+        {
+            std::vector<std::string> focusNames;
+            WowPsParty::BotFocusNames(bot->GetGUID(), focusNames);
+            if (!focusNames.empty())
+                focusMob = FindNearestFocusEnemy(bot, focusNames, FOCUS_SCAN_RANGE);
+        }
+        if (focusMob)
+            desired = focusMob;
+
         // ---- Pure threat gate: a non-tank only fights what the human TANK holds --
         // In a dungeon led by a human tank, a DPS *or healer* bot attacks a mob ONLY
         // once the tank has a real engage lead on it AND the bot is under
@@ -3080,6 +3149,9 @@ namespace WowPsParty
         // DPS; its HEALS are gated separately in TickRotation). BOSSES are exempt —
         // a boss is tank-and-spank, the tank holds it reliably, so DPS/heal blast
         // immediately. AoE pulls still can't be perfectly gated (accepted).
+        // Skipped entirely for a focus add — a must-kill rift/tomb gets immediate
+        // dps from the whole party, threat be damned.
+        if (!focusMob)
         {
             std::string const myRole = RoleForGuid(bot->GetGUID());
             bool const gated = desired && myRole != "tank";   // DPS AND healer; tank engages freely
@@ -3169,7 +3241,9 @@ namespace WowPsParty
         Unit* const current = bot->GetVictim();
         bool const currentValid = current && current->IsAlive()
                                   && bot->IsValidAttackTarget(current);
-        if (currentValid)
+        // A focus add bypasses the throttle AND the combo-point hold below — switch
+        // to it immediately even mid-cast / mid-combo; killing it is the priority.
+        if (currentValid && !focusMob)
         {
             if (!desired)
             {
