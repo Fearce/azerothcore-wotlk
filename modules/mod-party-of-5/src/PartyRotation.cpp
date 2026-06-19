@@ -974,55 +974,25 @@ namespace WowPsParty
     static bool TargetHasNamedAura(Unit* target, std::string const& name,
                                    ObjectGuid caster);  // fwd (defined below)
 
-    // Names from the cleanser's "protect_debuff:<a>,<b>,…" rule — debuffs the party
-    // must NOT cleanse off (e.g. Leech Poison on Hadronox, which the fight needs to
-    // stay applied). Mirrors BotFocusNames' parse.
-    static void ProtectedDebuffNames(ObjectGuid guid, std::vector<std::string>& out)
-    {
-        out.clear();
-        std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
-        auto it = g_rotationCache.find(guid.GetCounter());
-        if (it == g_rotationCache.end()) return;
-        for (RotationRule const& r : it->second)
-        {
-            if (r.action.rfind("protect_debuff:", 0) != 0) continue;
-            if (CsvContains(Lower(r.flags), "disabled")) continue;
-            std::string const list = r.action.substr(15);   // after "protect_debuff:"
-            size_t start = 0;
-            while (start <= list.size())
-            {
-                size_t const comma = list.find(',', start);
-                std::string token = list.substr(
-                    start, comma == std::string::npos ? std::string::npos : comma - start);
-                size_t const a = token.find_first_not_of(" \t");
-                size_t const b = token.find_last_not_of(" \t");
-                if (a != std::string::npos) out.push_back(token.substr(a, b - a + 1));
-                if (comma == std::string::npos) break;
-                start = comma + 1;
-            }
-        }
-    }
-
-    // Walk the bot's group and return the first member carrying a debuff
-    // of the requested dispel type. Returns nullptr if no member is
-    // afflicted (or no group). A member carrying a "protect_debuff" aura is
-    // SKIPPED — cleansing them risks stripping the protected debuff the fight
-    // needs to keep (Leech Poison on Hadronox), so they read as "nothing to
-    // cleanse" for both the cure_party target-pick AND the party_has_* gates.
-    static Player* FindPartyMemberWithDispelType(Player* bot, DispelType type)
+    // Walk the bot's group and return the first member carrying a debuff of the
+    // requested dispel type. Returns nullptr if none (or no group). A member
+    // carrying any aura named in `exclude` is SKIPPED — cleansing them risks
+    // stripping a debuff the fight needs kept (Leech Poison on Hadronox), so they
+    // read as "nothing to cleanse" of this type. `exclude` comes from the cure
+    // rule's own "Don't cleanse this debuff" (cleanse_exclude) conditions.
+    static Player* FindPartyMemberWithDispelType(
+        Player* bot, DispelType type, std::vector<std::string> const& exclude = {})
     {
         if (!bot) return nullptr;
-        std::vector<std::string> protectedNames;
-        ProtectedDebuffNames(bot->GetGUID(), protectedNames);
         std::vector<Player*> party;
         GatherPartyPlayers(bot, party, /*includeDead=*/false);
         for (Player* m : party)
         {
             if (!HasDebuffOfType(m, type)) continue;
-            bool protectedHit = false;
-            for (std::string const& n : protectedNames)
-                if (TargetHasNamedAura(m, n, ObjectGuid::Empty)) { protectedHit = true; break; }
-            if (protectedHit) continue;   // keep the protected debuff — don't cleanse this member
+            bool excluded = false;
+            for (std::string const& n : exclude)
+                if (TargetHasNamedAura(m, n, ObjectGuid::Empty)) { excluded = true; break; }
+            if (excluded) continue;   // keep that debuff — don't cleanse this member
             return m;
         }
         return nullptr;
@@ -1610,6 +1580,14 @@ namespace WowPsParty
             // Clustering gate for placed AoE (Blizzard / Flamestrike):
             // "enemies_clustered:10>2" → more than 2 enemies are within 10y of
             // EACH OTHER (the densest knot). Same R<op>N grammar as above.
+            // "cleanse_exclude:<debuff>" — a DIRECTIVE, not a real gate: it always
+            // passes (so it never blocks the rule) and is read by the cure_party
+            // action from the rule's own conditions to skip that debuff. Put it on
+            // a "Cure afflicted party member" rule to stop it stripping a debuff the
+            // fight needs kept (Leech Poison on Hadronox).
+            if (cname == "cleanse_exclude")
+                return true;
+
             if (cname == "enemies_clustered")
             {
                 auto opPosA = arg.find_first_of("<>");
@@ -3134,10 +3112,6 @@ namespace WowPsParty
         // so the rule loop falls through cleanly instead of logging "unknown verb".
         if (verb == "focus") return false;
 
-        // "protect_debuff:<names>" is a config marker read by FindPartyMemberWithDispelType
-        // (don't cleanse these), not a per-tick cast — never fires here.
-        if (verb == "protect_debuff") return false;
-
         // Mid "Come Hither" recall the recall owns movement — suppress any verb that
         // would issue its OWN movement, so the bot runs to the leader instead of
         // kiting/repositioning/pulling away. Instant CASTS still flow (cast-time is
@@ -3609,6 +3583,27 @@ namespace WowPsParty
             if (!spellId) return false;
             SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
             if (!info) return false;
+            // "Don't cleanse this debuff" — collect every cleanse_exclude:<name>
+            // clause from THIS rule's own conditions. A member carrying one of these
+            // is skipped, so the cleanse leaves it on (Leech Poison on Hadronox).
+            std::vector<std::string> exclude;
+            for (size_t p = 0; p <= cond.size(); )
+            {
+                size_t const amp = cond.find('&', p);
+                std::string clause = (amp == std::string::npos) ? cond.substr(p)
+                                                                : cond.substr(p, amp - p);
+                size_t const a = clause.find_first_not_of(" \t!");   // strip leading space / NOT
+                if (a != std::string::npos) clause = clause.substr(a);
+                if (clause.rfind("cleanse_exclude:", 0) == 0)
+                {
+                    std::string name = clause.substr(16);
+                    size_t const b = name.find_last_not_of(" \t");
+                    if (b != std::string::npos) name.erase(b + 1);
+                    if (!name.empty()) exclude.push_back(name);
+                }
+                if (amp == std::string::npos) break;
+                p = amp + 1;
+            }
             // Find a member afflicted with ANY dispel type this spell removes — not
             // just the FIRST effect's. A multi-type cleanse has several
             // SPELL_EFFECT_DISPEL effects (paladin Cleanse = poison+disease+magic,
@@ -3625,7 +3620,7 @@ namespace WowPsParty
                 if (eff.Effect != SPELL_EFFECT_DISPEL) continue;
                 DispelType const dt = DispelType(eff.MiscValue);
                 if (dt == DISPEL_NONE) continue;
-                target = FindPartyMemberWithDispelType(bot, dt);
+                target = FindPartyMemberWithDispelType(bot, dt, exclude);
             }
             if (!target) return false;
             if (IsInvulnerable(target)) return false;   // can't cleanse an invuln unit
