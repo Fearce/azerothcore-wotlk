@@ -205,22 +205,56 @@ namespace WowPsParty
         }
     }
 
+    // ---- per-tank multi-pull count (pull_count) ----------------------------
+    // First-class per-bot setting (party_loadout.pull_count), set from the rotation
+    // editor — mirrors safe_pull. Stored as '' (unset -> default 3) or '1'..'8'.
+    // The legacy "pull_count:N" rotation directive is still honoured as a fallback
+    // when the column is unset, so older rotations keep working.
+    static std::unordered_map<uint32, int> g_pullCount;   // guidLow -> 1..8 (explicit only)
+    static std::mutex g_pullCountMutex;
+
+    // val in [1,8] sets it; anything else clears it (back to default/legacy).
+    void PullCountCacheSet(uint32 guidLow, int val)
+    {
+        std::lock_guard<std::mutex> lock(g_pullCountMutex);
+        if (val < 1 || val > 8) g_pullCount.erase(guidLow);
+        else                    g_pullCount[guidLow] = val;
+    }
+
+    void PullCountRefreshFromDB(uint32 guidLow)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `pull_count` FROM `party_loadout` WHERE `guid` = {}", guidLow);
+        std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+        PullCountCacheSet(guidLow, v.empty() ? 0 : std::atoi(v.c_str()));   // out-of-range -> clear
+    }
+
     uint32 BotInitialPullCount(ObjectGuid guid)
     {
-        // Default 3: a lead tank opens on up to a 3-mob cluster unless the rotation
-        // says otherwise. "pull_count:1" restores the classic single-mob pull.
+        // Default 3: a lead tank opens on up to a 3-mob cluster. "pull_count:1"
+        // (or the editor set to 1) restores the classic single-mob pull.
         constexpr uint32 DEFAULT_PULL = 3;
-        std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
-        auto it = g_rotationCache.find(guid.GetCounter());
-        if (it == g_rotationCache.end()) return DEFAULT_PULL;
-        for (RotationRule const& r : it->second)
+        // 1. The first-class per-bot setting wins (set from the rotation editor).
+        //    PullCountCacheSet already clamped it to [1,8], so trust the stored value.
         {
-            if (r.action.rfind("pull_count:", 0) != 0) continue;
-            if (CsvContains(Lower(r.flags), "disabled")) continue;
-            int const n = std::atoi(r.action.c_str() + 11);   // after "pull_count:"
-            if (n < 1) return 1;
-            if (n > 8) return 8;                                // sane upper bound
-            return uint32(n);
+            std::lock_guard<std::mutex> lock(g_pullCountMutex);
+            auto it = g_pullCount.find(guid.GetCounter());
+            if (it != g_pullCount.end()) return uint32(it->second);
+        }
+        // 2. Legacy fallback: a "pull_count:N" rotation directive (older configs).
+        {
+            std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
+            auto it = g_rotationCache.find(guid.GetCounter());
+            if (it != g_rotationCache.end())
+                for (RotationRule const& r : it->second)
+                {
+                    if (r.action.rfind("pull_count:", 0) != 0) continue;
+                    if (CsvContains(Lower(r.flags), "disabled")) continue;
+                    int const n = std::atoi(r.action.c_str() + 11);   // after "pull_count:"
+                    if (n < 1) return 1;
+                    if (n > 8) return 8;                                // sane upper bound
+                    return uint32(n);
+                }
         }
         return DEFAULT_PULL;
     }

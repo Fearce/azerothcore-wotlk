@@ -1194,9 +1194,9 @@ namespace WowPsParty
     // Whether the lead tank OPENS a pack with a ranged pull + step-back (tag the
     // mob, back off, let the pack close in open space) or just barges straight
     // into melee. Stored in party_loadout.safe_pull as '' (unset), '1' (safe
-    // pull) or '0' (barge). Unlike wait_tank_threat there's no per-type split:
-    // the safe pull is the long-standing default for EVERY tank, so an absent
-    // entry means ON; the toggle only lets a tank opt OUT.
+    // pull) or '0' (barge). Like wait_tank_threat it has a per-type default
+    // (GetSafePull): a HERO/alt tank safe-pulls by default, a HENCHMAN barges
+    // (the ranged opener is unnecessary for hired fill). An explicit toggle wins.
     static std::unordered_map<uint32, int> g_safePull;   // guidLow -> 0/1 (explicit only)
     static std::mutex g_safePullMutex;
 
@@ -1210,10 +1210,16 @@ namespace WowPsParty
 
     bool GetSafePull(ObjectGuid guid)
     {
-        std::lock_guard<std::mutex> lock(g_safePullMutex);
-        auto it = g_safePull.find(guid.GetCounter());
-        if (it != g_safePull.end()) return it->second != 0;
-        return true;   // unset -> safe pull ON (the long-standing default)
+        {
+            std::lock_guard<std::mutex> lock(g_safePullMutex);
+            auto it = g_safePull.find(guid.GetCounter());
+            if (it != g_safePull.end()) return it->second != 0;
+        }
+        // Unset: per-type default. IsHenchman takes a DIFFERENT lock, so this call
+        // is outside the g_safePullMutex scope above (no nested locking). A henchman
+        // BARGES by default (the safe ranged opener is unnecessary for hired fill);
+        // a hero/alt keeps the safe pull.
+        return !IsHenchman(guid);
     }
 
     void SafePullRefreshFromDB(uint32 guidLow)

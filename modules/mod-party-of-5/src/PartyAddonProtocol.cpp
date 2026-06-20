@@ -68,6 +68,9 @@
 #include <sstream>
 #include <unordered_set>
 #include <vector>
+#ifdef _WIN32
+#include <excpt.h>   // SEH (__try/__except) guard for the item-field reads below
+#endif
 
 namespace WowPsParty
 {
@@ -310,6 +313,39 @@ namespace WowPsParty
         SendInventoryTo(requester);
     }
 
+    // Display fields read off an Item for the inventory/gear panels.
+    struct PartyItemFields { uint32 entry; uint32 count; uint32 guidLow; int32 randProp; uint32 suffix; };
+
+    // Defensive read of an item's display fields. A bag/equip slot can transiently
+    // hold an Item whose value-array is invalid — a partially-initialised / dangling
+    // item in the update queue (the recurring use-after-free, see the wowps-
+    // saveinventory crash). Reading its fields AVs, and that took the WHOLE world
+    // down (2026-06-20: a player banked Frozen Orbs, the follow-up REQ_INVENTORY scan
+    // dereferenced a null value-array in Object::GetUInt32Value). The panel read must
+    // never be a server SPOF, so SEH-guard the field reads: a single bad slot is
+    // skipped + logged and the scan continues. POD-only __try body (no C++ object
+    // needs unwinding) so this is well-formed under /EHsc. Returns false on an AV.
+    static bool SafeReadItemFields(Item* item, PartyItemFields& out)
+    {
+#ifdef _WIN32
+        __try
+        {
+#endif
+            out.entry    = item->GetEntry();
+            out.count    = item->GetCount();
+            out.guidLow  = item->GetGUID().GetCounter();
+            out.randProp = item->GetItemRandomPropertyId();
+            out.suffix   = item->GetItemSuffixFactor();
+            return true;
+#ifdef _WIN32
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+#endif
+    }
+
     // GEAR\t<slot>\t<eqSlot>:<itemId>:<itemGuidLow>:<randProp>:<suffixFactor>;...
     // (19 equipment slots). randProp/suffixFactor appended so the gear tooltip
     // renders a randomized item (e.g. "of the Bear") with its real stats, exactly
@@ -331,10 +367,25 @@ namespace WowPsParty
         {
             Item* item = target->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
             if (!item) continue;
+            PartyItemFields f;
+            if (!SafeReadItemFields(item, f))
+            {
+                LOG_ERROR("module", "[WowPsParty] SendGearTo: SKIPPED a bad item ptr=0x{:x} owner={} "
+                          "slot={} eqSlot={} (value-array AV — dangling/uninitialised item)",
+                          reinterpret_cast<uintptr_t>(item), target->GetGUID().GetCounter(), slot, uint32(i));
+                continue;
+            }
+            if (!sObjectMgr->GetItemTemplate(f.entry))
+            {
+                LOG_ERROR("module", "[WowPsParty] SendGearTo: SKIPPED unknown entry={} ptr=0x{:x} owner={} "
+                          "slot={} eqSlot={} (freed/garbage slot read clean)",
+                          f.entry, reinterpret_cast<uintptr_t>(item), target->GetGUID().GetCounter(), slot, uint32(i));
+                continue;
+            }
             if (!first) out << ';';
             first = false;
-            out << uint32(i) << ':' << item->GetEntry() << ':' << item->GetGUID().GetCounter()
-                << ':' << item->GetItemRandomPropertyId() << ':' << item->GetItemSuffixFactor();
+            out << uint32(i) << ':' << f.entry << ':' << f.guidLow
+                << ':' << f.randProp << ':' << f.suffix;
         }
         SendWPSP(requester, out.str());
     }
@@ -525,17 +576,39 @@ namespace WowPsParty
 
         auto emitItem = [&](uint32 partySlot, uint32 bag, uint32 pos, Item* item)
         {
+            PartyItemFields f;
+            if (!SafeReadItemFields(item, f))
+            {
+                // One bad slot must not crash the whole world (the 2026-06-20 Frozen-Orb
+                // bank-then-REQ_INVENTORY AV). Skip it + log so the dangling item can be
+                // root-caused; the panel just omits it and the next refresh re-reads it.
+                // The raw Item* is safe to print (only the value-array DEREF faults) and
+                // is the stable address to correlate against the next crash dump / the
+                // item-update-queue use-after-free investigation.
+                LOG_ERROR("module", "[WowPsParty] SendInventoryTo: SKIPPED a bad item ptr=0x{:x} in "
+                          "partySlot={} bag={} pos={} (value-array AV — dangling/uninitialised item)",
+                          reinterpret_cast<uintptr_t>(item), partySlot, bag, uint32(pos));
+                return;
+            }
+            // A freed-but-still-mapped slot can read clean garbage (no AV) — gate on a
+            // real item template so a phantom record never reaches the panel.
+            if (!sObjectMgr->GetItemTemplate(f.entry))
+            {
+                LOG_ERROR("module", "[WowPsParty] SendInventoryTo: SKIPPED unknown entry={} ptr=0x{:x} "
+                          "in partySlot={} bag={} pos={} (freed/garbage slot read clean)",
+                          f.entry, reinterpret_cast<uintptr_t>(item), partySlot, bag, uint32(pos));
+                return;
+            }
             std::ostringstream r;
             r << partySlot << ':' << bag << ':' << pos << ':'
-              << item->GetEntry() << ':' << item->GetCount() << ':'
-              << item->GetGUID().GetCounter()
+              << f.entry << ':' << f.count << ':' << f.guidLow
               // Random property / suffix so the addon tooltip renders the FULL item
               // (e.g. a rare with "of the Bear") instead of the base item with no
               // stats. RandomPropertyId is NEGATIVE for a random SUFFIX; the suffix
               // factor (property seed) scales its stats. Appended, so an older addon
               // that only reads the first 6 fields still parses fine.
-              << ':' << item->GetItemRandomPropertyId()
-              << ':' << item->GetItemSuffixFactor();
+              << ':' << f.randProp
+              << ':' << f.suffix;
             records.push_back(r.str());
         };
 
@@ -3204,19 +3277,23 @@ public:
                 "|cff66ccff[WowPsParty]|r Wait for tank threat: {}.", on ? "ON" : "OFF");
         }
         // REQ_SAFEPULL\t<token>  ->  SAFEPULL\t<token>\t<0|1>
-        // Reports the EFFECTIVE value; an unset row means the default, which is
-        // ON for every tank (so an unconfigured tank still shows the safe pull).
+        // Reports the EFFECTIVE value (explicit override, else the per-type default:
+        // a HERO/alt safe-pulls, a HENCHMAN barges) so the editor checkbox shows the
+        // real runtime behaviour even for a bot the user never configured.
         else if (command == "REQ_SAFEPULL")
         {
             std::string const token(payload);
             uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
-            bool on = true;   // default ON
+            bool on = true;
             if (guid)
             {
                 QueryResult q = CharacterDatabase.Query(
                     "SELECT `safe_pull` FROM `party_loadout` WHERE `guid` = {}", guid);
                 std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
-                if (v == "0") on = false;   // '1' or unset -> ON
+                if (v == "1")      on = true;
+                else if (v == "0") on = false;
+                else               on = !WowPsParty::IsHenchman(
+                                            ObjectGuid::Create<HighGuid::Player>(guid));
             }
             std::ostringstream out;
             out << "SAFEPULL\t" << token << '\t' << (on ? 1 : 0);
@@ -3242,6 +3319,47 @@ public:
             WowPsParty::SafePullCacheSet(guid, on ? 1 : 0);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Safe pull: {}.", on ? "ON" : "OFF");
+        }
+        // REQ_PULLCOUNT\t<token>  ->  PULLCOUNT\t<token>\t<1..8>
+        // Reports the EFFECTIVE lead-tank multi-pull size (explicit column, else the
+        // default 3) so the editor stepper shows the real runtime value.
+        else if (command == "REQ_PULLCOUNT")
+        {
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            int n = 3;   // default
+            if (guid)
+            {
+                QueryResult q = CharacterDatabase.Query(
+                    "SELECT `pull_count` FROM `party_loadout` WHERE `guid` = {}", guid);
+                std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+                int const parsed = v.empty() ? 0 : std::atoi(v.c_str());
+                if (parsed >= 1 && parsed <= 8) n = parsed;   // unset/out-of-range -> default 3
+            }
+            std::ostringstream out;
+            out << "PULLCOUNT\t" << token << '\t' << n;
+            SendWPSP(player, out.str());
+        }
+        // SET_PULLCOUNT\t<token>\t<1..8>  — the tank's multi-pull cluster size
+        else if (command == "SET_PULLCOUNT")
+        {
+            std::string rest;
+            std::string const token = WowPsParty::SplitToken(std::string(payload), rest);
+            int const n = rest.empty() ? 0 : std::atoi(rest.c_str());
+            if (n < 1 || n > 8) return;   // strict: ignore an out-of-range value
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            if (!guid) return;
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
+                "`gear_lock_json`, `priority_actions_json`, `pull_count`) "
+                "VALUES ({}, '', '', '', '', '', '{}') "
+                "ON DUPLICATE KEY UPDATE `pull_count` = VALUES(`pull_count`)",
+                guid, n);
+            CharacterDatabase.CommitTransaction(tx);
+            WowPsParty::PullCountCacheSet(guid, n);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Multi-pull count: {}.", n);
         }
         else if (command == "EQUIP")
         {

@@ -178,11 +178,16 @@ namespace WowPsParty
     // AssistTarget reads this to override target selection onto a matching enemy.
     void BotFocusNames(ObjectGuid guid, std::vector<std::string>& out);
 
-    // A lead tank's configured INITIAL-pull target size from a "pull_count:N"
-    // rotation directive (e.g. "always|pull_count:3|0"). Default 3, clamped [1,8].
+    // A lead tank's configured INITIAL-pull target size. Default 3, clamped [1,8];
     // 1 = the classic single-mob pull. TankLeadEngagement reads this to body-pull a
     // cluster of up to N mobs on the opener (cluster-aware, LoS- and Z-gated).
+    // Sourced from the first-class party_loadout.pull_count column (set in the
+    // rotation editor); a legacy "pull_count:N" rotation directive is the fallback.
     uint32 BotInitialPullCount(ObjectGuid guid);
+    // Per-bot pull_count cache (mirrors safe_pull). CacheSet: val in [1,8] sets it,
+    // anything else clears it. RefreshFromDB reloads it from party_loadout.
+    void PullCountCacheSet(uint32 guidLow, int val);
+    void PullCountRefreshFromDB(uint32 guidLow);
 
     // Returns true if the bot has at least one cached rule (cheap check, called
     // every UpdateAI tick).
