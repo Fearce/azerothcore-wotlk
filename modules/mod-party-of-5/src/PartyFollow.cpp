@@ -4522,6 +4522,37 @@ namespace WowPsParty
                 follower->Dismount();   // belt-and-braces if a mount set the flag without an aura
             }
 
+            // ---- Phase mirror (twilight realms etc.) ----------------------
+            // In an INSTANCE, a HERO alt mirrors the leader's phase so it follows
+            // through a phase SHIFT — e.g. the Obsidian Sanctum twilight portals
+            // (SPELL_TWILIGHT_SHIFT phases you into the twilight realm to kill the
+            // disciple). The follow-teleport below snaps to the leader's XYZ but NOT
+            // its phase, so without this the bot stands in the normal realm while the
+            // leader fights alone in twilight ("can't solo the mob in there"). Snap the
+            // bot onto the leader on the shift so it lands in the realm together; it
+            // mirrors BACK to phase 1 the same way when the leader leaves. HENCHMEN are
+            // deliberately excluded — they stay behind in the normal phase (the user
+            // wants only the 4 heroes in, the 5 henchmen out). Runs before the leash so
+            // a phase mismatch always wins.
+            if (!IsHenchman(d.followerGuid)
+                && follower->FindMap() && follower->FindMap()->Instanceable()
+                && follower->GetPhaseMask() != leader->GetPhaseMask()
+                && !follower->IsBeingTeleported())
+            {
+                if (follower->GetVictim()) follower->AttackStop();
+                if (follower->IsInCombat()) follower->CombatStop();
+                follower->GetMotionMaster()->Clear();
+                follower->StopMoving();
+                follower->SetPhaseMask(leader->GetPhaseMask(), true);
+                follower->TeleportTo(leader->GetMapId(),
+                    leader->GetPositionX(), leader->GetPositionY(),
+                    leader->GetPositionZ(), leader->GetOrientation());
+                LOG_INFO("module",
+                    "[WowPsParty Phase] {} mirrored leader phase={} — pulled into the realm",
+                    follower->GetName(), leader->GetPhaseMask());
+                return true;
+            }
+
             // ---- Party leash ----------------------------------------------
             // If the controlled char has run off, the bot abandons whatever
             // it's doing (combat, drinking, holding) and rejoins. >50y: break
