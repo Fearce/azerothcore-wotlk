@@ -72,6 +72,10 @@
 #include "PlayerbotAIConfig.h"  // sPlayerbotAIConfig.randomBotJoinBG (the "bg" strategy gate)
 #include "PlayerbotFactory.h"   // re-level a pool fill bot to the BG bracket on spawn
 #include "PlayerbotMgr.h"
+#include "RandomPlayerbotMgr.h" // sRandomPlayerbotMgr — server-side spawn for WG (no human anchor)
+#include "Battlefield.h"        // Wintergrasp: IsWarTime / war enrolment / participant sets
+#include "BattlefieldMgr.h"     // sBattlefieldMgr->GetBattlefieldToZoneId(WG)
+#include "MotionMaster.h"       // WG bot AI movement (MovePoint / MoveChase)
 
 #include <mutex>
 #include <string>
@@ -575,6 +579,233 @@ private:
 // party-of-5 users (companions enabled) — so the world tick backfills the heroes into
 // THIS bg the moment they appear in the party. Without this they sat in Dalaran,
 // never queued, and the human played the BG short-handed (the 6v10 Kevin saw).
+// ============================================================================
+// Wintergrasp population. WG is an outdoor Battlefield (zone 4197), not a BG instance,
+// and mod-playerbots has NO WG AI — so this both POPULATES it (rndbot-pool chars spawned
+// server-side, enrolled into the war) and DRIVES a simple advance-and-engage AI so it's a
+// lively ~30v30 instead of a dead zone. Everything is gated behind IsWarTime(): nothing
+// runs outside an active battle, and all fills are torn down when it ends.
+//   NEEDS LIVE TESTING in a real WG window (battlefield/vehicle paths can't be unit-
+//   tested). Siege-vehicle crewing is a deliberate follow-up — bots fight on foot here.
+// ============================================================================
+constexpr uint32 WG_ZONE_ID         = 4197;
+constexpr uint32 WG_MAP_ID          = 571;
+constexpr uint32 WG_TARGET_PER_SIDE = 30;
+constexpr uint32 WG_SPAWN_PER_TICK  = 3;     // ramp gradually; never spike the world thread
+constexpr uint8  WG_RELEVEL_TO      = 80;
+constexpr float  WG_ENGAGE_RANGE    = 45.0f;
+
+struct WgBot { uint32 team; bool releveled; bool enrolled; uint32 spawnMs; };
+std::unordered_map<uint32, WgBot> g_wgBots;   // guidLow -> state
+std::mutex                        g_wgMutex;
+
+// Contest points to fan the fills across (real WG locations so pathing stays on the
+// navmesh): the keep is the central objective both sides converge on, the NE workshop a
+// secondary so they don't all stack on one spot.
+struct WgPt { float x, y, z; };
+WgPt const WG_KEEP     { 5345.0f, 2842.0f, 410.0f };
+WgPt const WG_WORKSHOP { 5104.0f, 2300.0f, 368.0f };
+
+class PartyWgFillWorldScript : public WorldScript
+{
+public:
+    PartyWgFillWorldScript() : WorldScript("PartyWgFillWorldScript") {}
+
+    void OnUpdate(uint32 diff) override
+    {
+        _accum += diff;
+        if (_accum < 2000) return;   // 2s cadence
+        _accum = 0;
+        if (!WowPsParty::IsEnabled()) return;
+
+        Battlefield* wg = sBattlefieldMgr->GetBattlefieldToZoneId(WG_ZONE_ID);
+        if (!wg || !wg->IsWarTime())
+        {
+            DespawnSome(WG_SPAWN_PER_TICK);   // no active battle -> tear fills down gradually
+            return;
+        }
+
+        std::vector<std::pair<uint32, WgBot>> fills;
+        { std::lock_guard<std::mutex> lk(g_wgMutex); fills.assign(g_wgBots.begin(), g_wgBots.end()); }
+
+        uint32 haveA = 0, haveH = 0;
+        bool releveledThisTick = false;
+        for (auto const& [botLow, wb] : fills)
+        {
+            Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(botLow));
+            if (!bot)
+            {
+                if (getMSTime() - wb.spawnMs > 60000) Forget(botLow);   // never loaded -> drop
+                continue;
+            }
+            // A bot that never gets enrolled within a window (sub-level, stuck out of zone,
+            // a battlefield that keeps no-op'ing the invite) just wastes a slot AND counts
+            // toward `have`, suppressing TopUp. Drop it so a fresh one replaces it.
+            if (!wb.enrolled && getMSTime() - wb.spawnMs > 90000)
+            {
+                sRandomPlayerbotMgr.LogoutPlayerBot(bot->GetGUID());
+                Forget(botLow);
+                continue;
+            }
+            if (bot->GetTeamId() == TEAM_ALLIANCE) ++haveA; else ++haveH;
+
+            if (!wb.releveled)
+            {
+                if (bot->GetLevel() >= 75) { Mark(botLow, true, wb.enrolled); continue; } // already in bracket
+                if (releveledThisTick) continue;                                          // one heavy re-roll/tick
+                releveledThisTick = true;
+                RelevelFillBot(bot, WG_RELEVEL_TO);
+                Mark(botLow, true, wb.enrolled);
+                continue;
+            }
+            if (bot->GetZoneId() != WG_ZONE_ID) { TeleportToStaging(bot, wg); continue; }
+            if (!wb.enrolled)
+            {
+                // Only mark enrolled once the battlefield ACTUALLY lists the bot as a war
+                // participant. InvitePlayerToWar silently no-ops on sub-level / in-BG / mid-
+                // teleport, so blindly marking it would leave a ghost that DriveAI steers
+                // around but the battle never counts. Retry until it takes (bounded by the
+                // 90s max-lifetime drop above).
+                if (!IsInWar(wg, bot))
+                {
+                    wg->InvitePlayerToWar(bot);
+                    wg->PlayerAcceptInviteToWar(bot);
+                }
+                if (IsInWar(wg, bot)) Mark(botLow, true, true);
+                continue;
+            }
+            DriveAI(bot, wg);
+        }
+
+        TopUp(wg, TEAM_ALLIANCE, haveA);
+        TopUp(wg, TEAM_HORDE,    haveH);
+    }
+
+private:
+    uint32 _accum = 0;
+
+    static void Mark(uint32 botLow, bool releveled, bool enrolled)
+    {
+        std::lock_guard<std::mutex> lk(g_wgMutex);
+        auto it = g_wgBots.find(botLow);
+        if (it != g_wgBots.end()) { it->second.releveled = releveled; it->second.enrolled = enrolled; }
+    }
+    static void Forget(uint32 botLow)
+    {
+        std::lock_guard<std::mutex> lk(g_wgMutex);
+        g_wgBots.erase(botLow);
+    }
+
+    // Is the bot actually counted as a war participant (vs merely invited/teleported in)?
+    static bool IsInWar(Battlefield* wg, Player* bot)
+    {
+        GuidUnorderedSet const& set = wg->GetPlayersInWarSet(bot->GetTeamId());
+        return set.find(bot->GetGUID()) != set.end();
+    }
+
+    // Drop the bot at its team's staging point so the war-enrol (next tick) takes over.
+    static void TeleportToStaging(Player* bot, Battlefield* wg)
+    {
+        TeamId const team = bot->GetTeamId();
+        if (team == wg->GetDefenderTeam()) bot->TeleportTo(WG_MAP_ID, 5345.0f, 2842.0f, 410.0f, 3.14f);
+        else if (team == TEAM_HORDE)       bot->TeleportTo(WG_MAP_ID, 5025.857f, 3674.629f, 362.737f, 4.135f);
+        else                               bot->TeleportTo(WG_MAP_ID, 5101.284f, 2186.564f, 365.549f, 3.812f);
+    }
+
+    // Advance-and-engage: in combat -> the class combat AI fights; otherwise grab the
+    // nearest enemy war participant, or push toward an objective so the sides converge.
+    static void DriveAI(Player* bot, Battlefield* wg)
+    {
+        if (!bot->IsAlive()) return;                          // dead -> battlefield res handles it
+        if (bot->IsInCombat() && bot->GetVictim()) return;    // fighting -> combat AI owns it
+        if (bot->IsNonMeleeSpellCast(false, false, true)) return;
+
+        TeamId const enemyTeam = bot->GetTeamId() == TEAM_ALLIANCE ? TEAM_HORDE : TEAM_ALLIANCE;
+        Unit* enemy = nullptr; float bestD = WG_ENGAGE_RANGE;
+        for (ObjectGuid const& g : wg->GetPlayersInWarSet(enemyTeam))
+        {
+            Player* e = ObjectAccessor::FindConnectedPlayer(g);
+            if (!e || !e->IsAlive() || e->GetMapId() != bot->GetMapId()) continue;
+            if (!bot->IsValidAttackTarget(e)) continue;
+            float const d = bot->GetDistance(e);
+            if (d < bestD) { bestD = d; enemy = e; }
+        }
+        if (enemy)
+        {
+            if (bot->GetVictim() != enemy)
+            {
+                bot->Attack(enemy, true);
+                bot->GetMotionMaster()->MoveChase(enemy);   // (re)chase the new/closer target
+            }
+            else if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
+                bot->GetMotionMaster()->MoveChase(enemy);
+            return;
+        }
+
+        uint32 const guidLow = bot->GetGUID().GetCounter();
+        WgPt const& obj = (guidLow % 3 == 0) ? WG_WORKSHOP : WG_KEEP;
+        float const tx = obj.x + float(int(guidLow % 7) - 3) * 10.0f;   // fan out so they don't stack
+        float const ty = obj.y + float(int(guidLow / 7 % 7) - 3) * 10.0f;
+        if (!bot->isMoving() && bot->GetExactDist2d(tx, ty) > 8.0f)
+            bot->GetMotionMaster()->MovePoint(0, tx, ty, obj.z);
+    }
+
+    // Spawn rndbot-pool chars (race-correct, offline, prefer already-high-level to skip
+    // the heavy re-roll) up to the per-side target, a few per tick, within war vacancy.
+    static void TopUp(Battlefield* wg, TeamId team, uint32 have)
+    {
+        if (have >= WG_TARGET_PER_SIDE || !wg->HasWarVacancy(team)) return;
+        uint32 const need = std::min(WG_TARGET_PER_SIDE - have, WG_SPAWN_PER_TICK);
+        std::string const acctCsv = RndbotAccountCsv();
+        if (acctCsv.empty()) return;
+        std::string const sql =
+            "SELECT `guid` FROM `characters` WHERE `account` IN (" + acctCsv + ") AND `race` IN ("
+            + RaceCsv(team == TEAM_ALLIANCE) + ") AND `online` = 0 ORDER BY `level` DESC LIMIT "
+            + std::to_string(need * 4);
+        QueryResult q = CharacterDatabase.Query(sql);
+        if (!q) return;
+        uint32 spawned = 0;
+        do {
+            if (spawned >= need) break;
+            uint32 const guidLow = q->Fetch()[0].Get<uint32>();
+            { std::lock_guard<std::mutex> lk(g_wgMutex); if (g_wgBots.count(guidLow)) continue; }
+            sRandomPlayerbotMgr.AddPlayerBot(ObjectGuid::Create<HighGuid::Player>(guidLow), 0);
+            { std::lock_guard<std::mutex> lk(g_wgMutex);
+              g_wgBots[guidLow] = WgBot{ uint32(team), false, false, getMSTime() }; }
+            ++spawned;
+        } while (q->NextRow());
+        if (spawned)
+            LOG_INFO("module", "[WowPsParty WGFill] {} side: spawned {} (have {} -> target {})",
+                     team == TEAM_ALLIANCE ? "Alliance" : "Horde", spawned, have, WG_TARGET_PER_SIDE);
+    }
+
+    // Log out up to n fills (gradual, so a battle-end teardown of ~60 bots never spikes).
+    static void DespawnSome(uint32 n)
+    {
+        std::vector<std::pair<uint32, uint32>> snap;   // guidLow, spawnMs
+        {
+            std::lock_guard<std::mutex> lk(g_wgMutex);
+            if (g_wgBots.empty()) return;
+            for (auto const& kv : g_wgBots)
+            { snap.emplace_back(kv.first, kv.second.spawnMs); if (snap.size() >= n) break; }
+        }
+        uint32 cleared = 0;
+        for (auto const& [botLow, spawnMs] : snap)
+        {
+            ObjectGuid const g = ObjectGuid::Create<HighGuid::Player>(botLow);
+            // Idempotent: logs out an in-world bot, no-ops one not yet owned. Forget it ONLY
+            // once it's actually gone — and gate on the load grace so a bot that finished
+            // its async login AFTER the war ended still gets logged out before we drop it,
+            // instead of being orphaned in the world (forget-then-leak).
+            sRandomPlayerbotMgr.LogoutPlayerBot(g);
+            if (!ObjectAccessor::FindConnectedPlayer(g) && getMSTime() - spawnMs > 60000)
+            { Forget(botLow); ++cleared; }
+        }
+        if (cleared)
+            LOG_INFO("module", "[WowPsParty WGFill] despawned {} fill bot(s)", cleared);
+    }
+};
+
 class PartyBgFillBgScript : public AllBattlegroundScript
 {
 public:
@@ -602,4 +833,5 @@ void AddPartyBgFillScripts()
     new PartyBgFillPlayerScript();
     new PartyBgFillWorldScript();
     new PartyBgFillBgScript();
+    new PartyWgFillWorldScript();   // populate + drive Wintergrasp while the battle is active
 }
