@@ -859,15 +859,16 @@ namespace WowPsParty
     };
     static std::unordered_map<uint32, TankGatherState> g_tankGather;   // tankLow -> state
 
-    // GC backstop, NOT a behavior timer: the gather hold releases on threat (see
-    // IsTankGathering), never on this clock. It exists only so an abandoned entry (the
-    // tank disconnected / left mid-pull, so IsTankGathering never runs to drop it) can't
-    // linger in the map forever. Set far above any real gather so it can't gate play.
-    static constexpr uint32 TANK_GATHER_GC_MS  = 60000;
+    // GC backstop: the gather hold releases on THREAT once the tank engages (see
+    // IsTankGathering), not on this clock. It bounds the one case threat can't — a pull
+    // that gets STUCK before the tank ever engages (mob evaded/unreachable mid-approach,
+    // so no engage-lead ever lands) — and evicts an abandoned entry (tank DC'd). Long
+    // enough to never cut off a legit approach + threat build (~a few seconds), short
+    // enough that a stuck pull doesn't freeze the party for long.
+    static constexpr uint32 TANK_GATHER_GC_MS  = 12000;
     static constexpr float  PULL_GATHER_RANGE  = 30.0f;  // scan radius for the pull pool
     static constexpr float  MOB_CLUSTER_R      = 10.0f;  // mobs within this aggro/stack as one
     static constexpr float  PULL_Z_TOLERANCE   = 6.0f;   // "similar Z-level" as the tank
-    static constexpr float  GATHER_STACK_R     = 9.0f;   // a not-yet-aggroed set mob beyond this is a straggler the pull missed (drop it, don't freeze)
 
     static void MarkTankGathering(uint32 tankLow, std::vector<ObjectGuid> set)
     {
@@ -1644,13 +1645,16 @@ namespace WowPsParty
         if (Unit* v = bot->GetVictim())
             if (v->IsAlive()) return;
 
-        // Find the nearest hostile to the leader within 28y of them. (Was 40y —
-        // toned down ~30% so the tank doesn't go for a range-pull on a mob that's
-        // still quite far; it waits until the party is closer to the pack.)
-        // SelectNearbyTarget(exclude, dist) returns the nearest unit that
-        // `this` considers a valid attack target — perfect for "what's
-        // about to fight us".
-        Unit* nearest = leader->SelectNearbyTarget(nullptr, 28.0f);
+        // Find the nearest hostile TO THE TANK within 28y of IT — not the leader.
+        // The lead tank walks at the FRONT, so the pack it should open on is around
+        // the tank, not around the human DPS trailing behind (Kevin: "the centre
+        // point of the multi-pull range should be the tank, not the leader"); a
+        // leader-centred search missed the pack the tank was standing in and it just
+        // single-pulled. The tank can't out-run the party: a 30y leader-leash above
+        // (line ~1636) already blocks a pull while it's far ahead. 28y (was 40y, then
+        // leader-40y) keeps it from opening on a still-distant mob. SelectNearbyTarget
+        // returns the nearest unit `this` considers a valid attack target.
+        Unit* nearest = bot->SelectNearbyTarget(nullptr, 28.0f);
         if (!nearest || !nearest->IsAlive()) return;
         if (!bot->IsValidAttackTarget(nearest)) return;
 
@@ -1776,7 +1780,17 @@ namespace WowPsParty
             MarkTankPulling(bot->GetGUID(), 8000);
         }
         else
+        {
+            // Barge (melee tank, or a tank with safe_pull OFF — e.g. a henchman now
+            // that henchmen default to barge): there's no ranged-pull window, so the
+            // party would otherwise rush in ahead of the tank with no threat down
+            // (Kevin: "DPS instantly engage before the tank is even in melee range").
+            // Mark a single-mob GATHER so DPS/healer hold (threat-based, via
+            // IsPartyPullPending -> IsTankGathering) until the tank reaches the mob and
+            // builds a real engage lead — the multi-pull hold, applied to one mob.
+            MarkTankGathering(bot->GetGUID().GetCounter(), { nearest->GetGUID() });
             bot->GetMotionMaster()->MoveChase(nearest);              // melee: close in
+        }
 
         LOG_INFO("module", "[WowPsParty TankLead] guid={} {} mob_guid={} entry={} dist={:.1f} ok={}",
                  bot->GetGUID().GetCounter(), canRangedPull ? "RANGE-PULL" : "PULL",
@@ -2925,23 +2939,21 @@ namespace WowPsParty
         return mob->GetThreatMgr().GetThreat(tank) >= floor;
     }
 
-    // Bot lead-tank multi-pull gather gate (forward-declared up by g_tankGather). PURE
-    // THREAT, no timer — the same model the human-tank wait-gate uses, applied to a bot
-    // tank's body-pulled cluster. The party holds fire (IsPartyPullPending) while the
-    // tank is still locking the pack; releases the instant it has a real engage lead on
-    // every set member it's actually grabbing. Only TWO things keep the party held, and
-    // both resolve through the tank's own action within a beat or two (so it can never
-    // freeze on a mob that pathed off, evaded, or peeled onto someone else):
-    //   - a member in combat with the TANK as its target that the tank hasn't yet built
-    //     an engage lead on (ENGAGE_THREAT_HEALTH_FRAC of max HP) — it's mid-lock; OR
-    //   - a member not yet aggroed but within GATHER_STACK_R of the tank — the tank is
-    //     right on top of it, about to body-pull it in.
-    // Everything else releases (stops gating the party): dead/gone, a boss (tank-and-
-    // spank), a member the tank has already locked, a member that aggroed an ALLY rather
-    // than the tank (waiting can't make the tank lock it, and the held DPS can't peel it
-    // — so let the gather finish and normal assist grab it), and a far un-aggroed
-    // straggler the pull missed. Self-scales to any tank's threat output with no fixed
-    // wait. Drops the entry once every member is released.
+    // Bot lead-tank pull gather gate (forward-declared up by g_tankGather). Holds the
+    // party (IsPartyPullPending) from the moment the tank commits to a pull until it has
+    // threat on the pack — covering BOTH a multi-pull cluster and a single-mob barge
+    // (TankLeadEngagement marks a 1-mob set for melee/safe_pull-off tanks). The party is
+    // held while EITHER:
+    //   - the tank is still APPROACHING (tank not in combat) — it's running into the
+    //     pack and DPS must not engage ahead of it; OR
+    //   - the tank HAS a set member (it's the mob's target) but hasn't built a real
+    //     engage lead on it yet (ENGAGE_THREAT_HEALTH_FRAC of max HP) — it's mid-lock.
+    // Releases (stops gating) the instant a member is: dead/gone, a boss (tank-and-
+    // spank), locked by the tank (lead built), or — once the tank IS in combat — a
+    // straggler/ally-peel the tank isn't holding (waiting can't fix it and a held DPS
+    // can't peel it). Pure threat once engaged (no fixed DPS-wait timer); the GC
+    // backstop (TANK_GATHER_GC_MS) only evicts a pull that got stuck before engaging.
+    // Drops the entry once every member is released.
     static bool IsTankGathering(Player* tank)
     {
         if (!tank) return false;
@@ -2957,23 +2969,28 @@ namespace WowPsParty
             }
             set = it->second.set;
         }
+        bool const tankInCombat = tank->IsInCombat();
         for (ObjectGuid const& g : set)
         {
             Creature* m = ObjectAccessor::GetCreature(*tank, g);
             if (!m || !m->IsAlive()) continue;   // dead/gone -> released
             if (IsBossUnit(m))       continue;   // boss -> no gather hold
-            if (m->IsInCombat())
+            if (m->GetVictim() == tank)
             {
-                // Hold only while THIS tank is the one locking it and hasn't built the
-                // lead yet. A mob the tank has locked, or one that aggroed an ally
-                // instead, no longer gates the party (see header).
-                if (m->GetVictim() == tank && !TankHasEngageLead(m, ENGAGE_THREAT_HEALTH_FRAC))
-                    return true;
-                continue;
+                // The tank HAS it — hold only until it's built a real engage lead.
+                if (!TankHasEngageLead(m, ENGAGE_THREAT_HEALTH_FRAC)) return true;
+                continue;   // locked -> released
             }
-            if (tank->GetDistance(m) <= GATHER_STACK_R)
-                return true;                     // not yet aggroed but right here -> hold
-            // else: a far un-aggroed straggler the pull missed -> don't gate on it
+            // Not (yet) on the tank:
+            //  - APPROACH phase (tank not in combat): it's still running into the pack,
+            //    so HOLD — without this DPS engage before the tank ever reaches melee
+            //    (Kevin's "DPS instantly engage before the tank is even in melee range";
+            //    the old within-9y check released them during the whole run-in).
+            //  - tank already in combat: this is a straggler the pull didn't catch, or a
+            //    mob that aggroed an ally — neither resolves by waiting and a held DPS
+            //    can't peel it, so don't gate the party on it.
+            if (!tankInCombat) return true;
+            // else: straggler / ally-peel -> released
         }
         // every alive member released -> gather complete; drop the entry so it can't linger.
         std::lock_guard<std::mutex> lock(g_mutex);
