@@ -69,6 +69,7 @@
 #include "WorldSession.h"
 
 #include "PlayerbotAI.h"
+#include "PlayerbotAIConfig.h"  // sPlayerbotAIConfig.randomBotJoinBG (the "bg" strategy gate)
 #include "PlayerbotFactory.h"   // re-level a pool fill bot to the BG bracket on spawn
 #include "PlayerbotMgr.h"
 
@@ -473,10 +474,23 @@ public:
 
             if (bot->InBattleground())
             {
-                // In the match; its AI plays it. Remember it made it in, so when the
-                // match ENDS (below) we retire it from HERE — never from the BG-removal
-                // hook, where a synchronous LogoutPlayer mid-teardown (×10-40 bots on a
-                // BG end) is a crash risk.
+                // Make the fill bot actually PLAY the BG. It was added via
+                // AddPlayerBot(guid,0) and never registered in RandomPlayerbotMgr's
+                // currentBots, so IsRandomBot() is false and AiFactory NEVER gave it the
+                // "bg" strategy — it just stands in its start area / graveyard and only
+                // fights what reaches it (Kevin's "BG bots are AFK, never walk anywhere").
+                // Add the bg strategy ourselves — the same "+bg" mod-playerbots' own
+                // first-bot-to-join workaround uses. Guard on HasStrategy: addStrategy
+                // does remove-then-readd, so calling it every tick would re-init the
+                // strategy and reset its objective pathing each second — only add it when
+                // it's MISSING, which also recovers it if a death/res reset the bot.
+                if (sPlayerbotAIConfig.randomBotJoinBG)
+                    if (PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot))
+                        if (!ai->HasStrategy("bg", BOT_STATE_NON_COMBAT))
+                            ai->ChangeStrategy("+bg", BOT_STATE_NON_COMBAT);
+                // Remember it made it in, so when the match ENDS (below) we retire it from
+                // HERE — never from the BG-removal hook, where a synchronous LogoutPlayer
+                // mid-teardown (×10-40 bots on a BG end) is a crash risk.
                 if (!fe.entered)
                 {
                     std::lock_guard<std::mutex> lk(g_mutex);
