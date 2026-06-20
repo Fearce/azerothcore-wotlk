@@ -845,60 +845,48 @@ namespace WowPsParty
     // when the party is strong enough. Distinct from the single-mob ranged-pull-and-
     // isolate flow (g_tankPull above): a multi-pull BODY-PULLS a tight cluster so the
     // pack stacks on the tank's melee, and the party holds fire (IsPartyPullPending)
-    // until the whole set is gathered — giving the tank time to group them. Only an
-    // INITIAL pull triggers it (TankLeadEngagement already requires the whole party out
-    // of combat + rested AND the tank to have no live victim), so it never chain-pulls
-    // the dungeon: the party still eats/drinks between packs.
+    // until the tank has built a real THREAT lead on the pack — giving it time to lock
+    // them. The release is PURE THREAT, no timer (Kevin: "we don't like timers, base it
+    // on threat just like the human tank"): the gather completes exactly when the bot
+    // tank holds an engage lead on its cluster, mirroring the human-tank wait-gate
+    // (TankHasEngageLead). Only an INITIAL pull triggers it (TankLeadEngagement already
+    // requires the whole party out of combat + rested AND the tank to have no live
+    // victim), so it never chain-pulls: the party still eats/drinks between packs.
     struct TankGatherState
     {
-        uint32                  untilMs = 0;   // hard cap on the gather hold
+        uint32                  untilMs = 0;   // GC backstop only — see TANK_GATHER_GC_MS / IsTankGathering
         std::vector<ObjectGuid> set;           // the mobs this opener means to gather
     };
     static std::unordered_map<uint32, TankGatherState> g_tankGather;   // tankLow -> state
 
-    static constexpr uint32 TANK_GATHER_MAX_MS = 6000;   // cap the party hold for a gather
+    // GC backstop, NOT a behavior timer: the gather hold releases on threat (see
+    // IsTankGathering), never on this clock. It exists only so an abandoned entry (the
+    // tank disconnected / left mid-pull, so IsTankGathering never runs to drop it) can't
+    // linger in the map forever. Set far above any real gather so it can't gate play.
+    static constexpr uint32 TANK_GATHER_GC_MS  = 60000;
     static constexpr float  PULL_GATHER_RANGE  = 30.0f;  // scan radius for the pull pool
     static constexpr float  MOB_CLUSTER_R      = 10.0f;  // mobs within this aggro/stack as one
     static constexpr float  PULL_Z_TOLERANCE   = 6.0f;   // "similar Z-level" as the tank
-    static constexpr float  GATHER_STACK_R     = 9.0f;   // a set mob this near the tank = gathered
+    static constexpr float  GATHER_STACK_R     = 9.0f;   // a not-yet-aggroed set mob beyond this is a straggler the pull missed (drop it, don't freeze)
 
     static void MarkTankGathering(uint32 tankLow, std::vector<ObjectGuid> set)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         uint32 const now = getMSTime();
         // Opportunistic prune: a solo tank's gather entry is never read by
-        // IsPartyPullPending (no other members), so sweep expired entries here so the
+        // IsPartyPullPending (no other members), so sweep GC-expired entries here so the
         // map can't slowly accumulate stale tank guids.
         for (auto it = g_tankGather.begin(); it != g_tankGather.end(); )
             it = (it->first != tankLow && now >= it->second.untilMs)
                      ? g_tankGather.erase(it) : std::next(it);
         TankGatherState& s = g_tankGather[tankLow];
-        s.untilMs = now + TANK_GATHER_MAX_MS;
+        s.untilMs = now + TANK_GATHER_GC_MS;
         s.set     = std::move(set);
     }
 
-    // True while the tank is still gathering its multi-pull: the cap hasn't lapsed AND
-    // at least one alive set member hasn't stacked on the tank yet. Self-clears (returns
-    // false) at the cap so a mob that won't path can't freeze the party forever.
-    static bool IsTankGathering(Player* tank)
-    {
-        if (!tank) return false;
-        std::vector<ObjectGuid> set;
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            auto it = g_tankGather.find(tank->GetGUID().GetCounter());
-            if (it == g_tankGather.end()) return false;
-            if (getMSTime() >= it->second.untilMs) { g_tankGather.erase(it); return false; }
-            set = it->second.set;
-        }
-        for (ObjectGuid const& g : set)
-        {
-            Creature* m = ObjectAccessor::GetCreature(*tank, g);
-            if (!m || !m->IsAlive()) continue;                        // dead/gone -> gathered
-            if (tank->GetDistance(m) > GATHER_STACK_R) return true;   // still inbound -> hold
-        }
-        return false;   // every alive member is stacked on the tank -> done
-    }
+    // Pure-threat gather gate. Defined below the threat helpers it mirrors
+    // (TankHasEngageLead / IsBossUnit); forward-declared here, beside its state.
+    static bool IsTankGathering(Player* tank);
 
     // Build the INITIAL multi-pull set: the connected proximity-cluster (edges within
     // MOB_CLUSTER_R) that contains `anchor`, among UN-AGGROED hostiles near the tank
@@ -2807,9 +2795,9 @@ namespace WowPsParty
         Player* tank = PartyLeadTank(bot);
         if (!tank || tank == bot) return false;
 
-        // Multi-pull gather: hold until the whole cluster is stacked on the tank
-        // (bounded by TANK_GATHER_MAX_MS), so the tank can group the pack before DPS
-        // threat splits it across the not-yet-gathered mobs. Self-clears at the cap.
+        // Multi-pull gather: hold until the bot tank has built a threat lead on its
+        // cluster (pure threat, no timer), so DPS don't rip the not-yet-locked mobs off
+        // it. Self-releases per mob and can't freeze the party (see IsTankGathering).
         if (IsTankGathering(tank)) return true;
 
         if (!IsTankPulling(tank->GetGUID())) return false;
@@ -2918,6 +2906,62 @@ namespace WowPsParty
         if (!tank) return false;
         float const floor = float(mob->GetMaxHealth()) * frac;
         return mob->GetThreatMgr().GetThreat(tank) >= floor;
+    }
+
+    // Bot lead-tank multi-pull gather gate (forward-declared up by g_tankGather). PURE
+    // THREAT, no timer — the same model the human-tank wait-gate uses, applied to a bot
+    // tank's body-pulled cluster. The party holds fire (IsPartyPullPending) while the
+    // tank is still locking the pack; releases the instant it has a real engage lead on
+    // every set member it's actually grabbing. Only TWO things keep the party held, and
+    // both resolve through the tank's own action within a beat or two (so it can never
+    // freeze on a mob that pathed off, evaded, or peeled onto someone else):
+    //   - a member in combat with the TANK as its target that the tank hasn't yet built
+    //     an engage lead on (ENGAGE_THREAT_HEALTH_FRAC of max HP) — it's mid-lock; OR
+    //   - a member not yet aggroed but within GATHER_STACK_R of the tank — the tank is
+    //     right on top of it, about to body-pull it in.
+    // Everything else releases (stops gating the party): dead/gone, a boss (tank-and-
+    // spank), a member the tank has already locked, a member that aggroed an ALLY rather
+    // than the tank (waiting can't make the tank lock it, and the held DPS can't peel it
+    // — so let the gather finish and normal assist grab it), and a far un-aggroed
+    // straggler the pull missed. Self-scales to any tank's threat output with no fixed
+    // wait. Drops the entry once every member is released.
+    static bool IsTankGathering(Player* tank)
+    {
+        if (!tank) return false;
+        std::vector<ObjectGuid> set;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            auto it = g_tankGather.find(tank->GetGUID().GetCounter());
+            if (it == g_tankGather.end()) return false;
+            if (getMSTime() >= it->second.untilMs)   // GC backstop only (abandoned entry)
+            {
+                g_tankGather.erase(it);
+                return false;
+            }
+            set = it->second.set;
+        }
+        for (ObjectGuid const& g : set)
+        {
+            Creature* m = ObjectAccessor::GetCreature(*tank, g);
+            if (!m || !m->IsAlive()) continue;   // dead/gone -> released
+            if (IsBossUnit(m))       continue;   // boss -> no gather hold
+            if (m->IsInCombat())
+            {
+                // Hold only while THIS tank is the one locking it and hasn't built the
+                // lead yet. A mob the tank has locked, or one that aggroed an ally
+                // instead, no longer gates the party (see header).
+                if (m->GetVictim() == tank && !TankHasEngageLead(m, ENGAGE_THREAT_HEALTH_FRAC))
+                    return true;
+                continue;
+            }
+            if (tank->GetDistance(m) <= GATHER_STACK_R)
+                return true;                     // not yet aggroed but right here -> hold
+            // else: a far un-aggroed straggler the pull missed -> don't gate on it
+        }
+        // every alive member released -> gather complete; drop the entry so it can't linger.
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_tankGather.erase(tank->GetGUID().GetCounter());
+        return false;
     }
 
     // While a DPS/healer is waiting for the human tank, don't keep idling just because
