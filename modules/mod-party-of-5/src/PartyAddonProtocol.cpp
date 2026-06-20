@@ -31,7 +31,10 @@
 #include "GroupMgr.h"
 #include "Guild.h"
 #include "GuildMgr.h"
+#include "Opcodes.h"      // CMSG_PETITION_SIGN / CMSG_TURN_IN_PETITION — hero charter signing
+#include "PetitionMgr.h"  // sPetitionMgr / Petition / Signatures — charter detection
 #include "Pet.h"
+#include "World.h"        // sWorld->getIntConfig — petition-sign / max-level configs
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "Spell.h"
@@ -2704,6 +2707,90 @@ static void HandleGuildBankDeposit(Player* requester, std::string_view payload)
     if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
 }
 
+// A guild / arena-team CHARTER is a petition item with NO on-use spell, so the plain
+// USE path below reports "isn't usable". Right-clicking it in the panel instead has
+// the leader's online heroes sign it and — once enough signatures are gathered —
+// auto-creates the guild / arena team. Heroes are same-account alts; the core sign
+// path normally rejects same-account signers, but mod-playerbots'
+// OnPlayerbotCheckPetitionAccount waives that check for bot signers (every hero is a
+// playerbot), so each distinct hero guid counts. We reuse the core sign + turn-in
+// handlers verbatim (all eligibility checks + owner-facing packets), exactly as the
+// playerbots PetitionSignAction does, so this stays correct as the core evolves.
+// Arena charters additionally require each signer to be max level — the core handler
+// self-rejects lower-level heroes, so they simply don't count toward the total.
+static void HandleCharterSign(Player* owner, Item* charter, Petition const* petition)
+{
+    WorldSession* sess = owner->GetSession();
+    if (petition->ownerGuid != owner->GetGUID())
+    {
+        ChatHandler(sess).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r That charter belongs to someone else.");
+        return;
+    }
+
+    uint8 const  type     = petition->petitionType;
+    bool const   isArena  = type != GUILD_CHARTER_TYPE;
+    uint32 const required = isArena ? uint32(type) - 1
+                                    : sWorld->getIntConfig(CONFIG_MIN_PETITION_SIGNS);
+    // Copied now — the turn-in below frees the petition, dangling this pointer.
+    std::string const petName = petition->petitionName;
+
+    // Sign with every eligible online hero on the account (party slots), skipping the
+    // owner. The core handler self-rejects an ineligible signer (already in a guild /
+    // team, arena needs max level, faction) so those silently don't count.
+    uint32 const account = sess->GetAccountId();
+    if (QueryResult q = CharacterDatabase.Query(
+            "SELECT `guid` FROM `account_party` WHERE `account` = {} ORDER BY `slot`", account))
+    {
+        do
+        {
+            uint32 const heroLow = q->Fetch()[0].Get<uint32>();
+            if (heroLow == owner->GetGUID().GetCounter()) continue;
+            Player* hero = ObjectAccessor::FindConnectedPlayer(
+                ObjectGuid::Create<HighGuid::Player>(heroLow));
+            if (!hero || WowPsParty::MemberStorageUnstable(hero)) continue;
+
+            WorldPacket sign(CMSG_PETITION_SIGN, 8 + 1);
+            sign << charter->GetGUID();
+            sign << uint8(0);
+            hero->GetSession()->HandlePetitionSignOpcode(sign);
+        } while (q->NextRow());
+    }
+
+    Signatures const* sigs = sPetitionMgr->GetSignature(charter->GetGUID());
+    uint32 const have = sigs ? uint32(sigs->signatureMap.size()) : 0;
+
+    if (have < required)
+    {
+        if (isArena)
+            ChatHandler(sess).PSendSysMessage(
+                "|cffffcc00[WowPsParty]|r |cffffffff{}|r: {}/{} signatures. Arena charters can only "
+                "be signed by your level {} heroes — bring more max-level heroes into the party.",
+                petName, have, required, sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL));
+        else
+            ChatHandler(sess).PSendSysMessage(
+                "|cffffcc00[WowPsParty]|r |cffffffff{}|r: {}/{} signatures collected.",
+                petName, have, required);
+        WowPsParty::SendInventoryTo(owner);
+        return;
+    }
+
+    // Enough signatures — auto-create by replaying the turn-in through the core
+    // handler. Arena needs the 5 emblem fields after the guid (0 = the plain default
+    // tabard; the team can re-style at an arena registrar later).
+    WorldPacket turnIn(CMSG_TURN_IN_PETITION, isArena ? (8 + 20) : 8);
+    turnIn << charter->GetGUID();
+    if (isArena)
+        turnIn << uint32(0) << uint32(0) << uint32(0) << uint32(0) << uint32(0);
+    sess->HandleTurnInPetitionOpcode(turnIn);
+
+    LOG_INFO("module", "[WowPsParty Charter] {} auto-created '{}' (type={}) with {} hero signatures",
+        owner->GetName(), petName, uint32(type), have);
+    ChatHandler(sess).PSendSysMessage(
+        "|cff33ff99[WowPsParty]|r Created |cffffffff{}|r with {} hero signature(s)!", petName, have);
+    WowPsParty::SendInventoryTo(owner);
+}
+
 // USE\t<srcPartySlot>\t<srcItemGuidLow> — use a bag item. CONSUMABLES (food/
 // potions) fire their on-use on the requester and lose a charge from the owner.
 // NON-consumables (recipes to learn, essences/shards that CONVERT via reagents,
@@ -2733,6 +2820,14 @@ static void HandleUse(Player* requester, std::string_view payload)
     if (!srcItem) return;
     ItemTemplate const* t = srcItem->GetTemplate();
     if (!t) return;
+
+    // A guild / arena-team CHARTER (petition item, no on-use spell) is signed by the
+    // party's heroes instead of falling through to "isn't usable" below.
+    if (Petition const* petition = sPetitionMgr->GetPetition(srcItem->GetGUID()))
+    {
+        HandleCharterSign(requester, srcItem, petition);
+        return;
+    }
 
     uint32 useSpell = 0;
     int32  useSpellCharges = 0;
