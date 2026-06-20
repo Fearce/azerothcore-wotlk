@@ -94,7 +94,14 @@ namespace
         uint8  bmin;        // bracket min level — re-level target floor
         uint8  bmax;        // bracket max level — re-level target (top of bracket)
         bool   releveled;   // re-level done, or unnecessary (in-bracket pool char)
+        uint32 outSinceMs = 0;  // when it first read !InBattleground after entering (0 = in)
     };
+
+    // Grace before retiring a fill bot that read !InBattleground after entering. A real
+    // match-end stays out; a transient clear of bgInstanceID (an intra-BG teleport / a tick
+    // where the flag flickers) comes back within this window — without it an active bot got
+    // logged out mid-match ("a bot just left in the middle of a battleground").
+    constexpr uint32 BG_OUT_GRACE_MS = 8000;
 
     // A fill bot that never finishes its async login is retired after this so it
     // can't pin the leader's session (g_activeLeaders) forever.
@@ -495,16 +502,33 @@ public:
                 // Remember it made it in, so when the match ENDS (below) we retire it from
                 // HERE — never from the BG-removal hook, where a synchronous LogoutPlayer
                 // mid-teardown (×10-40 bots on a BG end) is a crash risk.
-                if (!fe.entered)
+                if (!fe.entered || fe.outSinceMs)
                 {
                     std::lock_guard<std::mutex> lk(g_mutex);
                     auto it = g_fillBots.find(botLow);
-                    if (it != g_fillBots.end()) it->second.entered = true;
+                    if (it != g_fillBots.end()) { it->second.entered = true; it->second.outSinceMs = 0; }
                 }
                 continue;
             }
-            // Out of the BG. If it had ENTERED, its match is over -> retire safely here.
-            if (fe.entered) { RetireFillBot(botLow, bot); continue; }
+            // Out of the BG after entering. Could be the match ending OR a transient clear
+            // of InBattleground (an intra-BG teleport, a tick where the flag flickers) —
+            // retiring on the transient case logs an ACTIVE bot out mid-match. Require it to
+            // stay out for a grace; a real match-end persists, a glitch comes back (which
+            // resets outSinceMs in the InBattleground branch above).
+            if (fe.entered)
+            {
+                uint32 const now = getMSTime();
+                if (!fe.outSinceMs)
+                {
+                    std::lock_guard<std::mutex> lk(g_mutex);
+                    auto it = g_fillBots.find(botLow);
+                    if (it != g_fillBots.end()) it->second.outSinceMs = now;
+                    continue;   // start the grace; re-check next tick
+                }
+                if (now - fe.outSinceMs < BG_OUT_GRACE_MS) continue;   // still settling — wait
+                RetireFillBot(botLow, bot);
+                continue;
+            }
 
             // Pre-pop: if the leader bailed the queue, the fill bots leave too.
             Player* leader = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(fe.leaderLow));
