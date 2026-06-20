@@ -2735,10 +2735,12 @@ static void HandleUse(Player* requester, std::string_view payload)
     if (!t) return;
 
     uint32 useSpell = 0;
+    int32  useSpellCharges = 0;
     for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
         if (t->Spells[i].SpellTrigger == ITEM_SPELLTRIGGER_ON_USE && t->Spells[i].SpellId > 0)
         {
             useSpell = uint32(t->Spells[i].SpellId);
+            useSpellCharges = t->Spells[i].SpellCharges;   // 0 = reusable; <0 = expendable
             break;
         }
     if (!useSpell)
@@ -2816,13 +2818,21 @@ static void HandleUse(Player* requester, std::string_view payload)
     if (t->Class == ITEM_CLASS_CONSUMABLE)
     {
         requester->CastSpell(requester, useSpell, true);
-        if (srcItem->GetCount() > 1)
+        // Consume ONLY if the on-use spell is actually expendable — the same rule the
+        // engine's Spell::TakeCastItem uses. A REUSABLE consumable (SpellCharges == 0,
+        // e.g. the Oculus Ruby/Amber/Emerald drake essences) is used on every platform
+        // and must NOT be destroyed ("the Ruby Essence vanishes after the first platform"
+        // bug). Single-use food/potions (SpellCharges != 0) still decrement/destroy.
+        if (useSpellCharges != 0)
         {
-            srcItem->SetCount(srcItem->GetCount() - 1);
-            srcItem->SetState(ITEM_CHANGED, srcChar);
+            if (srcItem->GetCount() > 1)
+            {
+                srcItem->SetCount(srcItem->GetCount() - 1);
+                srcItem->SetState(ITEM_CHANGED, srcChar);
+            }
+            else
+                srcChar->DestroyItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
         }
-        else
-            srcChar->DestroyItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
         WowPsParty::SendInventoryTo(requester);
         if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
         return;
