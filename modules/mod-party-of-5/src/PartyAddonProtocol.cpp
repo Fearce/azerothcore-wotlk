@@ -1526,6 +1526,51 @@ static uint32 PermEnchantIdOfSpell(SpellInfo const* spell)
     return 0;
 }
 
+// An item's ON-USE spell id if that spell is a permanent item-enchant (i.e. the
+// item is an ENCHANT SCROLL), else 0. The scroll's on-use spell IS the enchant
+// spell, so PermEnchantIdOfSpell(it) gives the enchant — and the addon picker can
+// resolve the spell id to a name like a known enchant.
+static uint32 EnchantScrollUseSpell(ItemTemplate const* t)
+{
+    if (!t) return 0;
+    for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+        if (t->Spells[i].SpellTrigger == ITEM_SPELLTRIGGER_ON_USE && t->Spells[i].SpellId > 0)
+        {
+            uint32 const sp = uint32(t->Spells[i].SpellId);
+            return PermEnchantIdOfSpell(sSpellMgr->GetSpellInfo(sp)) ? sp : 0;
+            // first on-use spell only — scrolls carry exactly one
+        }
+    return 0;
+}
+
+// Visit every ENCHANT SCROLL in any loaded party member's bags (backpack + the 4
+// equippable bags), calling fn(useSpellId, scrollItem, owner). Used to list scroll
+// enchants in REQ_ENCHANTS and to find + consume the scroll in HandleEnchant, so a
+// scroll is a first-class enchant source exactly like a known enchant spell.
+template <class Fn>
+static void ForEachPartyEnchantScroll(uint32 account, Fn&& fn)
+{
+    auto scan = [&](Player* p, Item* it)
+    {
+        if (!it) return;
+        if (uint32 sp = EnchantScrollUseSpell(it->GetTemplate()))
+            fn(sp, it, p);
+    };
+    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
+    {
+        uint32 const guid = WowPsParty::GuidForAccountSlot(account, partySlot);
+        if (!guid) continue;
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid));
+        if (!p) continue;
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            scan(p, p->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = p->GetBagByPos(b))
+                for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                    scan(p, p->GetItemByPos(b, uint8(j)));
+    }
+}
+
 // REQ_ENCHANTS\t<targetPartySlot>\t<targetItemGuidLow> — reply with ENCHANTS, the
 // enchant spell ids any loaded party member knows that FIT that specific item
 // (so the picker only ever shows valid choices for what was clicked).
@@ -1565,6 +1610,19 @@ static void HandleReqEnchants(Player* requester, std::string_view payload)
             spellIds.push_back(spellId);
         }
     }
+
+    // Also list enchant SCROLLS in the party's bags whose enchant FITS the item, so
+    // the user can apply a scroll the same way as a known enchant (HandleEnchant
+    // resolves the spell id back to the scroll and consumes it). Deduped against the
+    // known-spell list by spell id.
+    ForEachPartyEnchantScroll(account, [&](uint32 sp, Item* /*scroll*/, Player* /*owner*/)
+    {
+        if (seen.count(sp)) return;
+        SpellInfo const* spell = sSpellMgr->GetSpellInfo(sp);
+        if (!spell || !tgtItem->IsFitToSpellRequirements(spell)) return;
+        seen.insert(sp);
+        spellIds.push_back(sp);
+    });
 
     // DIAGNOSTIC ("can't enchant" report): how many applicable enchants the party
     // knows for this item. 0 here = the picker is empty because NO party member is an
@@ -1627,40 +1685,72 @@ static void HandleEnchant(Player* requester, std::string_view payload)
         Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid));
         if (p && p->HasSpell(enchantSpellId)) enchanter = p;
     }
+    // If nobody KNOWS the enchant, an enchant SCROLL in the party's bags can supply
+    // it — the scroll IS the cost (no reagents) and is consumed on a successful apply.
+    Item*   scroll      = nullptr;
+    Player* scrollOwner = nullptr;
     if (!enchanter)
+        ForEachPartyEnchantScroll(account, [&](uint32 sp, Item* it, Player* p)
+        {
+            if (!scroll && sp == enchantSpellId) { scroll = it; scrollOwner = p; }
+        });
+
+    if (!enchanter && !scroll)
     {
         ChatHandler(requester->GetSession()).PSendSysMessage(
-            "|cffff5555[WowPsParty]|r No-one in the party knows that enchant.");
+            "|cffff5555[WowPsParty]|r No-one knows that enchant and there's no scroll for it.");
         return;
     }
 
-    // Reagents: check the shared pool covers ALL of them before consuming any.
-    extern uint32 WowPsParty_PartyReagentCount(Player*, uint32);
-    extern void   WowPsParty_TakeReagent(Player*, uint32, uint32);
-    for (uint8 r = 0; r < MAX_SPELL_REAGENTS; ++r)
+    // Reagents apply ONLY to a known-spell caster — a scroll carries its own cost.
+    // Check the shared pool covers ALL of them before consuming any.
+    if (enchanter)
     {
-        if (spell->Reagent[r] <= 0) continue;
-        if (WowPsParty_PartyReagentCount(enchanter, uint32(spell->Reagent[r])) < uint32(spell->ReagentCount[r]))
+        extern uint32 WowPsParty_PartyReagentCount(Player*, uint32);
+        extern void   WowPsParty_TakeReagent(Player*, uint32, uint32);
+        for (uint8 r = 0; r < MAX_SPELL_REAGENTS; ++r)
         {
-            ChatHandler(requester->GetSession()).PSendSysMessage(
-                "|cffff5555[WowPsParty]|r Missing reagents for that enchant.");
-            return;
+            if (spell->Reagent[r] <= 0) continue;
+            if (WowPsParty_PartyReagentCount(enchanter, uint32(spell->Reagent[r])) < uint32(spell->ReagentCount[r]))
+            {
+                ChatHandler(requester->GetSession()).PSendSysMessage(
+                    "|cffff5555[WowPsParty]|r Missing reagents for that enchant.");
+                return;
+            }
         }
+        for (uint8 r = 0; r < MAX_SPELL_REAGENTS; ++r)
+            if (spell->Reagent[r] > 0)
+                WowPsParty_TakeReagent(enchanter, uint32(spell->Reagent[r]), uint32(spell->ReagentCount[r]));
     }
-    for (uint8 r = 0; r < MAX_SPELL_REAGENTS; ++r)
-        if (spell->Reagent[r] > 0)
-            WowPsParty_TakeReagent(enchanter, uint32(spell->Reagent[r]), uint32(spell->ReagentCount[r]));
 
     // Apply on the item's OWNER so equipped stats take effect (no-op for a bagged
     // item until equipped). Remove the old enchant first, then set + reapply.
+    ObjectGuid const casterGuid = enchanter ? enchanter->GetGUID() : scrollOwner->GetGUID();
     owner->ApplyEnchantment(item, PERM_ENCHANTMENT_SLOT, false);
-    item->SetEnchantment(PERM_ENCHANTMENT_SLOT, enchantId, 0, 0, enchanter->GetGUID());
+    item->SetEnchantment(PERM_ENCHANTMENT_SLOT, enchantId, 0, 0, casterGuid);
     owner->ApplyEnchantment(item, PERM_ENCHANTMENT_SLOT, true);
     item->SetState(ITEM_CHANGED, owner);
 
-    ChatHandler(requester->GetSession()).PSendSysMessage(
-        "|cff66ccff[WowPsParty]|r {} enchanted |cffffffff{}|r ({}'s).",
-        enchanter->GetName(), item->GetTemplate() ? item->GetTemplate()->Name1 : "item", owner->GetName());
+    // Consume the scroll (its cost) AFTER the enchant landed, so a failed apply never
+    // eats it — the exact dupe-loss the direct right-click bug caused.
+    std::string const itemName = item->GetTemplate() ? item->GetTemplate()->Name1 : "item";
+    if (scroll)
+    {
+        if (scroll->GetCount() > 1)
+        {
+            scroll->SetCount(scroll->GetCount() - 1);
+            scroll->SetState(ITEM_CHANGED, scrollOwner);
+        }
+        else
+            scrollOwner->DestroyItem(scroll->GetBagSlot(), scroll->GetSlot(), true);
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r Enchanted |cffffffff{}|r ({}'s) with a scroll.",
+            itemName, owner->GetName());
+    }
+    else
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r {} enchanted |cffffffff{}|r ({}'s).",
+            enchanter->GetName(), itemName, owner->GetName());
 
     WowPsParty::SendGearTo(requester, tgtSlot);
     WowPsParty::SendStatsTo(requester, tgtSlot);
@@ -2486,6 +2576,21 @@ static void HandleUse(Player* requester, std::string_view payload)
             requester->GetName(), t->ItemId, t->Name1, uint32(t->Class), t->Flags);
         ChatHandler(requester->GetSession()).PSendSysMessage(
             "|cffff5555[WowPsParty]|r |cffffffff{}|r isn't usable.", t->Name1);
+        return;
+    }
+
+    // An ENCHANT SCROLL (its on-use spell is a permanent enchant) must NOT be used
+    // here: a self-cast applies the enchant to NOTHING and just eats the scroll (the
+    // "right-clicked the scroll, it vanished, nothing got enchanted" dupe-loss). The
+    // scroll has no client target cursor through the panel anyway, and it can enchant
+    // a bot's gear — which the normal cursor can't reach. Route the user to the
+    // enchant picker (which now lists scroll enchants): click the target item, pick
+    // this from the list, and HandleEnchant applies + consumes the scroll.
+    if (PermEnchantIdOfSpell(sSpellMgr->GetSpellInfo(useSpell)))
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r To use |cffffffff{}|r, click the item you want to enchant "
+            "and pick it from the enchant list — don't right-click the scroll.", t->Name1);
         return;
     }
 
