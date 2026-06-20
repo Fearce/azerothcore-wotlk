@@ -25,6 +25,7 @@
 #include "QuestDef.h"
 #include "Reputation/ReputationMgr.h"
 #include "PartyFollow.h"
+#include "PartyPath.h"
 #include "ScriptMgr.h"
 #include "GroupScript.h"
 #include "SpellInfo.h"
@@ -399,8 +400,30 @@ public:
         PLAYERHOOK_ON_STORE_NEW_ITEM,
         PLAYERHOOK_ON_LEVEL_CHANGED,
         PLAYERHOOK_ON_QUEST_ABANDON,
-        PLAYERHOOK_ON_LEARN_TAXI_NODE
+        PLAYERHOOK_ON_LEARN_TAXI_NODE,
+        PLAYERHOOK_ON_MAP_CHANGED
     }) { }
+
+    // On entering a dungeon, tell the party leader whether a tank route is recorded
+    // for this map — so it's obvious up front whether the tank will lead the pull
+    // path or just follow. Only the human owner (has followers; bots never do) sees it.
+    void OnPlayerMapChanged(Player* player) override
+    {
+        if (!player || !player->GetMap() || !player->GetMap()->IsDungeon())
+            return;
+        if (WowPsParty::CountFollowersFor(player->GetGUID()) == 0)
+            return;   // not leading a party here — nothing to say about a tank route
+
+        uint32 const wps = WowPsParty::GetPathWaypointCount(player->GetMapId());
+        if (wps > 0)
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Recorded tank route found for this dungeon "
+                "({} waypoints) — the tank will lead the pull path.", wps);
+        else
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cffffcc00[WowPsParty]|r No recorded tank route for this dungeon — "
+                "the tank will follow you. Use Record Path to record one.");
+    }
 
     // Mirror a freshly-discovered FLIGHT PATH (taxi node) to every other LOADED
     // hero on the account, so flight paths are effectively ACCOUNT-BOUND: discover
