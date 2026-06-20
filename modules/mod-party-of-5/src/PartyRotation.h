@@ -168,6 +168,12 @@ namespace WowPsParty
     void RotationCacheClear(uint32 guid);
     void RotationCacheRefreshFromDB(uint32 guid);
 
+    // COMMON shared rotation (per ACCOUNT) — prepended to every party bot's rules in
+    // TickRotation. SET stores it; Get returns a copy; RefreshFromDB reloads it.
+    void SharedRotationCacheSet(uint32 account, std::vector<RotationRule> rules);
+    std::vector<RotationRule> GetSharedRotation(uint32 account);
+    void SharedRotationRefreshFromDB(uint32 account);
+
     // True when the rotation contains a keep_distance_* rule, i.e. the user has
     // opted the bot into rotation-driven positioning (kiting). AssistTarget then
     // stops chasing and lets the rotation own movement.

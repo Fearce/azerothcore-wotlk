@@ -1322,6 +1322,13 @@ namespace {
         static std::unordered_map<uint64, std::vector<WowPsParty::RotationRule>> m;
         return m;
     }
+
+    // Pending COMMON shared-rotation rules mid-save, keyed by ACCOUNT (the editor's).
+    std::unordered_map<uint32, std::vector<WowPsParty::RotationRule>>& PendingSharedRotationMap()
+    {
+        static std::unordered_map<uint32, std::vector<WowPsParty::RotationRule>> m;
+        return m;
+    }
 }
 
 // SELL\t<srcPartySlot>\t<srcItemGuidLow>
@@ -3727,12 +3734,92 @@ public:
                 guid, stored);
             CharacterDatabase.CommitTransaction(tx);
 
+            // A HENCHMAN never keeps a custom rotation (it's wiped on enroll), so an
+            // EMPTY save must not leave it ruleless — that gutted its combat (Kevin:
+            // "they fight much worse"). When the committed list is empty for a
+            // henchman, restore its class DEFAULT into the cache instead of clearing.
+            ObjectGuid const rotOg = ObjectGuid::Create<HighGuid::Player>(guid);
+            if (rules.empty() && WowPsParty::IsHenchman(rotOg))
+            {
+                if (Player* h = ObjectAccessor::FindConnectedPlayer(rotOg))
+                {
+                    WowPsParty::RotationCacheSet(guid, WowPsParty::ParseRotationString(
+                        WowPsParty::DefaultRotationForClass(h->getClass(), WowPsParty::RoleForGuid(rotOg))));
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cff66ccff[WowPsParty]|r Henchman rotation cleared — restored its class default.");
+                    LOG_INFO("module",
+                        "[WowPsParty] COMMIT_ROTATION henchman guid={} empty -> restored class default", guid);
+                    return;
+                }
+            }
+
             WowPsParty::RotationCacheSet(guid, rules);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Saved {} rule(s).", uint32(rules.size()));
             LOG_INFO("module",
                 "[WowPsParty] COMMIT_ROTATION target_guid={} n_rules={}",
                 guid, uint32(rules.size()));
+        }
+        // ---------- COMMON shared rotation (account-wide, chunked like above) -------
+        // Mirrors BEGIN/ROTATION_RULE/COMMIT but account-scoped (no target token): the
+        // common pre-rotation that runs on EVERY party bot. Stored in
+        // party_shared_rotation + the g_sharedRotation cache.
+        else if (command == "BEGIN_SHARED_ROTATION")
+        {
+            PendingSharedRotationMap()[player->GetSession()->GetAccountId()].clear();
+        }
+        else if (command == "SHARED_ROTATION_RULE")
+        {
+            // payload = "<condition>\t<action>\t<priority>[\t<flags>]"
+            std::string s(payload);
+            std::vector<std::string> f;
+            size_t p = 0;
+            while (p <= s.size())
+            {
+                size_t t = s.find('\t', p);
+                if (t == std::string::npos) { f.push_back(s.substr(p)); break; }
+                f.push_back(s.substr(p, t - p));
+                p = t + 1;
+            }
+            if (f.size() < 3) return;
+            WowPsParty::RotationRule r;
+            r.condition = f[0];
+            r.action    = f[1];
+            r.priority  = std::atoi(f[2].c_str());
+            r.flags     = f.size() >= 4 ? f[3] : "";
+            PendingSharedRotationMap()[player->GetSession()->GetAccountId()].push_back(std::move(r));
+        }
+        else if (command == "COMMIT_SHARED_ROTATION")
+        {
+            uint32 const account = player->GetSession()->GetAccountId();
+            auto& pending = PendingSharedRotationMap();
+            auto it = pending.find(account);
+            std::vector<WowPsParty::RotationRule> rules;
+            if (it != pending.end()) { rules = std::move(it->second); pending.erase(it); }
+            std::stable_sort(rules.begin(), rules.end(),
+                [](WowPsParty::RotationRule const& a, WowPsParty::RotationRule const& b)
+                { return a.priority > b.priority; });
+            std::string stored = WowPsParty::SerialiseRotationRules(rules);
+            CharacterDatabase.EscapeString(stored);
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "INSERT INTO `party_shared_rotation` (`account`, `priority_actions_json`) VALUES ({}, '{}') "
+                "ON DUPLICATE KEY UPDATE `priority_actions_json` = VALUES(`priority_actions_json`)",
+                account, stored);
+            CharacterDatabase.CommitTransaction(tx);
+            WowPsParty::SharedRotationCacheSet(account, rules);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Saved {} common rule(s) — runs on the whole party.",
+                uint32(rules.size()));
+        }
+        // REQ_SHARED_ROTATION  ->  SHARED_ROTATION\t<dsl>
+        else if (command == "REQ_SHARED_ROTATION")
+        {
+            uint32 const account = player->GetSession()->GetAccountId();
+            QueryResult q = CharacterDatabase.Query(
+                "SELECT `priority_actions_json` FROM `party_shared_rotation` WHERE `account` = {}", account);
+            std::string const dsl = q ? q->Fetch()[0].Get<std::string>() : std::string();
+            SendWPSP(player, "SHARED_ROTATION\t" + dsl);
         }
         else if (command == "SET_ROTATION")
         {

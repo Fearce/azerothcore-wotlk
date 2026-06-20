@@ -273,6 +273,35 @@ namespace WowPsParty
         RotationCacheSet(guid, std::move(rules));
     }
 
+    // ---- COMMON shared rotation (per ACCOUNT) ------------------------------
+    // One pre-rotation that runs FIRST on every party bot (heroes + henchmen) —
+    // prepended to each bot's own rules in TickRotation. Lets universal rules
+    // (interrupt a known dangerous cast, eat/drink, ...) live in one place.
+    static std::unordered_map<uint32, std::vector<RotationRule>> g_sharedRotation;  // account -> rules
+    static std::mutex g_sharedRotationMutex;
+
+    void SharedRotationCacheSet(uint32 account, std::vector<RotationRule> rules)
+    {
+        std::lock_guard<std::mutex> lock(g_sharedRotationMutex);
+        if (rules.empty()) g_sharedRotation.erase(account);
+        else               g_sharedRotation[account] = std::move(rules);
+    }
+
+    std::vector<RotationRule> GetSharedRotation(uint32 account)
+    {
+        std::lock_guard<std::mutex> lock(g_sharedRotationMutex);
+        auto it = g_sharedRotation.find(account);
+        return it == g_sharedRotation.end() ? std::vector<RotationRule>{} : it->second;
+    }
+
+    void SharedRotationRefreshFromDB(uint32 account)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `priority_actions_json` FROM `party_shared_rotation` WHERE `account` = {}", account);
+        std::string const dsl = q ? q->Fetch()[0].Get<std::string>() : std::string();
+        SharedRotationCacheSet(account, ParseRotationString(dsl));
+    }
+
     bool HasRotation(uint32 guid)
     {
         std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
@@ -3922,6 +3951,13 @@ namespace WowPsParty
         // ranks, leading to runaway consumption.
         if (verb == "drink" || verb == "eat")
         {
+            // A class with no mana pool (warrior / rogue / death knight) has nothing
+            // to DRINK for — skip it so a COMMON shared "drink" rule doesn't sit them
+            // pointlessly (Kevin: "those that don't use mana should skip drinking").
+            // "eat" still restores health for everyone.
+            if (verb == "drink" && bot->GetMaxPower(POWER_MANA) == 0)
+                return false;
+
             auto bailWithLog = [&](char const* reason) {
                 static thread_local std::unordered_map<uint32, uint32> lastLog;
                 uint32 const nowMs = getMSTime();
@@ -4783,13 +4819,22 @@ namespace WowPsParty
         EnsureHunterPet(bot);
         MaintainBotPet(bot);
 
-        std::vector<RotationRule> rules;
+        std::vector<RotationRule> ownRules;
         {
             std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
             auto it = g_rotationCache.find(bot->GetGUID().GetCounter());
-            if (it == g_rotationCache.end()) return false;
-            rules = it->second;  // copy, drop lock before doing real work
+            if (it != g_rotationCache.end()) ownRules = it->second;  // copy, drop lock
         }
+        // Prepend the account's COMMON shared rotation: it runs FIRST (a pre-rotation),
+        // then the bot's own rules — both already priority-sorted, and the eval loop
+        // below fires the first matching rule in vector order, so shared wins ties.
+        // Applies to EVERY bot (heroes + henchmen); a bot with no own rules still runs
+        // the shared ones.
+        std::vector<RotationRule> rules =
+            GetSharedRotation(bot->GetSession() ? bot->GetSession()->GetAccountId() : 0);
+        rules.reserve(rules.size() + ownRules.size());
+        for (auto& r : ownRules) rules.push_back(std::move(r));
+        if (rules.empty()) return false;
 
         // Party leash: if the controlled char has run >50y away, don't cast
         // or drink — yield so the follow ticker rejoins the leader (it walks

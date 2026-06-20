@@ -2081,6 +2081,10 @@ namespace WowPsParty
                          "members will NOT spawn. Re-login should fix.", activeGuid);
                 return;
             }
+            // Load the account's COMMON shared rotation once (it's account-wide, not
+            // per-bot) — prepended to every bot's rules in TickRotation.
+            WowPsParty::SharedRotationRefreshFromDB(account);
+
             // WoW party is capped at 5 members. Active player counts as 1,
             // so spawn at most 4 bots. Extra enrolled chars beyond that just
             // sit out this session.
