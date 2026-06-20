@@ -140,11 +140,16 @@ public:
             player->PrepareQuestMenu(creature->GetGUID());
         }
 
-        if (player->HasAura(SPELL_CORPORAL))
-        {
-            AddGossipItemFor(player, 9923, 0, GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF);
-        }
-        else if (player->HasAura(SPELL_LIEUTENANT))
+        // This server: a member of the faction that CONTROLS the workshop can build any
+        // siege vehicle, no WG rank required. Retail gated builds behind Corporal/
+        // Lieutenant (earned from honorable kills in the battle), but that made vehicles
+        // unreachable in an underpopulated WG — there's nobody to kill for rank, so the
+        // no-rank default gossip ("Only certified officers of the <faction>…") showed even
+        // to the controlling faction. The workshop's engineer NPC only exists for the
+        // controlling team, so matching the player's faction to the NPC IS the control
+        // check. (Catapult, demolisher, siege engine — same options Lieutenant had.)
+        bool const allianceShop = creature->GetEntry() == NPC_GNOMISH_ENGINEER;
+        if (player->GetTeamId() == (allianceShop ? TEAM_ALLIANCE : TEAM_HORDE))
         {
             AddGossipItemFor(player, 9923, 0, GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF);
             AddGossipItemFor(player, 9923, 1, GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF + 1);
