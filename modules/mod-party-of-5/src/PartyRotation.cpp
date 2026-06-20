@@ -1695,6 +1695,21 @@ namespace WowPsParty
                 return cname == "tank_has_aura" ? has : !has;
             }
 
+            // party_has_aura / party_missing_aura — true if ANY party member (leader +
+            // bots, incl. this bot) has / lacks the named aura. Backs a raid mechanic
+            // that lands on someone in the group, e.g. the Devourer of Souls' Mirrored
+            // Soul: `party_has_aura:Mirrored Soul | stop_attacking` holds the party's DPS
+            // (damage to the boss is mirrored to the linked player) while healing continues.
+            if (cname == "party_has_aura" || cname == "party_missing_aura")
+            {
+                std::vector<Player*> party;
+                GatherPartyPlayers(bot, party, /*includeDead=*/true);
+                bool has = false;
+                for (Player* m : party)
+                    if (TargetHasNamedAura(m, arg, auraCaster)) { has = true; break; }
+                return cname == "party_has_aura" ? has : !has;
+            }
+
             // --- Aura timing / stacks / cooldown (the min-max primitives) ---
             // These all share an arg of the form "<spell name><op><number>",
             // where <op> is the first '<' or '>' in the arg. Spell names have
@@ -2704,6 +2719,8 @@ namespace WowPsParty
         return nullptr;
     }
 
+    static bool IsOffensiveEnemyVerb(std::string const& verb);   // defined below
+
     static bool ExecAction(std::string const& act, Player* bot,
                            std::string const& flags, std::string const& cond)
     {
@@ -2711,6 +2728,33 @@ namespace WowPsParty
         auto colon = act.find(':');
         std::string verb = act.substr(0, colon);
         std::string arg  = colon == std::string::npos ? "" : act.substr(colon + 1);
+
+        // While a stop_attacking hold is live, drop every ENEMY-damaging action (the
+        // auto-attack itself is held in AssistTarget). Heals, buffs, cures, rez, dispels
+        // and movement still flow — so the Devourer of Souls' Mirrored Soul holds DPS
+        // but the party keeps healing the linked player.
+        if (verb != "stop_attacking"
+            && WowPsParty::IsOffensiveHeld(bot->GetGUID())
+            && IsOffensiveEnemyVerb(verb))
+            return false;
+
+        // "stop_attacking": arm the offensive hold (re-armed each tick its condition
+        // holds), stop the swing, and cancel any in-flight HOSTILE cast/channel/auto-shot
+        // (a nuke or Mind Flay would keep mirroring damage) — a friendly cast (a heal) is
+        // left to finish. Returns false so the SAME tick still falls through to lower-
+        // priority HEAL rules: stop_attacking suppresses offence, it must not block heals.
+        if (verb == "stop_attacking")
+        {
+            static constexpr uint32 STOP_ATTACK_HOLD_MS = 2000;   // > one rotation tick
+            WowPsParty::MarkOffensiveHold(bot->GetGUID(), STOP_ATTACK_HOLD_MS);
+            bot->AttackStop();
+            for (uint32 slot : { CURRENT_GENERIC_SPELL, CURRENT_CHANNELED_SPELL, CURRENT_AUTOREPEAT_SPELL })
+                if (Spell* s = bot->GetCurrentSpell(CurrentSpellTypes(slot)))
+                    if (SpellInfo const* si = s->GetSpellInfo())
+                        if (!si->IsPositive())
+                            bot->InterruptSpell(CurrentSpellTypes(slot), false);
+            return false;
+        }
 
         // "clip" flag: let this cast interrupt the bot's own in-progress
         // cast/channel. Without it, a rule is skipped while the bot is
@@ -4434,6 +4478,30 @@ namespace WowPsParty
         if (!pet || !pet->IsAlive()) return;
         CharmInfo* charm = pet->GetCharmInfo();
         if (!charm) return;
+
+        // stop_attacking hold (e.g. Mirrored Soul): call the PET off too — its damage
+        // mirrors back exactly like the owner's, so a hunter/warlock/DK/elemental pet
+        // left swinging would keep killing the linked player. Heel + PASSIVE so it can't
+        // re-aggro the boss on its own. Re-issue only on a real change (so we don't reset
+        // its follow every tick). Runs BEFORE the stance block, which would otherwise
+        // flip it back to DEFENSIVE. Resumes when the hold lapses (owner re-acquires).
+        if (WowPsParty::IsOffensiveHeld(bot->GetGUID()))
+        {
+            if (pet->GetVictim() || charm->IsCommandAttack()
+                || pet->GetReactState() != REACT_PASSIVE)
+            {
+                pet->AttackStop();
+                pet->SetReactState(REACT_PASSIVE);
+                charm->SetPlayerReactState(REACT_PASSIVE);
+                charm->SetIsCommandAttack(false);
+                charm->SetCommandState(COMMAND_FOLLOW);
+                charm->SetIsCommandFollow(true);
+                charm->SetIsFollowing(false);
+                charm->SetIsReturning(true);
+                pet->GetMotionMaster()->MoveFollow(bot, PET_FOLLOW_DIST, pet->GetFollowAngle());
+            }
+            return;
+        }
 
         // Keep a HUNTER pet permanently HAPPY = 125% pet damage (StatSystem scales
         // BASE_ATTACK by happiness: Happy 125% / Content 100% / Unhappy 75%). Pet

@@ -188,6 +188,14 @@ namespace WowPsParty
     // re-assert via the rotation, aren't paused.)
     bool IsBeingRecalled(ObjectGuid followerGuid);
 
+    // stop_attacking hold. While set, the bot suppresses ALL offence — AssistTarget
+    // won't engage/auto-attack and the rotation drops every offensive verb — but heals,
+    // buffs and movement still run. The `stop_attacking` rotation action re-arms it each
+    // tick its condition holds (e.g. party_has_aura:Mirrored Soul), so it lapses shortly
+    // after the condition clears and the bot resumes DPS.
+    void MarkOffensiveHold(ObjectGuid followerGuid, uint32 holdMs);
+    bool IsOffensiveHeld(ObjectGuid guid);
+
     // Out-of-combat gathering. If `bot` is one of the player's alts (not a
     // henchman) and was trained in Mining or Herbalism, harvest a nearby node
     // (within 30y, within the bot's skill) while travelling with the party,

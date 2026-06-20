@@ -242,6 +242,12 @@ namespace WowPsParty
         // (their actions re-assert the hold every tick).
         static std::unordered_map<uint32, uint32> g_recallUntilMs;
 
+        // stop_attacking hold: guidLow -> expiry. While live the bot suppresses ALL
+        // offence (AssistTarget won't engage; the rotation drops offensive verbs) but
+        // heals/buffs still run. Re-armed each tick the stop_attacking rule's condition
+        // holds, so it lapses shortly after the condition (e.g. Mirrored Soul) clears.
+        static std::unordered_map<uint32, uint32> g_offensiveHoldUntilMs;
+
         static std::mutex                g_mutex;
         static std::vector<Directive>    g_directives;
         // account -> the ACTIVE leader's own account_party role. The leader isn't a
@@ -636,6 +642,25 @@ namespace WowPsParty
         if (getMSTime() >= it->second)
         {
             g_recallUntilMs.erase(it);
+            return false;
+        }
+        return true;
+    }
+
+    void MarkOffensiveHold(ObjectGuid followerGuid, uint32 holdMs)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_offensiveHoldUntilMs[followerGuid.GetCounter()] = getMSTime() + holdMs;
+    }
+
+    bool IsOffensiveHeld(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_offensiveHoldUntilMs.find(guid.GetCounter());
+        if (it == g_offensiveHoldUntilMs.end()) return false;
+        if (getMSTime() >= it->second)
+        {
+            g_offensiveHoldUntilMs.erase(it);
             return false;
         }
         return true;
@@ -3309,6 +3334,14 @@ namespace WowPsParty
         if (bot->IsNonMeleeSpellCast(false, false, true)) { AssistLog(gLow, "skip: casting"); return; }
         // Rotation engine has parked this bot (drinking, etc).
         if (IsFollowerHeld(bot->GetGUID())) { AssistLog(gLow, "skip: held by rotation"); return; }
+        // stop_attacking hold (e.g. Mirrored Soul): drop the victim and DON'T engage or
+        // chase — heals/movement run elsewhere; this governs offence only.
+        if (IsOffensiveHeld(bot->GetGUID()))
+        {
+            if (bot->GetVictim()) bot->AttackStop();
+            AssistLog(gLow, "skip: offensive hold (stop_attacking)");
+            return;
+        }
 
         ObjectGuid const leaderGuid = GetLeaderFor(bot->GetGUID());
         if (!leaderGuid)
