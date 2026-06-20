@@ -2579,18 +2579,22 @@ static void HandleUse(Player* requester, std::string_view payload)
         return;
     }
 
-    // An ENCHANT SCROLL (its on-use spell is a permanent enchant) must NOT be used
-    // here: a self-cast applies the enchant to NOTHING and just eats the scroll (the
-    // "right-clicked the scroll, it vanished, nothing got enchanted" dupe-loss). The
-    // scroll has no client target cursor through the panel anyway, and it can enchant
-    // a bot's gear — which the normal cursor can't reach. Route the user to the
-    // enchant picker (which now lists scroll enchants): click the target item, pick
-    // this from the list, and HandleEnchant applies + consumes the scroll.
-    if (PermEnchantIdOfSpell(sSpellMgr->GetSpellInfo(useSpell)))
+    // An ENCHANT SCROLL (its on-use spell is a permanent enchant) must NOT be self-
+    // cast here — that applies the enchant to NOTHING and just eats the scroll (the
+    // "right-clicked the scroll, it vanished, nothing got enchanted" dupe-loss), and a
+    // scroll can enchant a BOT's gear which the normal client cursor can't even reach.
+    // Instead ARM the addon: tell it which enchant this scroll provides, and the next
+    // grid item the user clicks gets enchanted (ENCHSCROLL -> the addon's pending-
+    // enchant mode -> ENCHANT, which HandleEnchant applies via its scroll path +
+    // consumes the scroll). The scroll is NOT consumed here.
+    if (uint32 const enchSpell = useSpell; PermEnchantIdOfSpell(sSpellMgr->GetSpellInfo(enchSpell)))
     {
+        std::ostringstream out;
+        out << "ENCHSCROLL\t" << enchSpell << '\t' << t->Name1;
+        SendWPSP(requester, out.str());
         ChatHandler(requester->GetSession()).PSendSysMessage(
-            "|cff66ccff[WowPsParty]|r To use |cffffffff{}|r, click the item you want to enchant "
-            "and pick it from the enchant list — don't right-click the scroll.", t->Name1);
+            "|cff66ccff[WowPsParty]|r Now click the item you want to enchant with "
+            "|cffffffff{}|r (right-click an item to cancel).", t->Name1);
         return;
     }
 

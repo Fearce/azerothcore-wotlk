@@ -867,7 +867,7 @@ namespace WowPsParty
     // enough that a stuck pull doesn't freeze the party for long.
     static constexpr uint32 TANK_GATHER_GC_MS  = 12000;
     static constexpr float  PULL_GATHER_RANGE  = 30.0f;  // scan radius for the pull pool
-    static constexpr float  MOB_CLUSTER_R      = 10.0f;  // mobs within this aggro/stack as one
+    static constexpr float  MOB_CLUSTER_R      = 12.0f;  // mobs within this of each other cluster as one pack (tune via the no-cluster nearestNeighbour log)
     static constexpr float  PULL_Z_TOLERANCE   = 6.0f;   // "similar Z-level" as the tank
 
     static void MarkTankGathering(uint32 tankLow, std::vector<ObjectGuid> set)
@@ -904,11 +904,18 @@ namespace WowPsParty
         outSet.clear();
         if (!tank || !anchor || N < 2) return nullptr;
 
+        uint32 const tankLow = tank->GetGUID().GetCounter();
+        // Scan around the ANCHOR (the seed mob), NOT the tank. The tank pulls from far
+        // — logs show it opening at 26y+ — so a tank-centred 30y scan only catches the
+        // NEAR edge of the pack and the far half is out of range, so the cluster never
+        // forms and it single-pulls a pack (the live bug). The anchor sits INSIDE its
+        // pack, so an anchor-centred scan sees the whole thing; eligibility below still
+        // requires every mob be in the TANK's LoS + on its Z, so the tank can reach them.
         std::list<Unit*> nearby;
-        Acore::AnyUnfriendlyUnitInObjectRangeCheck check(tank, tank, PULL_GATHER_RANGE);
+        Acore::AnyUnfriendlyUnitInObjectRangeCheck check(anchor, tank, PULL_GATHER_RANGE);
         Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck>
-            searcher(tank, nearby, check);
-        Cell::VisitObjects(tank, searcher, PULL_GATHER_RANGE);
+            searcher(anchor, nearby, check);
+        Cell::VisitObjects(anchor, searcher, PULL_GATHER_RANGE);
 
         auto eligible = [&](Unit* u) -> bool
         {
@@ -920,12 +927,32 @@ namespace WowPsParty
         };
         // The anchor must itself be eligible to seed a clean cluster; if the tank can't
         // even see it / it's already fighting, fall back to a normal single pull.
-        if (!eligible(anchor)) return nullptr;
+        if (!eligible(anchor))
+        {
+            LOG_INFO("module", "[WowPsParty TankLead] guid={} no-cluster: anchor entry={} not eligible "
+                     "(in-combat/LoS/Z) — single pull", tankLow, anchor->GetEntry());
+            return nullptr;
+        }
 
         std::vector<Unit*> elig{ anchor };
         for (Unit* u : nearby)
             if (u != anchor && eligible(u)) elig.push_back(u);
-        if (elig.size() < 2) return nullptr;
+        // (diagnostic) nearest eligible neighbour to the anchor — the key "is the pack
+        // spread wider than MOB_CLUSTER_R?" number for tuning the range.
+        float nnDist = -1.0f;
+        for (Unit* u : elig)
+            if (u != anchor)
+            {
+                float const d = anchor->GetDistance(u);
+                if (nnDist < 0.0f || d < nnDist) nnDist = d;
+            }
+        if (elig.size() < 2)
+        {
+            LOG_INFO("module", "[WowPsParty TankLead] guid={} no-cluster: only {} eligible mob(s) "
+                     "within {:.0f}y of anchor entry={} — single pull",
+                     tankLow, uint32(elig.size()), PULL_GATHER_RANGE, anchor->GetEntry());
+            return nullptr;
+        }
 
         // Connected component of `anchor` (proximity graph, edge <= MOB_CLUSTER_R). BFS
         // capped at N+1 — the moment it grows past N we know it's an overshoot pack.
@@ -936,7 +963,14 @@ namespace WowPsParty
             for (size_t i = 0; i < elig.size(); ++i)
                 if (!used[i] && comp[head]->GetDistance(elig[i]) <= MOB_CLUSTER_R)
                 { used[i] = true; comp.push_back(elig[i]); }
-        if (comp.size() < 2 || comp.size() > N) return nullptr;   // isolated or overshoot
+        if (comp.size() < 2 || comp.size() > N)   // isolated or overshoot
+        {
+            LOG_INFO("module", "[WowPsParty TankLead] guid={} no-cluster: {} eligible, component={} "
+                     "(N={}, clusterR={:.0f}y, nearestNeighbour={:.1f}y) — {} — single pull",
+                     tankLow, uint32(elig.size()), uint32(comp.size()), N, MOB_CLUSTER_R, nnDist,
+                     comp.size() > N ? "pack bigger than count" : "anchor isolated (raise the cluster range?)");
+            return nullptr;
+        }
 
         // Body-pull from the most central member (most neighbours within MOB_CLUSTER_R).
         Unit* seed = comp[0];
