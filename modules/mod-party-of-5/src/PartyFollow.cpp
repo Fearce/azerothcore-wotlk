@@ -1520,7 +1520,7 @@ namespace WowPsParty
     // rather than walked. Nothing safe left to add, the tank's hurt, or it's stuck ->
     // it stops and fights what it has. Only ever armed on a fresh out-of-combat pull,
     // so it can't chain-pull the instance — the party rests between fights as before.
-    static constexpr float  GATHER_SCAN         = 50.0f;   // candidate search radius (LoS-gated)
+    static constexpr float  GATHER_SCAN         = 60.0f;   // candidate search radius (LoS-gated)
     static constexpr float  SOCIAL_AGGRO_R      = 10.0f;   // a candidate drags in un-aggroed mobs within this of it
     static constexpr uint32 GATHER_DRIVE_MAX_MS = 12000;   // safety bail if a gather gets stuck pre-engage
     static constexpr float  GATHER_LOW_HP_PCT   = 45.0f;   // tank this hurt -> stop gathering, fight + get healed
@@ -1695,7 +1695,30 @@ namespace WowPsParty
         // The OPENER (engaged==0) always walks in, even onto a pack bigger than N
         // (allowOversize) — never stand at range. Once engaged, a top-up add must fit.
         Unit* const add = FindNextSafeAdd(tank, targetN - engaged, grp, /*allowOversize=*/engaged == 0);
-        if (!add) { EndTankGather(tankLow); return; }                  // nothing safe -> fight what we have
+        if (!add)
+        {
+            // Diagnostic (once per gather): WHY did it stop short of N? Count nearby
+            // un-aggroed eligible mobs at <=50y vs <=80y + how many fit the cap, so the
+            // log distinguishes "nothing in scan range" (bump GATHER_SCAN) from "found
+            // but their groups are too big for the remaining room".
+            uint32 n50 = 0, n80 = 0, fit = 0;
+            {
+                std::list<Unit*> nb;
+                Acore::AnyUnfriendlyUnitInObjectRangeCheck ck(tank, tank, 80.0f);
+                Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck> sr(tank, nb, ck);
+                Cell::VisitObjects(tank, sr, 80.0f);
+                std::vector<Unit*> pool;
+                for (Unit* u : nb)
+                    if (GatherEligible(tank, u)) { pool.push_back(u); ++n80; if (tank->GetDistance(u) <= 50.0f) ++n50; }
+                uint32 const cap = targetN - engaged;
+                for (Unit* c : pool)
+                    if (tank->GetDistance(c) <= GATHER_SCAN && SocialGroupSize(c, pool) <= cap) ++fit;
+            }
+            LOG_INFO("module", "[WowPsParty TankGather] guid={} END no-add: engaged={}/{} cap={} "
+                     "unaggroed(<=50y)={} (<=80y)={} fitCap={}",
+                     tankLow, engaged, targetN, targetN - engaged, n50, n80, fit);
+            EndTankGather(tankLow); return;                            // nothing safe -> fight what we have
+        }
 
         // Keep the DPS held the whole gather: re-mark the hold with everything the tank
         // is in combat with PLUS the incoming add, so IsTankGathering keeps the party
