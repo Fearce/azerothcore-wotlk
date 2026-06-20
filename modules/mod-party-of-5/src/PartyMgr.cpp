@@ -875,6 +875,11 @@ namespace WowPsParty
                 break;
 
             case 9: // Warlock
+                // Demonology (talent tree 1) runs its signature FELGUARD, not the Imp.
+                // Higher priority than the Imp rule; if the bot doesn't actually know
+                // Summon Felguard (not deep enough in Demo), the cast fails and it falls
+                // through to the Imp below — so Affliction/Destruction still get the Imp.
+                add("pet_missing&primary_tree:1", "cast_self:Summon Felguard", 89);
                 add("pet_missing", "cast_self:Summon Imp", 88);
                 add("self_health<35", "cast:Death Coil", 82);
                 add("self_missing_aura:Demon Armor", "cast_self:Demon Armor", 76);

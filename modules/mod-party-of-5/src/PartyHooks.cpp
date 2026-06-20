@@ -286,6 +286,21 @@ namespace WowPsParty
                 "[WowPsParty] taught class-quest spell {} to {} (class {}, level {})",
                 q.spell, p->GetName(), uint32(cls), uint32(lvl));
         }
+
+        // Summon Felguard (30146) is a Demonology TALENT spell, not in the level table
+        // above — so a demo-specced warlock henchman wouldn't have its signature pet and
+        // the rotation fell back to the Imp. Teach it when Demonology is the primary tree
+        // (PrimaryTalentTree==1) and the lock is deep enough (50+), so a "demo lock" runs a
+        // Felguard. Idempotent (HasSpell skip); the rotation's pet rule then summons it.
+        if (cls == CLASS_WARLOCK && lvl >= 50 && !p->HasSpell(30146)
+            && WowPsParty::PrimaryTalentTree(p) == 1 && sSpellMgr->GetSpellInfo(30146))
+        {
+            p->learnSpell(30146, false);
+            ++learned;
+            LOG_INFO("module",
+                "[WowPsParty] taught Summon Felguard to demo warlock {} (level {})",
+                p->GetName(), uint32(lvl));
+        }
         return learned;
     }
 }
