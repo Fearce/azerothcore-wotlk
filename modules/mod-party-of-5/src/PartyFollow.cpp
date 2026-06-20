@@ -1629,7 +1629,10 @@ namespace WowPsParty
 
     // Nearest eligible un-aggroed candidate within GATHER_SCAN whose social group fits
     // `capacity`. Returns it + its group size in grpOut, or nullptr if none fit.
-    static Unit* FindNextSafeAdd(Player* tank, uint32 capacity, uint32& grpOut)
+    // `allowOversize` (the OPENER only): if nothing fits, fall back to the NEAREST mob
+    // anyway so the opening pull always WALKS IN — even onto a pack bigger than N —
+    // instead of standing at range (Kevin: "the opening pull should never stand still").
+    static Unit* FindNextSafeAdd(Player* tank, uint32 capacity, uint32& grpOut, bool allowOversize = false)
     {
         grpOut = 0;
         if (!tank || capacity == 0) return nullptr;
@@ -1646,6 +1649,13 @@ namespace WowPsParty
         {
             uint32 const g = SocialGroupSize(cand, pool);
             if (g <= capacity) { grpOut = g; return cand; }   // nearest that SAFELY fits
+        }
+        // Nothing fits the cap. For the opener, body-pull the nearest regardless (a
+        // top-up add NEVER does this — it must respect the cap to not overshoot N).
+        if (allowOversize && !pool.empty())
+        {
+            grpOut = SocialGroupSize(pool[0], pool);
+            return pool[0];
         }
         return nullptr;
     }
@@ -1682,7 +1692,9 @@ namespace WowPsParty
         if (engaged >= targetN) { EndTankGather(tankLow); return; }   // at target -> fight
 
         uint32 grp = 0;
-        Unit* const add = FindNextSafeAdd(tank, targetN - engaged, grp);
+        // The OPENER (engaged==0) always walks in, even onto a pack bigger than N
+        // (allowOversize) — never stand at range. Once engaged, a top-up add must fit.
+        Unit* const add = FindNextSafeAdd(tank, targetN - engaged, grp, /*allowOversize=*/engaged == 0);
         if (!add) { EndTankGather(tankLow); return; }                  // nothing safe -> fight what we have
 
         // Keep the DPS held the whole gather: re-mark the hold with everything the tank
