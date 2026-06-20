@@ -43,6 +43,7 @@
 #include "ThreatManager.h"   // threat-cap throttle: bots back off near the tank's threat
 #include "CombatManager.h"   // tank gather window: count mobs in combat with the tank
 #include "SpellInfo.h"   // SpellInfo::Effects[] for the leader's mount-type check
+#include "Vehicle.h"     // vehicle behaviour: GetVehicleKit / seats / passengers
 
 // Gathering (mining / herbalism) for follower bots.
 #include "Bag.h"
@@ -3287,6 +3288,152 @@ namespace WowPsParty
         return WaitForHumanTank(bot->GetGUID());
     }
 
+    // ========================================================================
+    // VEHICLE behaviour. WotLK has many vehicle fights (Oculus drakes, Malygos P3,
+    // Wintergrasp, Flame Leviathan…). Without this a bot whose leader mounts a vehicle
+    // just MoveFollows on the ground and "walks in the air", and a bot that somehow gets
+    // ON a vehicle spams its dead normal spells. EVERYTHING here is gated behind
+    // GetVehicleBase() (bot or leader on a vehicle), so normal follow + combat are
+    // provably untouched when no vehicle is involved.
+    // ========================================================================
+    static std::unordered_map<uint32, uint32> g_vehAcquireMs;   // guidLow -> last ride-cast ms
+    static std::unordered_map<uint32, uint32> g_vehCastMs;      // guidLow -> last ability-cast ms
+
+    // The Oculus drakes are PER-PLAYER summons, not free-standing vehicles a bot could
+    // board — so when the leader is on one, a bot gets its OWN by casting the matching
+    // ride spell on itself (the same spell the drake-giver casts on a player). entry->ride.
+    static uint32 OculusRideSpellForDrake(uint32 vehEntry)
+    {
+        switch (vehEntry)
+        {
+            case 27692: return 49427;   // Emerald Drake
+            case 27755: return 49459;   // Amber Drake
+            case 27756: return 49463;   // Ruby Drake
+            default:    return 0;
+        }
+    }
+
+    // Most-injured party member that is itself on a vehicle (so a vehicle heal/shield has
+    // a sensible target) at or below pctMax. Includes the leader. Returns the VEHICLE base.
+    static Unit* MostInjuredVehicleAlly(Player* bot, Player* leader, uint32 pctMax)
+    {
+        Unit* best = nullptr; uint32 bestPct = pctMax + 1;
+        auto consider = [&](Player* p)
+        {
+            if (!p || !p->IsAlive()) return;
+            Unit* veh = p->GetVehicleBase();
+            if (!veh || !veh->IsAlive()) return;
+            uint32 const pct = veh->GetHealthPct();
+            if (pct <= pctMax && pct < bestPct) { bestPct = pct; best = veh; }
+        };
+        if (leader) consider(leader);
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(bot->GetGUID(), party);
+        for (ObjectGuid const& g : party)
+            consider(ObjectAccessor::FindConnectedPlayer(g));
+        return best;
+    }
+
+    // Fire one of the vehicle creature's own abilities at `target`. The vehicle creature
+    // owns the spell + its cooldown, so casting FROM it is how the seat's abilities go off.
+    static bool CastVehicleAbility(Creature* vc, uint32 spellId, Unit* target)
+    {
+        if (!vc || !target || !target->IsAlive()) return false;
+        if (!sSpellMgr->GetSpellInfo(spellId)) return false;
+        if (vc->HasSpellCooldown(spellId)) return false;
+        if (!vc->IsWithinLOSInMap(target)) return false;
+        vc->CastSpell(target, spellId, false);
+        return true;
+    }
+
+    // Movement side, called from the follow ticker ONLY in a vehicle scenario. Returns
+    // true when it owns the bot this tick (caller then skips the normal ground follow).
+    bool TickBotVehicleMovement(Player* bot, Player* leader)
+    {
+        if (!bot || !leader) return false;
+        Unit* botVeh  = bot->GetVehicleBase();
+        Unit* leadVeh = leader->GetVehicleBase();
+
+        if (botVeh)   // bot is riding -> drive its vehicle after the leader's
+        {
+            if (!leadVeh) { bot->ExitVehicle(); return true; }   // leader got off -> so do we
+            Creature* vc = bot->GetVehicleCreatureBase();
+            if (vc && vc->IsAlive())
+            {
+                // Fly after the leader's vehicle in a loose fan. Re-issue only when not
+                // already following it — re-issuing every tick would reset the spline.
+                if (vc->GetMotionMaster()->GetCurrentMovementGeneratorType() != FOLLOW_MOTION_TYPE)
+                {
+                    int const fi = FormationIndexFor(bot->GetGUID(), leader->GetGUID());
+                    float const ang = 2.4f + 0.5f * float(fi >= 0 ? fi : 0);
+                    vc->GetMotionMaster()->Clear();
+                    vc->GetMotionMaster()->MoveFollow(leadVeh, 14.0f, ang);
+                }
+            }
+            return true;
+        }
+
+        if (leadVeh)   // leader is riding, bot is not -> get the bot onto a vehicle too
+        {
+            if (uint32 ride = OculusRideSpellForDrake(leadVeh->GetEntry()))
+            {
+                uint32 const now = getMSTime();
+                uint32& last = g_vehAcquireMs[bot->GetGUID().GetCounter()];
+                if (now - last > 3000) { last = now; bot->CastSpell(bot, ride, true); }
+                return true;
+            }
+            // No known way to put the bot on this vehicle type yet — at least DON'T walk
+            // in the air after the flying leader. Hold position. (Generic free-vehicle
+            // boarding is a follow-up.)
+            bot->GetMotionMaster()->Clear();
+            bot->StopMoving();
+            return true;
+        }
+        return false;
+    }
+
+    // Ability side, called from TickRotation when the bot is in a vehicle. Returns true
+    // (handled) so the normal rotation is skipped — the bot's normal spells don't work in
+    // a vehicle; its abilities come from the vehicle's override bar.
+    bool TickBotVehicleAbilities(Player* bot)
+    {
+        if (!bot) return true;
+        Creature* vc = bot->GetVehicleCreatureBase();
+        if (!vc) return true;
+        if (bot->IsNonMeleeSpellCast(false, false, true)) return true;
+
+        uint32 const now = getMSTime();
+        uint32& last = g_vehCastMs[bot->GetGUID().GetCounter()];
+        if (now - last < 1300) return true;   // ~GCD throttle
+
+        Player* leader = ObjectAccessor::FindConnectedPlayer(GetLeaderFor(bot->GetGUID()));
+        Unit* enemy = nullptr;
+        if (leader)
+        {
+            enemy = leader->GetVictim();
+            if (!enemy && leader->GetVehicleBase()) enemy = leader->GetVehicleBase()->GetVictim();
+        }
+        if (!enemy) enemy = vc->GetVictim();
+        Unit* injured = MostInjuredVehicleAlly(bot, leader, 65);
+
+        // Pass 0: keep allies up (a positive/heal ability on the injured ally). Pass 1:
+        // damage the leader's target. First castable ability wins the tick.
+        for (int pass = 0; pass < 2; ++pass)
+            for (uint8 i = 0; i < MAX_CREATURE_SPELLS; ++i)
+            {
+                uint32 const spellId = vc->m_spells[i];
+                if (!spellId) continue;
+                SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId);
+                if (!si) continue;
+                bool const positive = si->IsPositive();
+                if (pass == 0 && !(positive && injured)) continue;
+                if (pass == 1 && positive) continue;
+                Unit* const target = positive ? injured : enemy;
+                if (CastVehicleAbility(vc, spellId, target)) { last = now; return true; }
+            }
+        return true;
+    }
+
     static constexpr float FOCUS_SCAN_RANGE = 50.0f;   // how far to look for a "focus:" add
 
     // Nearest live, attackable enemy whose name is in `names` (the rotation
@@ -3330,6 +3477,9 @@ namespace WowPsParty
         // engage/stand-ground — that's what froze the party on incidental aggro; let
         // the follow ticker keep it riding after the leader.
         if (bot->IsMounted()) { AssistLog(gLow, "skip: mounted (transport fly-by)"); return; }
+        // In a vehicle: the vehicle drives movement + targeting (TickBotVehicleMovement /
+        // TickBotVehicleAbilities). Ground melee/chase here would fight the vehicle.
+        if (bot->GetVehicleBase()) { AssistLog(gLow, "skip: in vehicle"); return; }
         // Don't interrupt a cast in progress.
         if (bot->IsNonMeleeSpellCast(false, false, true)) { AssistLog(gLow, "skip: casting"); return; }
         // Rotation engine has parked this bot (drinking, etc).
@@ -4379,6 +4529,15 @@ namespace WowPsParty
             // flight crosses into the destination's map). Resumes the instant it
             // lands (IsInFlight clears).
             if (follower->IsInFlight()) return true;
+
+            // VEHICLE scenarios (the leader mounted a vehicle, or the bot is on one) are
+            // owned by the vehicle driver — board/acquire, fly after the leader, exit.
+            // Gated on a vehicle actually being involved, so the normal ground follow
+            // below is untouched otherwise. (A dead bot falls through to the revive logic.)
+            if (follower->IsAlive()
+                && (follower->GetVehicleBase() || leader->GetVehicleBase())
+                && TickBotVehicleMovement(follower, leader))
+                return true;
 
             // Default the humanize tick OFF for this bot. Only the pure open-
             // follow tail below flips it back on; every early-return path

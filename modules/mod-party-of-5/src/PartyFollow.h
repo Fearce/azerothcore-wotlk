@@ -196,6 +196,16 @@ namespace WowPsParty
     void MarkOffensiveHold(ObjectGuid followerGuid, uint32 holdMs);
     bool IsOffensiveHeld(ObjectGuid guid);
 
+    // Vehicle behaviour (Oculus drakes, etc.). Both are gated behind a vehicle scenario by
+    // their callers, so normal follow/rotation is untouched otherwise.
+    //  - TickBotVehicleMovement: from the follow ticker — board/acquire a vehicle when the
+    //    leader takes one, fly after the leader, exit when they do. True = owned this tick
+    //    (caller skips the normal ground follow).
+    //  - TickBotVehicleAbilities: from TickRotation — fire the vehicle's own abilities
+    //    instead of the bot's (dead) normal spells. Always returns true (rotation skipped).
+    bool TickBotVehicleMovement(Player* bot, Player* leader);
+    bool TickBotVehicleAbilities(Player* bot);
+
     // Out-of-combat gathering. If `bot` is one of the player's alts (not a
     // henchman) and was trained in Mining or Herbalism, harvest a nearby node
     // (within 30y, within the bot's skill) while travelling with the party,

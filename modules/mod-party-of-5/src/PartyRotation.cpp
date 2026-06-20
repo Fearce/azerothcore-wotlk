@@ -4820,6 +4820,12 @@ namespace WowPsParty
         // tick. (Resurrect-accept is handled separately in ApplyDirective.)
         if (!bot->IsAlive()) return false;
 
+        // In a VEHICLE: the bot's normal spells are replaced by the vehicle's override
+        // bar, so the normal rotation would just spam dead spells (the "drake/skeleton
+        // does nothing" bug). Run the vehicle's own abilities instead. Gated on actually
+        // being in a vehicle, so normal rotations are untouched.
+        if (bot->GetVehicleBase()) return WowPsParty::TickBotVehicleAbilities(bot);
+
         // On a taxi flight (escorting the leader's flight path): the flight spline
         // owns movement. Running the rotation would faceAndCast / reposition the
         // bot and fight the flight, so do nothing until it lands.
