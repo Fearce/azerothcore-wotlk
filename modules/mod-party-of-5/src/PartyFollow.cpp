@@ -2846,6 +2846,17 @@ namespace WowPsParty
         return LeaderRole(leader->GetSession()->GetAccountId()) == "tank";
     }
 
+    // The party's tank as a Player*, whoever it is: a bot/henchman lead tank
+    // (PartyLeadTank) or the human leader when its party role is tank (the leader
+    // has no follower directive, so PartyLeadTank can't see it). nullptr if the
+    // party has no live tank. Used to send a non-tank's loose add to the tank.
+    static Player* PartyTankPlayer(Player* bot, Player* leader)
+    {
+        if (Player* t = PartyLeadTank(bot)) return t;
+        if (leader && leader->IsAlive() && HumanTankLeadActive(bot, leader)) return leader;
+        return nullptr;
+    }
+
     // For the human-tank wait-gate: is `mob` currently attacking a TANK (the human
     // tank-leader or a tank-role bot)? The caller still holds DPS for a threat-
     // build delay even after this is true; a mob on the bot ITSELF / a non-tank
@@ -3130,6 +3141,9 @@ namespace WowPsParty
         // wasAlive / combatState). Dropped when the pull ends so the next one
         // re-captures from the fresh geometry.
         static thread_local std::unordered_map<uint32, float> g_pullAnchor;
+        // Non-tanks currently dragging a loose add back to the tank (see the
+        // drag-to-tank block below). thread_local for the same race-free reason.
+        static thread_local std::unordered_set<uint32> g_dragToTank;
         if (!IsLeadTank(bot->GetGUID()) && IsPartyPullPending(bot))
         {
             bool meleeThreatOnMe = false;
@@ -3498,7 +3512,12 @@ namespace WowPsParty
         if (!desired)
         {
             // Nothing to fight anywhere — drop combat so PartyFollow can
-            // resume movement.
+            // resume movement. Clear the drag marker here (this return sits ABOVE
+            // the drag block's own erase): otherwise a drag that ends because the
+            // add died/evaded leaves the marker set, the follow ticker reasserts
+            // MoveFollow(leader), and the NEXT add's first drag tick skips the
+            // MoveFollow(tank) re-issue — the bot trails the leader, not the tank.
+            g_dragToTank.erase(gLow);
             if (bot->GetVictim())
             {
                 AssistLog(gLow, "no-targets: AttackStop");
@@ -3534,6 +3553,62 @@ namespace WowPsParty
             AssistLog(gLow, "kite mode: rotation owns movement");
             return;
         }
+
+        // ---- Drag a loose add to the tank ---------------------------------------
+        // A non-tank with a mob beating on it in melee, while too far from the tank
+        // for it to peel (the tank scans ~30y around ITSELF for loose enemies via
+        // FindLooseEnemy / its cast_loose_enemy taunt rule), RUNS THE ADD TO THE TANK
+        // instead of standing and soloing it to death (Kevin: "they'll tank them for
+        // eternity and likely die if they're too far away"). Normal player behaviour —
+        // kite the add into the tank's reach; we run to the tank's threat bubble
+        // (DRAG_HANDOFF_DIST, inside its melee + Consecration/Thunderclap AoE) so the
+        // handoff works whether the tank taunts OR holds threat by AoE. Once back
+        // within TANK_GRAB_RANGE the drag stops and the existing "stand & fight, let
+        // the tank take it" handoff resumes. Skipped for: the tank itself (it WANTS
+        // the add), a focus must-kill add (kill it where it is), and kiters (above).
+        // The travel is intentionally UN-clamped (unlike the 18y peel-chase cap in
+        // pickPartyDefenseTarget): the run is always TOWARD the tank/party safe-zone
+        // and the add is already on us (not a fresh pull), so the geometry — not a
+        // distance cap — is what keeps it from chain-pulling. Don't clamp it to 18y.
+        static constexpr float TANK_GRAB_RANGE   = 30.0f;   // beyond this the tank can't reach the add
+        static constexpr float DRAG_HANDOFF_DIST = 8.0f;    // run the add to here from the tank
+        if (!focusMob && RoleForGuid(bot->GetGUID()) != "tank")
+        {
+            Player* const dragTank = PartyTankPlayer(bot, leader);
+            // A mob actually ON us in melee (targeting US, in the dead-zone band) —
+            // it FOLLOWS when we run. A ranged caster mob that stands off won't, so
+            // dragging wouldn't bring it along; leave those to the normal bands.
+            Unit* onMe = nullptr;
+            if (dragTank && dragTank != bot && bot->GetDistance(dragTank) > TANK_GRAB_RANGE)
+                for (Unit* a : bot->getAttackers())
+                    if (a && a->IsAlive() && a->GetVictim() == bot
+                        && bot->IsValidAttackTarget(a) && bot->GetDistance(a) < 8.0f)
+                    { onMe = a; break; }
+            if (onMe)
+            {
+                if (bot->GetVictim() != onMe)
+                {
+                    MarkRetarget(gLow, nowMs);
+                    bot->Attack(onMe, false);   // keep it engaged; we drive the feet
+                }
+                MovementGeneratorType const dmg =
+                    bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
+                // Force the follow on the first drag tick (the bot may have been CHASE/
+                // IDLE on the add, or still FOLLOWing the leader) and re-issue only if
+                // the follow was lost — re-issuing every tick stutters the spline.
+                if (!g_dragToTank.count(gLow) || dmg != FOLLOW_MOTION_TYPE)
+                {
+                    if (bot->getStandState() != UNIT_STAND_STATE_STAND)
+                        bot->SetStandState(UNIT_STAND_STATE_STAND);
+                    bot->GetMotionMaster()->Clear();
+                    bot->GetMotionMaster()->MoveFollow(dragTank, DRAG_HANDOFF_DIST, bot->GetFollowAngle());
+                }
+                g_dragToTank.insert(gLow);
+                AssistLog(gLow, "drag-to-tank: add on me, too far for the tank to peel — running it in");
+                return;
+            }
+        }
+        g_dragToTank.erase(gLow);   // reached here -> not dragging this tick
 
         // Lead-tank ranged pull, three beats while the mob hasn't reached melee:
         //   1. out of range  -> close to ability/throw range so the pull can fire.
