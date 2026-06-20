@@ -44,6 +44,8 @@
 #include "CombatManager.h"   // tank gather window: count mobs in combat with the tank
 #include "SpellInfo.h"   // SpellInfo::Effects[] for the leader's mount-type check
 #include "Vehicle.h"     // vehicle behaviour: GetVehicleKit / seats / passengers
+#include "Battlefield.h"     // re-group gate: don't reform the party mid Wintergrasp war
+#include "BattlefieldMgr.h"  // sBattlefieldMgr->GetBattlefieldToZoneId
 
 // Gathering (mining / herbalism) for follower bots.
 #include "Bag.h"
@@ -4561,6 +4563,38 @@ namespace WowPsParty
                 && (follower->GetVehicleBase() || leader->GetVehicleBase())
                 && TickBotVehicleMovement(follower, leader))
                 return true;
+
+            // Re-form the party if an enrolled HERO got dropped from the leader's group.
+            // Exiting Wintergrasp (and other battlefields / LFG) disbands or reshuffles the
+            // group; the hero stays enrolled in the roster but ungrouped and just sits there
+            // — Kevin had to kick + re-invite it via the roster after WG. Heroes are the
+            // player's own bot-controlled alts and OnRemoveMember does NOT dismiss them, so
+            // re-add directly. Skip henchmen (removal dismisses them — separate path) and
+            // skip while a BG/battlefield war owns the group, so we don't fight its battle-
+            // group management mid-war; this heals once the leader is back in the open world.
+            if (!d.henchman && follower->IsAlive() && !leader->InBattleground())
+            {
+                Battlefield* bf = sBattlefieldMgr->GetBattlefieldToZoneId(leader->GetZoneId());
+                bool const inWar = bf && bf->IsWarTime();
+                Group* lg = leader->GetGroup();
+                if (!inWar && (!lg || !lg->IsMember(d.followerGuid)))
+                {
+                    if (!lg)
+                    {
+                        lg = new Group();
+                        if (lg->Create(leader)) sGroupMgr->AddGroup(lg);
+                        else { delete lg; lg = nullptr; }
+                    }
+                    if (lg && !lg->IsMember(d.followerGuid) && !lg->IsFull())
+                    {
+                        if (follower->GetGroup()) follower->RemoveFromGroup();
+                        lg->AddMember(follower);
+                        LOG_INFO("module",
+                            "[WowPsParty Follow] re-grouped hero {} into {}'s party (was dropped, "
+                            "e.g. after a Wintergrasp exit)", follower->GetName(), leader->GetName());
+                    }
+                }
+            }
 
             // Default the humanize tick OFF for this bot. Only the pure open-
             // follow tail below flips it back on; every early-return path
