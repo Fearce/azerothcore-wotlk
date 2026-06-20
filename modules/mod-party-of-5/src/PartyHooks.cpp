@@ -957,7 +957,7 @@ public:
         GROUPHOOK_ON_REMOVE_MEMBER
     }) { }
 
-    void OnRemoveMember(Group* /*group*/, ObjectGuid guid, RemoveMethod /*method*/,
+    void OnRemoveMember(Group* group, ObjectGuid guid, RemoveMethod /*method*/,
                         ObjectGuid /*kicker*/, char const* /*reason*/) override
     {
         if (!WowPsParty::IsEnabled()) return;
@@ -976,7 +976,14 @@ public:
         // (If the group fully DISBANDS, each henchman's own removal hits the
         // branch above; this covers the case where the group survives without
         // the owner — e.g. matched LFG players stay behind.)
-        if (WowPsParty::CountHenchmenFor(guid) > 0)
+        //
+        // BUT only when the owner left a FOREIGN group — an LFG dungeon or a BG/raid
+        // where matched players stay behind. Leaving their OWN open-world party (an
+        // accidental "Leave Party" click) must NOT scatter the henchmen: the follow
+        // ticker re-forms the party around the human and re-groups the henchmen, so the
+        // human never ends up out of their own roster (Kevin: "never leave your roster").
+        if (WowPsParty::CountHenchmenFor(guid) > 0
+            && group && (group->isLFGGroup() || group->isBGGroup()))
         {
             std::vector<ObjectGuid> members;
             WowPsParty::GetPartyGuidsFor(guid, members);

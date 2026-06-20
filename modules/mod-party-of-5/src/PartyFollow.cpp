@@ -4591,15 +4591,16 @@ namespace WowPsParty
                 && TickBotVehicleMovement(follower, leader))
                 return true;
 
-            // Re-form the party if an enrolled HERO got dropped from the leader's group.
-            // Exiting Wintergrasp (and other battlefields / LFG) disbands or reshuffles the
-            // group; the hero stays enrolled in the roster but ungrouped and just sits there
-            // — Kevin had to kick + re-invite it via the roster after WG. Heroes are the
-            // player's own bot-controlled alts and OnRemoveMember does NOT dismiss them, so
-            // re-add directly. Skip henchmen (removal dismisses them — separate path) and
-            // skip while a BG/battlefield war owns the group, so we don't fight its battle-
-            // group management mid-war; this heals once the leader is back in the open world.
-            if (!d.henchman && follower->IsAlive() && !leader->InBattleground())
+            // Re-form the party if an enrolled member got dropped from the leader's group.
+            // Exiting Wintergrasp/LFG, OR the human accidentally clicking "Leave Party",
+            // disbands or reshuffles the group — the member stays enrolled but ungrouped, and
+            // the human ends up out of their OWN roster having to re-invite themselves (Kevin).
+            // Re-add it, creating the group with the human as LEADER if needed — so the human
+            // is back in their party too. Heroes re-add directly (OnRemoveMember never
+            // dismisses them); a henchman needs the regroup guard so the RemoveFromGroup below
+            // doesn't trip OnRemoveMember's dismiss. Skip while a BG/battlefield war owns the
+            // group (don't fight its battle-group management); heals in the open world.
+            if (follower->IsAlive() && !leader->InBattleground())
             {
                 Battlefield* bf = sBattlefieldMgr->GetBattlefieldToZoneId(leader->GetZoneId());
                 bool const inWar = bf && bf->IsWarTime();
@@ -4614,11 +4615,17 @@ namespace WowPsParty
                     }
                     if (lg && !lg->IsMember(d.followerGuid) && !lg->IsFull())
                     {
-                        if (follower->GetGroup()) follower->RemoveFromGroup();
+                        if (follower->GetGroup())
+                        {
+                            if (d.henchman) SetHenchmanRegrouping(d.followerGuid, true);
+                            follower->RemoveFromGroup();
+                            if (d.henchman) SetHenchmanRegrouping(d.followerGuid, false);
+                        }
                         lg->AddMember(follower);
                         LOG_INFO("module",
-                            "[WowPsParty Follow] re-grouped hero {} into {}'s party (was dropped, "
-                            "e.g. after a Wintergrasp exit)", follower->GetName(), leader->GetName());
+                            "[WowPsParty Follow] re-grouped {} {} into {}'s party (was dropped — "
+                            "WG/LFG exit or an accidental leave)",
+                            d.henchman ? "henchman" : "hero", follower->GetName(), leader->GetName());
                     }
                 }
             }
