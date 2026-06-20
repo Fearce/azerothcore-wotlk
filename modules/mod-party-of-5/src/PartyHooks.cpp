@@ -34,6 +34,7 @@
 #include "WorldSession.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
+#include "PartyRotation.h"   // RecordSpellDamageTaken (backs took_damage_from:<name>)
 
 #include <algorithm>
 #include <mutex>
@@ -948,10 +949,28 @@ public:
     }
 };
 
+// Records every SPELL that damages a player so the took_damage_from:<name> rotation
+// condition can react to a specific source (e.g. Ingvar's spinning axe) — a damage
+// event with no debuff aura to test for. Read-only on the damage; only victim+spell
+// are captured.
+class PartyDamageTrackScript : public UnitScript
+{
+public:
+    PartyDamageTrackScript() : UnitScript("PartyDamageTrackScript", true, { UNITHOOK_MODIFY_SPELL_DAMAGE_TAKEN }) { }
+
+    void ModifySpellDamageTaken(Unit* target, Unit* /*attacker*/, int32& /*damage*/, SpellInfo const* spellInfo) override
+    {
+        if (!target || !spellInfo) return;
+        if (Player* p = target->ToPlayer())
+            WowPsParty::RecordSpellDamageTaken(p->GetGUID().GetCounter(), spellInfo->Id);
+    }
+};
+
 void AddPartyHooksScripts()
 {
     new PartyHooksPlayerScript();
     new PartyHenchmanGroupScript();
+    new PartyDamageTrackScript();
 }
 
 // Trampoline called from the [WowPsParty PATCH] in PlayerQuest.cpp::AddQuest.

@@ -1317,6 +1317,41 @@ namespace WowPsParty
         return i == want.size() && nm[i] == '\0';
     }
 
+    // ---- recent spell-damage tracker (backs took_damage_from:<name>) ----------
+    // The ModifySpellDamageTaken UnitScript (PartyHooks.cpp) records every spell that
+    // DAMAGES a player; took_damage_from:<name> then checks the last few within a short
+    // window, so a bot can REACT to a specific source — e.g. reposition out of Ingvar's
+    // spinning axe — even when that source leaves no debuff aura to test for.
+    static constexpr uint32 RECENT_DMG_WINDOW_MS = 1500;   // "JUST took damage"
+    static constexpr size_t RECENT_DMG_MAX       = 8;      // ring per player
+    static std::unordered_map<uint32, std::vector<std::pair<uint32, uint32>>> g_recentDamage;  // guidLow -> [{spellId, ms}]
+    static std::mutex g_recentDamageMutex;
+
+    void RecordSpellDamageTaken(uint32 guidLow, uint32 spellId)
+    {
+        if (!spellId) return;
+        std::lock_guard<std::mutex> lock(g_recentDamageMutex);
+        auto& v = g_recentDamage[guidLow];
+        v.emplace_back(spellId, getMSTime());
+        if (v.size() > RECENT_DMG_MAX) v.erase(v.begin());
+    }
+
+    // True if `guidLow` took damage from a spell matching `want` (display name or id)
+    // within the last RECENT_DMG_WINDOW_MS.
+    static bool TookDamageFrom(uint32 guidLow, std::string const& want)
+    {
+        if (want.empty()) return false;
+        uint32 const now = getMSTime();
+        std::lock_guard<std::mutex> lock(g_recentDamageMutex);
+        auto it = g_recentDamage.find(guidLow);
+        if (it == g_recentDamage.end()) return false;
+        for (auto const& [spellId, ms] : it->second)
+            if (now - ms <= RECENT_DMG_WINDOW_MS
+                && SpellNameOrIdMatches(sSpellMgr->GetSpellInfo(spellId), want))
+                return true;
+        return false;
+    }
+
     // ---- Curated "known dangerous cast" registries --------------------------
     // Hand-maintained lists of enemy casts worth answering, grown over time as we
     // meet more of them. Two buckets by how you STOP the cast:
@@ -1827,6 +1862,12 @@ namespace WowPsParty
                 if (arg == "known_dangerous_uninterruptible") return IsKnownDangerousCast(casting, true);
                 return SpellNameOrIdMatches(casting, arg);
             }
+
+            // took_damage_from:<spell> — true if THIS bot took damage from a spell
+            // matching <name/id> in the last ~1.5s. React to a specific hit (reposition
+            // out of Ingvar's spinning axe) even when it leaves no debuff to test for.
+            if (cname == "took_damage_from")
+                return !arg.empty() && TookDamageFrom(bot->GetGUID().GetCounter(), arg);
         }
         if (cond == "in_combat")     return bot->IsInCombat();
         if (cond == "out_of_combat") return !bot->IsInCombat();
