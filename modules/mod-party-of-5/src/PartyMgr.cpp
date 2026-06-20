@@ -1046,42 +1046,6 @@ namespace WowPsParty
         return out;
     }
 
-    // Query offline random-pool chars of the given classes near `level`, of the
-    // given races (so henchmen match the player's faction).
-    static void QueryHenchCandidates(std::string const& acctCsv,
-        std::string const& classCsv, std::string const& raceCsv,
-        uint8 lo, uint8 hi, uint8 level,
-        uint32 limit, std::vector<HenchmanCandidate>& out)
-    {
-        if (acctCsv.empty() || raceCsv.empty()) return;
-        (void)level;  // band already constrains proximity; order is pure random
-        // ORDER BY RAND(), not ABS(level-L): proximity ordering made the same
-        // few exact-level chars rank top every time, so "Refresh" re-rolled to
-        // an identical-looking list. Random within the (already tight) level
-        // band gives a genuinely different set each refresh.
-        QueryResult q = CharacterDatabase.Query(
-            "SELECT `guid`,`name`,`class`,`level` FROM `characters` "
-            "WHERE `account` IN ({}) AND `online` = 0 AND `class` IN ({}) "
-            "AND `race` IN ({}) AND `level` BETWEEN {} AND {} "
-            "ORDER BY RAND() LIMIT {}",
-            acctCsv, classCsv, raceCsv, uint32(lo), uint32(hi), limit);
-        if (!q) return;
-        do {
-            Field* f = q->Fetch();
-            HenchmanCandidate c;
-            c.guid  = f[0].Get<uint32>();
-            c.name  = f[1].Get<std::string>();
-            c.cls   = f[2].Get<uint8>();
-            c.level = f[3].Get<uint8>();
-            // Show the role the bot ACTUALLY is (from its talents) — the same
-            // inference the hire uses — not the flat class default. Otherwise
-            // the list "marks" every druid a healer while a feral one hires in
-            // as a tank (the reported bug).
-            InferHenchmanRoleAndSpec(c.guid, c.cls, ClassDefaultRole(c.cls), c.role, c.spec);
-            out.push_back(std::move(c));
-        } while (q->NextRow());
-    }
-
     std::vector<HenchmanCandidate> BuildHenchmanCandidates(Player* requester)
     {
         std::vector<HenchmanCandidate> out;
@@ -1090,9 +1054,6 @@ namespace WowPsParty
         if (acctCsv.empty()) return out;
 
         uint8 const L  = requester->GetLevel();
-        // ±4 band (was ±2): a wider eligible pool so each randomized Refresh
-        // shows a meaningfully different set instead of recycling the same
-        // handful of exact-level chars. Still "~your level".
         uint8 const lo = uint8(std::max(1, int(L) - 4));
         uint8 const hi = uint8(std::min(80, int(L) + 4));
 
@@ -1102,32 +1063,75 @@ namespace WowPsParty
             ? "1,3,4,7,11"   // Human, Dwarf, Night Elf, Gnome, Draenei
             : "2,5,6,8,10";  // Orc, Undead, Tauren, Troll, Blood Elf
 
-        // ~20 candidates: 4 tanks (Warr/Pala/DK/Druid), 4 healers
-        // (Priest/Pala/Shaman/Druid), 12 dps (any class), each a random draw
-        // from the ±4 band so Refresh re-rolls.
-        QueryHenchCandidates(acctCsv, "1,2,6,11", raceCsv, lo, hi, L, 4, out);
-        QueryHenchCandidates(acctCsv, "2,5,7,11", raceCsv, lo, hi, L, 4, out);
-        QueryHenchCandidates(acctCsv, "1,2,3,4,5,6,7,8,9,11", raceCsv, lo, hi, L, 12, out);
+        // Broad near-level slice of the OFFLINE pool, every class, ordered by
+        // level-proximity so the char kept per spec is the closest to the player.
+        // `online = 0` already excludes every BUSY pool bot — a hired henchman is
+        // logged in, and so are the LFG/BG/WG fill bots — and IsHenchman below is
+        // the in-memory belt-and-suspenders for the same "not busy" guarantee.
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `guid`,`name`,`class`,`level` FROM `characters` "
+            "WHERE `account` IN ({}) AND `online` = 0 AND `race` IN ({}) "
+            "AND `level` BETWEEN {} AND {} "
+            "ORDER BY ABS(CAST(`level` AS SIGNED) - {}) ASC LIMIT 150",
+            acctCsv, raceCsv, uint32(lo), uint32(hi), uint32(L));
 
-        // Force the role label per the slot it was drawn for (the same char
-        // could appear via two class sets; dedupe by guid keeping first role).
-        std::vector<HenchmanCandidate> deduped;
-        for (auto& c : out)
+        struct Raw { uint32 guid; std::string name; uint8 cls; uint8 level; };
+        std::vector<Raw> raws;
+        std::string guidCsv;
+        if (q) do {
+            Field* f = q->Fetch();
+            uint32 const guidLow = f[0].Get<uint32>();
+            if (WowPsParty::IsHenchman(ObjectGuid::Create<HighGuid::Player>(guidLow)))
+                continue;   // busy: already hired by someone
+            Raw r;
+            r.guid  = guidLow;
+            r.name  = f[1].Get<std::string>();
+            r.cls   = f[2].Get<uint8>();
+            r.level = f[3].Get<uint8>();
+            if (!guidCsv.empty()) guidCsv += ',';
+            guidCsv += std::to_string(guidLow);
+            raws.push_back(std::move(r));
+        } while (q->NextRow());
+
+        // One batch talent read for ALL candidates (vs a query per row) — keyed
+        // by guid so each candidate's role/spec is inferred from its own tree.
+        std::unordered_map<uint32, std::unordered_set<uint32>> talents;
+        if (!guidCsv.empty())
         {
-            bool seen = false;
-            for (auto const& d : deduped) if (d.guid == c.guid) { seen = true; break; }
-            if (!seen) deduped.push_back(c);
+            QueryResult tq = CharacterDatabase.Query(
+                "SELECT `guid`,`spell` FROM `character_talent` WHERE `guid` IN ({})", guidCsv);
+            if (tq) do {
+                Field* tf = tq->Fetch();
+                talents[tf[0].Get<uint32>()].insert(tf[1].Get<uint32>());
+            } while (tq->NextRow());
         }
 
-        // Coverage guarantee: every faction-valid class should be hirable in
-        // THIS bracket. If the ±4 band produced no candidate for a class, pull
-        // the nearest-level pool char of that class (any level) and present it at
-        // the player's level — it's re-leveled to the player when hired (see the
-        // spawn handler in HireHenchman). The RNDBOT pool holds every class per
-        // faction (CreateRandomBots makes one per class per account), so this
-        // needs no new characters; the rare empty case just leaves that class out.
+        // Keep ONE candidate per (class, spec) — never a duplicate spec. Proximity
+        // order means the kept one is the nearest-level char for that spec.
+        std::unordered_set<uint32> const noTalents;
+        std::unordered_set<std::string> seenSpec;
+        for (Raw const& r : raws)
+        {
+            auto const it = talents.find(r.guid);
+            std::unordered_set<uint32> const& known = (it != talents.end()) ? it->second : noTalents;
+            HenchmanCandidate c;
+            c.guid  = r.guid;
+            c.name  = r.name;
+            c.cls   = r.cls;
+            c.level = r.level;
+            c.role  = RoleFromTalents(c.cls, known, ClassDefaultRole(c.cls));
+            c.spec  = SpecAbbrevFromTalents(c.cls, known);
+            if (!seenSpec.insert(std::to_string(c.cls) + ":" + c.spec).second)
+                continue;   // already showing this (class, spec)
+            out.push_back(std::move(c));
+        }
+
+        // Coverage guarantee: every faction-valid class should be hirable in THIS
+        // bracket. If the ±4 band produced no candidate for a class, pull the
+        // nearest-level pool char of that class (any level) and present it at the
+        // player's level — re-leveled to the player when hired (see HireHenchman).
         bool present[12] = { false };
-        for (auto const& c : deduped) if (c.cls < 12) present[c.cls] = true;
+        for (auto const& c : out) if (c.cls < 12) present[c.cls] = true;
         static uint8 const kAllClasses[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 11 };
         for (uint8 cls : kAllClasses)
         {
@@ -1140,21 +1144,34 @@ namespace WowPsParty
                 acctCsv, uint32(cls), raceCsv, uint32(L));
             if (!mq) continue;   // pool genuinely lacks this faction+class
             Field* mf = mq->Fetch();
+            uint32 const guidLow = mf[0].Get<uint32>();
+            if (WowPsParty::IsHenchman(ObjectGuid::Create<HighGuid::Player>(guidLow)))
+                continue;   // busy
             HenchmanCandidate c;
-            c.guid  = mf[0].Get<uint32>();
+            c.guid  = guidLow;
             c.name  = mf[1].Get<std::string>();
             c.cls   = cls;
             c.level = L;   // shown + costed at the player's level; re-leveled on hire
-            // Inferred from current talents like the other path — BOTH role and
-            // spec, so a coverage-fill candidate shows its spec tag too (the old
-            // single-role call left c.spec blank: the "high-level henchman, no spec"
-            // bug). NOTE: an out-of-band pick is re-rolled by Randomize on spawn, so
-            // role/spec are re-derived AFTER that re-roll in HireHenchman — this
-            // label is the best pre-hire estimate.
             InferHenchmanRoleAndSpec(c.guid, cls, ClassDefaultRole(cls), c.role, c.spec);
-            deduped.push_back(std::move(c));
+            out.push_back(std::move(c));
         }
-        return deduped;
+
+        // Sort for the hire screen: tanks first, then healers, then dps; within
+        // a role by class id, then spec. (Kevin's requested ordering.)
+        auto roleRank = [](std::string const& role) -> int {
+            if (role == "tank")   return 0;
+            if (role == "healer") return 1;
+            return 2;   // dps / anything else
+        };
+        std::sort(out.begin(), out.end(),
+            [&](HenchmanCandidate const& a, HenchmanCandidate const& b)
+            {
+                int const ra = roleRank(a.role), rb = roleRank(b.role);
+                if (ra != rb)       return ra < rb;
+                if (a.cls != b.cls) return a.cls < b.cls;
+                return a.spec < b.spec;
+            });
+        return out;
     }
 
     // Set the group's loot rule based on whether any henchman is present:
