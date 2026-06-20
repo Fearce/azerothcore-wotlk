@@ -2335,11 +2335,25 @@ namespace WowPsParty
         int32 const level      = c->GetLevel();
         int32 const reqValue   = (skillValue < 100) ? (level - 10) * 10 : level * 5;
         if (reqValue > skillValue) return false;
-        // Ready if the engine already flagged it, OR it's a genuine party kill we
-        // can force ready at harvest time (our bots leave corpse loot unfinished,
-        // so the flag is usually never set — see WowPsParty_ForceSkinReady).
+        // Ready if the engine already flagged it (regular loot was removed first, so the
+        // quest item is already gone — safe to skin).
         if (c->HasUnitFlag(UNIT_FLAG_SKINNABLE)) return true;
-        return c->GetLootRecipient() || c->GetLootRecipientGroup();
+        // Otherwise the force-skin path: a genuine party kill we can force ready at harvest
+        // (our bots leave corpse loot unfinished, so the flag is usually never set — see
+        // WowPsParty_ForceSkinReady, which force-CLEARS the leftover regular loot).
+        if (!(c->GetLootRecipient() || c->GetLootRecipientGroup()))
+            return false;
+        // BUT never force-skin while the corpse still has unlooted regular loot
+        // (UNIT_DYNFLAG_LOOTABLE) AND can drop a QUEST item the human leader needs —
+        // force-clearing the loot would destroy the human's quest drop (Viv's Stranglethorn
+        // report: "skinner grabs leather before I get my quest item"). Wait for the human to
+        // loot it (DYNFLAG clears), then skin. Self-resolves once the quest is turned in.
+        if (c->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE))
+            if (Player* leader = ObjectAccessor::FindConnectedPlayer(GetLeaderFor(bot->GetGUID())))
+                if (LootTemplates_Creature.HaveQuestLootForPlayer(
+                        c->GetCreatureTemplate()->lootid, leader))
+                    return false;
+        return true;
     }
 
     static Creature* FindNearestSkinnable(Player* bot, float range, ObjectGuid avoid)
