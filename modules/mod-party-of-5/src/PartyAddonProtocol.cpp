@@ -684,6 +684,18 @@ namespace WowPsParty
         // the 6 colons the item parser needs, so the items loop ignores them.
         { std::ostringstream r; r << "CAP:"  << totalSlots;             records.push_back(r.str()); }
         { std::ostringstream r; r << "POOL:" << requester->GetMoney();  records.push_back(r.str()); }
+        // The requester's BANK bag slots: one record per slot (idx:purchased:bagEntry) so
+        // the panel shows which are unlocked and which bag sits in each. <6 colons, so the
+        // item parser ignores them like BAG:/CAP:/POOL:.
+        for (uint8 s = BANK_SLOT_BAG_START; s < BANK_SLOT_BAG_END; ++s)
+        {
+            uint32 const idx = s - BANK_SLOT_BAG_START;
+            uint32 const purchased = idx < requester->GetBankBagSlotCount() ? 1u : 0u;
+            Item* bagItem = requester->GetItemByPos(INVENTORY_SLOT_BAG_0, s);
+            std::ostringstream r;
+            r << "BANKBAG:" << idx << ':' << purchased << ':' << (bagItem ? bagItem->GetEntry() : 0);
+            records.push_back(r.str());
+        }
 
         // CHUNKED send. One INVENTORY message holding the whole party's items is
         // far over the addon-message size the 3.3.5a client accepts — it silently
@@ -2376,6 +2388,124 @@ static void HandleBankDeposit(Player* requester, std::string_view payload)
     if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
 }
 
+// "Ng Ms Kc" for a copper amount.
+static std::string FormatMoneyGSC(uint32 copper)
+{
+    uint32 const g = copper / 10000, s = (copper % 10000) / 100, c = copper % 100;
+    std::ostringstream o;
+    if (g) o << g << "g ";
+    if (g || s) o << s << "s ";
+    o << c << "c";
+    return o.str();
+}
+
+// Buy the NEXT bank bag slot for the requester — banker-less, the same convenience the
+// remote deposit already is. Mirrors WorldSession::HandleBuyBankSlotOpcode (price from
+// BankBagSlotPrices.dbc + gold check) without the banker/CanUseBank requirement.
+static void HandleBuyBankSlot(Player* requester)
+{
+    if (!requester || !requester->GetSession()) return;
+    uint32 const slot = uint32(requester->GetBankBagSlotCount()) + 1;   // next slot, 1-based
+    BankBagSlotPricesEntry const* e = sBankBagSlotPricesStore.LookupEntry(slot);
+    if (!e)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r All bank bag slots are already unlocked.");
+        return;
+    }
+    if (!requester->HasEnoughMoney(uint32(e->price)))
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Not enough gold for bank bag slot {} (costs {}).",
+            slot, FormatMoneyGSC(e->price));
+        return;
+    }
+    requester->SetBankBagSlotCount(uint8(slot));
+    requester->ModifyMoney(-int32(e->price));
+    ChatHandler(requester->GetSession()).PSendSysMessage(
+        "|cff66ccff[WowPsParty]|r Unlocked bank bag slot {} for {}. Drop a bag onto it.",
+        slot, FormatMoneyGSC(e->price));
+    WowPsParty::SendInventoryTo(requester);
+}
+
+// Place a bag from a party member's bags into the requester's next FREE (purchased) bank
+// bag slot. Banker-less. Pulls the bag onto the requester first (safe cross-char move +
+// bounce-back), then stores it into the specific bank bag slot the canonical way
+// (CanBankItem -> RemoveItem -> BankItem), so it never double-references the Item*.
+static void HandleBankBag(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const srcSlot        = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+    if (!srcItemGuidLow) return;
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    QueryResult q = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, srcSlot);
+    if (!q) return;
+    Player* srcChar = ObjectAccessor::FindConnectedPlayer(
+        ObjectGuid::Create<HighGuid::Player>(q->Fetch()[0].Get<uint32>()));
+    if (!srcChar) return;
+    Item* item = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!item) return;
+    ItemTemplate const* t = item->GetTemplate();
+    std::string const itemName = t ? t->Name1 : "item";
+    if (!item->IsBag())
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r |cffffffff{}|r isn't a bag.", itemName);
+        return;
+    }
+    // Only an EMPTY bag can be moved into a bank bag slot. PullItemToRequester routes
+    // through CanStoreItem(NULL_BAG,NULL_SLOT), which rejects a non-empty bag — both its
+    // store AND bounce-back would fail, stranding the bag off its owner. Guard up front.
+    if (item->IsNotEmptyBag())
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Empty |cffffffff{}|r first — only an empty bag can go "
+            "into a bank bag slot.", itemName);
+        return;
+    }
+
+    Item* owned = PullItemToRequester(requester, srcChar, item);
+    if (!owned)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Couldn't move |cffffffff{}|r to your bags.", itemName);
+        WowPsParty::SendInventoryTo(requester);
+        if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
+        return;
+    }
+
+    // First free PURCHASED bank bag slot (67.. up to GetBankBagSlotCount()).
+    uint8 target = 0; bool haveTarget = false;
+    for (uint8 s = BANK_SLOT_BAG_START; s < BANK_SLOT_BAG_END; ++s)
+    {
+        if (uint32(s - BANK_SLOT_BAG_START) >= requester->GetBankBagSlotCount()) break;  // not purchased
+        if (!requester->GetItemByPos(INVENTORY_SLOT_BAG_0, s)) { target = s; haveTarget = true; break; }
+    }
+
+    ItemPosCountVec dest;
+    if (haveTarget
+        && requester->CanBankItem(INVENTORY_SLOT_BAG_0, target, dest, owned, false) == EQUIP_ERR_OK)
+    {
+        requester->RemoveItem(owned->GetBagSlot(), owned->GetSlot(), true);
+        requester->BankItem(dest, owned, true);
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r Added |cffffffff{}|r to a bank bag slot.", itemName);
+    }
+    else
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r No free bank bag slot for |cffffffff{}|r — buy a slot first, "
+            "or empty one. It stays in your bags.", itemName);
+    }
+    WowPsParty::SendInventoryTo(requester);
+    if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
+}
+
 // Move one item from a party member's bags onto the requester, preserving it on
 // failure (bounce back, never stranded). Returns the item now in the requester's
 // inventory (possibly a merged stack), or nullptr if the requester had no room.
@@ -3528,6 +3658,14 @@ public:
         else if (command == "GBANK")
         {
             HandleGuildBankDeposit(player, payload);
+        }
+        else if (command == "BUY_BANK_SLOT")
+        {
+            HandleBuyBankSlot(player);
+        }
+        else if (command == "BANK_BAG")
+        {
+            HandleBankBag(player, payload);
         }
         else if (command == "SORT_BAGS")
         {
