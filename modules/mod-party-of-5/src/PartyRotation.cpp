@@ -3409,8 +3409,9 @@ namespace WowPsParty
         // gated in faceAndCast), so a recalled bot keeps DPSing/healing as it runs in.
         if (WowPsParty::IsBeingRecalled(bot->GetGUID())
             && (verb == "keep_distance_enemy" || verb == "keep_distance_healer"
-                || verb == "keep_distance_party" || verb == "close_to_enemy"
-                || verb == "move_behind"      || verb == "hold_position"
+                || verb == "keep_distance_party" || verb == "keep_distance_tank"
+                || verb == "close_to_enemy"   || verb == "move_behind"
+                || verb == "stay_in_front"    || verb == "hold_position"
                 || verb == "move_out_of_los"  || verb == "pull"
                 || verb == "reposition_random"))
             return false;
@@ -4090,6 +4091,55 @@ namespace WowPsParty
                             std::max(v->GetCombatReach() + 1.0f, 2.0f), back);
             WowPsParty::HoldFollower(bot->GetGUID(), 1500);
             bot->GetMotionMaster()->MovePoint(0, x, y, z);
+            return true;
+        }
+
+        // "stay_in_front:N" — hold the target's FRONTAL arc, N yards out (the direction it
+        // faces). The mirror of move_behind, for "stack in front" / frontal-soak phases.
+        // Default to melee reach if no number. HoldFollower's so AssistTarget keeps its
+        // hands off the feet; returns false (lets casts fire) once in position.
+        if (verb == "stay_in_front")
+        {
+            Unit* v = bot->GetVictim();
+            if (!v || !v->IsAlive()) return false;
+            float want = float(std::atof(arg.c_str()));
+            if (want <= 0.0f) want = std::max(v->GetCombatReach() + 1.0f, 2.0f);
+            WowPsParty::HoldFollower(bot->GetGUID(), 1500);
+            if (v->isInFront(bot) && bot->GetDistance(v) <= want + 2.0f)
+                return false;   // already in the frontal arc at range -> hold + let casts fire
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+            {
+                float fx, fy, fz;
+                v->GetNearPoint(bot, fx, fy, fz, 0.0f, want, v->GetOrientation());
+                bot->GetMotionMaster()->MovePoint(0, fx, fy, fz, FORCED_MOVEMENT_NONE,
+                                                  0.0f, 0.0f, /*generatePath=*/true,
+                                                  /*forceDestination=*/false);
+            }
+            return true;
+        }
+
+        // "keep_distance_tank:N" — STACK on the party tank: close to within N yards of it.
+        // For stack/soak phases and melee-pile mechanics. Unlike the kite verbs it fires
+        // WITH a tank up (that's the whole point) and HoldFollower's so AssistTarget yields
+        // the feet while it stacks. The tank itself no-ops (tank == bot).
+        if (verb == "keep_distance_tank")
+        {
+            Player* tank = FindPartyMemberByRole(bot, "tank");
+            if (!tank || tank == bot || !tank->IsAlive()) return false;
+            if (bot->IsNonMeleeSpellCast(false, false, true)) return false;
+            float const want = float(std::atof(arg.c_str()));
+            if (want <= 0.0f) return false;
+            WowPsParty::HoldFollower(bot->GetGUID(), 1500);
+            if (bot->GetDistance(tank) <= want) return false;   // stacked -> let casts fire
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+            {
+                float tx, ty, tz;
+                tank->GetNearPoint(bot, tx, ty, tz, 0.0f, std::max(want - 2.0f, 2.0f),
+                                   tank->GetAngle(bot));
+                bot->GetMotionMaster()->MovePoint(0, tx, ty, tz, FORCED_MOVEMENT_NONE,
+                                                  0.0f, 0.0f, /*generatePath=*/true,
+                                                  /*forceDestination=*/false);
+            }
             return true;
         }
 
