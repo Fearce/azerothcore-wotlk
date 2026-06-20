@@ -31,6 +31,7 @@
 #include "GroupMgr.h"
 #include "Guild.h"
 #include "GuildMgr.h"
+#include "ArenaTeam.h"    // GetSlotByType / MAX_ARENA_SLOT — arena-charter eligibility
 #include "Opcodes.h"      // CMSG_PETITION_SIGN / CMSG_TURN_IN_PETITION — hero charter signing
 #include "PetitionMgr.h"  // sPetitionMgr / Petition / Signatures — charter detection
 #include "Pet.h"
@@ -2728,45 +2729,91 @@ static void HandleCharterSign(Player* owner, Item* charter, Petition const* peti
         return;
     }
 
-    uint8 const  type     = petition->petitionType;
-    bool const   isArena  = type != GUILD_CHARTER_TYPE;
-    uint32 const required = isArena ? uint32(type) - 1
-                                    : sWorld->getIntConfig(CONFIG_MIN_PETITION_SIGNS);
+    uint8 const   type      = petition->petitionType;
+    bool const    isArena   = type != GUILD_CHARTER_TYPE;
+    uint32 const  maxLevel  = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
+    uint32 const  required  = isArena ? uint32(type) - 1
+                                      : sWorld->getIntConfig(CONFIG_MIN_PETITION_SIGNS);
+    uint8 const   arenaSlot = isArena ? ArenaTeam::GetSlotByType(type) : uint8(0xFF);
+    ObjectGuid const charterGuid = charter->GetGUID();
+    uint32 const  petId     = petition->petitionId;
     // Copied now — the turn-in below frees the petition, dangling this pointer.
     std::string const petName = petition->petitionName;
 
-    // Sign with every eligible online hero on the account (party slots), skipping the
-    // owner. The core handler self-rejects an ineligible signer (already in a guild /
-    // team, arena needs max level, faction) so those silently don't count.
-    uint32 const account = sess->GetAccountId();
-    if (QueryResult q = CharacterDatabase.Query(
-            "SELECT `guid` FROM `account_party` WHERE `account` = {} ORDER BY `slot`", account))
+    // Sign with the leader's online heroes (skipping the owner), up to the bracket size.
+    // We DON'T route through HandlePetitionSignOpcode: its same-account rejection needs
+    // the playerbot bypass, and its other gates fail SILENTLY (un-diagnosable — heroes
+    // came back 0/4 with every gate seemingly satisfied). Instead we do the eligibility
+    // checks ourselves (logged) and add the signature directly — distinct hero guids each
+    // get a petition_sign row, exactly what the turn-in then reads to add members.
+    std::vector<ObjectGuid> party;
+    WowPsParty::GetPartyGuidsFor(owner->GetGUID(), party);
+
+    CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+    for (ObjectGuid const& g : party)
     {
-        do
+        if (g == owner->GetGUID()) continue;
+
+        Signatures const* cur = sPetitionMgr->GetSignature(charterGuid);
+        uint32 const haveNow = cur ? uint32(cur->signatureMap.size()) : 0;
+        if (haveNow >= required) break;   // bracket full — don't over-fill the team
+
+        Player* hero = ObjectAccessor::FindConnectedPlayer(g);
+        if (!hero) hero = ObjectAccessor::FindPlayer(g);
+        if (!hero)
         {
-            uint32 const heroLow = q->Fetch()[0].Get<uint32>();
-            if (heroLow == owner->GetGUID().GetCounter()) continue;
-            Player* hero = ObjectAccessor::FindConnectedPlayer(
-                ObjectGuid::Create<HighGuid::Player>(heroLow));
-            if (!hero || WowPsParty::MemberStorageUnstable(hero)) continue;
+            LOG_INFO("module", "[WowPsParty Charter] '{}' skip {} — offline", petName, g.ToString());
+            continue;
+        }
+        if (cur && cur->signatureMap.find(hero->GetGUID()) != cur->signatureMap.end())
+            continue;   // already signed this charter
 
-            WorldPacket sign(CMSG_PETITION_SIGN, 8 + 1);
-            sign << charter->GetGUID();
-            sign << uint8(0);
-            hero->GetSession()->HandlePetitionSignOpcode(sign);
-        } while (q->NextRow());
+        if (isArena)
+        {
+            if (hero->GetLevel() < maxLevel)
+            {
+                LOG_INFO("module", "[WowPsParty Charter] '{}' skip {} — level {} < {}",
+                    petName, hero->GetName(), uint32(hero->GetLevel()), maxLevel);
+                continue;
+            }
+            if (arenaSlot < MAX_ARENA_SLOT && hero->GetArenaTeamId(arenaSlot))
+            {
+                LOG_INFO("module", "[WowPsParty Charter] '{}' skip {} — already in a {}v{} team",
+                    petName, hero->GetName(), uint32(type), uint32(type));
+                continue;
+            }
+        }
+        else if (hero->GetGuildId())
+        {
+            LOG_INFO("module", "[WowPsParty Charter] '{}' skip {} — already in a guild",
+                petName, hero->GetName());
+            continue;
+        }
+
+        uint32 const heroAcct = hero->GetSession() ? hero->GetSession()->GetAccountId() : 0;
+        tx->Append("INSERT IGNORE INTO `petition_sign` "
+                   "(`ownerguid`, `petitionguid`, `petition_id`, `playerguid`, `player_account`) "
+                   "VALUES ({}, {}, {}, {}, {})",
+                   owner->GetGUID().GetCounter(), charterGuid.GetCounter(), petId,
+                   hero->GetGUID().GetCounter(), heroAcct);
+        sPetitionMgr->AddSignature(charterGuid, heroAcct, hero->GetGUID());
+        LOG_INFO("module", "[WowPsParty Charter] '{}' signed by {} (acct {})",
+            petName, hero->GetName(), heroAcct);
     }
+    CharacterDatabase.CommitTransaction(tx);
 
-    Signatures const* sigs = sPetitionMgr->GetSignature(charter->GetGUID());
+    Signatures const* sigs = sPetitionMgr->GetSignature(charterGuid);
     uint32 const have = sigs ? uint32(sigs->signatureMap.size()) : 0;
+    LOG_INFO("module", "[WowPsParty Charter] '{}' now {}/{} signatures (party {})",
+        petName, have, required, uint32(party.size()));
 
     if (have < required)
     {
         if (isArena)
             ChatHandler(sess).PSendSysMessage(
-                "|cffffcc00[WowPsParty]|r |cffffffff{}|r: {}/{} signatures. Arena charters can only "
-                "be signed by your level {} heroes — bring more max-level heroes into the party.",
-                petName, have, required, sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL));
+                "|cffffcc00[WowPsParty]|r |cffffffff{}|r: {}/{} signatures. Arena charters need {} "
+                "level-{} heroes besides you — bring more max-level heroes into the party.",
+                petName, have, required, required, maxLevel);
         else
             ChatHandler(sess).PSendSysMessage(
                 "|cffffcc00[WowPsParty]|r |cffffffff{}|r: {}/{} signatures collected.",
@@ -2775,16 +2822,16 @@ static void HandleCharterSign(Player* owner, Item* charter, Petition const* peti
         return;
     }
 
-    // Enough signatures — auto-create by replaying the turn-in through the core
-    // handler. Arena needs the 5 emblem fields after the guid (0 = the plain default
-    // tabard; the team can re-style at an arena registrar later).
+    // Enough signatures — auto-create by replaying the turn-in through the core handler
+    // (reuses guild / arena-team creation + member-add + DB cleanup). Arena needs the 5
+    // emblem fields after the guid (0 = the plain default tabard; re-style later).
     WorldPacket turnIn(CMSG_TURN_IN_PETITION, isArena ? (8 + 20) : 8);
-    turnIn << charter->GetGUID();
+    turnIn << charterGuid;
     if (isArena)
         turnIn << uint32(0) << uint32(0) << uint32(0) << uint32(0) << uint32(0);
     sess->HandleTurnInPetitionOpcode(turnIn);
 
-    LOG_INFO("module", "[WowPsParty Charter] {} auto-created '{}' (type={}) with {} hero signatures",
+    LOG_INFO("module", "[WowPsParty Charter] {} auto-created '{}' (type={}) with {} signatures",
         owner->GetName(), petName, uint32(type), have);
     ChatHandler(sess).PSendSysMessage(
         "|cff33ff99[WowPsParty]|r Created |cffffffff{}|r with {} hero signature(s)!", petName, have);
