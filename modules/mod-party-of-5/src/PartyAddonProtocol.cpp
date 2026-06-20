@@ -3818,7 +3818,10 @@ public:
             uint32 const account = player->GetSession()->GetAccountId();
             QueryResult q = CharacterDatabase.Query(
                 "SELECT `priority_actions_json` FROM `party_shared_rotation` WHERE `account` = {}", account);
-            std::string const dsl = q ? q->Fetch()[0].Get<std::string>() : std::string();
+            std::string dsl = q ? q->Fetch()[0].Get<std::string>() : std::string();
+            // DB stores '|'-delimited fields; the editor's parser wants '~' ('|' is a
+            // WoW escape prefix it can't read). Same conversion REQ_ROTATION does.
+            std::replace(dsl.begin(), dsl.end(), '|', '~');
             SendWPSP(player, "SHARED_ROTATION\t" + dsl);
         }
         else if (command == "SET_ROTATION")
