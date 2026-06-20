@@ -2345,16 +2345,22 @@ namespace WowPsParty
         // WowPsParty_ForceSkinReady, which force-CLEARS the leftover regular loot).
         if (!(c->GetLootRecipient() || c->GetLootRecipientGroup()))
             return false;
-        // BUT never force-skin while the corpse still has unlooted regular loot
-        // (UNIT_DYNFLAG_LOOTABLE) AND can drop a QUEST item the human leader needs —
-        // force-clearing the loot would destroy the human's quest drop (Viv's Stranglethorn
-        // report: "skinner grabs leather before I get my quest item"). Wait for the human to
-        // loot it (DYNFLAG clears), then skin. Self-resolves once the quest is turned in.
-        if (c->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE))
-            if (Player* leader = ObjectAccessor::FindConnectedPlayer(GetLeaderFor(bot->GetGUID())))
-                if (LootTemplates_Creature.HaveQuestLootForPlayer(
-                        c->GetCreatureTemplate()->lootid, leader))
-                    return false;
+        // BUT never force-skin a corpse whose loot table can drop a QUEST item the
+        // human leader still needs — force-clearing the loot would destroy that drop.
+        // We DELIBERATELY do NOT also gate on UNIT_DYNFLAG_LOOTABLE: a QuestRequired
+        // drop only enters loot for a player who HAS the quest, so the skinner bot (the
+        // loot recipient, not on the quest) never sees it and the corpse carries NO
+        // lootable flag whenever its regular loot happens to roll empty — and that is
+        // exactly when Viv's Mistvale Giblets (a 40% QuestRequired drop off Elder Mistvale
+        // Gorillas) got skinned out from under her. The static loot-table check is the
+        // only signal that survives an empty regular roll. HaveQuestLootForPlayer ->
+        // HasQuestForItem self-clears the instant the leader has collected enough of the
+        // item (count met, before turn-in), so leather is only delayed while she still
+        // genuinely needs the drop — then these corpses skin normally again.
+        if (Player* leader = ObjectAccessor::FindConnectedPlayer(GetLeaderFor(bot->GetGUID())))
+            if (LootTemplates_Creature.HaveQuestLootForPlayer(
+                    c->GetCreatureTemplate()->lootid, leader))
+                return false;
         return true;
     }
 
@@ -3528,6 +3534,21 @@ namespace WowPsParty
         Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
         if (!leader || !leader->IsInWorld()) { AssistLog(gLow, "skip: leader not in world"); return; }
         if (leader->GetMapId() != bot->GetMapId()) { AssistLog(gLow, "skip: leader on different map"); return; }
+
+        // BATTLEGROUND leash: keep party bots within 30y of the human so the healer can't
+        // wander off (e.g. to cure random raid bots) and leave the human to die when a fight
+        // breaks out (Kevin's rule: "in BGs party members should NEVER go more than 30 yards
+        // away from you"). Tighter than the 50y open-world leash below, and we actively walk
+        // back rather than waiting for the 1Hz follow tick, so the healer is back in heal
+        // range fast. Returns to ~8y, so it can range out to 30y again before re-leashing.
+        if (bot->InBattleground() && bot->GetDistance(leader) > 30.0f)
+        {
+            if (bot->GetVictim()) bot->AttackStop();
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != FOLLOW_MOTION_TYPE)
+                bot->GetMotionMaster()->MoveFollow(leader, 8.0f, bot->GetFollowAngle());
+            AssistLog(gLow, "skip: BG 30y leash — rejoining leader");
+            return;
+        }
 
         // Party leash: once the leader is >50y away, stop engaging and let the
         // follow ticker bring us back (it walks at 50y, teleports past 100y).

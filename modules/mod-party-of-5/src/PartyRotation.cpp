@@ -447,9 +447,14 @@ namespace WowPsParty
         // other human when they die"). consider() dedupes by pointer, so our own
         // account-mates already added above aren't counted twice, and it filters
         // to same-map / in-world, so an off-map groupmate is ignored.
-        if (Group* grp = bot->GetGroup())
-            for (GroupReference* itr = grp->GetFirstMember(); itr; itr = itr->next())
-                consider(itr->GetSource());
+        //   EXCEPT in a battleground: there the "group" is the entire BG raid, so folding
+        //   it in made the healer chase + cure random raid bots across the map while the
+        //   human got nothing ("my healer walks off to cure random bots and I die"). In a
+        //   BG the enrolled party above is the focus.
+        if (!bot->InBattleground())
+            if (Group* grp = bot->GetGroup())
+                for (GroupReference* itr = grp->GetFirstMember(); itr; itr = itr->next())
+                    consider(itr->GetSource());
 
         if (out.empty())
             consider(bot);
