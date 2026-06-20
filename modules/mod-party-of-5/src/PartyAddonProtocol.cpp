@@ -347,6 +347,38 @@ namespace WowPsParty
 #endif
     }
 
+    // True if a party member's Player/item storage is mid-teardown — not in world,
+    // being removed from world, or logging out. GetItemByPos and value-array reads
+    // on such a member can hand back a FREED Item* / a null value array and AV the
+    // world thread (the 2026-06-20 REQ_STATS/REQ_GEAR crash on a henchman dismissed
+    // after an LFG dungeon). Every addon-protocol read of a member's fields must
+    // skip it; SendInventoryTo inlines the same check, gear/stats now share this.
+    static bool MemberStorageUnstable(Player* p)
+    {
+        if (!p || !p->IsInWorld() || p->IsDuringRemoveFromWorld())
+            return true;
+        WorldSession* s = p->GetSession();
+        return s && s->isLogingOut();
+    }
+
+    // SEH-guarded item template fetch. Item::GetTemplate() reads the item's value
+    // array (GetEntry -> Object::GetUInt32Value); a dangling / half-initialised item
+    // AVs there and took the world thread down through the STATS/GEAR gearscore
+    // reads, which called GetTemplate() raw. Returns nullptr on an AV (same skip-the
+    // -slot contract as SafeReadItemFields), so the gearscore just omits that piece.
+    static ItemTemplate const* SafeItemTemplate(Item* item)
+    {
+        if (!item) return nullptr;
+        uint32 entry = 0;
+#ifdef _WIN32
+        __try { entry = item->GetEntry(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+#else
+        entry = item->GetEntry();
+#endif
+        return sObjectMgr->GetItemTemplate(entry);
+    }
+
     // GEAR\t<slot>\t<eqSlot>:<itemId>:<itemGuidLow>:<randProp>:<suffixFactor>;...
     // (19 equipment slots). randProp/suffixFactor appended so the gear tooltip
     // renders a randomized item (e.g. "of the Bear") with its real stats, exactly
@@ -360,6 +392,12 @@ namespace WowPsParty
         ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
         Player* target = ObjectAccessor::FindConnectedPlayer(og);
         if (!target) return;
+        if (MemberStorageUnstable(target))
+        {
+            LOG_INFO("module", "[WowPsParty] SendGearTo: skip member guid={} "
+                "slot={} — storage tearing down", guid, uint32(slot));
+            return;
+        }
 
         std::ostringstream out;
         out << "GEAR\t" << slot << '\t';
@@ -464,8 +502,8 @@ namespace WowPsParty
         {
             Item* mh = p->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
             Item* oh = p->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
-            ItemTemplate const* mhp = mh ? mh->GetTemplate() : nullptr;
-            ItemTemplate const* ohp = oh ? oh->GetTemplate() : nullptr;
+            ItemTemplate const* mhp = SafeItemTemplate(mh);
+            ItemTemplate const* ohp = SafeItemTemplate(oh);
             if ((mhp && mhp->InventoryType == INVTYPE_2HWEAPON) ||
                 (ohp && ohp->InventoryType == INVTYPE_2HWEAPON))
                 titanGrip = 0.5f;
@@ -477,7 +515,9 @@ namespace WowPsParty
             if (i == EQUIPMENT_SLOT_BODY || i == EQUIPMENT_SLOT_TABARD) continue;
             Item* item = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
             if (!item) continue;
-            float s = float(GearScoreForItem(item->GetTemplate()));
+            ItemTemplate const* proto = SafeItemTemplate(item);
+            if (!proto) continue;
+            float s = float(GearScoreForItem(proto));
             if (isHunter && (i == EQUIPMENT_SLOT_MAINHAND || i == EQUIPMENT_SLOT_OFFHAND))
                 s *= 0.3164f;
             if (isHunter && i == EQUIPMENT_SLOT_RANGED)
@@ -507,6 +547,12 @@ namespace WowPsParty
         Player* p = ObjectAccessor::FindConnectedPlayer(og);
         if (!p) p = ObjectAccessor::FindPlayer(og);
         if (!p) return;
+        if (MemberStorageUnstable(p))
+        {
+            LOG_INFO("module", "[WowPsParty] SendStatsTo: skip member guid={} "
+                "slot={} — storage tearing down", guid, uint32(slot));
+            return;
+        }
 
         // Average item level over equipped gear (excl. shirt + tabard).
         uint32 ilvlSum = 0, ilvlCount = 0;
@@ -514,7 +560,7 @@ namespace WowPsParty
         {
             if (i == EQUIPMENT_SLOT_BODY || i == EQUIPMENT_SLOT_TABARD) continue;
             Item* item = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
-            ItemTemplate const* proto = item ? item->GetTemplate() : nullptr;
+            ItemTemplate const* proto = SafeItemTemplate(item);
             if (!proto) continue;
             ilvlSum += proto->ItemLevel;
             ++ilvlCount;
