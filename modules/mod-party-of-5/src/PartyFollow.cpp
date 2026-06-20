@@ -4319,8 +4319,14 @@ namespace WowPsParty
                 if (mg != POINT_MOTION_TYPE)
                 {
                     float lx, ly, lz;
+                    // Aim RIGHT IN (~4y), not ~10y: a near-point still 10y out usually sits
+                    // on the SAME blind side of the corner, so the bot paths there, STILL
+                    // has no LoS, and settles — the recurring "caster stuck behind a corner,
+                    // never joins the fight" bug. A point ~4y from the target is past the
+                    // edge; the bot regains LoS en route and the ranged bands back it out to
+                    // firing range the instant it does, so it rarely actually reaches melee.
                     desired->GetNearPoint(bot, lx, ly, lz, 0.0f,
-                                          std::min(hold, 10.0f), desired->GetAngle(bot));
+                                          4.0f, desired->GetAngle(bot));
                     // generatePath rounds the corner / climbs the stairs;
                     // forceDestination=false so an unreachable spot just isn't
                     // taken (no straight-line dive through geometry).
