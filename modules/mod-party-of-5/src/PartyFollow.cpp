@@ -866,9 +866,7 @@ namespace WowPsParty
     // enough to never cut off a legit approach + threat build (~a few seconds), short
     // enough that a stuck pull doesn't freeze the party for long.
     static constexpr uint32 TANK_GATHER_GC_MS  = 12000;
-    static constexpr float  PULL_GATHER_RANGE  = 30.0f;  // scan radius for the pull pool
-    static constexpr float  MOB_CLUSTER_R      = 12.0f;  // mobs within this of each other cluster as one pack (tune via the no-cluster nearestNeighbour log)
-    static constexpr float  PULL_Z_TOLERANCE   = 6.0f;   // "similar Z-level" as the tank
+    static constexpr float  PULL_Z_TOLERANCE   = 6.0f;   // "similar Z-level" as the tank (used by the maintain-N gather)
 
     static void MarkTankGathering(uint32 tankLow, std::vector<ObjectGuid> set)
     {
@@ -889,101 +887,6 @@ namespace WowPsParty
     // (TankHasEngageLead / IsBossUnit); forward-declared here, beside its state.
     static bool IsTankGathering(Player* tank);
 
-    // Build the INITIAL multi-pull set: the connected proximity-cluster (edges within
-    // MOB_CLUSTER_R) that contains `anchor`, among UN-AGGROED hostiles near the tank
-    // that the tank can SEE (LoS) and that sit on a similar Z-level. Returns the most
-    // central member to body-pull (running to it sweeps the cluster's aggro radius) and
-    // fills `outSet`, ONLY when the cluster size is in [2, N] — it fills the pull target
-    // without overshooting. Returns nullptr (caller does a normal single pull) when the
-    // anchor is isolated (<2) OR its cluster is bigger than N (don't body-pull a whole
-    // big pack — the careful single pull is safer). This is the cluster-awareness: a mob
-    // that would drag the pack past N is simply never made into a multi-pull.
-    static Unit* SelectInitialPullCluster(Player* tank, Unit* anchor, uint32 N,
-                                          std::vector<ObjectGuid>& outSet)
-    {
-        outSet.clear();
-        if (!tank || !anchor || N < 2) return nullptr;
-
-        uint32 const tankLow = tank->GetGUID().GetCounter();
-        // Scan around the ANCHOR (the seed mob), NOT the tank. The tank pulls from far
-        // — logs show it opening at 26y+ — so a tank-centred 30y scan only catches the
-        // NEAR edge of the pack and the far half is out of range, so the cluster never
-        // forms and it single-pulls a pack (the live bug). The anchor sits INSIDE its
-        // pack, so an anchor-centred scan sees the whole thing; eligibility below still
-        // requires every mob be in the TANK's LoS + on its Z, so the tank can reach them.
-        std::list<Unit*> nearby;
-        Acore::AnyUnfriendlyUnitInObjectRangeCheck check(anchor, tank, PULL_GATHER_RANGE);
-        Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck>
-            searcher(anchor, nearby, check);
-        Cell::VisitObjects(anchor, searcher, PULL_GATHER_RANGE);
-
-        auto eligible = [&](Unit* u) -> bool
-        {
-            if (!u || !u->IsAlive() || u->IsInCombat()) return false;   // un-aggroed only
-            if (u->IsTotem()) return false;
-            if (!tank->IsValidAttackTarget(u)) return false;
-            if (std::fabs(u->GetPositionZ() - tank->GetPositionZ()) > PULL_Z_TOLERANCE) return false;
-            return tank->IsWithinLOSInMap(u, VMAP::ModelIgnoreFlags::M2);
-        };
-        // The anchor must itself be eligible to seed a clean cluster; if the tank can't
-        // even see it / it's already fighting, fall back to a normal single pull.
-        if (!eligible(anchor))
-        {
-            LOG_INFO("module", "[WowPsParty TankLead] guid={} no-cluster: anchor entry={} not eligible "
-                     "(in-combat/LoS/Z) — single pull", tankLow, anchor->GetEntry());
-            return nullptr;
-        }
-
-        std::vector<Unit*> elig{ anchor };
-        for (Unit* u : nearby)
-            if (u != anchor && eligible(u)) elig.push_back(u);
-        // (diagnostic) nearest eligible neighbour to the anchor — the key "is the pack
-        // spread wider than MOB_CLUSTER_R?" number for tuning the range.
-        float nnDist = -1.0f;
-        for (Unit* u : elig)
-            if (u != anchor)
-            {
-                float const d = anchor->GetDistance(u);
-                if (nnDist < 0.0f || d < nnDist) nnDist = d;
-            }
-        if (elig.size() < 2)
-        {
-            LOG_INFO("module", "[WowPsParty TankLead] guid={} no-cluster: only {} eligible mob(s) "
-                     "within {:.0f}y of anchor entry={} — single pull",
-                     tankLow, uint32(elig.size()), PULL_GATHER_RANGE, anchor->GetEntry());
-            return nullptr;
-        }
-
-        // Connected component of `anchor` (proximity graph, edge <= MOB_CLUSTER_R). BFS
-        // capped at N+1 — the moment it grows past N we know it's an overshoot pack.
-        std::vector<Unit*> comp{ elig[0] };
-        std::vector<bool>  used(elig.size(), false);
-        used[0] = true;
-        for (size_t head = 0; head < comp.size() && comp.size() <= N; ++head)
-            for (size_t i = 0; i < elig.size(); ++i)
-                if (!used[i] && comp[head]->GetDistance(elig[i]) <= MOB_CLUSTER_R)
-                { used[i] = true; comp.push_back(elig[i]); }
-        if (comp.size() < 2 || comp.size() > N)   // isolated or overshoot
-        {
-            LOG_INFO("module", "[WowPsParty TankLead] guid={} no-cluster: {} eligible, component={} "
-                     "(N={}, clusterR={:.0f}y, nearestNeighbour={:.1f}y) — {} — single pull",
-                     tankLow, uint32(elig.size()), uint32(comp.size()), N, MOB_CLUSTER_R, nnDist,
-                     comp.size() > N ? "pack bigger than count" : "anchor isolated (raise the cluster range?)");
-            return nullptr;
-        }
-
-        // Body-pull from the most central member (most neighbours within MOB_CLUSTER_R).
-        Unit* seed = comp[0];
-        uint32 bestDeg = 0;
-        for (Unit* a : comp)
-        {
-            uint32 deg = 0;
-            for (Unit* b : comp) if (a != b && a->GetDistance(b) <= MOB_CLUSTER_R) ++deg;
-            if (deg > bestDeg) { bestDeg = deg; seed = a; }
-        }
-        for (Unit* u : comp) outSet.push_back(u->GetGUID());
-        return seed;
-    }
 
     // Henchmen currently being MOVED between groups during a (re-)hire. While a
     // guid is in here, the group-removal dismiss hook ignores it — otherwise
@@ -1606,6 +1509,214 @@ namespace WowPsParty
         return leader ? leader->GetVictim() : nullptr;
     }
 
+    // ===== Maintain-N pull (pull_count) =====================================
+    // At the START of a pull the lead tank tops its engaged headcount up toward N by
+    // WALKING to nearby un-aggroed mobs to proximity-aggro them (their neighbours
+    // social-aggro in on their own — so we never body-pull a "cluster", we just walk
+    // close). A candidate is added only if its social group fits the remaining
+    // capacity, so the tank never overshoots N. DAZED/rooted/snared -> it taunts the
+    // add in instead (TankRangedPullSpell — Heroic Throw / Avenger's Shield / Icy
+    // Touch / Faerie Fire, never gun/bow); the FINAL add that hits N is also taunted
+    // rather than walked. Nothing safe left to add, the tank's hurt, or it's stuck ->
+    // it stops and fights what it has. Only ever armed on a fresh out-of-combat pull,
+    // so it can't chain-pull the instance — the party rests between fights as before.
+    static constexpr float  GATHER_SCAN         = 50.0f;   // candidate search radius (LoS-gated)
+    static constexpr float  SOCIAL_AGGRO_R      = 10.0f;   // a candidate drags in un-aggroed mobs within this of it
+    static constexpr uint32 GATHER_DRIVE_MAX_MS = 12000;   // safety bail if a gather gets stuck pre-engage
+    static constexpr float  GATHER_LOW_HP_PCT   = 45.0f;   // tank this hurt -> stop gathering, fight + get healed
+
+    struct TankGatherDrive { uint32 startMs; uint32 targetN; };
+    static std::unordered_map<uint32, TankGatherDrive> g_tankGatherDrive;   // tankLow -> active gather
+    static std::mutex g_tankGatherDriveMutex;
+
+    static void StartTankGather(uint32 tankLow, uint32 targetN)
+    {
+        std::lock_guard<std::mutex> lock(g_tankGatherDriveMutex);
+        uint32 const now = getMSTime();
+        // Opportunistic prune: a tank that left mid-gather (logout / left party / left
+        // the dungeon) never reaches EndTankGather, so its entry would linger. Sweep
+        // any entry far older than the drive cap so a re-formed/re-hired guid can't
+        // inherit a phantom gather. (Mirrors MarkTankGathering's prune of g_tankGather.)
+        for (auto it = g_tankGatherDrive.begin(); it != g_tankGatherDrive.end(); )
+            it = (it->first != tankLow && now - it->second.startMs > GATHER_DRIVE_MAX_MS * 3)
+                     ? g_tankGatherDrive.erase(it) : std::next(it);
+        g_tankGatherDrive[tankLow] = { now, targetN };
+    }
+    bool TankGatherActive(uint32 tankLow)
+    {
+        std::lock_guard<std::mutex> lock(g_tankGatherDriveMutex);
+        return g_tankGatherDrive.count(tankLow) != 0;
+    }
+    static bool GetTankGather(uint32 tankLow, uint32& targetN, uint32& startMs)
+    {
+        std::lock_guard<std::mutex> lock(g_tankGatherDriveMutex);
+        auto it = g_tankGatherDrive.find(tankLow);
+        if (it == g_tankGatherDrive.end()) return false;
+        targetN = it->second.targetN; startMs = it->second.startMs;
+        return true;
+    }
+    void EndTankGather(uint32 tankLow)
+    {
+        { std::lock_guard<std::mutex> lock(g_tankGatherDriveMutex); g_tankGatherDrive.erase(tankLow); }
+        // Collapse the DPS-hold GC backstop so it can't linger ~12s after the drive
+        // ends: the tank now FIGHTS, so its threat lead governs the real release (per
+        // IsTankGathering); this 2s floor just stops a stuck/no-lead tail from holding
+        // DPS for the full GC. Separate lock scope -> never nested with the drive mutex.
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_tankGather.find(tankLow);
+        if (it != g_tankGather.end())
+        {
+            uint32 const soon = getMSTime() + 2000;
+            if (it->second.untilMs > soon) it->second.untilMs = soon;
+        }
+    }
+
+    // Can the tank walk an add down at (near) full speed? A daze/snare/root or hard CC
+    // means it must taunt instead (or bail).
+    static bool TankCanWalkFreely(Player* tank)
+    {
+        if (!tank) return false;
+        if (tank->HasUnitState(UNIT_STATE_ROOT | UNIT_STATE_STUNNED | UNIT_STATE_CONFUSED
+                               | UNIT_STATE_FLEEING)) return false;
+        if (tank->HasAuraType(SPELL_AURA_MOD_ROOT)) return false;
+        return tank->GetSpeedRate(MOVE_RUN) >= 0.95f;   // not snared / dazed
+    }
+
+    // Can the tank still CAST a taunt right now? Hard CC / silence blocks it.
+    static bool TankCanCastNow(Player* tank)
+    {
+        if (!tank) return false;
+        if (tank->HasUnitState(UNIT_STATE_STUNNED | UNIT_STATE_CONFUSED | UNIT_STATE_FLEEING)) return false;
+        if (tank->IsNonMeleeSpellCast(false, false, true)) return false;
+        return !tank->HasUnitFlag(UNIT_FLAG_SILENCED);
+    }
+
+    // Distinct live hostile creatures currently in combat with the tank.
+    static uint32 CountEngagedHostiles(Player* tank)
+    {
+        if (!tank) return 0;
+        uint32 n = 0;
+        for (auto const& [refGuid, ref] : tank->GetCombatManager().GetPvECombatRefs())
+        {
+            Unit* const o = ref->GetOther(tank);
+            if (o && o->IsAlive() && o->ToCreature()) ++n;
+        }
+        return n;
+    }
+
+    // A clean, un-aggroed pull candidate the tank can reach + actually see (not
+    // through a wall).
+    static bool GatherEligible(Player* tank, Unit* u)
+    {
+        if (!u || !u->IsAlive() || u->IsInCombat()) return false;   // un-aggroed only
+        if (u->IsTotem() || !u->ToCreature()) return false;
+        if (!tank->IsValidAttackTarget(u)) return false;
+        if (std::fabs(u->GetPositionZ() - tank->GetPositionZ()) > PULL_Z_TOLERANCE) return false;
+        return tank->IsWithinLOSInMap(u, VMAP::ModelIgnoreFlags::M2);
+    }
+
+    // How many mobs `cand` would drag in: itself + un-aggroed neighbours within
+    // SOCIAL_AGGRO_R (single hop, matching how social aggro fans out from the pulled
+    // mob). `pool` is the eligible set.
+    static uint32 SocialGroupSize(Unit* cand, std::vector<Unit*> const& pool)
+    {
+        uint32 n = 1;
+        for (Unit* u : pool)
+            if (u != cand && cand->GetDistance(u) <= SOCIAL_AGGRO_R)
+                ++n;
+        return n;
+    }
+
+    // Nearest eligible un-aggroed candidate within GATHER_SCAN whose social group fits
+    // `capacity`. Returns it + its group size in grpOut, or nullptr if none fit.
+    static Unit* FindNextSafeAdd(Player* tank, uint32 capacity, uint32& grpOut)
+    {
+        grpOut = 0;
+        if (!tank || capacity == 0) return nullptr;
+        std::list<Unit*> nearby;
+        Acore::AnyUnfriendlyUnitInObjectRangeCheck check(tank, tank, GATHER_SCAN);
+        Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck> searcher(tank, nearby, check);
+        Cell::VisitObjects(tank, searcher, GATHER_SCAN);
+
+        std::vector<Unit*> pool;
+        for (Unit* u : nearby) if (GatherEligible(tank, u)) pool.push_back(u);
+        std::sort(pool.begin(), pool.end(),
+                  [&](Unit* a, Unit* b){ return tank->GetDistance(a) < tank->GetDistance(b); });
+        for (Unit* cand : pool)
+        {
+            uint32 const g = SocialGroupSize(cand, pool);
+            if (g <= capacity) { grpOut = g; return cand; }   // nearest that SAFELY fits
+        }
+        return nullptr;
+    }
+
+    // Cast the tank's fast ranged-pull / taunt (never gun/bow) at `target`. True if it
+    // went out (known, off cooldown, in range, in LoS).
+    static bool TryTankFastRangedPull(Player* tank, Unit* target)
+    {
+        if (!tank || !target || !TankCanCastNow(tank)) return false;
+        uint32 const spellId = WowPsParty::TankRangedPullSpell(tank);
+        if (!spellId || tank->HasSpellCooldown(spellId)) return false;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId);
+        if (!si) return false;
+        if (tank->GetDistance(target) > si->GetMaxRange(false, tank)) return false;
+        if (!tank->IsWithinLOSInMap(target, VMAP::ModelIgnoreFlags::M2)) return false;
+        tank->CastSpell(target, spellId, false);
+        return true;
+    }
+
+    // One tick of an active maintain-N gather: walk (or taunt) the next safe add in,
+    // or finish. Runs from TankLeadEngagement AFTER AssistTarget, so its MoveChase
+    // overrides the combat chase for this tick.
+    static void TankGatherStep(Player* tank)
+    {
+        uint32 const tankLow = tank->GetGUID().GetCounter();
+        uint32 targetN = 0, startMs = 0;
+        if (!GetTankGather(tankLow, targetN, startMs)) return;
+
+        // Bail conditions: stuck too long, or the tank's getting low — fight + heal.
+        if (getMSTime() - startMs > GATHER_DRIVE_MAX_MS) { EndTankGather(tankLow); return; }
+        if (tank->GetHealthPct() <= GATHER_LOW_HP_PCT)   { EndTankGather(tankLow); return; }
+
+        uint32 const engaged = CountEngagedHostiles(tank);
+        if (engaged >= targetN) { EndTankGather(tankLow); return; }   // at target -> fight
+
+        uint32 grp = 0;
+        Unit* const add = FindNextSafeAdd(tank, targetN - engaged, grp);
+        if (!add) { EndTankGather(tankLow); return; }                  // nothing safe -> fight what we have
+
+        // Keep the DPS held the whole gather: re-mark the hold with everything the tank
+        // is in combat with PLUS the incoming add, so IsTankGathering keeps the party
+        // back until the tank has actually grabbed + threatened the pack.
+        std::vector<ObjectGuid> set;
+        for (auto const& [rg, ref] : tank->GetCombatManager().GetPvECombatRefs())
+            if (Unit* o = ref->GetOther(tank))
+                if (o->IsAlive() && o->ToCreature()) set.push_back(o->GetGUID());
+        set.push_back(add->GetGUID());
+        MarkTankGathering(tankLow, set);
+
+        bool const isFinal = (engaged + grp >= targetN);   // this add reaches the target
+        bool const canWalk = TankCanWalkFreely(tank);
+
+        // Final add, or can't walk (dazed) -> taunt it in rather than trekking over.
+        if (isFinal || !canWalk)
+        {
+            if (TryTankFastRangedPull(tank, add)) return;
+            if (canWalk)                                      // final but no taunt up -> just walk it down
+            {
+                tank->SetFacingToObject(add);
+                tank->GetMotionMaster()->MoveChase(add);
+                return;
+            }
+            EndTankGather(tankLow);                           // dazed AND no taunt -> bail, fight what we have
+            return;
+        }
+        // Walk close enough to proximity-aggro it (no need to hit it — the per-tick
+        // re-eval advances the instant it's in combat).
+        tank->SetFacingToObject(add);
+        tank->GetMotionMaster()->MoveChase(add);
+    }
+
     void TankLeadEngagement(Player* bot)
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
@@ -1628,6 +1739,16 @@ namespace WowPsParty
         if (!leader || !leader->IsInWorld()) return;
         if (leader->GetMapId() != bot->GetMapId()) return;
         if (!leader->GetMap() || !leader->GetMap()->IsDungeon()) return;
+
+        // Active maintain-N gather: drive it (walk/taunt to the next safe add) BEFORE
+        // the out-of-combat-only pull logic below — the tank is mid-gather (in combat),
+        // so the settle/leash/victim guards would otherwise bail. Runs after
+        // AssistTarget this tick, so its MoveChase wins.
+        if (TankGatherActive(bot->GetGUID().GetCounter()))
+        {
+            TankGatherStep(bot);
+            return;
+        }
 
         // Don't auto-pull the instant a fight ends — hold off until the WHOLE party
         // has been out of combat for POST_COMBAT_PULL_DELAY, so it can loot / regroup
@@ -1750,42 +1871,22 @@ namespace WowPsParty
         }
         bot->SetFacingToObject(nearest);
 
-        // Multi-pull (pull_count:N, default 3): on this INITIAL pull, try to open on a
-        // whole CLUSTER instead of one mob. If the nearest mob seeds a tight cluster of
-        // 2..N eligible (un-aggroed, in the tank's LoS, similar Z) mobs, BODY-PULL it —
-        // run into the cluster so the pack aggros and stacks on the tank — mark the
-        // gather (the party holds fire until they're stacked, via IsPartyPullPending),
-        // and skip the single-mob ranged-isolate flow below. A bigger-than-N pack or an
-        // isolated mob returns null and falls through to the normal single pull. Gated
-        // to a real initial pull by the no-live-victim + party-rested checks above, so
-        // it never chain-pulls; the party eats/drinks between packs as before.
-        // INTENTIONAL precedence over safe_pull: a found 2..N cluster is body-pulled even
-        // when safe_pull is ON (it's the whole point of pull_count). A LONE mob still
-        // falls through to the safe ranged pull below, so safe_pull keeps governing the
-        // common single-target case; set pull_count:1 to force single pulls everywhere.
+        // Maintain-N pull (pull_count): OPEN on the nearest mob normally — its
+        // neighbours social-aggro in on their own (no cluster body-pull) — then arm the
+        // maintain-N gather, which walks the engaged headcount up toward N from nearby
+        // SAFE adds without overshooting (TankGatherStep, above). Only armed here, on a
+        // fresh out-of-combat + rested pull, so it never chain-pulls. N==1 falls through
+        // to the classic single ranged/barge pull below.
         uint32 const pullN = WowPsParty::BotInitialPullCount(bot->GetGUID());
         if (pullN >= 2)
         {
-            std::vector<ObjectGuid> set;
-            if (Unit* seed = SelectInitialPullCluster(bot, nearest, pullN, set))
-            {
-                // The seed may differ from `nearest`; (re)attack it. If it's evading or
-                // immune, Unit::Attack rejects it — abandon the multi-pull and fall
-                // through to the single pull on `nearest` (already attacked above), so we
-                // never charge + hold the party on a mob we can't actually engage
-                // (mirrors the single-pull CANT-ATTACK bail).
-                if (bot->GetVictim() == seed || bot->Attack(seed, true))
-                {
-                    MarkTankGathering(bot->GetGUID().GetCounter(), set);
-                    bot->SetFacingToObject(seed);
-                    bot->GetMotionMaster()->MoveChase(seed);   // body-pull into the cluster
-                    LOG_INFO("module",
-                        "[WowPsParty TankLead] guid={} MULTI-PULL {}/{} mobs seed_guid={} entry={} dist={:.1f}",
-                        bot->GetGUID().GetCounter(), uint32(set.size()), pullN,
-                        seed->GetGUID().GetCounter(), seed->GetEntry(), bot->GetDistance(seed));
-                    return;
-                }
-            }
+            MarkTankGathering(bot->GetGUID().GetCounter(), { nearest->GetGUID() });   // DPS hold
+            StartTankGather(bot->GetGUID().GetCounter(), pullN);
+            bot->GetMotionMaster()->MoveChase(nearest);   // body-pull the opener (walk in)
+            LOG_INFO("module",
+                "[WowPsParty TankLead] guid={} OPEN+GATHER target={} on entry={} dist={:.1f}",
+                bot->GetGUID().GetCounter(), pullN, nearest->GetEntry(), bot->GetDistance(nearest));
+            return;
         }
 
         // Ranged pull: a tank that can open from range doesn't charge into the
