@@ -314,7 +314,7 @@ namespace WowPsParty
     }
 
     // Display fields read off an Item for the inventory/gear panels.
-    struct PartyItemFields { uint32 entry; uint32 count; uint32 guidLow; int32 randProp; uint32 suffix; };
+    struct PartyItemFields { uint32 entry; uint32 count; uint32 guidLow; int32 randProp; uint32 suffix; uint32 enchant; };
 
     // Defensive read of an item's display fields. A bag/equip slot can transiently
     // hold an Item whose value-array is invalid — a partially-initialised / dangling
@@ -336,6 +336,7 @@ namespace WowPsParty
             out.guidLow  = item->GetGUID().GetCounter();
             out.randProp = item->GetItemRandomPropertyId();
             out.suffix   = item->GetItemSuffixFactor();
+            out.enchant  = item->GetEnchantmentId(PERM_ENCHANTMENT_SLOT);   // perm enchant, for the tooltip
             return true;
 #ifdef _WIN32
         }
@@ -385,7 +386,7 @@ namespace WowPsParty
             if (!first) out << ';';
             first = false;
             out << uint32(i) << ':' << f.entry << ':' << f.guidLow
-                << ':' << f.randProp << ':' << f.suffix;
+                << ':' << f.randProp << ':' << f.suffix << ':' << f.enchant;
         }
         SendWPSP(requester, out.str());
     }
@@ -605,10 +606,12 @@ namespace WowPsParty
               // Random property / suffix so the addon tooltip renders the FULL item
               // (e.g. a rare with "of the Bear") instead of the base item with no
               // stats. RandomPropertyId is NEGATIVE for a random SUFFIX; the suffix
-              // factor (property seed) scales its stats. Appended, so an older addon
+              // factor (property seed) scales its stats. Then the permanent enchant id
+              // so the tooltip shows the applied enchant. Appended, so an older addon
               // that only reads the first 6 fields still parses fine.
               << ':' << f.randProp
-              << ':' << f.suffix;
+              << ':' << f.suffix
+              << ':' << f.enchant;
             records.push_back(r.str());
         };
 
