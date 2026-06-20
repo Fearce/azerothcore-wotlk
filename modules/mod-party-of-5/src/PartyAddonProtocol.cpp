@@ -1498,13 +1498,21 @@ static void SendBuybackTo(Player* requester)
         {
             Item* it = p->GetItemFromBuyBackSlot(s);
             if (!it) continue;
+            WowPsParty::PartyItemFields f;
+            if (!WowPsParty::SafeReadItemFields(it, f))
+            {
+                LOG_ERROR("module", "[WowPsParty] SendBuybackTo: SKIPPED a bad item "
+                    "ptr=0x{:x} owner={} bbslot={} (value-array AV — dangling item)",
+                    reinterpret_cast<uintptr_t>(it), p->GetGUID().GetCounter(), uint32(s));
+                continue;
+            }
             uint8 const idx = uint8(s - BUYBACK_SLOT_START);
             uint32 const price = p->GetUInt32Value(PLAYER_FIELD_BUYBACK_PRICE_1 + idx);
             std::ostringstream r;
             r << uint32(partySlot) << ':' << uint32(idx) << ':'
-              << it->GetEntry() << ':' << it->GetCount() << ':' << price << ':'
-              << it->GetGUID().GetCounter() << ':'
-              << it->GetItemRandomPropertyId() << ':' << it->GetItemSuffixFactor();
+              << f.entry << ':' << f.count << ':' << price << ':'
+              << f.guidLow << ':'
+              << f.randProp << ':' << f.suffix;
             records.push_back(r.str());
         }
     }
@@ -1621,7 +1629,7 @@ static void ForEachPartyEnchantScroll(uint32 account, Fn&& fn)
     auto scan = [&](Player* p, Item* it)
     {
         if (!it) return;
-        if (uint32 sp = EnchantScrollUseSpell(it->GetTemplate()))
+        if (uint32 sp = EnchantScrollUseSpell(WowPsParty::SafeItemTemplate(it)))
             fn(sp, it, p);
     };
     for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
@@ -1630,6 +1638,7 @@ static void ForEachPartyEnchantScroll(uint32 account, Fn&& fn)
         if (!guid) continue;
         Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid));
         if (!p) continue;
+        if (WowPsParty::MemberStorageUnstable(p)) continue;
         for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
             scan(p, p->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
         for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
@@ -1655,6 +1664,7 @@ static void HandleReqEnchants(Player* requester, std::string_view payload)
     if (!tgtGuid) return;
     Player* tgtChar = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(tgtGuid));
     if (!tgtChar) return;
+    if (WowPsParty::MemberStorageUnstable(tgtChar)) return;
     Item* tgtItem = tgtChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(tgtItemGuidLow));
     if (!tgtItem) return;
 
@@ -1666,6 +1676,7 @@ static void HandleReqEnchants(Player* requester, std::string_view payload)
         if (!guid) continue;
         Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid));
         if (!p) continue;
+        if (WowPsParty::MemberStorageUnstable(p)) continue;
         for (auto const& kv : p->GetSpellMap())
         {
             if (kv.second->State == PLAYERSPELL_REMOVED) continue;
@@ -1695,9 +1706,10 @@ static void HandleReqEnchants(Player* requester, std::string_view payload)
     // DIAGNOSTIC ("can't enchant" report): how many applicable enchants the party
     // knows for this item. 0 here = the picker is empty because NO party member is an
     // enchanter (or none fit the item) — that's the usual "can't enchant", not a bug.
+    ItemTemplate const* tgtProto = WowPsParty::SafeItemTemplate(tgtItem);
     LOG_INFO("module",
         "[WowPsParty Enchant] REQ_ENCHANTS by {} for item entry={} -> {} applicable enchant(s) across the party",
-        requester->GetName(), tgtItem->GetTemplate() ? tgtItem->GetTemplate()->ItemId : 0u, uint32(spellIds.size()));
+        requester->GetName(), tgtProto ? tgtProto->ItemId : 0u, uint32(spellIds.size()));
 
     std::ostringstream out;
     out << "ENCHANTS\t" << tgtSlot << '\t' << tgtItemGuidLow << '\t';
