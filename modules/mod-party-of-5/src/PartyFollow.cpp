@@ -1695,13 +1695,23 @@ namespace WowPsParty
         set.push_back(add->GetGUID());
         MarkTankGathering(tankLow, set);
 
-        bool const isFinal = (engaged + grp >= targetN);   // this add reaches the target
+        // The taunt-instead-of-walk optimisation is ONLY for a top-up add once the tank
+        // is ALREADY engaged. The OPENER (engaged==0) is always WALKED in — otherwise a
+        // pack whose social group already fills N makes the opener "final" and the tank
+        // Heroic-Throws it from ~28y then stands waiting for it to walk over (Yltas in
+        // RFK: "tries to range-pull then stands there for ages"). Walking opens cleanly.
+        bool const isFinal = (engaged > 0 && engaged + grp >= targetN);   // a TOP-UP add that reaches the target
         bool const canWalk = TankCanWalkFreely(tank);
 
-        // Final add, or can't walk (dazed) -> taunt it in rather than trekking over.
+        // Final top-up add, or can't walk (dazed) -> taunt it in rather than trekking over.
         if (isFinal || !canWalk)
         {
-            if (TryTankFastRangedPull(tank, add)) return;
+            if (TryTankFastRangedPull(tank, add))
+            {
+                LOG_INFO("module", "[WowPsParty TankGather] guid={} TAUNT add entry={} grp={} engaged={}/{} ({})",
+                         tankLow, add->GetEntry(), grp, engaged, targetN, canWalk ? "final" : "dazed");
+                return;
+            }
             if (canWalk)                                      // final but no taunt up -> just walk it down
             {
                 tank->SetFacingToObject(add);
