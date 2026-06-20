@@ -97,6 +97,28 @@ local WEAPON_SUBCLASS_TO_SKILL = {
     [19] = 228,
 }
 
+-- Bitmask flag per class (item_template.AllowableClass).
+local CLASS_FLAG = {
+    [1] = 1, [2] = 2, [3] = 4, [4] = 8, [5] = 16,
+    [6] = 32, [7] = 64, [8] = 128, [9] = 256, [11] = 1024,
+}
+-- Classes that can equip a shield (armor subclass 6).
+local SHIELD_CLASSES = { [1] = true, [2] = true, [7] = true }   -- Warrior / Paladin / Shaman
+-- Relic armor subclass -> the single class that uses it.
+local RELIC_OWNER = { [7] = 2, [8] = 11, [9] = 7, [10] = 6 }     -- Libram->Pala, Idol->Druid, Totem->Shaman, Sigil->DK
+
+-- Guaranteed end-of-run gear: every completed key grants real gear pulled live
+-- from item_template, item level scaled to the key tier, filtered to the class.
+-- Pets/mounts stay as the separate chance-based bonus rolls. Tune freely.
+local GUARANTEED_GEAR = {
+    enabled  = true,
+    baseIlvl = 200,    -- ilvl awarded at tier 1 (heroic / Naxx-entry tier)
+    perTier  = 7,      -- +ilvl per tier above 1
+    capIlvl  = 284,    -- ICC-heroic ceiling
+    bandHalf = 8,      -- accept items within +/- this of the target ilvl
+    quality  = "3,4",  -- rare + epic
+}
+
 local BossNameCache = {
     ["enUS"] = {},
     ["deDE"] = {},
@@ -1982,6 +2004,112 @@ function isVaultTierEligibleForBracket(bracket, tier)
     return false
 end
 
+-- Is this item actually appropriate for the class — exact armor type, a weapon
+-- the class trains, the right shield/relic. Stricter than CanPlayerUseItem, which
+-- also passes lighter armor a plate wearer would never equip.
+local function RewardGearRelevant(playerClass, class, subClass, inventoryType)
+    if class == 2 then               -- weapon: must be in the class's proficiency
+        local skillId = WEAPON_SUBCLASS_TO_SKILL[subClass]
+        if not skillId then return false end
+        local prof = WEAPON_PROFICIENCY[skillId]
+        return prof ~= nil and prof[playerClass] == true
+    elseif class == 4 then           -- armor
+        if subClass == 0 then return true end              -- neck / ring / trinket
+        if inventoryType == 16 then return true end         -- cloak: every class
+        if subClass >= 1 and subClass <= 4 then             -- cloth/leather/mail/plate
+            return subClass == CLASS_ARMOR_TYPES[playerClass]
+        end
+        if subClass == 6 then return SHIELD_CLASSES[playerClass] == true end
+        if RELIC_OWNER[subClass] then return RELIC_OWNER[subClass] == playerClass end
+        return false                                         -- buckler / unknown
+    end
+    return false
+end
+
+-- Target item-level band for a tier's guaranteed gear.
+local function MythicGearBand(tier)
+    local center = GUARANTEED_GEAR.baseIlvl + (math.max(1, tier) - 1) * GUARANTEED_GEAR.perTier
+    if center > GUARANTEED_GEAR.capIlvl then center = GUARANTEED_GEAR.capIlvl end
+    local lo = center - GUARANTEED_GEAR.bandHalf
+    local hi = center + GUARANTEED_GEAR.bandHalf
+    if lo < 1 then lo = 1 end
+    return lo, hi
+end
+
+-- Random pool of class-appropriate item entries within the ilvl band.
+local function BuildGearRewardPool(player, lo, hi)
+    local pclass = player:GetClass()
+    local classFlag = CLASS_FLAG[pclass]
+    if not classFlag then return {} end
+    local prace = player:GetRace()
+    local q = WorldDBQuery(string.format([[
+        SELECT entry, class, subclass, InventoryType, AllowableRace
+        FROM item_template
+        WHERE class IN (2,4)
+          AND Quality IN (%s)
+          AND ItemLevel BETWEEN %d AND %d
+          AND InventoryType > 0
+          AND RequiredLevel <= %d
+          AND (AllowableClass = 0 OR (AllowableClass & %d) > 0)
+        ORDER BY RAND() LIMIT 500]],
+        GUARANTEED_GEAR.quality, lo, hi, player:GetLevel(), classFlag))
+    local pool = {}
+    if q then
+        repeat
+            local entry = q:GetUInt32(0)
+            local class = q:GetUInt32(1)
+            local subc  = q:GetUInt32(2)
+            local invt  = q:GetUInt32(3)
+            local arace = q:GetUInt32(4)   -- -1 reads back as all-bits => all races
+            if HasRaceFlag(arace, prace) and RewardGearRelevant(pclass, class, subc, invt) then
+                pool[#pool + 1] = entry
+            end
+        until not q:NextRow()
+    end
+    return pool
+end
+
+-- Deliver a reward item to bags, falling back to mail when bags are full so a
+-- guaranteed reward is never silently lost. Returns "bags" or "mail".
+local function DeliverReward(player, itemId)
+    if player:AddItem(itemId, 1) then return "bags" end
+    SendMail(
+        GetLocalizedText(player, "UI", "Mythic+ Reward"),
+        GetLocalizedText(player, "UI", "Your bags were full, so your Mythic+ reward is attached."),
+        player:GetGUIDLow(), 0, 41, 0, 0, 0, itemId, 1)
+    return "mail"
+end
+
+-- The main reward: every completed key grants real gear scaled to its tier. A
+-- timed run (+2 / +3) grants a second piece.
+local function GrantGuaranteedGear(player, tier, upgradeLevel)
+    if not GUARANTEED_GEAR.enabled then return end
+    local lo, hi = MythicGearBand(tier)
+    local pool = BuildGearRewardPool(player, lo, hi)
+    if #pool == 0 then   -- widen once if the tight band held nothing for this class
+        pool = BuildGearRewardPool(player, math.max(1, lo - 25), hi + 25)
+    end
+    if #pool == 0 then
+        player:SendBroadcastMessage("[Mythic+] " .. GetLocalizedText(player, "UI",
+            "No gear reward was available for your class this run."))
+        return
+    end
+
+    local pieces = (upgradeLevel >= 2) and 2 or 1
+    for _ = 1, pieces do
+        if #pool == 0 then break end
+        local idx = math.random(1, #pool)
+        local itemId = pool[idx]
+        table.remove(pool, idx)        -- no duplicate piece in a single run
+        local where = DeliverReward(player, itemId)
+        local itemData = CacheItemTemplate(itemId)
+        local itemName = (itemData and itemData.name) or "Unknown Item"
+        local suffix = (where == "mail") and (" (" .. GetLocalizedText(player, "UI", "mailed") .. ")") or ""
+        player:SendBroadcastMessage("[Mythic+] " ..
+            GetLocalizedText(player, "UI", "Gear reward:") .. " " .. itemName .. suffix)
+    end
+end
+
 local function TryRewardMythicLoot(player, tier, upgradeLevel)
     local faction = player:GetTeam() == 67 and "A" or (player:GetTeam() == 469 and "H" or "N")
     local eligible = {}
@@ -2122,6 +2250,7 @@ function AwardMythicPoints(player, tier, duration, deaths, remainingTime)
         end, 500, 1)
     end
 
+    GrantGuaranteedGear(player, tier, upgradeLevel)
     TryRewardMythicLoot(player, tier, upgradeLevel)
     UpdateVaultProgress(player, tier, true)
     LeaderboardCache.lastUpdate = 0
