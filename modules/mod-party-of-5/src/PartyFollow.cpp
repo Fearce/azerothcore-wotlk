@@ -692,6 +692,15 @@ namespace WowPsParty
         p->ClearUnitState(UNIT_STATE_ROOT | UNIT_STATE_STUNNED | UNIT_STATE_DIED
                           | UNIT_STATE_DISTRACTED | UNIT_STATE_NO_COMBAT_MOVEMENT);
         p->RemoveUnitMovementFlag(MOVEMENTFLAG_ROOT);
+        // A clientless bot revived by some paths keeps a stale/zero movement speed (the
+        // speed update normally round-trips through the player's client, which a bot
+        // lacks). A follow generator then installs but its spline can't progress at 0
+        // speed — unitState=FOLLOW yet moveFlags=0, frozen — so the catch-up teleport
+        // pops it every few yards instead of walking ("teleports after a res"). Recompute
+        // every speed from base+auras so it can actually move. Forced + clientless = a
+        // pure server-side state set, no packet a bot would need to ack.
+        for (uint8 mt = 0; mt < MAX_MOVE_TYPE; ++mt)
+            p->UpdateSpeed(UnitMoveType(mt), true);
     }
 
     // MotionMaster point id for the "Come Hither" recall (just needs to be unique
@@ -5008,9 +5017,9 @@ namespace WowPsParty
                         leader, PET_FOLLOW_DIST, follower->GetFollowAngle());
                     LOG_INFO("module",
                         "[WowPsParty Follow] unstick-in-place: {} dist={:.1f} idle={} "
-                        "unitState={:#x} moveFlags={:#x}",
+                        "unitState={:#x} moveFlags={:#x} runSpeed={:.2f}",
                         follower->GetName(), dist, s.idle, ustate,
-                        follower->GetUnitMovementFlags());
+                        follower->GetUnitMovementFlags(), follower->GetSpeed(MOVE_RUN));
                 }
                 else
                 {
