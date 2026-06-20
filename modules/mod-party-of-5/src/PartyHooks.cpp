@@ -994,9 +994,22 @@ public:
 class PartyDamageTrackScript : public UnitScript
 {
 public:
-    PartyDamageTrackScript() : UnitScript("PartyDamageTrackScript", true, { UNITHOOK_MODIFY_SPELL_DAMAGE_TAKEN }) { }
+    PartyDamageTrackScript() : UnitScript("PartyDamageTrackScript", true,
+        { UNITHOOK_MODIFY_SPELL_DAMAGE_TAKEN, UNITHOOK_MODIFY_PERIODIC_DAMAGE_AURAS_TICK }) { }
 
     void ModifySpellDamageTaken(Unit* target, Unit* /*attacker*/, int32& /*damage*/, SpellInfo const* spellInfo) override
+    {
+        if (!target || !spellInfo) return;
+        if (Player* p = target->ToPlayer())
+            WowPsParty::RecordSpellDamageTaken(p->GetGUID().GetCounter(), spellInfo->Id);
+    }
+
+    // PERIODIC (DOT / ground-effect aura) ticks go through a SEPARATE damage path the
+    // direct hook above never sees — so without this took_damage_from missed every
+    // "stand in the fire" mechanic (Coldflame ticks via SPELL_COLDFLAME_PASSIVE, Defile,
+    // Consecration, …), which is the most common thing a reposition rule reacts to
+    // (Kevin: healer stood in Coldflame, took ticks, never moved). Record these too.
+    void ModifyPeriodicDamageAurasTick(Unit* target, Unit* /*attacker*/, uint32& /*damage*/, SpellInfo const* spellInfo) override
     {
         if (!target || !spellInfo) return;
         if (Player* p = target->ToPlayer())

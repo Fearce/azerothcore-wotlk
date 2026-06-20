@@ -4368,6 +4368,12 @@ namespace WowPsParty
         {
             float dist = float(std::atof(arg.c_str()));
             if (dist <= 0.0f) dist = 4.0f;            // sane default if no number given
+            // Keep AssistTarget off our feet for the hop (same as move_out_of_los does).
+            // Without it a HEALER — which AssistTarget plants with MoveIdle "hold near
+            // party" — gets re-planted right back into the fire the instant it hops, so it
+            // never actually escapes (Kevin: healer stood in Coldflame). Re-asserted each
+            // tick the rule is active so the hold never lapses mid-hop.
+            WowPsParty::HoldFollower(bot->GetGUID(), 1500);
             // Already mid-hop? let it finish before issuing another.
             if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE
                 && bot->isMoving())
@@ -4909,8 +4915,17 @@ namespace WowPsParty
         // below fires the first matching rule in vector order, so shared wins ties.
         // Applies to EVERY bot (heroes + henchmen); a bot with no own rules still runs
         // the shared ones.
-        std::vector<RotationRule> rules =
-            GetSharedRotation(bot->GetSession() ? bot->GetSession()->GetAccountId() : 0);
+        // Key the COMMON rotation off the LEADER's account, NOT the bot's own. Heroes are
+        // alts on the leader's account (matches), but HENCHMEN are rndbot-pool chars on
+        // DIFFERENT accounts — so keying off the bot's account gave them NO Common rotation
+        // at all (Kevin: "Common must run on heroes AND henchmen"). The leader (the human)
+        // owns the shared rotation.
+        uint32 sharedAccount = bot->GetSession() ? bot->GetSession()->GetAccountId() : 0;
+        if (ObjectGuid const lgShared = GetLeaderFor(bot->GetGUID()))
+            if (Player* leaderShared = ObjectAccessor::FindConnectedPlayer(lgShared))
+                if (leaderShared->GetSession())
+                    sharedAccount = leaderShared->GetSession()->GetAccountId();
+        std::vector<RotationRule> rules = GetSharedRotation(sharedAccount);
         rules.reserve(rules.size() + ownRules.size());
         for (auto& r : ownRules) rules.push_back(std::move(r));
         if (rules.empty()) return false;
