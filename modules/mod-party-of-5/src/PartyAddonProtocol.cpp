@@ -2313,6 +2313,8 @@ static void ApplyGlyphFromItem(Player* target, Player* itemOwner, Item* glyphIte
 // requester first, then bank it (CanBankItem/BankItem) — the same primitives the
 // core's auto-bank uses. No banker NPC is required: the shared grid is already a
 // non-physical convenience. Bounces the item back to its owner if the bank is full.
+static Item* PullItemToRequester(Player* requester, Player* srcChar, Item* item);   // defined below
+
 static void HandleBankDeposit(Player* requester, std::string_view payload)
 {
     if (!requester || !requester->GetSession()) return;
@@ -2334,36 +2336,39 @@ static void HandleBankDeposit(Player* requester, std::string_view payload)
     ItemTemplate const* t = item->GetTemplate();
     std::string const itemName = t ? t->Name1 : "item";
 
-    if (srcChar != requester)   // re-own to the requester so the bank store is on THEIR item
+    // Land the item in the REQUESTER's own bags first. PullItemToRequester does the
+    // cross-char move safely and bounces it back to its owner if the requester has no
+    // room, so the deposit below is always the simple, canonical same-player path. (For
+    // an item already on the requester it's a no-op returning the same item.)
+    Item* owned = PullItemToRequester(requester, srcChar, item);
+    if (!owned)
     {
-        srcChar->MoveItemFromInventory(item->GetBagSlot(), item->GetSlot(), true);
-        item->SetOwnerGUID(requester->GetGUID());
-        item->FSetState(ITEM_CHANGED);
-        CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
-        item->SaveToDB(tx);
-        CharacterDatabase.CommitTransaction(tx);
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Couldn't move |cffffffff{}|r to your bags.", itemName);
+        WowPsParty::SendInventoryTo(requester);
+        if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
+        return;
     }
 
+    // Mirror WorldSession::HandleAutoBankItemOpcode EXACTLY: compute the bank slot, then
+    // REMOVE the item from the bag BEFORE BankItem. Storing it while it is still
+    // registered in the bag double-references the Item* into two slots and corrupts its
+    // count — that is the "deposited belt shows as a 2-stack and doesn't actually move"
+    // bug, and the dangling Item* that SendInventoryTo had to SEH-guard against.
     ItemPosCountVec dest;
-    if (requester->CanBankItem(NULL_BAG, NULL_SLOT, dest, item, false) == EQUIP_ERR_OK)
+    InventoryResult const msg = requester->CanBankItem(NULL_BAG, NULL_SLOT, dest, owned, false);
+    if (msg == EQUIP_ERR_OK && !(dest.size() == 1 && dest[0].pos == owned->GetPos()))
     {
-        requester->BankItem(dest, item, true);
+        requester->RemoveItem(owned->GetBagSlot(), owned->GetSlot(), true);
+        requester->ItemRemovedQuestCheck(owned->GetEntry(), owned->GetCount());
+        requester->BankItem(dest, owned, true);
         ChatHandler(requester->GetSession()).PSendSysMessage(
             "|cff66ccff[WowPsParty]|r Banked |cffffffff{}|r.", itemName);
     }
     else
     {
-        if (srcChar != requester)   // bank full — hand it back so it never strands
-        {
-            item->SetOwnerGUID(srcChar->GetGUID());
-            item->FSetState(ITEM_CHANGED);
-            ItemPosCountVec back;
-            if (srcChar->CanStoreItem(NULL_BAG, NULL_SLOT, back, item, false) == EQUIP_ERR_OK)
-                srcChar->MoveItemToInventory(back, item, true);
-            CharacterDatabaseTransaction tx2 = CharacterDatabase.BeginTransaction();
-            item->SaveToDB(tx2);
-            CharacterDatabase.CommitTransaction(tx2);
-        }
+        // Bank full (or it was already there) — leave it in the requester's bags; it was
+        // moved there safely above, so nothing strands and nothing duplicates.
         ChatHandler(requester->GetSession()).PSendSysMessage(
             "|cffff5555[WowPsParty]|r Your bank is full — couldn't deposit |cffffffff{}|r.", itemName);
     }
