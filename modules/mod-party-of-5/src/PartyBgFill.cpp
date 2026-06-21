@@ -80,6 +80,7 @@
 
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -96,6 +97,8 @@ namespace
         uint8  bmax;        // bracket max level — re-level target (top of bracket)
         bool   releveled;   // re-level done, or unnecessary (in-bracket pool char)
         uint32 outSinceMs = 0;  // when it first read !InBattleground after entering (0 = in)
+        uint32 account = 0; // the pool account this char is on — only ONE char per account
+                            // can be online, so fills must claim DISTINCT accounts
     };
 
     // Grace before retiring a fill bot that read !InBattleground after entering. A real
@@ -152,6 +155,20 @@ namespace
         return csv;
     }
 
+    // CSV of ACCOUNTS already claimed by an active fill (any leader, both factions).
+    // Only one char per account can be online at once, and a RNDBOT account holds BOTH
+    // factions, so a new draw MUST avoid these accounts or its logins silently fail —
+    // the cause of the lopsided "40 ally / 23 enemy" AV: the ally fills (drawn first)
+    // claimed accounts the enemy Horde draw then collided with. "0" is a never-an-account
+    // placeholder so NOT IN stays valid when nothing is active yet.
+    std::string ActiveFillAccountCsv()
+    {
+        std::string csv = "0";
+        std::lock_guard<std::mutex> lk(g_mutex);
+        for (auto const& kv : g_fillBots) { csv += ','; csv += std::to_string(kv.second.account); }
+        return csv;
+    }
+
     // Spawn up to `count` parked rndbot chars of the given races as independent bots
     // (master 0) and register them as fill bots for this leader's BG. Draws IN-BRACKET
     // chars first (no re-level needed); any shortfall is backfilled from out-of-bracket
@@ -164,30 +181,55 @@ namespace
     {
         if (count == 0) return 0;
 
-        std::string const exclude = ActiveFillCsv();
-        std::vector<std::pair<uint32, bool>> picks;   // {guid, needsRelevel}
+        // Claim DISTINCT accounts. Only one char per account can be online at once, and a
+        // RNDBOT account holds BOTH factions, so two picks on the same account (or an enemy
+        // pick on an account the ally fill already used) collide and the second login
+        // silently fails — the lopsided "40 ally / 23 enemy" AV. `exclAccts` = accounts
+        // any active fill already holds; `usedAccts` = accounts taken within THIS draw.
+        // `GROUP BY account` yields one char per account; the NOT IN excludes claimed ones.
+        std::string const exclAccts = ActiveFillAccountCsv();
+        std::vector<std::tuple<uint32, uint32, bool>> picks;   // {guid, account, needsRelevel}
+        std::vector<uint32> usedAccts;
+        auto accExclude = [&]() {
+            std::string s = exclAccts;
+            for (uint32 a : usedAccts) { s += ','; s += std::to_string(a); }
+            return s;
+        };
+        auto take = [&](QueryResult& r, bool needsRelevel) {
+            do {
+                Field* f = r->Fetch();
+                uint32 const guid = f[0].Get<uint32>();
+                uint32 const acct = f[1].Get<uint32>();
+                usedAccts.push_back(acct);
+                picks.emplace_back(guid, acct, needsRelevel);
+            } while (r->NextRow() && picks.size() < count);
+        };
 
-        // 1) In-bracket parked chars — usable as-is, no re-level.
+        // 1) In-bracket parked chars — usable as-is, no re-level. One per distinct account.
+        //    The inner "account NOT IN (online chars)" also skips accounts busy with an
+        //    online char from ANOTHER path (a hired henchman, a prior fill) — those are
+        //    rndbot accounts too, and one online char per account is the hard limit.
         if (QueryResult q = CharacterDatabase.Query(
-                "SELECT `guid` FROM `characters` WHERE `account` IN ({}) AND `online` = 0 "
-                "AND `race` IN ({}) AND `level` BETWEEN {} AND {} AND `guid` NOT IN ({}) "
-                "ORDER BY RAND() LIMIT {}",
-                acctCsv, races, uint32(bmin), uint32(bmax), exclude, count))
-            do { picks.emplace_back(q->Fetch()[0].Get<uint32>(), false); } while (q->NextRow());
+                "SELECT MIN(`guid`), `account` FROM `characters` WHERE `account` IN ({}) "
+                "AND `account` NOT IN ({}) AND `account` NOT IN (SELECT `account` FROM `characters` WHERE `online` = 1) "
+                "AND `online` = 0 AND `race` IN ({}) "
+                "AND `level` BETWEEN {} AND {} GROUP BY `account` ORDER BY RAND() LIMIT {}",
+                acctCsv, accExclude(), races, uint32(bmin), uint32(bmax), count))
+            take(q, false);
 
-        // 2) Out-of-bracket backfill, re-leveled on spawn. Exclude the in-bracket picks
-        //    too, and prefer the closest levels (smallest re-level jump).
+        // 2) Out-of-bracket backfill, re-leveled on spawn — from accounts not already taken.
+        //    (No "closest level" ordering: RelevelFillBot does a FULL re-roll to the bracket,
+        //    so the starting level is irrelevant; distinct accounts are what matter.)
         if (picks.size() < count)
         {
             uint32 const remaining = count - uint32(picks.size());
-            std::string ex2 = exclude;
-            for (auto const& p : picks) { ex2 += ','; ex2 += std::to_string(p.first); }
             if (QueryResult q2 = CharacterDatabase.Query(
-                    "SELECT `guid` FROM `characters` WHERE `account` IN ({}) AND `online` = 0 "
-                    "AND `race` IN ({}) AND (`level` < {} OR `level` > {}) AND `guid` NOT IN ({}) "
-                    "ORDER BY ABS(CAST(`level` AS SIGNED) - {}) ASC, RAND() LIMIT {}",
-                    acctCsv, races, uint32(bmin), uint32(bmax), ex2, uint32(bmax), remaining))
-                do { picks.emplace_back(q2->Fetch()[0].Get<uint32>(), true); } while (q2->NextRow());
+                    "SELECT MIN(`guid`), `account` FROM `characters` WHERE `account` IN ({}) "
+                    "AND `account` NOT IN ({}) AND `account` NOT IN (SELECT `account` FROM `characters` WHERE `online` = 1) "
+                    "AND `online` = 0 AND `race` IN ({}) "
+                    "AND (`level` < {} OR `level` > {}) GROUP BY `account` ORDER BY RAND() LIMIT {}",
+                    acctCsv, accExclude(), races, uint32(bmin), uint32(bmax), remaining))
+                take(q2, true);
         }
 
         if (picks.empty())
@@ -198,14 +240,14 @@ namespace
         }
 
         uint32 spawned = 0;
-        for (auto const& [g, needsRelevel] : picks)
+        for (auto const& [g, acct, needsRelevel] : picks)
         {
             ObjectGuid const botGuid = ObjectGuid::Create<HighGuid::Player>(g);
             mgr->AddPlayerBot(botGuid, 0);   // master 0 -> isRndbot bypass, no group/follow
             {
                 std::lock_guard<std::mutex> lk(g_mutex);
                 g_fillBots[g] = { leaderLow, bgTypeId, getMSTime(), false, ally,
-                                  bmin, bmax, !needsRelevel };
+                                  bmin, bmax, !needsRelevel, 0, acct };
             }
             ++spawned;
         }
@@ -631,7 +673,7 @@ constexpr uint32 WG_SPAWN_PER_TICK  = 3;     // ramp gradually; never spike the 
 constexpr uint8  WG_RELEVEL_TO      = 80;
 constexpr float  WG_ENGAGE_RANGE    = 45.0f;
 
-struct WgBot { uint32 team; bool releveled; bool enrolled; uint32 spawnMs; };
+struct WgBot { uint32 team; bool releveled; bool enrolled; uint32 spawnMs; uint32 account; };
 std::unordered_map<uint32, WgBot> g_wgBots;   // guidLow -> state
 std::mutex                        g_wgMutex;
 
@@ -799,20 +841,33 @@ private:
         uint32 const need = std::min(WG_TARGET_PER_SIDE - have, WG_SPAWN_PER_TICK);
         std::string const acctCsv = RndbotAccountCsv();
         if (acctCsv.empty()) return;
+        // Claim DISTINCT, FREE accounts only. One char per account can be online, and a
+        // RNDBOT account holds both factions, so picking an account already busy with an
+        // online char (the other team's fill, a henchman) or one an in-flight WG fill has
+        // claimed makes the login silently fail and the side under-fills. Exclude accounts
+        // any in-flight WG fill holds, then let SQL skip accounts with an online char and
+        // collapse to one char per account.
+        std::string acctExclude = "0";
+        { std::lock_guard<std::mutex> lk(g_wgMutex);
+          for (auto const& kv : g_wgBots) { acctExclude += ','; acctExclude += std::to_string(kv.second.account); } }
         std::string const sql =
-            "SELECT `guid` FROM `characters` WHERE `account` IN (" + acctCsv + ") AND `race` IN ("
-            + RaceCsv(team == TEAM_ALLIANCE) + ") AND `online` = 0 ORDER BY `level` DESC LIMIT "
-            + std::to_string(need * 4);
+            "SELECT MIN(`guid`), `account` FROM `characters` WHERE `account` IN (" + acctCsv + ") "
+            "AND `account` NOT IN (" + acctExclude + ") "
+            "AND `account` NOT IN (SELECT `account` FROM `characters` WHERE `online` = 1) "
+            "AND `race` IN (" + RaceCsv(team == TEAM_ALLIANCE) + ") AND `online` = 0 "
+            "GROUP BY `account` ORDER BY RAND() LIMIT " + std::to_string(need);
         QueryResult q = CharacterDatabase.Query(sql);
         if (!q) return;
         uint32 spawned = 0;
         do {
             if (spawned >= need) break;
-            uint32 const guidLow = q->Fetch()[0].Get<uint32>();
+            Field* f = q->Fetch();
+            uint32 const guidLow = f[0].Get<uint32>();
+            uint32 const acct    = f[1].Get<uint32>();
             { std::lock_guard<std::mutex> lk(g_wgMutex); if (g_wgBots.count(guidLow)) continue; }
             sRandomPlayerbotMgr.AddPlayerBot(ObjectGuid::Create<HighGuid::Player>(guidLow), 0);
             { std::lock_guard<std::mutex> lk(g_wgMutex);
-              g_wgBots[guidLow] = WgBot{ uint32(team), false, false, getMSTime() }; }
+              g_wgBots[guidLow] = WgBot{ uint32(team), false, false, getMSTime(), acct }; }
             ++spawned;
         } while (q->NextRow());
         if (spawned)
