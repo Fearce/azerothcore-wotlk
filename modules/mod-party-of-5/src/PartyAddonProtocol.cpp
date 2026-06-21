@@ -4558,6 +4558,27 @@ public:
             tx->Append(
                 "UPDATE `party_loadout` SET `priority_actions_json` = '' WHERE `guid` = {}", guid);
             CharacterDatabase.CommitTransaction(tx);
+
+            // The editor sends CLEAR_ROTATION (not an empty COMMIT) whenever the
+            // saved rule list is empty. A HENCHMAN must never be left ruleless —
+            // that gutted its combat (Kevin: "they fight much worse") — so mirror
+            // the empty-COMMIT path: restore its class default into the cache
+            // instead of clearing it. Non-henchmen clear as before.
+            ObjectGuid const rotOg = ObjectGuid::Create<HighGuid::Player>(guid);
+            if (WowPsParty::IsHenchman(rotOg))
+            {
+                if (Player* h = ObjectAccessor::FindConnectedPlayer(rotOg))
+                {
+                    WowPsParty::RotationCacheSet(guid, WowPsParty::ParseRotationString(
+                        WowPsParty::DefaultRotationForClass(h->getClass(), WowPsParty::RoleForGuid(rotOg))));
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cff66ccff[WowPsParty]|r Henchman rotation cleared — restored its class default.");
+                    LOG_INFO("module",
+                        "[WowPsParty] CLEAR_ROTATION henchman guid={} -> restored class default", guid);
+                    return;
+                }
+            }
+
             WowPsParty::RotationCacheClear(guid);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Cleared rotation.");
