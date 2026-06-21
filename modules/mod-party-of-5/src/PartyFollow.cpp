@@ -1633,17 +1633,27 @@ namespace WowPsParty
     static constexpr uint32 GATHER_DRIVE_MAX_MS = 18000;   // safety bail if a gather gets stuck pre-engage (raised
                                                            // with GATHER_SCAN: a 90y walk-in needs more than 12s)
     static constexpr float  GATHER_LOW_HP_PCT   = 45.0f;   // tank this hurt -> stop gathering, fight + get healed
-    static constexpr uint32 GATHER_REARM_GIVEUP_MS = 1500; // in-combat re-arm: after this long with nothing
-                                                           // pullable, de-arm for the rest of the fight so the
-                                                           // tank doesn't chain-pull the instance — the party
-                                                           // gets downtime to eat/drink/loot (Mill).
+    static constexpr uint32 GATHER_REACH_GRACE_MS  = 3000;  // after committing to an add, give the tank up to
+                                                            // this long to REACH it before re-checking for more
+                                                            // (Mill: pace each multi-pull; don't re-arm every
+                                                            // tick). Re-checks early the moment the add is grabbed.
+    static constexpr uint32 GATHER_NO_ADD_GRACE_MS = 2000;  // once nothing's pullable, hold the gather this long
+                                                            // (a straggler may wander in) before concluding and
+                                                            // resuming combat.
 
-    // Per-tank, per-combat latch for the in-combat maintain-N re-arm. Once the cap is
-    // reached, a boss is engaged, or nothing's been pullable for GATHER_REARM_GIVEUP_MS,
-    // `concluded` latches true and the gather stops re-arming until the tank drops combat.
-    struct GatherLatch { bool concluded = false; uint32 firstNoAddMs = 0; };
-
-    struct TankGatherDrive { uint32 startMs; uint32 targetN; };
+    // The maintain-N gather is the BODY-PULL phase: the lead tank MOVES only (no rotation,
+    // no attack — TankIsBodyPulling suppresses TickRotation), grabbing up to N mobs by
+    // walking into them (proximity aggro). It CONCLUDES — and combat resumes — when it has
+    // N, nothing pullable is left (after a grace), or the tank's HP drops. curAdd/curAddMs
+    // pace each pull; noAddSinceMs runs the conclude grace.
+    struct TankGatherDrive
+    {
+        uint32     startMs;
+        uint32     targetN;
+        ObjectGuid curAdd;             // the add we're walking to (empty = none)
+        uint32     curAddMs     = 0;   // when we committed to curAdd
+        uint32     noAddSinceMs = 0;   // start of the current no-reachable-add streak (0 = none)
+    };
     static std::unordered_map<uint32, TankGatherDrive> g_tankGatherDrive;   // tankLow -> active gather
     static std::mutex g_tankGatherDriveMutex;
 
@@ -1665,6 +1675,21 @@ namespace WowPsParty
         std::lock_guard<std::mutex> lock(g_tankGatherDriveMutex);
         return g_tankGatherDrive.count(tankLow) != 0;
     }
+
+    // True for the WHOLE body-pull/gather: the lead tank MOVES only and runs NO rotation
+    // (TickRotation early-returns on this), gathering up to N by walking into mobs. It does
+    // NOT resume at the first pack — only when the gather CONCLUDES (reached N, nothing
+    // pullable, or HP-bail), at which point combat resumes, the tank builds threat, and the
+    // DPS engage (Mill). Tied to TankGatherActive, which PERSISTS for the whole gather. The
+    // gather is only ever armed for a multi-pull (pull_count >= 2), which is ALWAYS a body-
+    // pull regardless of safe_pull (safe_pull's ranged opener is the single-pull path). BAILS
+    // (rotation runs — fight back / defensive) when HP is low.
+    bool TankIsBodyPulling(Player* bot)
+    {
+        if (!bot || !IsLeadTank(bot->GetGUID())) return false;
+        if (bot->GetHealthPct() <= GATHER_LOW_HP_PCT) return false; // in danger -> fight / bail
+        return TankGatherActive(bot->GetGUID().GetCounter());       // gather active -> move only
+    }
     static bool GetTankGather(uint32 tankLow, uint32& targetN, uint32& startMs)
     {
         std::lock_guard<std::mutex> lock(g_tankGatherDriveMutex);
@@ -1672,6 +1697,25 @@ namespace WowPsParty
         if (it == g_tankGatherDrive.end()) return false;
         targetN = it->second.targetN; startMs = it->second.startMs;
         return true;
+    }
+    // Copy the whole drive entry (false if none). Caller works on the copy so it can call
+    // FindNextSafeAdd / EndTankGather / DriveTankChase without holding the drive mutex.
+    static bool GetTankGatherFull(uint32 tankLow, TankGatherDrive& out)
+    {
+        std::lock_guard<std::mutex> lock(g_tankGatherDriveMutex);
+        auto it = g_tankGatherDrive.find(tankLow);
+        if (it == g_tankGatherDrive.end()) return false;
+        out = it->second;
+        return true;
+    }
+    // Write back the gather's pacing progress (current add + its timers). No-op if the
+    // drive ended in between (we never resurrect a concluded gather).
+    static void UpdateTankGatherProgress(uint32 tankLow, ObjectGuid curAdd, uint32 curAddMs, uint32 noAddSinceMs)
+    {
+        std::lock_guard<std::mutex> lock(g_tankGatherDriveMutex);
+        auto it = g_tankGatherDrive.find(tankLow);
+        if (it == g_tankGatherDrive.end()) return;
+        it->second.curAdd = curAdd; it->second.curAddMs = curAddMs; it->second.noAddSinceMs = noAddSinceMs;
     }
     void EndTankGather(uint32 tankLow)
     {
@@ -1738,14 +1782,18 @@ namespace WowPsParty
         return false;
     }
 
-    // A clean, un-aggroed pull candidate the tank can reach + actually see (not
-    // through a wall). Bosses are never gathered (Mill: no multi-pull into bosses).
+    // A clean, un-aggroed pull candidate the tank can reach + actually see (not through a
+    // wall). Bosses are never gathered (Mill: no multi-pull into bosses). PASSIVE / neutral
+    // (yellow) mobs are excluded: a body-pull works by PROXIMITY aggro, but a passive mob
+    // won't aggro when the tank walks up — the tank would just stand on it. Only genuinely
+    // HOSTILE (red) mobs that will react to the tank can be body-pulled (Mill).
     static bool GatherEligible(Player* tank, Unit* u)
     {
         if (!u || !u->IsAlive() || u->IsInCombat()) return false;   // un-aggroed only
         if (u->IsTotem() || !u->ToCreature()) return false;
         if (IsBossUnit(u)) return false;                            // never gather a boss
         if (!tank->IsValidAttackTarget(u)) return false;
+        if (!u->IsHostileTo(tank)) return false;                   // passive/neutral (yellow) -> can't body-pull
         if (std::fabs(u->GetPositionZ() - tank->GetPositionZ()) > PULL_Z_TOLERANCE) return false;
         return tank->IsWithinLOSInMap(u, VMAP::ModelIgnoreFlags::M2);
     }
@@ -1820,96 +1868,67 @@ namespace WowPsParty
         lc = ag;
     }
 
-    // One tick of an active maintain-N gather: walk (or taunt) the next safe add in,
-    // or finish. Runs from TankLeadEngagement AFTER AssistTarget, so its MoveChase
-    // overrides the combat chase for this tick.
+    // One tick of an active maintain-N BODY-PULL gather. The tank MOVES only here (the
+    // rotation is suppressed for the whole gather, see TankIsBodyPulling): it walks up to
+    // N mobs in one at a time, by proximity, pacing each pull, and CONCLUDES (resume combat)
+    // when it has N / nothing's pullable / HP-bails. Runs from TankLeadEngagement.
     static void TankGatherStep(Player* tank)
     {
         uint32 const tankLow = tank->GetGUID().GetCounter();
-        uint32 targetN = 0, startMs = 0;
-        if (!GetTankGather(tankLow, targetN, startMs)) return;
+        TankGatherDrive d;
+        if (!GetTankGatherFull(tankLow, d)) return;
+        uint32 const now = getMSTime();
 
-        // Bail conditions: stuck too long, the tank's getting low, or a boss joined the
-        // fight mid-walk-in (never multi-pull into a boss — the latch can't catch this
-        // while a drive is active, since the re-arm block is skipped during a drive).
-        if (getMSTime() - startMs > GATHER_DRIVE_MAX_MS) { EndTankGather(tankLow); return; }
-        if (tank->GetHealthPct() <= GATHER_LOW_HP_PCT)   { EndTankGather(tankLow); return; }
-        if (TankFightingBoss(tank))                      { EndTankGather(tankLow); return; }
-
+        // ---- CONCLUDE conditions (then the rotation resumes and the tank fights) -------
+        if (now - d.startMs > GATHER_DRIVE_MAX_MS)      { EndTankGather(tankLow); return; }  // overall safety cap
+        if (tank->GetHealthPct() <= GATHER_LOW_HP_PCT)  { EndTankGather(tankLow); return; }  // BAIL: in danger
+        if (TankFightingBoss(tank))                     { EndTankGather(tankLow); return; }  // never gather into a boss
         uint32 const engaged = CountEngagedHostiles(tank);
-        if (engaged >= targetN) { EndTankGather(tankLow); return; }   // at target -> fight
+        if (engaged >= d.targetN)                       { EndTankGather(tankLow); return; }  // reached N -> fight
 
-        uint32 grp = 0;
-        // STRICT cap — only add a mob whose social group fits the remaining room, so the
-        // engaged headcount never exceeds N (absolute cap). The opener body-pull (the
-        // single nearest mob) is issued separately in TankLeadEngagement, so a pack
-        // bigger than N doesn't leave the tank standing — it just isn't topped up.
-        Unit* const add = FindNextSafeAdd(tank, targetN - engaged, grp);
-        if (!add)
+        // ---- pace each pull: keep walking the committed add in until it's grabbed (in
+        //      combat / dead / in melee) or its reach-grace expires, BEFORE looking for the
+        //      next one (Mill: "give it time to reach the target of every multi-pull before
+        //      it re-arms the check"). ------------------------------------------------------
+        if (d.curAdd)
         {
-            // Diagnostic (once per gather): WHY did it stop short of N? Count nearby
-            // un-aggroed eligible mobs at <=50y vs <=80y + how many fit the cap, so the
-            // log distinguishes "nothing in scan range" (bump GATHER_SCAN) from "found
-            // but their groups are too big for the remaining room".
-            uint32 n50 = 0, n80 = 0, fit = 0;
+            Unit* const cur = ObjectAccessor::GetUnit(*tank, d.curAdd);
+            bool const reached = !cur || !cur->IsAlive() || cur->IsInCombat()
+                              || tank->IsWithinMeleeRange(cur);
+            if (!reached && now - d.curAddMs < GATHER_REACH_GRACE_MS)
             {
-                std::list<Unit*> nb;
-                Acore::AnyUnfriendlyUnitInObjectRangeCheck ck(tank, tank, 80.0f);
-                Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck> sr(tank, nb, ck);
-                Cell::VisitObjects(tank, sr, 80.0f);
-                std::vector<Unit*> pool;
-                for (Unit* u : nb)
-                    if (GatherEligible(tank, u)) { pool.push_back(u); ++n80; if (tank->GetDistance(u) <= 50.0f) ++n50; }
-                uint32 const cap = targetN - engaged;
-                for (Unit* c : pool)
-                    if (tank->GetDistance(c) <= GATHER_SCAN && SocialGroupSize(c, pool) <= cap) ++fit;
+                DriveTankChase(tank, cur);    // still walking it in — give it time, don't re-pick
+                return;
             }
-            LOG_INFO("module", "[WowPsParty TankGather] guid={} END no-add: engaged={}/{} cap={} "
-                     "unaggroed(<=50y)={} (<=80y)={} fitCap={}",
-                     tankLow, engaged, targetN, targetN - engaged, n50, n80, fit);
-            EndTankGather(tankLow); return;                            // nothing safe -> fight what we have
+            UpdateTankGatherProgress(tankLow, ObjectGuid::Empty, 0, d.noAddSinceMs);  // reached / timed out -> re-pick
         }
 
-        // Keep the DPS held the whole gather: re-mark the hold with everything the tank
-        // is in combat with PLUS the incoming add, so IsTankGathering keeps the party
-        // back until the tank has actually grabbed + threatened the pack.
-        std::vector<ObjectGuid> set;
-        for (auto const& [rg, ref] : tank->GetCombatManager().GetPvECombatRefs())
-            if (Unit* o = ref->GetOther(tank))
-                if (o->IsAlive() && o->ToCreature()) set.push_back(o->GetGUID());
-        set.push_back(add->GetGUID());
-        MarkTankGathering(tankLow, set);
-
-        // BODY-PULL by default: WALK to every add. The taunt-instead-of-walk shortcut is
-        // gated on the per-tank safe_pull toggle (now OFF by default) — Mill: "the tank
-        // should absolutely not taunt on a pull it's going to body-pull anyway; taunt is
-        // only for safe-pull." A tank that simply CAN'T walk (dazed/rooted) still taunts
-        // as the only option. The OPENER (engaged==0) is never "final", so it always walks.
-        bool const isFinal = (engaged > 0 && engaged + grp >= targetN);   // a TOP-UP add that reaches the target
-        bool const canWalk = TankCanWalkFreely(tank);
-        bool const safePull = WowPsParty::GetSafePull(tank->GetGUID());
-
-        // Safe-pull final top-up add, or can't walk (dazed) -> taunt it in; else walk.
-        if ((safePull && isFinal) || !canWalk)
+        // ---- find the next safe add (STRICT cap: its social group must fit N - engaged) --
+        uint32 grp = 0;
+        Unit* const add = FindNextSafeAdd(tank, d.targetN - engaged, grp);
+        if (add)
         {
-            if (TryTankFastRangedPull(tank, add))
-            {
-                LOG_INFO("module", "[WowPsParty TankGather] guid={} TAUNT add entry={} grp={} engaged={}/{} ({})",
-                         tankLow, add->GetEntry(), grp, engaged, targetN, canWalk ? "final" : "dazed");
-                return;
-            }
-            if (canWalk)                                      // final but no taunt up -> just walk it down
-            {
-                DriveTankChase(tank, add);
-                return;
-            }
-            EndTankGather(tankLow);                           // dazed AND no taunt -> bail, fight what we have
+            // Hold the DPS for the WHOLE gather: re-mark with the current pack + the incoming
+            // add (IsTankGathering / TankGatherActive keep the party back until we conclude).
+            std::vector<ObjectGuid> set;
+            for (auto const& [rg, ref] : tank->GetCombatManager().GetPvECombatRefs())
+                if (Unit* o = ref->GetOther(tank))
+                    if (o->IsAlive() && o->ToCreature()) set.push_back(o->GetGUID());
+            set.push_back(add->GetGUID());
+            MarkTankGathering(tankLow, set);
+
+            UpdateTankGatherProgress(tankLow, add->GetGUID(), now, 0);  // commit + clear the no-add clock
+            DriveTankChase(tank, add);                                  // BODY-PULL: walk it in (no taunt)
             return;
         }
-        // Walk close enough to proximity-aggro it (no need to hit it — the per-tick
-        // re-eval advances the instant it's in combat). Deduped so we don't reset the
-        // spline every tick (the opener-spazz / never-closes bug).
-        DriveTankChase(tank, add);
+
+        // ---- nothing pullable right now: hold a short grace (a straggler may wander into
+        //      range), then CONCLUDE and resume combat. ------------------------------------
+        if (d.noAddSinceMs == 0) { UpdateTankGatherProgress(tankLow, ObjectGuid::Empty, 0, now); return; }
+        if (now - d.noAddSinceMs <= GATHER_NO_ADD_GRACE_MS) return;     // still within grace — wait
+        LOG_INFO("module", "[WowPsParty TankGather] guid={} CONCLUDE: engaged={}/{} no more pullable -> resume combat",
+                 tankLow, engaged, d.targetN);
+        EndTankGather(tankLow);
     }
 
     void TankLeadEngagement(Player* bot)
@@ -1945,58 +1964,11 @@ namespace WowPsParty
             return;
         }
 
-        // In-combat maintain-N TOP-UP. The opener gather is one-shot (ends on the first
-        // no-add / drive timeout), so this re-arms it WHILE in combat so the tank tops up
-        // toward N as a stray mob becomes reachable ("fought 3 mobs, won't go fetch the
-        // lone mob right there" — Mill). Safe mid-fight: once the tank is in combat,
-        // IsTankGathering treats a not-yet-grabbed add as a released straggler, so DPS
-        // keep killing the current pack instead of being re-held.
-        //
-        // But the re-arm DE-ARMS for the rest of the fight (a per-combat latch) once the
-        // cap is reached, a boss is engaged, or nothing's been pullable for a short window
-        // — so the tank tops up ONCE and then commits to the fight, instead of chain-
-        // pulling the whole instance. The party gets its downtime to eat/drink/loot, and
-        // the next pull re-arms cleanly (the latch is cleared the moment the tank is out
-        // of combat). The cap is never overshot: FindNextSafeAdd is strict.
-        // No GC sweep needed (unlike g_tankGatherDrive): a stale entry only gates re-arm
-        // and self-clears on the tank's next out-of-combat tick; it can't freeze anything.
-        static thread_local std::unordered_map<uint32, GatherLatch> gatherLatch;
-        if (bot->IsInCombat())
-        {
-            uint32 const pullN = WowPsParty::BotInitialPullCount(bot->GetGUID());
-            if (pullN >= 2)
-            {
-                GatherLatch& gl = gatherLatch[bot->GetGUID().GetCounter()];
-                uint32 const engaged = CountEngagedHostiles(bot);
-                if (!gl.concluded)
-                {
-                    if (engaged >= pullN || TankFightingBoss(bot))
-                    {
-                        gl.concluded = true;   // cap met / boss fight -> stop, fight + downtime
-                    }
-                    else
-                    {
-                        uint32 grp = 0;
-                        if (FindNextSafeAdd(bot, pullN - engaged, grp))
-                        {
-                            gl.firstNoAddMs = 0;                       // progress -> reset the give-up clock
-                            StartTankGather(bot->GetGUID().GetCounter(), pullN);
-                            return;   // next tick: TankGatherActive -> TankGatherStep drives the fetch
-                        }
-                        // Nothing pullable right now — give it a short grace, then de-arm.
-                        uint32 const now = getMSTime();
-                        if (gl.firstNoAddMs == 0) gl.firstNoAddMs = now;
-                        else if (now - gl.firstNoAddMs > GATHER_REARM_GIVEUP_MS) gl.concluded = true;
-                    }
-                }
-            }
-            // In combat (latched, N==1, or nothing to fetch): fall through to the settle
-            // block, which sees the tank in combat, resets the post-combat timer, returns.
-        }
-        else
-        {
-            gatherLatch.erase(bot->GetGUID().GetCounter());   // out of combat -> re-arm next pull
-        }
+        // (No in-combat re-arm: the gather PERSISTS for the whole body-pull — it grabs up
+        // to N, paces each pull, and only EndTankGathers when it has N / nothing's pullable /
+        // the tank HP-bails. One armed gather covers the whole pull, then the rotation
+        // resumes and the tank fights; the next pull arms a fresh gather once the party is
+        // out of combat + rested. Mill: pull-to-N-once-then-fight, with downtime after.)
 
         // Don't auto-pull the instant a fight ends — hold off until the WHOLE party
         // has been out of combat for POST_COMBAT_PULL_DELAY, so it can loot / regroup
@@ -2060,6 +2032,7 @@ namespace WowPsParty
         Unit* nearest = bot->SelectNearbyTarget(nullptr, 28.0f);
         if (!nearest || !nearest->IsAlive()) return;
         if (!bot->IsValidAttackTarget(nearest)) return;
+        if (!nearest->IsHostileTo(bot)) return;   // never auto-engage a PASSIVE/neutral (yellow) mob (Mill)
 
         // Pull pacing — don't yank the next out-of-combat pack until mana is
         // topped off, so the party never chain-pulls on fumes. A PALADIN tank
@@ -2096,6 +2069,26 @@ namespace WowPsParty
             }
         }
 
+        // Maintain-N BODY-PULL (pull_count >= 2): the tank walks the pack in by PROXIMITY
+        // aggro — it does NOT Attack and does NOT run its rotation here (TankIsBodyPulling
+        // suppresses TickRotation for the whole gather). It grabs up to N, then the gather
+        // CONCLUDES, combat resumes, threat builds, and the DPS engage (Mill: "don't use the
+        // rotation during a body pull; gather up to N, then resume combat"). DPS + healer
+        // hold the whole gather. N==1 (or opening on a BOSS — never multi-pull a boss) falls
+        // through to the classic single ranged/barge pull below.
+        uint32 const pullN = WowPsParty::BotInitialPullCount(bot->GetGUID());
+        if (pullN >= 2 && !IsBossUnit(nearest))
+        {
+            MarkTankGathering(bot->GetGUID().GetCounter(), { nearest->GetGUID() });   // DPS hold
+            StartTankGather(bot->GetGUID().GetCounter(), pullN);
+            DriveTankChase(bot, nearest);                 // walk the opener in (deduped) — NO attack
+            LOG_INFO("module",
+                "[WowPsParty TankLead] guid={} OPEN+GATHER target={} on entry={} dist={:.1f}",
+                bot->GetGUID().GetCounter(), pullN, nearest->GetEntry(), bot->GetDistance(nearest));
+            return;
+        }
+
+        // Single pull (N==1 / boss): attack now (the ranged/barge logic below moves it in).
         bool const ok = bot->Attack(nearest, true);
         if (!ok)
         {
@@ -2118,25 +2111,6 @@ namespace WowPsParty
             return;
         }
         bot->SetFacingToObject(nearest);
-
-        // Maintain-N pull (pull_count): OPEN on the nearest mob normally — its
-        // neighbours social-aggro in on their own (no cluster body-pull) — then arm the
-        // maintain-N gather, which walks the engaged headcount up toward N from nearby
-        // SAFE adds without overshooting (TankGatherStep, above). Only armed here, on a
-        // fresh out-of-combat + rested pull, so it never chain-pulls. N==1 (or opening on
-        // a BOSS — never multi-pull into a boss, Mill) falls through to the classic single
-        // ranged/barge pull below.
-        uint32 const pullN = WowPsParty::BotInitialPullCount(bot->GetGUID());
-        if (pullN >= 2 && !IsBossUnit(nearest))
-        {
-            MarkTankGathering(bot->GetGUID().GetCounter(), { nearest->GetGUID() });   // DPS hold
-            StartTankGather(bot->GetGUID().GetCounter(), pullN);
-            DriveTankChase(bot, nearest);                 // body-pull the opener (walk in), deduped
-            LOG_INFO("module",
-                "[WowPsParty TankLead] guid={} OPEN+GATHER target={} on entry={} dist={:.1f}",
-                bot->GetGUID().GetCounter(), pullN, nearest->GetEntry(), bot->GetDistance(nearest));
-            return;
-        }
 
         // Ranged pull: a tank that can open from range doesn't charge into the
         // pack. It closes only to ability range, then the rotation (Heroic Throw,
@@ -3350,9 +3324,15 @@ namespace WowPsParty
         Player* tank = PartyLeadTank(bot);
         if (!tank || tank == bot) return false;
 
-        // Multi-pull gather: hold until the bot tank has built a threat lead on its
-        // cluster (pure threat, no timer), so DPS don't rip the not-yet-locked mobs off
-        // it. Self-releases per mob and can't freeze the party (see IsTankGathering).
+        // BODY-PULL gather active: HOLD the whole time the lead tank is gathering the pack
+        // (it runs no rotation / builds no threat during this — see TankIsBodyPulling). The
+        // DPS must not engage until the gather CONCLUDES and the tank starts building threat,
+        // else they'd rip the not-yet-threatened pack off it. Once the gather ends the tank
+        // fights and the threat gate (TankLeadActive / THREAT_CAP) governs the real release.
+        if (TankGatherActive(tank->GetGUID().GetCounter())) return true;
+
+        // (Legacy) multi-pull gather mark — held until the tank has a threat lead; self-
+        // releases per mob. Kept for the non-gather mark path.
         if (IsTankGathering(tank)) return true;
 
         if (!IsTankPulling(tank->GetGUID())) return false;
@@ -3584,6 +3564,25 @@ namespace WowPsParty
     {
         if (!bot) return false;
         if (RoleForGuid(bot->GetGUID()) != "healer") return false;
+
+        // BODY-PULL gather active (bot lead tank — the gather is bot-tank-only): the
+        // gathering tank builds NO threat yet, so a heal lands its threat on the healer and
+        // rips the not-yet-tanked pack onto it. Hold heals for the whole gather — with the
+        // same emergency override
+        // (heal NOW if anyone's in real danger). Clears the instant the gather concludes and
+        // the tank starts building threat.
+        if (Player* lt = PartyLeadTank(bot))
+            if (lt != bot && TankGatherActive(lt->GetGUID().GetCounter()))
+            {
+                std::vector<ObjectGuid> gp;
+                GetPartyGuidsFor(bot->GetGUID(), gp);
+                for (ObjectGuid const& g : gp)
+                    if (Player* m = ObjectAccessor::FindConnectedPlayer(g))
+                        if (m->IsAlive() && m->GetHealthPct() <= TANK_GATHER_LOW_PCT)
+                            return false;   // someone in danger -> heal now
+                return true;                // hold during the body-pull gather
+            }
+
         ObjectGuid const lg = GetLeaderFor(bot->GetGUID());
         if (!lg) return false;
         Player* leader = ObjectAccessor::FindConnectedPlayer(lg);
@@ -3845,6 +3844,11 @@ namespace WowPsParty
         if (bot->IsNonMeleeSpellCast(false, false, true)) { AssistLog(gLow, "skip: casting"); return; }
         // Rotation engine has parked this bot (drinking, etc).
         if (IsFollowerHeld(bot->GetGUID())) { AssistLog(gLow, "skip: held by rotation"); return; }
+        // Lead tank mid BODY-PULL/gather: do NOTHING here — no target, no attack (so it
+        // builds NO threat until the pack is grouped), no chase. TankLeadEngagement /
+        // TankGatherStep own the feet and the rotation is suppressed (TickRotation). Resumes
+        // the instant the gather concludes -> then it engages, builds threat, DPS follow (Mill).
+        if (TankIsBodyPulling(bot)) { AssistLog(gLow, "skip: body-pulling (gather) — move only"); return; }
         // stop_attacking hold (e.g. Mirrored Soul): drop the victim and DON'T engage or
         // chase — heals/movement run elsewhere; this governs offence only.
         if (IsOffensiveHeld(bot->GetGUID()))

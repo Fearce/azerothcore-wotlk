@@ -144,6 +144,10 @@ namespace WowPsParty
     // healed. Consulted by TickRotation to suppress the cast_party_lowest verbs.
     bool HealerShouldHoldHeal(Player* bot);
 
+    // True for the whole body-pull/gather phase of the lead tank — the tank MOVES only and
+    // its rotation must be suppressed. Consulted by TickRotation (early-returns on it).
+    bool TankIsBodyPulling(Player* bot);
+
     // True while `bot` (a non-tank) is waiting for a human tank-lead to take threat.
     // MaintainBotPet uses it to heel a hunter/warlock pet during the hold instead of
     // letting it charge the pull before the tank has aggro.

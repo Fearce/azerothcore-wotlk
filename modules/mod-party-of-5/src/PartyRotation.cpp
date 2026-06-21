@@ -5039,6 +5039,13 @@ namespace WowPsParty
             bot->Dismount();    // the party is fighting on foot — get off and engage
         }
 
+        // BODY-PULL: while the lead tank is gathering the pack it runs NO rotation — it just
+        // MOVES (TankLeadEngagement/TankGatherStep drive the feet). Running the rotation made
+        // it stop to cast (stand still / spazz) and build threat at range so the DPS engaged
+        // too early. It resumes the instant the gather CONCLUDES (reached N / nothing pullable
+        // / HP-bail), and only then builds threat and the DPS engage (Mill).
+        if (WowPsParty::TankIsBodyPulling(bot)) return false;
+
         // Sample movement for the cast-settle gate (faceAndCast cast-time / wand):
         // record the tick if the bot's spline is live, so a cast/wand only starts
         // once it's been stationary CAST_SETTLE_MS. Must run every tick before the
