@@ -957,7 +957,7 @@ public:
         GROUPHOOK_ON_REMOVE_MEMBER
     }) { }
 
-    void OnRemoveMember(Group* group, ObjectGuid guid, RemoveMethod /*method*/,
+    void OnRemoveMember(Group* group, ObjectGuid guid, RemoveMethod method,
                         ObjectGuid /*kicker*/, char const* /*reason*/) override
     {
         if (!WowPsParty::IsEnabled()) return;
@@ -977,13 +977,21 @@ public:
         // branch above; this covers the case where the group survives without
         // the owner — e.g. matched LFG players stay behind.)
         //
-        // BUT only when the owner left a FOREIGN group — an LFG dungeon or a BG/raid
-        // where matched players stay behind. Leaving their OWN open-world party (an
-        // accidental "Leave Party" click) must NOT scatter the henchmen: the follow
-        // ticker re-forms the party around the human and re-groups the henchmen, so the
-        // human never ends up out of their own roster (Kevin: "never leave your roster").
-        if (WowPsParty::CountHenchmenFor(guid) > 0
-            && group && (group->isLFGGroup() || group->isBGGroup()))
+        // Dismiss the henchmen when the owner leaves in either of two cases:
+        //  1. a FOREIGN group (LFG dungeon / BG / raid) where matched players stay
+        //     behind — the henchmen would otherwise orphan-follow the ex-leader; or
+        //  2. the owner DELIBERATELY left (GROUP_REMOVEMETHOD_LEAVE — the "Leave Party"
+        //     click, HandleGroupDisbandOpcode): leaving a party of henchmen must
+        //     actually dismiss them "like normal".
+        // It must NOT fire for an INTERNAL removal of the owner's OWN open-world party
+        // (method DEFAULT — e.g. the follow ticker's transient regroup, a WG/LFG
+        // reshuffle): those keep the henchmen so the self-heal re-forms the roster
+        // around the human (Kevin: "never leave your roster" — the regression this gate
+        // exists for). The deliberate-leave click is LEAVE, the transient churn is
+        // DEFAULT, so RemoveMethod cleanly separates them.
+        if (WowPsParty::CountHenchmenFor(guid) > 0 && group
+            && (group->isLFGGroup() || group->isBGGroup()
+                || method == GROUP_REMOVEMETHOD_LEAVE))
         {
             std::vector<ObjectGuid> members;
             WowPsParty::GetPartyGuidsFor(guid, members);
