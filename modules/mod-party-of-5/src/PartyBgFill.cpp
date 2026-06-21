@@ -465,6 +465,9 @@ namespace
         uint32 botTeamId;
         std::vector<uint32> members; // bot member guidLows (captain first)
         uint32 spawnMs;
+        uint32 humanMmr = 1500;      // queue the bot team at THIS matchmaker rating so it
+                                     // pairs with the human within Arena.MaxRatingDifference
+                                     // (else a >150 gap waits out the 10-min discard timer)
         bool   queued  = false;
         bool   entered = false;      // a bot made it into the arena instance
         uint32 outSinceMs = 0;       // first tick all bots read !InBattleground after entering
@@ -541,7 +544,10 @@ namespace
         BattlegroundQueue& q = sBattlegroundMgr->GetBattlegroundQueue(qt);
         uint32 rating = at->GetRating();
         if (rating == 0) rating = 1;
-        uint32 const mmr = at->GetAverageMMR(grp);
+        // Queue at the HUMAN's matchmaker rating (not the bot team's own) so the pair is
+        // inside Arena.MaxRatingDifference and pops NOW. The bot team's persistent rating
+        // (above) is untouched, so the post-match result still updates real ratings.
+        uint32 const mmr = s.humanMmr;
         bgt->SetRated(true);
         q.AddGroup(captain, grp, BATTLEGROUND_AA, bracket, arenatype, /*isRated=*/true, /*isPremade=*/false,
                    rating, mmr, at->GetId(), at->GetPreviousOpponents());
@@ -570,6 +576,11 @@ namespace
         ArenaTeam* hat = sArenaTeamMgr->GetArenaTeamById(humanTeamId);
         uint32 humanRating = hat ? hat->GetRating() : 0;
         if (humanRating == 0) humanRating = 1500;   // fresh team — match mid-ladder
+        // The human's matchmaker rating drives the pairing window (Arena.MaxRatingDifference).
+        // We queue the bot team at THIS so it pops immediately regardless of the team's
+        // own (possibly far) rating.
+        uint32 humanMmr = (hat && human->GetGroup()) ? hat->GetAverageMMR(human->GetGroup()) : 0;
+        if (humanMmr == 0) humanMmr = humanRating;
 
         bool const allianceHuman = human->GetTeamId() == TEAM_ALLIANCE;
         char const* const oppRaces = RaceCsv(!allianceHuman);   // bot CAPTAIN must be opposite faction (queue bucket)
@@ -608,7 +619,10 @@ namespace
             mgr->AddPlayerBot(ObjectGuid::Create<HighGuid::Player>(g), 0);   // master 0 -> rndbot bypass
 
         { std::lock_guard<std::mutex> lk(g_mutex);
-          g_arenaFills[leaderLow] = ArenaFillSession{ leaderLow, arenaType, teamId, members, getMSTime(), false, false, 0 }; }
+          ArenaFillSession sess;
+          sess.leaderLow = leaderLow; sess.arenaType = arenaType; sess.botTeamId = teamId;
+          sess.members = members; sess.spawnMs = getMSTime(); sess.humanMmr = humanMmr;
+          g_arenaFills[leaderLow] = sess; }
         LOG_INFO("module",
             "[WowPsParty ArenaFill] {} queued rated {}v{} — spawning bot team {} ({} members) to match (humanRating {})",
             human->GetName(), uint32(arenaType), uint32(arenaType), teamId, uint32(members.size()), humanRating);
