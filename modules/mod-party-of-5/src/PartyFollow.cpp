@@ -1239,6 +1239,39 @@ namespace WowPsParty
         SafePullCacheSet(guidLow, v == "1" ? 1 : (v == "0" ? 0 : -1));
     }
 
+    // ---- "anchor on tank" toggle (NON-TANK) --------------------------------
+    // When ON for a non-tank bot, that bot formation-follows the party TANK
+    // instead of the human leader (only while the leader isn't the tank), so
+    // melee reach the front fast when the leader is ranged. Stored in
+    // party_loadout.anchor_tank as '' (unset), '1' (anchor) or '0' (off).
+    // Unlike safe_pull there is NO per-type default: unset = OFF everywhere.
+    static std::unordered_map<uint32, int> g_anchorTank;   // guidLow -> 0/1 (explicit only)
+    static std::mutex g_anchorTankMutex;
+
+    // val: 0 = explicit off, 1 = explicit anchor, <0 = clear (back to default OFF).
+    void AnchorTankCacheSet(uint32 guidLow, int val)
+    {
+        std::lock_guard<std::mutex> lock(g_anchorTankMutex);
+        if (val < 0) g_anchorTank.erase(guidLow);
+        else         g_anchorTank[guidLow] = val ? 1 : 0;
+    }
+
+    bool BotAnchorOnTank(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(g_anchorTankMutex);
+        auto it = g_anchorTank.find(guid.GetCounter());
+        if (it != g_anchorTank.end()) return it->second != 0;
+        return false;   // unset -> OFF everywhere (no per-type default)
+    }
+
+    void AnchorTankRefreshFromDB(uint32 guidLow)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `anchor_tank` FROM `party_loadout` WHERE `guid` = {}", guidLow);
+        std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+        AnchorTankCacheSet(guidLow, v == "1" ? 1 : (v == "0" ? 0 : -1));
+    }
+
     // ---- retarget throttle --------------------------------------------------
     // Timestamp (getMSTime) of each bot's last target SWITCH. Used to stop the
     // "spinbot" when several mobs flank the tank and the nearest-loose pick
@@ -5468,6 +5501,17 @@ namespace WowPsParty
                     || !leader->IsInWorld() || follower == leader)
                 { h.wandering = false; continue; }
 
+                // Anchor-on-tank: a non-tank with the toggle ON formation-follows the party
+                // TANK instead of the leader, so melee reach the front fast when the leader is
+                // ranged. PartyTankPlayer returns the leader itself when the leader IS the tank,
+                // so tank==leader naturally means "no change". Non-combat positioning only.
+                Player* anchor = leader;
+                if (BotAnchorOnTank(d.followerGuid) && !IsLeadTank(d.followerGuid))
+                    if (Player* tank = PartyTankPlayer(follower, leader))
+                        if (tank != leader && tank != follower && tank->IsInWorld()
+                            && tank->IsAlive() && tank->GetMapId() == follower->GetMapId())
+                            anchor = tank;
+
                 // Live guard re-check — bail (yield to whoever owns it) the instant
                 // this bot is anything but a calm open-follower.
                 if (!follower->IsAlive()
@@ -5483,7 +5527,7 @@ namespace WowPsParty
 
                 MovementGeneratorType const mg =
                     follower->GetMotionMaster()->GetCurrentMovementGeneratorType();
-                bool const leaderMoving = leader->isMoving();
+                bool const leaderMoving = anchor->isMoving();
 
                 // Re-assert the formation slot ONLY when it isn't already in
                 // effect (gen isn't FOLLOW, or the jittered slot drifted) — so
@@ -5500,7 +5544,7 @@ namespace WowPsParty
                     if (mg == FOLLOW_MOTION_TYPE && h.followAsserted && !slotChanged)
                         return;
                     follower->GetMotionMaster()->Clear();
-                    follower->GetMotionMaster()->MoveFollow(leader, h.slotDist, h.slotAngle);
+                    follower->GetMotionMaster()->MoveFollow(anchor, h.slotDist, h.slotAngle);
                     h.followAsserted = true;
                     h.apptAngle = h.slotAngle;
                     h.apptDist  = h.slotDist;
@@ -5542,7 +5586,7 @@ namespace WowPsParty
                 }
 
                 float const wanderCap = std::min(h.slotDist + 6.0f, 7.0f);
-                float const dLead     = follower->GetDistance(leader);
+                float const dLead     = follower->GetDistance(anchor);
 
                 // Notably out of formation — e.g. just left combat away from the
                 // party — walk back toward the slot. The threshold sits ABOVE the
@@ -5571,7 +5615,7 @@ namespace WowPsParty
                 // Occasionally take a short stroll from the CURRENT spot (not a
                 // return to formation) so the party keeps shifting its weight
                 // instead of freezing. Frequency is ~half the first cut. The
-                // direction is weighted back toward the leader the further out
+                // direction is weighted back toward the anchor the further out
                 // we are, so repeated strolls can't creep into the leash.
                 if (now >= h.nextFidgetMs)
                 {
@@ -5582,7 +5626,7 @@ namespace WowPsParty
                                     / std::max(1.0f, wanderCap - h.slotDist);
                         wBack = wBack < 0.0f ? 0.0f : (wBack > 1.0f ? 1.0f : wBack);
                         float const randDir = frand(0.0f, 2.0f * float(M_PI));
-                        float const dir = LerpAngle(randDir, follower->GetAngle(leader), wBack);
+                        float const dir = LerpAngle(randDir, follower->GetAngle(anchor), wBack);
                         float const r = frand(1.5f, 3.5f);
                         float wx = follower->GetPositionX() + r * std::cos(dir);
                         float wy = follower->GetPositionY() + r * std::sin(dir);
@@ -5592,7 +5636,7 @@ namespace WowPsParty
                         // >8y window (needless unstick on a big party).
                         if (follower->GetMap()
                             && follower->GetMap()->CanReachPositionAndGetValidCoords(follower, wx, wy, wz)
-                            && leader->GetExactDist2d(wx, wy) < wanderCap)
+                            && anchor->GetExactDist2d(wx, wy) < wanderCap)
                         {
                             follower->GetMotionMaster()->Clear();
                             follower->GetMotionMaster()->MovePoint(WANDER_POINT_ID, wx, wy, wz);

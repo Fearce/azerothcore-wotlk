@@ -3784,6 +3784,47 @@ public:
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Safe pull: {}.", on ? "ON" : "OFF");
         }
+        // REQ_ANCHORTANK\t<token>  ->  ANCHORTANK\t<token>\t<0|1>
+        // Reports the stored value (explicit column, else the default OFF — there
+        // is no per-type default) so the editor checkbox shows the real runtime
+        // behaviour even for a bot the user never configured.
+        else if (command == "REQ_ANCHORTANK")
+        {
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            bool on = false;
+            if (guid)
+            {
+                QueryResult q = CharacterDatabase.Query(
+                    "SELECT `anchor_tank` FROM `party_loadout` WHERE `guid` = {}", guid);
+                std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+                on = (v == "1");   // unset/'0' -> OFF
+            }
+            std::ostringstream out;
+            out << "ANCHORTANK\t" << token << '\t' << (on ? 1 : 0);
+            SendWPSP(player, out.str());
+        }
+        // SET_ANCHORTANK\t<token>\t<0|1>  — explicit value (the user toggled it)
+        else if (command == "SET_ANCHORTANK")
+        {
+            std::string rest;
+            std::string const token = WowPsParty::SplitToken(std::string(payload), rest);
+            if (rest != "0" && rest != "1") return;   // strict: ignore a malformed/empty value
+            bool const on = (rest == "1");
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            if (!guid) return;
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
+                "`gear_lock_json`, `priority_actions_json`, `anchor_tank`) "
+                "VALUES ({}, '', '', '', '', '', '{}') "
+                "ON DUPLICATE KEY UPDATE `anchor_tank` = VALUES(`anchor_tank`)",
+                guid, on ? "1" : "0");
+            CharacterDatabase.CommitTransaction(tx);
+            WowPsParty::AnchorTankCacheSet(guid, on ? 1 : 0);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Anchor on tank: {}.", on ? "ON" : "OFF");
+        }
         // REQ_PULLCOUNT\t<token>  ->  PULLCOUNT\t<token>\t<1..8>
         // Reports the EFFECTIVE lead-tank multi-pull size (explicit column, else the
         // default 3) so the editor stepper shows the real runtime value.

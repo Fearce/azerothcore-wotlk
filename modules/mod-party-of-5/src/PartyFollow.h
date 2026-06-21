@@ -157,6 +157,14 @@ namespace WowPsParty
     void SafePullRefreshFromDB(uint32 guidLow);
     bool GetSafePull(ObjectGuid guid);
 
+    // Per-NON-TANK "anchor on tank" toggle. Default OFF everywhere (no per-type
+    // default). When ON, a non-tank bot formation-follows the party TANK instead
+    // of the human leader while the leader isn't the tank — melee reach the front
+    // fast when the leader is ranged. Non-combat formation follow only.
+    void AnchorTankCacheSet(uint32 guidLow, int val);
+    void AnchorTankRefreshFromDB(uint32 guidLow);
+    bool BotAnchorOnTank(ObjectGuid guid);
+
     // Tell the follow ticker to LEAVE this bot alone for the next
     // `durationMs` milliseconds — used by the rotation engine's
     // `drink` / `hold_position` actions so a bot that's just been told
