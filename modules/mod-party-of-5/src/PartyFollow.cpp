@@ -4853,7 +4853,13 @@ namespace WowPsParty
             // dismisses them); a henchman needs the regroup guard so the RemoveFromGroup below
             // doesn't trip OnRemoveMember's dismiss. Skip while a BG/battlefield war owns the
             // group (don't fight its battle-group management); heals in the open world.
-            if (follower->IsAlive() && !leader->InBattleground())
+            // ALSO skip while the FOLLOWER itself is in a BG/arena queue or match: when the
+            // human enters a rated arena the heroes are briefly ungrouped while their own
+            // invite is pending, and re-grouping them here yanks them out of the arena queue
+            // before they can port in — the "heroes stuck in Dalaran, 1v5" bug. Leave a
+            // queued/in-match follower alone; the party re-forms once the match is over.
+            if (follower->IsAlive() && !leader->InBattleground()
+                && !follower->InBattleground() && !follower->InBattlegroundQueue())
             {
                 Battlefield* bf = sBattlefieldMgr->GetBattlefieldToZoneId(leader->GetZoneId());
                 bool const inWar = bf && bf->IsWarTime();
