@@ -2436,10 +2436,17 @@ namespace lfg
                 }
                 if (anyBot && !anyHumanStillIn)
                 {
+                    // Reset EVERY member's LFG state — bots AND humans. The original
+                    // patch reset only the bots, leaving each HUMAN stuck at
+                    // LFG_STATE_FINISHED_DUNGEON in PlayersStore: the eye cleared
+                    // (group flag dropped) but the stale PLAYER state then blocked
+                    // BG/arena queueing ("cannot queue ... while using the dungeon
+                    // system") until a kick+reinvite or relog. The gate above proves
+                    // the whole party is out of a COMPLETED run, so clearing every
+                    // member is correct — the same reset a normal Leave Dungeon does.
                     for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
                         if (Player* m = itr->GetSource())
-                            if (WowPsParty_BotHasActiveFollowDirective_Trampoline(m->GetGUID()))
-                                SetState(m->GetGUID(), LFG_STATE_NONE);
+                            SetState(m->GetGUID(), LFG_STATE_NONE);
                     SetState(group->GetGUID(), LFG_STATE_NONE);
                     group->RemoveLFGFlag();   // reverts to a normal group; SendUpdate() clears the eye
                     LOG_INFO("module",
