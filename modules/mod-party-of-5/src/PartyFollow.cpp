@@ -1624,9 +1624,13 @@ namespace WowPsParty
     // rather than walked. Nothing safe left to add, the tank's hurt, or it's stuck ->
     // it stops and fights what it has. Only ever armed on a fresh out-of-combat pull,
     // so it can't chain-pull the instance — the party rests between fights as before.
-    static constexpr float  GATHER_SCAN         = 60.0f;   // candidate search radius (LoS-gated)
+    static constexpr float  GATHER_SCAN         = 90.0f;   // candidate search radius (LoS-gated). 90y so the
+                                                           // maintain-N gather reaches the NEXT pack (logs showed
+                                                           // un-aggroed mobs sitting 50-80y out, beyond the old 60y,
+                                                           // so the tank just stalled — Mill's "won't fetch more").
     static constexpr float  SOCIAL_AGGRO_R      = 10.0f;   // a candidate drags in un-aggroed mobs within this of it
-    static constexpr uint32 GATHER_DRIVE_MAX_MS = 12000;   // safety bail if a gather gets stuck pre-engage
+    static constexpr uint32 GATHER_DRIVE_MAX_MS = 18000;   // safety bail if a gather gets stuck pre-engage (raised
+                                                           // with GATHER_SCAN: a 90y walk-in needs more than 12s)
     static constexpr float  GATHER_LOW_HP_PCT   = 45.0f;   // tank this hurt -> stop gathering, fight + get healed
 
     struct TankGatherDrive { uint32 startMs; uint32 targetN; };
@@ -1733,10 +1737,14 @@ namespace WowPsParty
 
     // Nearest eligible un-aggroed candidate within GATHER_SCAN whose social group fits
     // `capacity`. Returns it + its group size in grpOut, or nullptr if none fit.
-    // `allowOversize` (the OPENER only): if nothing fits, fall back to the NEAREST mob
-    // anyway so the opening pull always WALKS IN — even onto a pack bigger than N —
-    // instead of standing at range (Kevin: "the opening pull should never stand still").
-    static Unit* FindNextSafeAdd(Player* tank, uint32 capacity, uint32& grpOut, bool allowOversize = false)
+    // `allowOversize`: if nothing fits `capacity`, fall back to the nearest mob whose
+    // group is <= `oversizeCeiling` (0 = no ceiling) so the gather still WALKS IN rather
+    // than standing at range. The OPENER passes ceiling 0 (always pull, even a >N pack);
+    // a TOP-UP passes ceiling N so it'll grab a cluster bigger than the *remaining* room
+    // (slight overshoot of N) but won't drag a whole room beyond N — Mill: "with a cap
+    // of 6 a lone pack nearby should fit fine," and the old top-up just stalled instead.
+    static Unit* FindNextSafeAdd(Player* tank, uint32 capacity, uint32& grpOut,
+                                 bool allowOversize = false, uint32 oversizeCeiling = 0)
     {
         grpOut = 0;
         if (!tank || capacity == 0) return nullptr;
@@ -1754,13 +1762,15 @@ namespace WowPsParty
             uint32 const g = SocialGroupSize(cand, pool);
             if (g <= capacity) { grpOut = g; return cand; }   // nearest that SAFELY fits
         }
-        // Nothing fits the cap. For the opener, body-pull the nearest regardless (a
-        // top-up add NEVER does this — it must respect the cap to not overshoot N).
-        if (allowOversize && !pool.empty())
-        {
-            grpOut = SocialGroupSize(pool[0], pool);
-            return pool[0];
-        }
+        // Nothing fits the remaining room — fall back to the nearest mob within the
+        // oversize ceiling so the gather keeps advancing instead of stalling with
+        // pullable mobs right there.
+        if (allowOversize)
+            for (Unit* cand : pool)
+            {
+                uint32 const g = SocialGroupSize(cand, pool);
+                if (oversizeCeiling == 0 || g <= oversizeCeiling) { grpOut = g; return cand; }
+            }
         return nullptr;
     }
 
@@ -1797,8 +1807,12 @@ namespace WowPsParty
 
         uint32 grp = 0;
         // The OPENER (engaged==0) always walks in, even onto a pack bigger than N
-        // (allowOversize) — never stand at range. Once engaged, a top-up add must fit.
-        Unit* const add = FindNextSafeAdd(tank, targetN - engaged, grp, /*allowOversize=*/engaged == 0);
+        // (ceiling 0). A TOP-UP also walks in if the remaining room won't fit anything,
+        // but only onto a cluster up to N (ceiling targetN) — so it grabs a lone nearby
+        // pack instead of stalling, without dragging a whole over-N room.
+        Unit* const add = FindNextSafeAdd(tank, targetN - engaged, grp,
+                                          /*allowOversize=*/true,
+                                          /*oversizeCeiling=*/engaged == 0 ? 0u : targetN);
         if (!add)
         {
             // Diagnostic (once per gather): WHY did it stop short of N? Count nearby
@@ -1897,6 +1911,33 @@ namespace WowPsParty
         {
             TankGatherStep(bot);
             return;
+        }
+
+        // In-combat maintain-N TOP-UP. The opener gather (StartTankGather, below) is
+        // one-shot — it ends on the first no-add or the drive timeout. But Mill wants the
+        // tank to KEEP fetching toward N as the current pack thins out or a stray mob
+        // becomes reachable ("fought 3 mobs, won't go fetch the lone mob right there").
+        // So while the tank is in combat under a maintain-N pull and still below N, if a
+        // safe add is in scan range, re-arm the gather drive so TankGatherStep walks it
+        // in. Safe to do mid-fight: once the tank is in combat, IsTankGathering treats the
+        // not-yet-grabbed add as a released straggler, so the DPS keep killing the current
+        // pack instead of being re-held while the tank steps out to grab the next mob.
+        if (bot->IsInCombat())
+        {
+            uint32 const pullN = WowPsParty::BotInitialPullCount(bot->GetGUID());
+            if (pullN >= 2)
+            {
+                uint32 const engaged = CountEngagedHostiles(bot);
+                uint32 grp = 0;
+                if (engaged < pullN &&
+                    FindNextSafeAdd(bot, pullN - engaged, grp, /*allowOversize=*/true, /*ceiling=*/pullN))
+                {
+                    StartTankGather(bot->GetGUID().GetCounter(), pullN);
+                    return;   // next tick: TankGatherActive -> TankGatherStep drives the fetch
+                }
+            }
+            // In combat but nothing to fetch (or N==1): fall through to the settle block,
+            // which sees the tank in combat, resets the post-combat timer, and returns.
         }
 
         // Don't auto-pull the instant a fight ends — hold off until the WHOLE party
@@ -3301,6 +3342,21 @@ namespace WowPsParty
         return LeaderRole(leader->GetSession()->GetAccountId()) == "tank";
     }
 
+    // The threat-wait gate fires whenever a TANK leads the dungeon — the human leader
+    // (HumanTankLeadActive) OR a bot/henchman lead tank while the human plays a DPS.
+    // Mill: "the threat throttle isn't respected — when my tank is a henchman the DPS
+    // just rip everything off it." The gate's machinery (MobOnTank / BotOverThreatVsTank /
+    // TankHasEngageLead) is already tank-agnostic; only this entry condition was scoped
+    // to a human tank. A non-tank bot in a bot-tank party now waits for the bot tank's
+    // engage lead exactly as it would for a human tank.
+    static bool TankLeadActive(Player* bot, Player* leader)
+    {
+        if (!bot || !bot->GetMap() || !bot->GetMap()->IsDungeon()) return false;
+        if (HumanTankLeadActive(bot, leader)) return true;
+        Player* const t = PartyLeadTank(bot);
+        return t && t != bot && t->IsAlive();
+    }
+
     // The party's tank as a Player*, whoever it is: a bot/henchman lead tank
     // (PartyLeadTank) or the human leader when its party role is tank (the leader
     // has no follower directive, so PartyLeadTank can't see it). nullptr if the
@@ -4028,8 +4084,8 @@ namespace WowPsParty
         {
             std::string const myRole = RoleForGuid(bot->GetGUID());
             bool const gated = desired && myRole != "tank";   // DPS AND healer; tank engages freely
-            if (gated && HumanTankLeadActive(bot, leader)
-                && WaitForHumanTank(bot->GetGUID())            // default WAIT under a human tank; '0' opts out
+            if (gated && TankLeadActive(bot, leader)
+                && WaitForHumanTank(bot->GetGUID())            // default WAIT under a tank (human OR bot); '0' opts out
                 && !IsBossUnit(desired))                       // bosses: no throttle, blast on
             {
                 // Release ONLY once the tank holds the mob (top-threat) AND has built
@@ -5418,10 +5474,21 @@ namespace WowPsParty
                 follower->SetStandState(UNIT_STAND_STATE_STAND);
 
             // The LEAD TANK body-pulls from a precise spot ahead of the leader —
-            // never jittered/wandered. Install it immediately here and leave the
-            // humanize tick disabled for it (eligible already false).
+            // never jittered/wandered.
             if (isLeadTank)
             {
+                // The lead tank is driven by TankFollowPath (recorded wing) or the
+                // lead-ahead MoveFollow below — NEVER by the humanize formation tick.
+                // Explicitly clear any stale eligibility: a tank that was a normal
+                // follower (e.g. out in the open world) had eligible=true set, and
+                // becoming the lead tank here never reset it. In a wing with NO recorded
+                // path, TankFollowPath bails WITHOUT MarkTankLeading, so HumanizeTick's
+                // IsTankLeading guard doesn't skip it either — and the 250ms humanize
+                // keeps yanking the tank to its REAR formation slot while this 1 Hz block
+                // pushes it to the FRONT lead spot. The tank then ping-pongs between the
+                // two while the leader stands still (Mill's idle oscillation).
+                g_humanize[d.followerGuid.GetCounter()].eligible = false;
+
                 // If THIS WING has a recorded path, the path-follow ticker drives
                 // the tank's motion — skip MoveFollow so the two don't fight. Must
                 // be leader-WING-aware (not just "any path on the map"): in an
@@ -5429,13 +5496,37 @@ namespace WowPsParty
                 // MoveFollow has to run or the tank is stranded.
                 if (WowPsParty::HasPathForLeader(leader->GetMapId(), leader))
                     return true;
+
                 // MoveFollow's angle is relative to the leader's facing: 0 =
                 // directly in front, M_PI = directly behind. The lead tank must
                 // be IN FRONT (the old M_PI put it 12y behind — the "tank trails
-                // far behind" bug). A few yards ahead so it body-pulls.
-                follower->GetMotionMaster()->Clear();
-                follower->GetMotionMaster()->MoveFollow(
-                    leader, float(WowPsParty::BotLeadDistance(d.followerGuid)), 0.0f);
+                // far behind" bug). A few yards ahead so it body-pulls. Install the
+                // follow ONCE and let MoveFollow's heartbeat maintain it — re-Clearing
+                // + re-MoveFollow every 1 Hz tick resets the spline each second (the
+                // jitter the humanize path deliberately avoids); only (re)assert when
+                // the generator isn't already FOLLOW or the slider distance changed.
+                float const leadDist = float(WowPsParty::BotLeadDistance(d.followerGuid));
+                MovementGeneratorType const lmg =
+                    follower->GetMotionMaster()->GetCurrentMovementGeneratorType();
+                static thread_local std::unordered_map<uint32, std::pair<uint32, float>> leadAssert;
+                auto& la = leadAssert[d.followerGuid.GetCounter()];
+                bool const leadChanged = la.first != leader->GetGUID().GetCounter()
+                                      || std::fabs(la.second - leadDist) > 0.01f;
+                // Reassert too when the tank is sitting much CLOSER than the lead
+                // distance: another follow path (the unstick / catch-up code installs a
+                // REAR pet-distance MoveFollow) can leave a FOLLOW generator at the wrong
+                // offset, which the gen+leadChanged dedup alone wouldn't notice — the tank
+                // would then trail BEHIND instead of leading until the next combat. While
+                // the tank is genuinely catching up to the lead spot it's also "too close",
+                // so this keeps driving it forward, which is exactly what we want.
+                bool const tooClose = follower->GetDistance(leader) < leadDist - 4.0f;
+                if (lmg != FOLLOW_MOTION_TYPE || leadChanged || tooClose)
+                {
+                    follower->GetMotionMaster()->Clear();
+                    follower->GetMotionMaster()->MoveFollow(leader, leadDist, 0.0f);
+                    la.first  = leader->GetGUID().GetCounter();
+                    la.second = leadDist;
+                }
                 return true;
             }
 
