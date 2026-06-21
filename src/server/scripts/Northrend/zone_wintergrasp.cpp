@@ -808,15 +808,15 @@ public:
 
         uint32 checkTimer;
 
-        bool CanControlVehicle(Unit* passenger)
+        bool CanControlVehicle(Unit* /*passenger*/)
         {
-            if (passenger->HasAura(SPELL_LIEUTENANT))
-                return true;
-
-            if (me->GetEntry() == NPC_WINTERGRASP_CATAPULT && passenger->HasAura(SPELL_CORPORAL))
-                return true;
-
-            return false;
+            // [WowPsParty] No WG rank gate on this server — mirrors the build-gate removal
+            // above. Retail required the Lieutenant (or Corporal for a catapult) rank,
+            // earned from honorable kills IN the battle, to DRIVE a siege; without it the
+            // per-second check below ejected the driver the instant they built + entered
+            // one (the "thrown off immediately" bug). A player who built and entered a
+            // siege may drive it, no rank required.
+            return true;
         }
 
         void UpdateAI(uint32 diff) override
