@@ -1754,6 +1754,7 @@ namespace WowPsParty
     }
 
     static bool IsBossUnit(Unit* u);   // fwd decl (defined further down); used by the gather
+    static bool NavReachable(Player* bot, float x, float y, float z, float straight);  // fwd decl (defined below)
 
     // Distinct live hostile creatures currently in combat with the tank.
     static uint32 CountEngagedHostiles(Player* tank)
@@ -1795,7 +1796,15 @@ namespace WowPsParty
         if (!tank->IsValidAttackTarget(u)) return false;
         if (!u->IsHostileTo(tank)) return false;                   // passive/neutral (yellow) -> can't body-pull
         if (std::fabs(u->GetPositionZ() - tank->GetPositionZ()) > PULL_Z_TOLERANCE) return false;
-        return tank->IsWithinLOSInMap(u, VMAP::ModelIgnoreFlags::M2);
+        if (!tank->IsWithinLOSInMap(u, VMAP::ModelIgnoreFlags::M2)) return false;
+        // Must be NAVMESH-reachable — a mob in LoS across a gap/ledge the tank can't path to
+        // would otherwise pin the gather forever (the tank body-pulls but never closes; live
+        // log: OPEN+GATHER entry=4308 dist=27 -> END(drive-timeout) engaged=0/8). Reachability
+        // is the last (priciest) check so it only runs for an otherwise-eligible candidate.
+        float const dx = u->GetPositionX() - tank->GetPositionX();
+        float const dy = u->GetPositionY() - tank->GetPositionY();
+        return NavReachable(tank, u->GetPositionX(), u->GetPositionY(), u->GetPositionZ(),
+                            std::sqrt(dx * dx + dy * dy));
     }
 
     // How many mobs `cand` would drag in: itself + un-aggroed neighbours within
@@ -2040,6 +2049,23 @@ namespace WowPsParty
         if (!nearest || !nearest->IsAlive()) return;
         if (!bot->IsValidAttackTarget(nearest)) return;
         if (!nearest->IsHostileTo(bot)) return;   // never auto-engage a PASSIVE/neutral (yellow) mob (Mill)
+        // SelectNearbyTarget returns the nearest valid target even if it's NAVMESH-UNREACHABLE
+        // (a mob across a gap/ledge). Opening on it locks the tank onto a mob it can never
+        // close on — the live "OPEN+GATHER entry=4308 dist=27 -> 18s timeout, engaged=0, no
+        // body pull". If the nearest isn't reachable, switch to the nearest REACHABLE eligible
+        // hostile (FindNextSafeAdd); if there's none, don't auto-pull this tick.
+        {
+            float const dx = nearest->GetPositionX() - bot->GetPositionX();
+            float const dy = nearest->GetPositionY() - bot->GetPositionY();
+            if (!NavReachable(bot, nearest->GetPositionX(), nearest->GetPositionY(),
+                              nearest->GetPositionZ(), std::sqrt(dx * dx + dy * dy)))
+            {
+                uint32 grp = 0;
+                Unit* const reachable = FindNextSafeAdd(bot, 8, grp);   // nearest reachable eligible hostile
+                if (!reachable) return;
+                nearest = reachable;
+            }
+        }
 
         // Pull pacing — don't yank the next out-of-combat pack until mana is
         // topped off, so the party never chain-pulls on fumes. A PALADIN tank
