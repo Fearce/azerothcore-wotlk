@@ -459,6 +459,27 @@ namespace
 
             BattlegroundTypeId const bgTypeId = BattlegroundMgr::BGTemplateId(qt);
             uint8 const arenaType = BattlegroundMgr::BGArenaType(qt);
+            // ARENA port-reject diagnostic (rate-limited): the port is sent but the heroes
+            // never enter — log exactly what HandleBattleFieldPortOpcode checks, so the
+            // rejection cause is visible (it only LOG_DEBUGs, which is off). Grep "arena-port".
+            if (arenaType != 0)
+            {
+                static thread_local std::unordered_map<uint32, uint32> dgMs;
+                uint32 const now = getMSTime();
+                uint32& dg = dgMs[bot->GetGUID().GetCounter()];
+                if (now - dg > 3000)
+                {
+                    dg = now;
+                    Battleground* abg = sBattlegroundMgr->GetBattleground(ginfo.IsInvitedToBGInstanceGUID, bgTypeId);
+                    LOG_INFO("module",
+                        "[WowPsParty BGFill] arena-port {} inCombat={} charm={} beingTP={} inQueue={} "
+                        "invitedForQ={} bgFound={} inst={} qt={}",
+                        bot->GetName(), bot->IsInCombat(), bool(bot->GetCharmGUID()),
+                        bot->IsBeingTeleported(), bot->InBattlegroundQueue(),
+                        bot->IsInvitedForBattlegroundQueueType(qt), abg != nullptr,
+                        ginfo.IsInvitedToBGInstanceGUID, uint32(qt));
+                }
+            }
             // DEFER the port: QUEUE the CMSG_BATTLEFIELD_PORT so the core processes it
             // in the bot's normal session update — do NOT call HandleBattleFieldPortOpcode
             // synchronously here. This runs inside the world OnUpdate tick, and porting a
