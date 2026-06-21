@@ -982,7 +982,7 @@ namespace WowPsParty
                     add("self_health<35", "buff_self:Survival Instincts", 88);
                     add("self_health<35", "buff_self:Frenzied Regeneration", 87);
                     add("always", "buff_self:Bear Form", 84);
-                    add("enemies_in_melee>2", "cast:Swipe", 70);
+                    add("enemies_in_melee>2", "cast:Swipe (Bear)", 70);
                     add("has_target", "cast:Mangle (Bear)", 68);
                     add("target_missing_aura:Lacerate", "cast:Lacerate", 64);
                     add("has_target", "cast:Lacerate", 58);
