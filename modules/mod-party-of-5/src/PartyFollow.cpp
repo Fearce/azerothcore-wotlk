@@ -5803,12 +5803,14 @@ namespace WowPsParty
                 float const wanderCap = std::min(h.slotDist + 6.0f, 7.0f);
                 float const dLead     = follower->GetDistance(anchor);
 
-                // Notably out of formation — e.g. just left combat away from the
-                // party — walk back toward the slot. The threshold sits ABOVE the
-                // wander cap, so a bot that merely strolled out is never yanked
-                // back (the user wants it to keep its wandered spot); only a real
-                // post-combat drift reforms.
-                if (dLead > wanderCap + 0.5f)
+                // Reform to the slot when NOTABLY out of formation — either too FAR (just
+                // left combat away from the party; threshold ABOVE the wander cap so a bot
+                // that merely strolled out keeps its spot) OR STACKED on the anchor (closer
+                // than its slot). Without the too-close case a bot that ended up on the
+                // leader's pixel just "settles in place" there and fidgets back and forth on
+                // it forever instead of spreading out (Mill: "2 dps walk back and forth on
+                // the exact pixel I'm standing on").
+                if (dLead > wanderCap + 0.5f || dLead < h.slotDist - 1.0f)
                 {
                     moveToFormation();
                     continue;
