@@ -1803,6 +1803,23 @@ namespace WowPsParty
         return true;
     }
 
+    // Drive a body-pull chase toward `add` WITHOUT re-issuing MoveChase every tick. The
+    // gather runs each AI tick; calling MoveChase(add) unconditionally each tick re-inits
+    // the chase generator and RESETS the spline, so the tank stutters/turns in place and
+    // never actually closes — the "tank spazzes, won't body-pull, stands looking at the
+    // mob" report. Only (re)issue when the target changed or the chase generator was lost.
+    static void DriveTankChase(Player* tank, Unit* add)
+    {
+        static thread_local std::unordered_map<uint32, uint64> lastChase;   // tankLow -> add raw guid
+        uint64 const ag = add->GetGUID().GetRawValue();
+        uint64& lc = lastChase[tank->GetGUID().GetCounter()];
+        MovementGeneratorType const mg = tank->GetMotionMaster()->GetCurrentMovementGeneratorType();
+        if (lc == ag && mg == CHASE_MOTION_TYPE) return;    // already chasing this exact target — don't reset
+        tank->SetFacingToObject(add);                       // face it only when (re)issuing the chase
+        tank->GetMotionMaster()->MoveChase(add);
+        lc = ag;
+    }
+
     // One tick of an active maintain-N gather: walk (or taunt) the next safe add in,
     // or finish. Runs from TankLeadEngagement AFTER AssistTarget, so its MoveChase
     // overrides the combat chase for this tick.
@@ -1883,17 +1900,16 @@ namespace WowPsParty
             }
             if (canWalk)                                      // final but no taunt up -> just walk it down
             {
-                tank->SetFacingToObject(add);
-                tank->GetMotionMaster()->MoveChase(add);
+                DriveTankChase(tank, add);
                 return;
             }
             EndTankGather(tankLow);                           // dazed AND no taunt -> bail, fight what we have
             return;
         }
         // Walk close enough to proximity-aggro it (no need to hit it — the per-tick
-        // re-eval advances the instant it's in combat).
-        tank->SetFacingToObject(add);
-        tank->GetMotionMaster()->MoveChase(add);
+        // re-eval advances the instant it's in combat). Deduped so we don't reset the
+        // spline every tick (the opener-spazz / never-closes bug).
+        DriveTankChase(tank, add);
     }
 
     void TankLeadEngagement(Player* bot)
@@ -2115,7 +2131,7 @@ namespace WowPsParty
         {
             MarkTankGathering(bot->GetGUID().GetCounter(), { nearest->GetGUID() });   // DPS hold
             StartTankGather(bot->GetGUID().GetCounter(), pullN);
-            bot->GetMotionMaster()->MoveChase(nearest);   // body-pull the opener (walk in)
+            DriveTankChase(bot, nearest);                 // body-pull the opener (walk in), deduped
             LOG_INFO("module",
                 "[WowPsParty TankLead] guid={} OPEN+GATHER target={} on entry={} dist={:.1f}",
                 bot->GetGUID().GetCounter(), pullN, nearest->GetEntry(), bot->GetDistance(nearest));
@@ -2157,7 +2173,7 @@ namespace WowPsParty
             // IsPartyPullPending -> IsTankGathering) until the tank reaches the mob and
             // builds a real engage lead — the multi-pull hold, applied to one mob.
             MarkTankGathering(bot->GetGUID().GetCounter(), { nearest->GetGUID() });
-            bot->GetMotionMaster()->MoveChase(nearest);              // melee: close in
+            DriveTankChase(bot, nearest);                            // melee: close in, deduped
         }
 
         LOG_INFO("module", "[WowPsParty TankLead] guid={} {} mob_guid={} entry={} dist={:.1f} ok={}",
@@ -4512,6 +4528,18 @@ namespace WowPsParty
                      gLow, desired->GetGUID().GetCounter(), rangedCaster ? 1 : 0);
         }
 
+        // The LEAD TANK's FEET are owned by TankLeadEngagement / TankGatherStep while it's
+        // pulling or gathering — they run AFTER this assist pass and body-pull the mob/add
+        // (deduped via DriveTankChase). If we ALSO issue a chase here, the two fight every
+        // tick: this pass re-picks the tank's victim and chases it at a FORMATION ORBIT
+        // angle whenever the victim changes, while the gather chases its add DEAD-ON — so
+        // the tank spazzes/turns in place and never closes (the recurring "tank won't body-
+        // pull, stands looking at the mob" bug). Keep the victim + auto-attack set above;
+        // just don't move. Once the pull/gather ends, this pass owns the combat chase again.
+        if (IsLeadTank(bot->GetGUID())
+            && (TankGatherActive(bot->GetGUID().GetCounter()) || IsTankPulling(bot->GetGUID())))
+            return;
+
         MovementGeneratorType const mg =
             bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
 
@@ -5417,19 +5445,24 @@ namespace WowPsParty
             float const movedSelf = std::sqrt(dxs * dxs + dys * dys);
             s.x = follower->GetPositionX();
             s.y = follower->GetPositionY();
-            // The LEAD TANK legitimately stands STILL several yards AHEAD of the leader
-            // (its lead-distance spot) whenever the leader is stationary — that's leading,
-            // NOT being stuck. Without this the stuck-detector flags it (dist>8, not moving)
-            // and teleports it back onto the leader, which then walks out to its lead spot
-            // and gets teleported again: the "tank stands around, teleports to me, resets
-            // to formation, oscillates" report. Only exempt while it's roughly AT its lead
-            // spot of a STATIONARY leader; a moving leader (it should be following) or a
-            // far gap (a real wedge) still arms the detector.
-            bool const leadTankHolding =
+            // The LEAD TANK is SUPPOSED to be away from the leader — holding its lead spot
+            // ahead, or fighting a pull ahead of a hanging-back (e.g. healer) leader. The
+            // idle-stuck teleport measures distance to the LEADER, so it kept teleporting a
+            // tank that was correctly standing in melee ~18y from a back-line leader ("got
+            // teleported to me after the pull", and the formation/oscillation churn). Exempt
+            // the lead tank from the idle teleport entirely within a generous 60y; a
+            // genuinely lost tank (>60y) still teleports as a backstop. Its real positioning
+            // is owned by the isLeadTank MoveFollow + TankLeadEngagement / AssistTarget, and
+            // the chase/follow generators re-assert when their generator is lost.
+            // Require the LEADER to be stationary for the exemption: a tank holding its
+            // lead spot / standing in melee ahead of an idle leader is fine, but if the
+            // leader is WALKING and the tank isn't keeping up, that's a genuine stall — let
+            // the detector recover it (this closes the "dead follow path within 60y freezes
+            // forever" hole: the moment the leader moves, a frozen tank is re-armed).
+            bool const leadTankExempt =
                 leader->GetMap() && leader->GetMap()->IsDungeon()
-                && IsLeadTank(d.followerGuid) && !leader->isMoving()
-                && dist <= float(WowPsParty::BotLeadDistance(d.followerGuid)) + 6.0f;
-            if (dist > 8.0f && movedSelf < 1.0f && !leadTankHolding) ++s.idle;
+                && IsLeadTank(d.followerGuid) && dist < 60.0f && !leader->isMoving();
+            if (dist > 8.0f && movedSelf < 1.0f && !leadTankExempt) ++s.idle;
             else { s.idle = 0; s.unstickAttempts = 0; }   // moved / caught up / leading = recovered
             // Genuine long-distance gaps are already handled above (the >50y
             // leash re-walks, >100y snaps), so by here dist <= 50: a "stuck" bot
