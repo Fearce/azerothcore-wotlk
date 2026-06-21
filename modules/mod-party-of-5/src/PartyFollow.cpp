@@ -1880,11 +1880,18 @@ namespace WowPsParty
         uint32 const now = getMSTime();
 
         // ---- CONCLUDE conditions (then the rotation resumes and the tank fights) -------
-        if (now - d.startMs > GATHER_DRIVE_MAX_MS)      { EndTankGather(tankLow); return; }  // overall safety cap
-        if (tank->GetHealthPct() <= GATHER_LOW_HP_PCT)  { EndTankGather(tankLow); return; }  // BAIL: in danger
-        if (TankFightingBoss(tank))                     { EndTankGather(tankLow); return; }  // never gather into a boss
         uint32 const engaged = CountEngagedHostiles(tank);
-        if (engaged >= d.targetN)                       { EndTankGather(tankLow); return; }  // reached N -> fight
+        char const* end = nullptr;
+        if      (now - d.startMs > GATHER_DRIVE_MAX_MS)     end = "drive-timeout";  // overall safety cap
+        else if (tank->GetHealthPct() <= GATHER_LOW_HP_PCT) end = "hp-bail";        // in danger
+        else if (TankFightingBoss(tank))                    end = "boss";           // never gather into a boss
+        else if (engaged >= d.targetN)                      end = "reached-N";      // reached N -> fight
+        if (end)
+        {
+            LOG_INFO("module", "[WowPsParty TankGather] guid={} END({}) engaged={}/{} ageMs={} hp={:.0f}",
+                     tankLow, end, engaged, d.targetN, now - d.startMs, tank->GetHealthPct());
+            EndTankGather(tankLow); return;
+        }
 
         // ---- pace each pull: keep walking the committed add in until it's grabbed (in
         //      combat / dead / in melee) or its reach-grace expires, BEFORE looking for the
@@ -2069,48 +2076,41 @@ namespace WowPsParty
             }
         }
 
-        // Maintain-N BODY-PULL (pull_count >= 2): the tank walks the pack in by PROXIMITY
-        // aggro — it does NOT Attack and does NOT run its rotation here (TankIsBodyPulling
-        // suppresses TickRotation for the whole gather). It grabs up to N, then the gather
-        // CONCLUDES, combat resumes, threat builds, and the DPS engage (Mill: "don't use the
-        // rotation during a body pull; gather up to N, then resume combat"). DPS + healer
-        // hold the whole gather. N==1 (or opening on a BOSS — never multi-pull a boss) falls
-        // through to the classic single ranged/barge pull below.
-        uint32 const pullN = WowPsParty::BotInitialPullCount(bot->GetGUID());
-        if (pullN >= 2 && !IsBossUnit(nearest))
-        {
-            MarkTankGathering(bot->GetGUID().GetCounter(), { nearest->GetGUID() });   // DPS hold
-            StartTankGather(bot->GetGUID().GetCounter(), pullN);
-            DriveTankChase(bot, nearest);                 // walk the opener in (deduped) — NO attack
-            LOG_INFO("module",
-                "[WowPsParty TankLead] guid={} OPEN+GATHER target={} on entry={} dist={:.1f}",
-                bot->GetGUID().GetCounter(), pullN, nearest->GetEntry(), bot->GetDistance(nearest));
-            return;
-        }
-
-        // Single pull (N==1 / boss): attack now (the ranged/barge logic below moves it in).
+        // Engage the target. AUTO-ATTACK only — the ability ROTATION stays suppressed for the
+        // whole body-pull (TankIsBodyPulling -> TickRotation + AssistTarget skip), so the tank
+        // builds no early RANGED threat; white swings only land once it's in melee (by which
+        // point it's grouping the pack). Attack ALSO detects an EVADING / unreachable mob
+        // (ok==false) so the tank BAILS instead of standing forever on a mob it can't path to
+        // (the "stands still looking at the pack" report) — proximity-aggro alone could never
+        // recover from that. Re-armed each tick, so it self-corrects when the mob is reachable.
         bool const ok = bot->Attack(nearest, true);
         if (!ok)
         {
-            // We CAN'T actually attack this mob even though it passed
-            // IsValidAttackTarget — Unit::Attack rejects an EVADING creature (it
-            // aggroed but couldn't path to us across the corner/wall, so it reset),
-            // and a few flag/event states. Critically, the old code ignored this
-            // `ok` and MoveChased / MarkTankPulling'd anyway, locking the tank onto
-            // a mob it can NEVER engage and freezing the whole party holding fire —
-            // the "party waited around the corner instead of moving into LoS"
-            // report (an Utgarde Dragonflayer Forge Master evading at ~3y). Bail:
-            // the follow system walks the tank with the leader, and the instant the
-            // mob is attackable again (reset finished / now in reach) the lead
-            // resumes and pulls it. Re-armed each tick, so it self-corrects.
             LOG_INFO("module",
                 "[WowPsParty TankLead] guid={} CANT-ATTACK mob_guid={} entry={} dist={:.1f} "
-                "(evading/immune) — bailing, NOT holding the party",
+                "(evading/immune/unreachable) — bailing, NOT holding the party",
                 bot->GetGUID().GetCounter(), nearest->GetGUID().GetCounter(),
                 nearest->GetEntry(), bot->GetDistance(nearest));
             return;
         }
         bot->SetFacingToObject(nearest);
+
+        // Maintain-N BODY-PULL (pull_count >= 2): the tank walks the pack in (DriveTankChase)
+        // grabbing up to N, running NO ability rotation (TankIsBodyPulling). Once the gather
+        // CONCLUDES (N / nothing pullable / HP-bail) combat resumes, threat builds, DPS engage
+        // (Mill). DPS + healer hold the whole gather. N==1 (or a BOSS — never multi-pull a
+        // boss) falls through to the classic single ranged/barge pull below.
+        uint32 const pullN = WowPsParty::BotInitialPullCount(bot->GetGUID());
+        if (pullN >= 2 && !IsBossUnit(nearest))
+        {
+            MarkTankGathering(bot->GetGUID().GetCounter(), { nearest->GetGUID() });   // DPS hold
+            StartTankGather(bot->GetGUID().GetCounter(), pullN);
+            DriveTankChase(bot, nearest);                 // walk the opener in (deduped)
+            LOG_INFO("module",
+                "[WowPsParty TankLead] guid={} OPEN+GATHER target={} on entry={} dist={:.1f}",
+                bot->GetGUID().GetCounter(), pullN, nearest->GetEntry(), bot->GetDistance(nearest));
+            return;
+        }
 
         // Ranged pull: a tank that can open from range doesn't charge into the
         // pack. It closes only to ability range, then the rotation (Heroic Throw,
