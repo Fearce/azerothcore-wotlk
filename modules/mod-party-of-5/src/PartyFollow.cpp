@@ -1632,6 +1632,15 @@ namespace WowPsParty
     static constexpr uint32 GATHER_DRIVE_MAX_MS = 18000;   // safety bail if a gather gets stuck pre-engage (raised
                                                            // with GATHER_SCAN: a 90y walk-in needs more than 12s)
     static constexpr float  GATHER_LOW_HP_PCT   = 45.0f;   // tank this hurt -> stop gathering, fight + get healed
+    static constexpr uint32 GATHER_REARM_GIVEUP_MS = 1500; // in-combat re-arm: after this long with nothing
+                                                           // pullable, de-arm for the rest of the fight so the
+                                                           // tank doesn't chain-pull the instance — the party
+                                                           // gets downtime to eat/drink/loot (Mill).
+
+    // Per-tank, per-combat latch for the in-combat maintain-N re-arm. Once the cap is
+    // reached, a boss is engaged, or nothing's been pullable for GATHER_REARM_GIVEUP_MS,
+    // `concluded` latches true and the gather stops re-arming until the tank drops combat.
+    struct GatherLatch { bool concluded = false; uint32 firstNoAddMs = 0; };
 
     struct TankGatherDrive { uint32 startMs; uint32 targetN; };
     static std::unordered_map<uint32, TankGatherDrive> g_tankGatherDrive;   // tankLow -> active gather
@@ -1699,6 +1708,8 @@ namespace WowPsParty
         return !tank->HasUnitFlag(UNIT_FLAG_SILENCED);
     }
 
+    static bool IsBossUnit(Unit* u);   // fwd decl (defined further down); used by the gather
+
     // Distinct live hostile creatures currently in combat with the tank.
     static uint32 CountEngagedHostiles(Player* tank)
     {
@@ -1712,12 +1723,27 @@ namespace WowPsParty
         return n;
     }
 
+    // Is the tank currently in combat with a boss? Used to suppress the maintain-N
+    // gather during a boss fight (Mill: "do not multi-pull into bosses") — a boss is
+    // tank-and-spank, never a cluster to grow.
+    static bool TankFightingBoss(Player* tank)
+    {
+        if (!tank) return false;
+        for (auto const& [refGuid, ref] : tank->GetCombatManager().GetPvECombatRefs())
+        {
+            Unit* const o = ref->GetOther(tank);
+            if (o && o->IsAlive() && IsBossUnit(o)) return true;
+        }
+        return false;
+    }
+
     // A clean, un-aggroed pull candidate the tank can reach + actually see (not
-    // through a wall).
+    // through a wall). Bosses are never gathered (Mill: no multi-pull into bosses).
     static bool GatherEligible(Player* tank, Unit* u)
     {
         if (!u || !u->IsAlive() || u->IsInCombat()) return false;   // un-aggroed only
         if (u->IsTotem() || !u->ToCreature()) return false;
+        if (IsBossUnit(u)) return false;                            // never gather a boss
         if (!tank->IsValidAttackTarget(u)) return false;
         if (std::fabs(u->GetPositionZ() - tank->GetPositionZ()) > PULL_Z_TOLERANCE) return false;
         return tank->IsWithinLOSInMap(u, VMAP::ModelIgnoreFlags::M2);
@@ -1736,15 +1762,11 @@ namespace WowPsParty
     }
 
     // Nearest eligible un-aggroed candidate within GATHER_SCAN whose social group fits
-    // `capacity`. Returns it + its group size in grpOut, or nullptr if none fit.
-    // `allowOversize`: if nothing fits `capacity`, fall back to the nearest mob whose
-    // group is <= `oversizeCeiling` (0 = no ceiling) so the gather still WALKS IN rather
-    // than standing at range. The OPENER passes ceiling 0 (always pull, even a >N pack);
-    // a TOP-UP passes ceiling N so it'll grab a cluster bigger than the *remaining* room
-    // (slight overshoot of N) but won't drag a whole room beyond N — Mill: "with a cap
-    // of 6 a lone pack nearby should fit fine," and the old top-up just stalled instead.
-    static Unit* FindNextSafeAdd(Player* tank, uint32 capacity, uint32& grpOut,
-                                 bool allowOversize = false, uint32 oversizeCeiling = 0)
+    // `capacity` (= N - engaged). Returns it + its group size in grpOut, or nullptr if
+    // none fit. STRICT: an add is taken only if it won't push the engaged headcount over
+    // N — the cap is absolute, never overshot (Mill: "the multi-pull cap is absolute, do
+    // NOT overshoot it"). A pack bigger than the remaining room is simply left alone.
+    static Unit* FindNextSafeAdd(Player* tank, uint32 capacity, uint32& grpOut)
     {
         grpOut = 0;
         if (!tank || capacity == 0) return nullptr;
@@ -1762,15 +1784,6 @@ namespace WowPsParty
             uint32 const g = SocialGroupSize(cand, pool);
             if (g <= capacity) { grpOut = g; return cand; }   // nearest that SAFELY fits
         }
-        // Nothing fits the remaining room — fall back to the nearest mob within the
-        // oversize ceiling so the gather keeps advancing instead of stalling with
-        // pullable mobs right there.
-        if (allowOversize)
-            for (Unit* cand : pool)
-            {
-                uint32 const g = SocialGroupSize(cand, pool);
-                if (oversizeCeiling == 0 || g <= oversizeCeiling) { grpOut = g; return cand; }
-            }
         return nullptr;
     }
 
@@ -1798,21 +1811,22 @@ namespace WowPsParty
         uint32 targetN = 0, startMs = 0;
         if (!GetTankGather(tankLow, targetN, startMs)) return;
 
-        // Bail conditions: stuck too long, or the tank's getting low — fight + heal.
+        // Bail conditions: stuck too long, the tank's getting low, or a boss joined the
+        // fight mid-walk-in (never multi-pull into a boss — the latch can't catch this
+        // while a drive is active, since the re-arm block is skipped during a drive).
         if (getMSTime() - startMs > GATHER_DRIVE_MAX_MS) { EndTankGather(tankLow); return; }
         if (tank->GetHealthPct() <= GATHER_LOW_HP_PCT)   { EndTankGather(tankLow); return; }
+        if (TankFightingBoss(tank))                      { EndTankGather(tankLow); return; }
 
         uint32 const engaged = CountEngagedHostiles(tank);
         if (engaged >= targetN) { EndTankGather(tankLow); return; }   // at target -> fight
 
         uint32 grp = 0;
-        // The OPENER (engaged==0) always walks in, even onto a pack bigger than N
-        // (ceiling 0). A TOP-UP also walks in if the remaining room won't fit anything,
-        // but only onto a cluster up to N (ceiling targetN) — so it grabs a lone nearby
-        // pack instead of stalling, without dragging a whole over-N room.
-        Unit* const add = FindNextSafeAdd(tank, targetN - engaged, grp,
-                                          /*allowOversize=*/true,
-                                          /*oversizeCeiling=*/engaged == 0 ? 0u : targetN);
+        // STRICT cap — only add a mob whose social group fits the remaining room, so the
+        // engaged headcount never exceeds N (absolute cap). The opener body-pull (the
+        // single nearest mob) is issued separately in TankLeadEngagement, so a pack
+        // bigger than N doesn't leave the tank standing — it just isn't topped up.
+        Unit* const add = FindNextSafeAdd(tank, targetN - engaged, grp);
         if (!add)
         {
             // Diagnostic (once per gather): WHY did it stop short of N? Count nearby
@@ -1913,31 +1927,57 @@ namespace WowPsParty
             return;
         }
 
-        // In-combat maintain-N TOP-UP. The opener gather (StartTankGather, below) is
-        // one-shot — it ends on the first no-add or the drive timeout. But Mill wants the
-        // tank to KEEP fetching toward N as the current pack thins out or a stray mob
-        // becomes reachable ("fought 3 mobs, won't go fetch the lone mob right there").
-        // So while the tank is in combat under a maintain-N pull and still below N, if a
-        // safe add is in scan range, re-arm the gather drive so TankGatherStep walks it
-        // in. Safe to do mid-fight: once the tank is in combat, IsTankGathering treats the
-        // not-yet-grabbed add as a released straggler, so the DPS keep killing the current
-        // pack instead of being re-held while the tank steps out to grab the next mob.
+        // In-combat maintain-N TOP-UP. The opener gather is one-shot (ends on the first
+        // no-add / drive timeout), so this re-arms it WHILE in combat so the tank tops up
+        // toward N as a stray mob becomes reachable ("fought 3 mobs, won't go fetch the
+        // lone mob right there" — Mill). Safe mid-fight: once the tank is in combat,
+        // IsTankGathering treats a not-yet-grabbed add as a released straggler, so DPS
+        // keep killing the current pack instead of being re-held.
+        //
+        // But the re-arm DE-ARMS for the rest of the fight (a per-combat latch) once the
+        // cap is reached, a boss is engaged, or nothing's been pullable for a short window
+        // — so the tank tops up ONCE and then commits to the fight, instead of chain-
+        // pulling the whole instance. The party gets its downtime to eat/drink/loot, and
+        // the next pull re-arms cleanly (the latch is cleared the moment the tank is out
+        // of combat). The cap is never overshot: FindNextSafeAdd is strict.
+        // No GC sweep needed (unlike g_tankGatherDrive): a stale entry only gates re-arm
+        // and self-clears on the tank's next out-of-combat tick; it can't freeze anything.
+        static thread_local std::unordered_map<uint32, GatherLatch> gatherLatch;
         if (bot->IsInCombat())
         {
             uint32 const pullN = WowPsParty::BotInitialPullCount(bot->GetGUID());
             if (pullN >= 2)
             {
+                GatherLatch& gl = gatherLatch[bot->GetGUID().GetCounter()];
                 uint32 const engaged = CountEngagedHostiles(bot);
-                uint32 grp = 0;
-                if (engaged < pullN &&
-                    FindNextSafeAdd(bot, pullN - engaged, grp, /*allowOversize=*/true, /*ceiling=*/pullN))
+                if (!gl.concluded)
                 {
-                    StartTankGather(bot->GetGUID().GetCounter(), pullN);
-                    return;   // next tick: TankGatherActive -> TankGatherStep drives the fetch
+                    if (engaged >= pullN || TankFightingBoss(bot))
+                    {
+                        gl.concluded = true;   // cap met / boss fight -> stop, fight + downtime
+                    }
+                    else
+                    {
+                        uint32 grp = 0;
+                        if (FindNextSafeAdd(bot, pullN - engaged, grp))
+                        {
+                            gl.firstNoAddMs = 0;                       // progress -> reset the give-up clock
+                            StartTankGather(bot->GetGUID().GetCounter(), pullN);
+                            return;   // next tick: TankGatherActive -> TankGatherStep drives the fetch
+                        }
+                        // Nothing pullable right now — give it a short grace, then de-arm.
+                        uint32 const now = getMSTime();
+                        if (gl.firstNoAddMs == 0) gl.firstNoAddMs = now;
+                        else if (now - gl.firstNoAddMs > GATHER_REARM_GIVEUP_MS) gl.concluded = true;
+                    }
                 }
             }
-            // In combat but nothing to fetch (or N==1): fall through to the settle block,
-            // which sees the tank in combat, resets the post-combat timer, and returns.
+            // In combat (latched, N==1, or nothing to fetch): fall through to the settle
+            // block, which sees the tank in combat, resets the post-combat timer, returns.
+        }
+        else
+        {
+            gatherLatch.erase(bot->GetGUID().GetCounter());   // out of combat -> re-arm next pull
         }
 
         // Don't auto-pull the instant a fight ends — hold off until the WHOLE party
@@ -2065,10 +2105,11 @@ namespace WowPsParty
         // neighbours social-aggro in on their own (no cluster body-pull) — then arm the
         // maintain-N gather, which walks the engaged headcount up toward N from nearby
         // SAFE adds without overshooting (TankGatherStep, above). Only armed here, on a
-        // fresh out-of-combat + rested pull, so it never chain-pulls. N==1 falls through
-        // to the classic single ranged/barge pull below.
+        // fresh out-of-combat + rested pull, so it never chain-pulls. N==1 (or opening on
+        // a BOSS — never multi-pull into a boss, Mill) falls through to the classic single
+        // ranged/barge pull below.
         uint32 const pullN = WowPsParty::BotInitialPullCount(bot->GetGUID());
-        if (pullN >= 2)
+        if (pullN >= 2 && !IsBossUnit(nearest))
         {
             MarkTankGathering(bot->GetGUID().GetCounter(), { nearest->GetGUID() });   // DPS hold
             StartTankGather(bot->GetGUID().GetCounter(), pullN);
