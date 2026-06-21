@@ -2014,7 +2014,20 @@ GroupJoinBattlegroundResult Group::CanJoinBattlegroundQueue(Battleground const* 
         lfg::LfgState lfgState = sLFGMgr->GetState(member->GetGUID());
         if (lfgState > lfg::LFG_STATE_NONE && (lfgState != lfg::LFG_STATE_QUEUED || !sWorld->getBoolConfig(CONFIG_ALLOW_JOIN_BG_AND_LFG)))
         {
-            return ERR_LFG_CANT_USE_BATTLEGROUND;
+            // [WowPsParty] We're PAST the isLFGGroup() guard above, so this is a NORMAL
+            // group — a member still flagged in the dungeon system is STALE. A persistent
+            // party-of-5 never disbands, so an LFG dungeon/finished state can linger on the
+            // human OR a bot member after a run and block EVERY later BG/arena queue until a
+            // kick+reinvite (the recurring "can't queue, no eye" bug). Clear the stale
+            // post-dungeon state and let the queue proceed; a real LFG_STATE_QUEUED (still
+            // in the dungeon finder) or role-check/proposal is left to block as before.
+            if (lfgState == lfg::LFG_STATE_DUNGEON || lfgState == lfg::LFG_STATE_FINISHED_DUNGEON || lfgState == lfg::LFG_STATE_BOOT)
+            {
+                sLFGMgr->LeaveLfg(member->GetGUID());
+                LOG_INFO("module", "[WowPsParty LFG] cleared stale dungeon state on {} so the party can queue BG/arena", member->GetName());
+            }
+            else
+                return ERR_LFG_CANT_USE_BATTLEGROUND;
         }
 
         // pussywizard: prevent joining when any member is in bg/arena

@@ -153,6 +153,16 @@ void WorldSession::HandleBattlemasterJoinOpcode(WorldPacket& recvData)
     if (!joinAsGroup)
     {
         lfg::LfgState lfgState = sLFGMgr->GetState(GetPlayer()->GetGUID());
+        // [WowPsParty] Clear a STALE post-dungeon state (DUNGEON/FINISHED/BOOT) when the
+        // player isn't actually in an LFG group — a persistent party-of-5 lingers it after
+        // a run and it blocks the BG/arena queue forever (no eye, "can't queue while using
+        // the dungeon system"). Re-read so the gate below sees NONE.
+        if ((lfgState == lfg::LFG_STATE_DUNGEON || lfgState == lfg::LFG_STATE_FINISHED_DUNGEON || lfgState == lfg::LFG_STATE_BOOT)
+            && !(GetPlayer()->GetGroup() && GetPlayer()->GetGroup()->isLFGGroup()))
+        {
+            sLFGMgr->LeaveLfg(GetPlayer()->GetGUID());
+            lfgState = sLFGMgr->GetState(GetPlayer()->GetGUID());
+        }
         if (GetPlayer()->InBattleground()) // currently in battleground
         {
             err = ERR_BATTLEGROUND_NOT_IN_BATTLEGROUND;
@@ -762,6 +772,15 @@ void WorldSession::HandleBattlemasterJoinArena(WorldPacket& recvData)
     if (!asGroup)
     {
         lfg::LfgState lfgState = sLFGMgr->GetState(GetPlayer()->GetGUID());
+        // [WowPsParty] Clear a STALE post-dungeon state when not actually in an LFG group
+        // (see the JOIN handler above) so a lingering party-of-5 state can't block the
+        // solo arena queue forever.
+        if ((lfgState == lfg::LFG_STATE_DUNGEON || lfgState == lfg::LFG_STATE_FINISHED_DUNGEON || lfgState == lfg::LFG_STATE_BOOT)
+            && !(GetPlayer()->GetGroup() && GetPlayer()->GetGroup()->isLFGGroup()))
+        {
+            sLFGMgr->LeaveLfg(GetPlayer()->GetGUID());
+            lfgState = sLFGMgr->GetState(GetPlayer()->GetGUID());
+        }
         if (GetPlayer()->InBattleground()) // currently in battleground
         {
             err = ERR_BATTLEGROUND_NOT_IN_BATTLEGROUND;
