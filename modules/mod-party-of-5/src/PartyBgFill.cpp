@@ -316,6 +316,98 @@ namespace
             "|cff66ccff[WowPsParty]|r Forming a full match: +{} allies, +{} opponents…", allies, enemies);
     }
 
+    // Prep-phase deficit TOP-UP. The spawn-at-queue fill (StartFill) can lose the
+    // login/relevel/queue race, so a match locks in under-filled (Mill: "joined a 6v6
+    // that should've been a 10v10"). This is the safety net: while a tracked leader is in
+    // a BG that is STILL in its pre-gate countdown (STATUS_WAIT_JOIN — the ~90s before the
+    // doors open, where joins are guaranteed accepted, exactly the real-server "join an
+    // in-progress BG with room" behaviour Mill described), keep BOTH teams topped up to
+    // MaxPlayersPerTeam by spawning fills for the REAL deficit read off the LIVE instance.
+    // Deficit-based and self-throttling — newly-spawned fills are counted as in-flight, so
+    // it converges to a full match and stops spawning. Runs every world tick; the cheap
+    // both-teams-full check below short-circuits the steady state (a correctly-filled match
+    // counting down) BEFORE any DB query, so the DB hits (RndbotAccountCsv + SpawnFillTeam)
+    // only run while a deficit actually exists. Called from OnUpdate for each tracked leader.
+    void TopUpBgInPrep(Player* leader)
+    {
+        if (!leader || !leader->IsInWorld() || !leader->InBattleground()) return;
+        Battleground* bg = leader->GetBattleground();
+        if (!bg || bg->isArena()) return;
+        if (bg->GetStatus() != STATUS_WAIT_JOIN) return;   // only before the gates open
+        uint32 const maxPerTeam = bg->GetMaxPlayersPerTeam();
+        if (maxPerTeam == 0) return;
+        // Both teams already full -> nothing to do; skip the DB queries below. This is the
+        // common steady state for the rest of the prep countdown once the fill succeeded.
+        if (bg->GetPlayersCountByTeam(TEAM_ALLIANCE) >= maxPerTeam
+            && bg->GetPlayersCountByTeam(TEAM_HORDE) >= maxPerTeam) return;
+
+        PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(leader);
+        if (!mgr) return;
+        Battleground* tpl = sBattlegroundMgr->GetBattlegroundTemplate(bg->GetBgTypeID());
+        if (!tpl) return;
+        PvPDifficultyEntry const* br = GetBattlegroundBracketByLevel(tpl->GetMapId(), leader->GetLevel());
+        if (!br) return;
+        uint8 const cap  = uint8(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL));
+        uint8 const bmin = std::min<uint8>(uint8(br->minLevel), cap);
+        uint8 const bmax = std::min<uint8>(uint8(br->maxLevel), cap);
+
+        std::string const acctCsv = RndbotAccountCsv();
+        if (acctCsv.empty()) return;
+
+        uint32 const leaderLow  = leader->GetGUID().GetCounter();
+        uint32 const bgTypeId   = uint32(bg->GetBgTypeID());   // resolved real BG (Random BG -> real type)
+        TeamId const leaderTeam = leader->GetTeamId();
+
+        // Heroes (managed party bots) not yet in the BG will take the leader-team slots —
+        // count them so the top-up doesn't over-spawn ally fills on top of them.
+        uint32 pendingHeroes = 0;
+        {
+            std::vector<ObjectGuid> party;
+            WowPsParty::GetPartyGuidsFor(leader->GetGUID(), party);
+            for (ObjectGuid const& g : party)
+            {
+                if (g == leader->GetGUID()) continue;
+                Player* pb = ObjectAccessor::FindConnectedPlayer(g);
+                if (pb && sPlayerbotsMgr.GetPlayerbotAI(pb) && !pb->InBattleground()) ++pendingHeroes;
+            }
+        }
+
+        for (uint8 ti = 0; ti < 2; ++ti)
+        {
+            TeamId const t = TeamId(ti);                       // TEAM_ALLIANCE=0, TEAM_HORDE=1
+            bool   const ally = (t == leaderTeam);
+            uint32 const present = bg->GetPlayersCountByTeam(t);
+
+            // My fills already heading to this team (spawned, not yet in) — counted so we
+            // don't re-spawn what's already in flight.
+            uint32 inFlight = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_mutex);
+                for (auto const& kv : g_fillBots)
+                {
+                    if (kv.second.leaderLow != leaderLow || kv.second.entered) continue;
+                    TeamId const feTeam = kv.second.ally
+                        ? leaderTeam
+                        : (leaderTeam == TEAM_ALLIANCE ? TEAM_HORDE : TEAM_ALLIANCE);
+                    if (feTeam == t) ++inFlight;
+                }
+            }
+
+            uint32 accounted = present + inFlight;
+            if (ally) accounted += pendingHeroes;              // heroes en route fill this team
+            if (accounted >= maxPerTeam) continue;
+
+            uint32 const need = maxPerTeam - accounted;
+            uint32 const spawned = SpawnFillTeam(mgr, leaderLow, bgTypeId, acctCsv,
+                                                 RaceCsv(t == TEAM_ALLIANCE), bmin, bmax, need, ally,
+                                                 ally ? "ally-topup" : "enemy-topup");
+            if (spawned)
+                LOG_INFO("module",
+                    "[WowPsParty BGFill] prep top-up bg {} team {}: present={} inFlight={} pendingHeroes={} -> +{} fills",
+                    bgTypeId, uint32(t), present, inFlight, ally ? pendingHeroes : 0u, spawned);
+        }
+    }
+
     // Re-level an out-of-bracket pool fill bot to the top of the BG bracket so a small
     // flat pool serves every bracket. PlayerbotFactory::Randomize(false) is the same full
     // re-roll mod-playerbots uses for its random bots (level + gear + talents + spells);
@@ -977,6 +1069,9 @@ public:
                 if (!hasFills) g_activeLeaders.erase(leaderLow);
                 continue;
             }
+            // Keep the match topped up to max while it's still in its pre-gate countdown
+            // (no-op unless the leader is in a BG in STATUS_WAIT_JOIN with a real deficit).
+            TopUpBgInPrep(leader);
             std::vector<ObjectGuid> party;
             WowPsParty::GetPartyGuidsFor(leader->GetGUID(), party);
             for (ObjectGuid const& g : party)
