@@ -80,6 +80,11 @@
 #include "Battlefield.h"        // Wintergrasp: IsWarTime / war enrolment / participant sets
 #include "BattlefieldMgr.h"     // sBattlefieldMgr->GetBattlefieldToZoneId(WG)
 #include "MotionMaster.h"       // WG bot AI movement (MovePoint / MoveChase)
+#include "GameObject.h"         // WG siege: destructible keep-wall damage (ModifyHealth)
+#include "Cell.h"               // grid search for the keep walls
+#include "CellImpl.h"
+#include "GridNotifiers.h"      // GameObjectListSearcher
+#include "GridNotifiersImpl.h"
 
 #include <mutex>
 #include <string>
@@ -1141,6 +1146,37 @@ struct WgBot { uint32 team; bool releveled; bool enrolled; uint32 spawnMs; uint3
 std::unordered_map<uint32, WgBot> g_wgBots;   // guidLow -> state
 std::mutex                        g_wgMutex;
 
+// ---- Attacker siege vehicles -------------------------------------------------
+// The attackers maintain up to WG_MAX_VEHICLES siege creatures that drive to the keep
+// walls and batter them down (Mill). Each is spawned attacker-faction (so defenders treat
+// it as a target) and, when one's available, an idle attacking fill bot is seated as the
+// driver for flavour; the vehicle's motion + wall damage are driven server-side regardless.
+constexpr uint32 WG_MAX_VEHICLES      = 5;
+constexpr float  WG_VEH_WALL_RANGE    = 16.0f;    // within this of a wall -> batter it
+constexpr uint32 WG_VEH_WALL_DMG_DEN  = 25;       // damage/tick = wall maxHealth / this (~50s/wall solo)
+struct WgVehicle { ObjectGuid driver; uint32 spawnMs; };
+std::unordered_map<ObjectGuid, WgVehicle> g_wgVehicles;   // vehicle GUID -> state
+
+// Random attacker siege creatures. Siege Engine is faction-specific; demolisher/catapult
+// are shared. (Entries from BattlefieldWG.h.)
+uint32 const WG_VEH_SIEGE_ALLY  = 28312;
+uint32 const WG_VEH_SIEGE_HORDE = 32627;
+uint32 const WG_VEH_DEMOLISHER  = 28094;
+uint32 const WG_VEH_CATAPULT    = 27881;
+
+// Finds intact destructible buildings (the keep walls/towers) near a point.
+struct WgWallCheck
+{
+    float x, y, z, range;
+    WgWallCheck(float _x, float _y, float _z, float _r) : x(_x), y(_y), z(_z), range(_r) {}
+    bool operator()(GameObject* go) const
+    {
+        if (!go || go->GetGoType() != GAMEOBJECT_TYPE_DESTRUCTIBLE_BUILDING) return false;
+        if (go->GetDestructibleState() == GO_DESTRUCTIBLE_DESTROYED) return false;
+        return go->IsWithinDist3d(x, y, z, range);
+    }
+};
+
 // Contest points to fan the fills across (real WG locations so pathing stays on the
 // navmesh): the keep is the central objective both sides converge on, the NE workshop a
 // secondary so they don't all stack on one spot.
@@ -1163,6 +1199,7 @@ public:
         Battlefield* wg = sBattlefieldMgr->GetBattlefieldToZoneId(WG_ZONE_ID);
         if (!wg || !wg->IsWarTime())
         {
+            DespawnVehicles();                // war over -> despawn siege vehicles + clear tracking
             DespawnSome(WG_SPAWN_PER_TICK);   // no active battle -> tear fills down gradually
             return;
         }
@@ -1226,6 +1263,10 @@ public:
 
         TopUp(wg, TEAM_ALLIANCE, haveA);
         TopUp(wg, TEAM_HORDE,    haveH);
+
+        EnrolHeroes(wg);                              // bring the human's heroes into the war (the Icecrown fix)
+        uint32 const liveVeh = DriveVehicles(wg);     // drive attacker siege vehicles into the walls + batter them
+        TopUpVehicles(wg, liveVeh);                   // keep up to WG_MAX_VEHICLES attacker vehicles in the field
     }
 
 private:
@@ -1289,12 +1330,163 @@ private:
             return;
         }
 
+        // No enemy PLAYER in range. A DEFENDER heads for the nearest attacking SIEGE
+        // VEHICLE — that's where the real fight is (vehicles batter the walls), exactly how
+        // people play WG (Mill). Attack it if in range, else march to intercept. Attackers
+        // (and a defender with no vehicle to chase) fall back to the keep objective.
+        if (bot->GetTeamId() == wg->GetDefenderTeam())
+        {
+            std::vector<ObjectGuid> vguids;
+            { std::lock_guard<std::mutex> lk(g_wgMutex); for (auto const& kv : g_wgVehicles) vguids.push_back(kv.first); }
+            Creature* veh = nullptr; float vd = 300.0f;
+            for (ObjectGuid const& vg : vguids)
+            {
+                Creature* v = ObjectAccessor::GetCreature(*bot, vg);
+                if (!v || !v->IsAlive() || v->GetMapId() != bot->GetMapId()) continue;
+                float const d = bot->GetDistance(v);
+                if (d < vd) { vd = d; veh = v; }
+            }
+            if (veh)
+            {
+                if (vd <= WG_ENGAGE_RANGE && bot->IsValidAttackTarget(veh))
+                {
+                    if (bot->GetVictim() != veh) { bot->Attack(veh, true); bot->GetMotionMaster()->MoveChase(veh); }
+                    else if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
+                        bot->GetMotionMaster()->MoveChase(veh);
+                }
+                else if (!bot->isMoving())
+                    bot->GetMotionMaster()->MovePoint(0, veh->GetPositionX(), veh->GetPositionY(), veh->GetPositionZ());
+                return;
+            }
+        }
+
         uint32 const guidLow = bot->GetGUID().GetCounter();
         WgPt const& obj = (guidLow % 3 == 0) ? WG_WORKSHOP : WG_KEEP;
         float const tx = obj.x + float(int(guidLow % 7) - 3) * 10.0f;   // fan out so they don't stack
         float const ty = obj.y + float(int(guidLow / 7 % 7) - 3) * 10.0f;
         if (!bot->isMoving() && bot->GetExactDist2d(tx, ty) > 8.0f)
             bot->GetMotionMaster()->MovePoint(0, tx, ty, obj.z);
+    }
+
+    // ---- Attacker siege vehicles + hero war-enrolment --------------------------------
+
+    // The human's party HEROES (managed bots) queued WG with them but never accepted the
+    // pop, so they sat in Icecrown while the human fought alone (Mill). Enrol any managed
+    // hero whose human leader is IN the war: invite + accept + teleport to staging, exactly
+    // like the rndbot fills. Bounded by the battlefield's own war-vacancy checks.
+    static void EnrolHeroes(Battlefield* wg)
+    {
+        for (uint8 ti = 0; ti < 2; ++ti)
+        {
+            TeamId const team = TeamId(ti);
+            std::vector<ObjectGuid> participants(wg->GetPlayersInWarSet(team).begin(),
+                                                 wg->GetPlayersInWarSet(team).end());
+            for (ObjectGuid const& pg : participants)
+            {
+                Player* leader = ObjectAccessor::FindConnectedPlayer(pg);
+                if (!leader || sPlayerbotsMgr.GetPlayerbotAI(leader)) continue;   // humans only
+                std::vector<ObjectGuid> party;
+                WowPsParty::GetPartyGuidsFor(leader->GetGUID(), party);
+                for (ObjectGuid const& hg : party)
+                {
+                    if (hg == leader->GetGUID()) continue;
+                    Player* hero = ObjectAccessor::FindConnectedPlayer(hg);
+                    if (!hero || !sPlayerbotsMgr.GetPlayerbotAI(hero)) continue;   // managed heroes only
+                    if (hero->GetTeamId() != leader->GetTeamId()) continue;
+                    if (IsInWar(wg, hero)) continue;                                // already enrolled
+                    if (hero->GetZoneId() != WG_ZONE_ID) { TeleportToStaging(hero, wg); continue; }
+                    wg->InvitePlayerToWar(hero);
+                    wg->PlayerAcceptInviteToWar(hero);
+                }
+            }
+        }
+    }
+
+    // Drive every tracked attacker vehicle into the nearest intact keep wall and batter it.
+    // Cleans up vehicles that died / despawned / no longer have a war (returns the live count).
+    static uint32 DriveVehicles(Battlefield* wg)
+    {
+        std::vector<ObjectGuid> vguids;
+        { std::lock_guard<std::mutex> lk(g_wgMutex); for (auto const& kv : g_wgVehicles) vguids.push_back(kv.first); }
+        if (vguids.empty()) return 0;
+        // Anchor for creature lookups: any in-map war participant (creatures resolve via its map).
+        WorldObject* anchor = nullptr;
+        for (uint8 ti = 0; ti < 2 && !anchor; ++ti)
+            for (ObjectGuid const& g : wg->GetPlayersInWarSet(TeamId(ti)))
+                if (Player* p = ObjectAccessor::FindConnectedPlayer(g)) { anchor = p; break; }
+        if (!anchor) return uint32(vguids.size());   // can't resolve right now; assume still live
+        uint32 live = 0;
+        for (ObjectGuid const& vg : vguids)
+        {
+            Creature* veh = ObjectAccessor::GetCreature(*anchor, vg);
+            if (!veh || !veh->IsAlive())
+            {
+                if (veh) veh->DespawnOrUnsummon();
+                { std::lock_guard<std::mutex> lk(g_wgMutex); g_wgVehicles.erase(vg); }
+                continue;
+            }
+            ++live;
+            // Nearest intact wall to the vehicle (scan around it; the keep walls are clustered).
+            GameObject* wall = nullptr; float bestD = 1e9f;
+            std::list<GameObject*> walls;
+            WgWallCheck check(veh->GetPositionX(), veh->GetPositionY(), veh->GetPositionZ(), 300.0f);
+            Acore::GameObjectListSearcher<WgWallCheck> searcher(veh, walls, check);
+            Cell::VisitObjects(veh, searcher, 300.0f);
+            for (GameObject* w : walls)
+            {
+                float const d = veh->GetDistance(w);
+                if (d < bestD) { bestD = d; wall = w; }
+            }
+            if (!wall) continue;   // walls all down (battle nearly won) — nothing to batter
+            if (bestD > WG_VEH_WALL_RANGE)
+            {
+                if (!veh->isMoving())
+                    veh->GetMotionMaster()->MovePoint(0, wall->GetPositionX(), wall->GetPositionY(), wall->GetPositionZ());
+            }
+            else
+            {
+                uint32 const maxHp = wall->GetGOValue()->Building.MaxHealth;
+                int32 const dmg = std::max<int32>(1, int32(maxHp / WG_VEH_WALL_DMG_DEN));
+                wall->ModifyHealth(-dmg, veh);   // siege damage; WG building hooks react -> battle progresses
+            }
+        }
+        return live;
+    }
+
+    // Keep up to WG_MAX_VEHICLES attacker siege vehicles in the field. Spawn near the
+    // attacker staging and, if an idle attacking fill bot is free, seat it as the driver.
+    static void TopUpVehicles(Battlefield* wg, uint32 live)
+    {
+        if (live >= WG_MAX_VEHICLES || !wg->IsWarTime()) return;
+
+        TeamId const atk = wg->GetAttackerTeam();
+        Position const stage = (atk == TEAM_HORDE) ? Position(5025.857f, 3674.629f, 362.737f, 4.135f)
+                                                   : Position(5101.284f, 2186.564f, 365.549f, 3.812f);
+        uint32 const entries[4] = { atk == TEAM_ALLIANCE ? WG_VEH_SIEGE_ALLY : WG_VEH_SIEGE_HORDE,
+                                    WG_VEH_DEMOLISHER, WG_VEH_CATAPULT, WG_VEH_DEMOLISHER };
+        static uint32 vehRoll = 0;
+        uint32 const pick = entries[(vehRoll++) % 4];   // vary the entry across spawns
+        Creature* veh = wg->SpawnCreature(pick, stage, atk);
+        if (!veh) return;
+
+        // Seat an idle attacking fill bot as the driver (flavour — the vehicle drives itself
+        // server-side regardless). Pick one not already in a vehicle / fighting.
+        ObjectGuid driver;
+        {
+            std::vector<uint32> cand;
+            { std::lock_guard<std::mutex> lk(g_wgMutex);
+              for (auto const& kv : g_wgBots) if (kv.second.team == uint32(atk) && kv.second.enrolled) cand.push_back(kv.first); }
+            for (uint32 bl : cand)
+            {
+                Player* b = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(bl));
+                if (!b || !b->IsAlive() || b->GetVehicle() || b->IsInCombat()) continue;
+                b->EnterVehicle(veh, 0);
+                driver = b->GetGUID();
+                break;
+            }
+        }
+        { std::lock_guard<std::mutex> lk(g_wgMutex); g_wgVehicles[veh->GetGUID()] = WgVehicle{ driver, getMSTime() }; }
+        LOG_INFO("module", "[WowPsParty WGFill] spawned attacker vehicle entry={} (live now {})", pick, live + 1);
     }
 
     // Spawn rndbot-pool chars (race-correct, offline, prefer already-high-level to skip
@@ -1337,6 +1529,35 @@ private:
         if (spawned)
             LOG_INFO("module", "[WowPsParty WGFill] {} side: spawned {} (have {} -> target {})",
                      team == TEAM_ALLIANCE ? "Alliance" : "Horde", spawned, have, WG_TARGET_PER_SIDE);
+    }
+
+    // War over: despawn every tracked attacker siege vehicle and clear the tracking map so
+    // neither the creatures nor the dict leak across battles (DriveVehicles — the only other
+    // place that erases them — doesn't run once IsWarTime() is false). The map is cleared
+    // unconditionally (no tracking leak even if no anchor is loaded to resolve the creatures);
+    // a still-loaded fill bot serves as the anchor to actually despawn the creatures, and
+    // fills linger for several post-war ticks (DespawnSome is gradual) so one is available.
+    static void DespawnVehicles()
+    {
+        std::vector<ObjectGuid> vguids;
+        {
+            std::lock_guard<std::mutex> lk(g_wgMutex);
+            for (auto const& kv : g_wgVehicles) vguids.push_back(kv.first);
+            g_wgVehicles.clear();
+        }
+        if (vguids.empty()) return;
+        WorldObject* anchor = nullptr;
+        {
+            std::vector<uint32> bl;
+            { std::lock_guard<std::mutex> lk(g_wgMutex); for (auto const& kv : g_wgBots) bl.push_back(kv.first); }
+            for (uint32 b : bl)
+                if (Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(b)))
+                { anchor = p; break; }
+        }
+        if (!anchor) return;
+        for (ObjectGuid const& vg : vguids)
+            if (Creature* v = ObjectAccessor::GetCreature(*anchor, vg))
+                v->DespawnOrUnsummon();
     }
 
     // Log out up to n fills (gradual, so a battle-end teardown of ~60 bots never spikes).
