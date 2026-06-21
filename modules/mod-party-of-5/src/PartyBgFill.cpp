@@ -51,9 +51,12 @@
 #include "PartyMgr.h"
 #include "PartyFollow.h"
 
+#include "ArenaTeam.h"        // rated-arena enemy fill: bot arena teams
+#include "ArenaTeamMgr.h"     // sArenaTeamMgr->GetArenaTeamById
 #include "Battleground.h"
 #include "BattlegroundMgr.h"
 #include "BattlegroundQueue.h"
+#include "GroupMgr.h"         // sGroupMgr->AddGroup for the bot arena team's group
 #include "Chat.h"
 #include "DBCStores.h"        // GetBattlegroundBracketByLevel
 #include "DBCStructure.h"     // PvPDifficultyEntry
@@ -446,14 +449,297 @@ namespace
         }
         return 0;
     }
+
+    // ===== Rated ARENA enemy fill (Phase 1) ================================
+    // A rated arena queue can only pop against an OPPOSING arena team. When a managed
+    // party's leader queues rated, pick a full, opposite-faction bot arena team whose
+    // rating is nearest the human's (so it pops promptly AND the result is a real rated
+    // win/loss — ratings stay spread), log its members in, group them under the captain,
+    // queue the team rated, and drive it to accept the pop. Bot teams already exist in
+    // the DB (arena_team); Phase 2 will top them up to 15/bracket + add an hourly
+    // bot-vs-bot loop to spread ratings. Mirrors HandleBattlemasterJoinArena's rated path.
+    struct ArenaFillSession
+    {
+        uint32 leaderLow;
+        uint8  arenaType;            // 2 / 3 / 5
+        uint32 botTeamId;
+        std::vector<uint32> members; // bot member guidLows (captain first)
+        uint32 spawnMs;
+        bool   queued  = false;
+        bool   entered = false;      // a bot made it into the arena instance
+        uint32 outSinceMs = 0;       // first tick all bots read !InBattleground after entering
+    };
+    std::unordered_map<uint32, ArenaFillSession> g_arenaFills;   // leaderLow -> session
+
+    void RetireArenaFill(uint32 leaderLow)
+    {
+        ArenaFillSession s;
+        {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            auto it = g_arenaFills.find(leaderLow);
+            if (it == g_arenaFills.end()) return;
+            s = it->second;
+            g_arenaFills.erase(it);
+        }
+        for (uint32 g : s.members)
+        {
+            ObjectGuid const bg = ObjectGuid::Create<HighGuid::Player>(g);
+            Player* b = ObjectAccessor::FindConnectedPlayer(bg);
+            if (!b || !b->GetSession()) continue;
+            if (b->IsBeingTeleported() || !b->IsInWorld()) continue;   // never log out mid-port
+            if (b->GetGroup()) b->RemoveFromGroup();
+            // master-0 (rndbot) bots register on sRandomPlayerbotMgr's holder, NOT the
+            // leader's, so log them out THERE — the WG fill uses the same call.
+            sRandomPlayerbotMgr.LogoutPlayerBot(bg);
+        }
+    }
+
+    // Form the bot team into a group and queue it rated. Mirrors the rated branch of
+    // WorldSession::HandleBattlemasterJoinArena (AddGroup + per-member AddBattlegroundQueueId
+    // + ScheduleQueueUpdate). Called from the world tick once every member is online.
+    void QueueBotArenaTeam(uint32 leaderLow)
+    {
+        ArenaFillSession s;
+        {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            auto it = g_arenaFills.find(leaderLow);
+            if (it == g_arenaFills.end() || it->second.queued) return;
+            s = it->second;
+        }
+        ArenaTeam* at = sArenaTeamMgr->GetArenaTeamById(s.botTeamId);
+        if (!at) { RetireArenaFill(leaderLow); return; }
+        Player* captain = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(s.members.front()));
+        if (!captain) { RetireArenaFill(leaderLow); return; }
+
+        // BattlegroundQueue::AddGroup ASSERTs no member is already queued — a stale-queued
+        // bot (mid-retire, or pulled into another fill) would crash the worldserver. Bail
+        // softly instead; the session retires and the human can re-queue.
+        for (uint32 g : s.members)
+        {
+            Player* m = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g));
+            if (m && m->InBattlegroundQueue()) { RetireArenaFill(leaderLow); return; }
+        }
+
+        if (captain->GetGroup()) captain->RemoveFromGroup();
+        Group* grp = new Group();
+        if (!grp->Create(captain)) { delete grp; RetireArenaFill(leaderLow); return; }
+        sGroupMgr->AddGroup(grp);
+        for (size_t i = 1; i < s.members.size(); ++i)
+        {
+            Player* m = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(s.members[i]));
+            if (!m) continue;
+            if (m->GetGroup()) m->RemoveFromGroup();
+            grp->AddMember(m);
+        }
+
+        Battleground* bgt = sBattlegroundMgr->GetBattlegroundTemplate(BATTLEGROUND_AA);
+        if (!bgt) { RetireArenaFill(leaderLow); return; }
+        PvPDifficultyEntry const* bracket = GetBattlegroundBracketByLevel(bgt->GetMapId(), captain->GetLevel());
+        if (!bracket) { RetireArenaFill(leaderLow); return; }
+        uint8 const arenatype = s.arenaType;
+        BattlegroundQueueTypeId const qt = BattlegroundMgr::BGQueueTypeId(BATTLEGROUND_AA, arenatype);
+        BattlegroundQueue& q = sBattlegroundMgr->GetBattlegroundQueue(qt);
+        uint32 rating = at->GetRating();
+        if (rating == 0) rating = 1;
+        uint32 const mmr = at->GetAverageMMR(grp);
+        bgt->SetRated(true);
+        q.AddGroup(captain, grp, BATTLEGROUND_AA, bracket, arenatype, /*isRated=*/true, /*isPremade=*/false,
+                   rating, mmr, at->GetId(), at->GetPreviousOpponents());
+        for (GroupReference* itr = grp->GetFirstMember(); itr; itr = itr->next())
+            if (Player* mm = itr->GetSource())
+                mm->AddBattlegroundQueueId(qt);
+        sBattlegroundMgr->ScheduleQueueUpdate(mmr, arenatype, qt, BATTLEGROUND_AA, bracket->GetBracketId());
+
+        { std::lock_guard<std::mutex> lk(g_mutex);
+          auto it = g_arenaFills.find(leaderLow);
+          if (it != g_arenaFills.end()) it->second.queued = true; }
+        LOG_INFO("module",
+            "[WowPsParty ArenaFill] bot team {} queued rated {}v{} (rating {}, mmr {}) to face leader {}",
+            at->GetId(), uint32(arenatype), uint32(arenatype), rating, mmr, leaderLow);
+    }
+
+    void StartArenaFill(Player* human, uint8 arenaType)
+    {
+        if (!human || !human->GetSession()) return;
+        uint32 const leaderLow = human->GetGUID().GetCounter();
+        { std::lock_guard<std::mutex> lk(g_mutex); if (g_arenaFills.count(leaderLow)) return; }   // one session per leader
+
+        uint8 const slot = ArenaTeam::GetSlotByType(arenaType);
+        uint32 const humanTeamId = human->GetArenaTeamId(slot);
+        if (!humanTeamId) return;   // not a rated team queue
+        ArenaTeam* hat = sArenaTeamMgr->GetArenaTeamById(humanTeamId);
+        uint32 humanRating = hat ? hat->GetRating() : 0;
+        if (humanRating == 0) humanRating = 1500;   // fresh team — match mid-ladder
+
+        bool const allianceHuman = human->GetTeamId() == TEAM_ALLIANCE;
+        char const* const oppRaces = RaceCsv(!allianceHuman);   // bot CAPTAIN must be opposite faction (queue bucket)
+
+        // Nearest-rating, FULL, opposite-faction bot team with NO member currently online
+        // (a busy member can't log in for the match — one char per account).
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT at.arenaTeamId, at.captainGuid FROM arena_team at "
+            "JOIN characters cap ON cap.guid = at.captainGuid "
+            "WHERE at.type = {} AND cap.race IN ({}) AND at.arenaTeamId <> {} "
+            "AND (SELECT COUNT(*) FROM arena_team_member m WHERE m.arenaTeamId = at.arenaTeamId) = {} "
+            "AND NOT EXISTS (SELECT 1 FROM arena_team_member m JOIN characters mc ON mc.guid = m.guid "
+            "WHERE m.arenaTeamId = at.arenaTeamId AND mc.online = 1) "
+            "ORDER BY ABS(CAST(at.rating AS SIGNED) - {}) ASC LIMIT 1",
+            uint32(arenaType), oppRaces, humanTeamId, uint32(arenaType), humanRating);
+        if (!q)
+        {
+            ChatHandler(human->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Rated arena: no free bot team to match right now — try again in a moment.");
+            LOG_INFO("module", "[WowPsParty ArenaFill] {} rated {}v{}: no available opposite-faction bot team",
+                     human->GetName(), uint32(arenaType), uint32(arenaType));
+            return;
+        }
+        uint32 const teamId     = q->Fetch()[0].Get<uint32>();
+        uint32 const captainLow = q->Fetch()[1].Get<uint32>();
+
+        std::vector<uint32> members;
+        members.push_back(captainLow);
+        if (QueryResult mq = CharacterDatabase.Query(
+                "SELECT guid FROM arena_team_member WHERE arenaTeamId = {} AND guid <> {}", teamId, captainLow))
+            do { members.push_back(mq->Fetch()[0].Get<uint32>()); } while (mq->NextRow());
+
+        PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(human);
+        if (!mgr) return;
+        for (uint32 g : members)
+            mgr->AddPlayerBot(ObjectGuid::Create<HighGuid::Player>(g), 0);   // master 0 -> rndbot bypass
+
+        { std::lock_guard<std::mutex> lk(g_mutex);
+          g_arenaFills[leaderLow] = ArenaFillSession{ leaderLow, arenaType, teamId, members, getMSTime(), false, false, 0 }; }
+        LOG_INFO("module",
+            "[WowPsParty ArenaFill] {} queued rated {}v{} — spawning bot team {} ({} members) to match (humanRating {})",
+            human->GetName(), uint32(arenaType), uint32(arenaType), teamId, uint32(members.size()), humanRating);
+    }
+
+    // World-tick driver: queue the bot team once its members are online, accept the pop,
+    // and retire (log out) the bots once the match ends. Reuses AcceptBgInvite (it ports
+    // via a deferred CMSG_BATTLEFIELD_PORT, the same crash-safe path the BG fill uses).
+    void DriveArenaFills()
+    {
+        std::vector<uint32> leaders;
+        { std::lock_guard<std::mutex> lk(g_mutex);
+          if (g_arenaFills.empty()) return;
+          for (auto const& kv : g_arenaFills) leaders.push_back(kv.first); }
+
+        for (uint32 leaderLow : leaders)
+        {
+            ArenaFillSession s;
+            { std::lock_guard<std::mutex> lk(g_mutex);
+              auto it = g_arenaFills.find(leaderLow); if (it == g_arenaFills.end()) continue; s = it->second; }
+
+            std::vector<Player*> bots;
+            for (uint32 g : s.members)
+                if (Player* b = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g)))
+                    bots.push_back(b);
+            Player* leader = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(leaderLow));
+
+            if (!s.queued)
+            {
+                if (bots.size() < s.members.size())   // still logging in
+                {
+                    if (getMSTime() - s.spawnMs > FILL_SPAWN_GRACE_MS)
+                    {
+                        LOG_INFO("module", "[WowPsParty ArenaFill] bot team {} never fully logged in — retiring", s.botTeamId);
+                        RetireArenaFill(leaderLow);
+                    }
+                    continue;
+                }
+                // Leader left the queue before we could field the enemy → stand down.
+                if (!leader || (!leader->InBattleground() && !leader->InBattlegroundQueue()))
+                { RetireArenaFill(leaderLow); continue; }
+                QueueBotArenaTeam(leaderLow);
+                continue;
+            }
+
+            // Queued: accept the pop / track the match.
+            bool anyIn = false;
+            for (Player* b : bots)
+            {
+                if (b->InBattleground())
+                {
+                    anyIn = true;
+                    // master-0 bots aren't IsRandomBot(), so AiFactory never gave them a
+                    // PvP strategy — without this they stand AFK and the human wins by
+                    // default. The "bg" strategy has an isArena() branch, so it drives
+                    // arena combat too. Add once (HasStrategy-guarded; re-add resets pathing).
+                    if (sPlayerbotAIConfig.randomBotJoinBG)
+                        if (PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(b))
+                            if (!ai->HasStrategy("bg", BOT_STATE_NON_COMBAT))
+                                ai->ChangeStrategy("+bg", BOT_STATE_NON_COMBAT);
+                    continue;
+                }
+                if (!b->IsBeingTeleported()) AcceptBgInvite(b);
+            }
+            if (anyIn)
+            {
+                if (!s.entered)
+                { std::lock_guard<std::mutex> lk(g_mutex);
+                  auto it = g_arenaFills.find(leaderLow); if (it != g_arenaFills.end()) { it->second.entered = true; it->second.outSinceMs = 0; } }
+                continue;
+            }
+            if (s.entered)
+            {
+                // Entered, now nobody's in → match ended (grace against a flicker).
+                uint32 const now = getMSTime();
+                if (!s.outSinceMs)
+                { std::lock_guard<std::mutex> lk(g_mutex);
+                  auto it = g_arenaFills.find(leaderLow); if (it != g_arenaFills.end()) it->second.outSinceMs = now; continue; }
+                if (now - s.outSinceMs < BG_OUT_GRACE_MS) continue;
+                RetireArenaFill(leaderLow);
+                continue;
+            }
+            // Queued but never entered: pop timed out / leader bailed → retire after a while.
+            if ((!leader || (!leader->InBattleground() && !leader->InBattlegroundQueue()))
+                && getMSTime() - s.spawnMs > FILL_SPAWN_GRACE_MS)
+                RetireArenaFill(leaderLow);
+        }
+    }
 }
 
 class PartyBgFillPlayerScript : public PlayerScript
 {
 public:
     PartyBgFillPlayerScript() : PlayerScript("PartyBgFillPlayerScript", {
-        PLAYERHOOK_ON_PLAYER_JOIN_BG
+        PLAYERHOOK_ON_PLAYER_JOIN_BG,
+        PLAYERHOOK_ON_PLAYER_JOIN_ARENA
     }) { }
+
+    // Rated arena: a queue can only pop against an opposing arena team, so when a
+    // managed party's leader queues rated, field an opposite-faction bot team (see
+    // StartArenaFill). The hook fires per group member — react only to the human
+    // team LEADER queuing a RATED bracket (i.e. they hold an arena team for the slot).
+    void OnPlayerJoinArena(Player* player) override
+    {
+        if (!WowPsParty::IsEnabled() || !player || !player->GetSession()) return;
+        if (sPlayerbotsMgr.GetPlayerbotAI(player)) return;   // a bot queued; only the human leader
+
+        uint8 arenaType = 0;
+        BattlegroundQueueTypeId arenaQt = BATTLEGROUND_QUEUE_NONE;
+        for (uint8 i = 0; i < PLAYER_MAX_BATTLEGROUND_QUEUES; ++i)
+        {
+            BattlegroundQueueTypeId const qt = player->GetBattlegroundQueueTypeId(i);
+            if (qt == BATTLEGROUND_QUEUE_NONE) continue;
+            if (uint8 const at = BattlegroundMgr::BGArenaType(qt)) { arenaType = at; arenaQt = qt; break; }
+        }
+        if (!arenaType) return;                                            // not an arena queue
+        if (Group* g = player->GetGroup())
+            if (g->GetLeaderGUID() != player->GetGUID()) return;           // only the team leader
+        std::vector<ObjectGuid> party;
+        WowPsParty::GetPartyGuidsFor(player->GetGUID(), party);
+        if (party.size() < 2) return;                                      // managed party only
+        // Only fill for a RATED queue — the hook ALSO fires for skirmish (which needs no
+        // team and shouldn't force a rated bot match). The authoritative flag lives on the
+        // queue entry the core just created (read it back, as AcceptBgInvite does).
+        {
+            BattlegroundQueue& q = sBattlegroundMgr->GetBattlegroundQueue(arenaQt);
+            GroupQueueInfo gi;
+            if (!q.GetPlayerGroupInfoData(player->GetGUID(), &gi) || !gi.IsRated) return;
+        }
+        StartArenaFill(player, arenaType);
+    }
 
     void OnPlayerJoinBG(Player* player) override
     {
@@ -500,6 +786,10 @@ public:
         _accum += diff;
         if (_accum < 1000) return;
         _accum = 0;
+
+        // Rated-arena enemy fill runs on the same 1s cadence (its own state map, so it
+        // must run BEFORE the BG-fill early-return below).
+        DriveArenaFills();
 
         std::vector<std::pair<uint32, FillEntry>> fills;
         std::vector<std::pair<uint32, uint32>>    leaders;
