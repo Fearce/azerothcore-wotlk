@@ -2057,26 +2057,54 @@ namespace WowPsParty
     // combat + rested), this is a deliberate manual override that works MID-FIGHT
     // — exactly the "grab the next pack now" control a Mythic+ chain-pull needs.
 
-    // The single nearest pull candidate to the tank within `range` — un-aggroed,
-    // attackable, similar-Z, in-LoS (GatherEligible, defined above). Deliberately
-    // the NEAREST mob, not the best-fitting social group: the bind says "pull the
-    // one nearest extra", so neighbours that social-aggro in are the player's call.
-    static Unit* FindNearestPullExtra(Player* tank, float range)
+    // Defined later in this file (before AssistTarget).
+    static bool NavReachable(Player* bot, float x, float y, float z, float straight);
+
+    // How far the "pull more" BIND reaches. Deliberately huge so the player can
+    // chain-pull across a whole dungeon by spamming the bind, dragging the tank (and
+    // its current mob) toward the next pack a little at a time.
+    static constexpr float PULL_MORE_BIND_RANGE = 200.0f;
+
+    // Pull candidate for the "pull more" BIND ONLY. This is INTENTIONALLY far more
+    // permissive than the rotation-editor auto-pull (GatherEligible / TankLeadEngagement,
+    // which keep their tight 60y + LoS + 6y-Z rules — DO NOT route the auto-pull through
+    // here): the bind searches a wide radius around the HUMAN, ignores line of sight (the
+    // tank navmesh-paths to it even out of view), and uses a generous Z so multi-level
+    // dungeons work. Returns the un-aggroed mob NEAREST THE HUMAN that the tank can
+    // actually path to — the next pack the player is looking at — so repeated presses
+    // drag the tank toward it.
+    static Unit* FindPullExtraForBind(Player* tank, Player* leader, float range)
     {
-        if (!tank) return nullptr;
+        if (!tank || !leader) return nullptr;
         std::list<Unit*> nearby;
-        Acore::AnyUnfriendlyUnitInObjectRangeCheck check(tank, tank, range);
-        Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck> searcher(tank, nearby, check);
-        Cell::VisitObjects(tank, searcher, range);
-        Unit* best = nullptr;
-        float bestD = 0.0f;
+        Acore::AnyUnfriendlyUnitInObjectRangeCheck check(leader, leader, range);
+        Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck> searcher(leader, nearby, check);
+        Cell::VisitObjects(leader, searcher, range);
+
+        std::vector<Unit*> cands;
         for (Unit* u : nearby)
         {
-            if (!GatherEligible(tank, u)) continue;
-            float const d = tank->GetDistance(u);
-            if (!best || d < bestD) { best = u; bestD = d; }
+            if (!u || !u->IsAlive() || u->IsInCombat()) continue;   // un-aggroed only (a NEW pack)
+            if (!u->ToCreature() || u->IsTotem()) continue;          // real mobs, not totems/objects
+            if (!tank->IsValidAttackTarget(u)) continue;             // hostile + attackable
+            // NO LoS check (fetch packs out of sight), and a GENEROUS Z (vs the auto-pull's
+            // 6y) so a ramp/upper platform doesn't exclude the next pack.
+            if (std::fabs(u->GetPositionZ() - leader->GetPositionZ()) > 60.0f) continue;
+            cands.push_back(u);
         }
-        return best;
+        // Nearest THE HUMAN first (it's the next pack the player sees), and prefer one the
+        // tank can navmesh-reach so a press isn't wasted on an unreachable mob.
+        std::sort(cands.begin(), cands.end(),
+                  [&](Unit* a, Unit* b){ return leader->GetDistance(a) < leader->GetDistance(b); });
+        for (Unit* u : cands)
+        {
+            float const dx = u->GetPositionX() - tank->GetPositionX();
+            float const dy = u->GetPositionY() - tank->GetPositionY();
+            if (NavReachable(tank, u->GetPositionX(), u->GetPositionY(), u->GetPositionZ(),
+                             std::sqrt(dx * dx + dy * dy)))
+                return u;
+        }
+        return cands.empty() ? nullptr : cands.front();   // nothing cleanly reachable — try the nearest anyway
     }
 
     void PullNearestExtra(Player* leader, uint32 holdMs)
@@ -2100,11 +2128,13 @@ namespace WowPsParty
         { notify("|cff66ccff[WowPsParty]|r Pull more: tank isn't with you."); return; }
         if (tank->HasUnitFlag(UNIT_FLAG_POSSESSED)) return;   // human is driving the tank
 
-        Unit* mob = FindNearestPullExtra(tank, GATHER_SCAN);
+        // BIND-only finder: 200y around the HUMAN, ignores LoS, nearest-to-human, tank
+        // navmesh-paths there. (The rotation-editor pull config is unaffected.)
+        Unit* mob = FindPullExtraForBind(tank, leader, PULL_MORE_BIND_RANGE);
         if (!mob)
         {
             ClearTankPullMore(tank->GetGUID().GetCounter());
-            notify("|cff66ccff[WowPsParty]|r Pull more: no out-of-combat mob in range.");
+            notify("|cff66ccff[WowPsParty]|r Pull more: no out-of-combat mob within 200y.");
             return;
         }
 
