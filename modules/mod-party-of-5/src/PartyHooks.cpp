@@ -14,6 +14,7 @@
 #include "DBCStores.h"   // sLockStore — identify "key" items that open world objects
 #include "Group.h"
 #include "GroupMgr.h"
+#include "LFGMgr.h"      // clear a stale group LFG state after a BG (dungeon-finder unblock)
 #include "Bag.h"
 #include "Item.h"
 #include "ItemTemplate.h"
@@ -416,8 +417,51 @@ public:
         PLAYERHOOK_ON_LEVEL_CHANGED,
         PLAYERHOOK_ON_QUEST_ABANDON,
         PLAYERHOOK_ON_LEARN_TAXI_NODE,
-        PLAYERHOOK_ON_MAP_CHANGED
+        PLAYERHOOK_ON_MAP_CHANGED,
+        PLAYERHOOK_ON_REMOVE_FROM_BATTLEGROUND
     }) { }
+
+    // After a managed party leaves a BG, the dungeon finder can be wrongly disabled
+    // ("Join as Party" greyed, can't queue anything "like I'm not the leader") even
+    // though the DB group is fine and the leader icon shows — a runtime state stuck on
+    // the GROUP that survives relog (the in-memory group persists via the hero bots) and
+    // is only cleared by kick+reinvite (a fresh group) or a server restart.
+    // Log the exact post-BG group state to pin the cause, and clear a stale LFG state
+    // (the most likely culprit: the group reads as "in the dungeon system"). Deferred so
+    // it runs AFTER the BG-group teardown + original-group restore.
+    void OnPlayerRemoveFromBattleground(Player* player, Battleground* /*bg*/) override
+    {
+        if (!WowPsParty::IsEnabled() || !player || !player->GetSession()) return;
+        if (sPlayerbotsMgr.GetPlayerbotAI(player)) return;            // human leader only
+        if (WowPsParty::CountFollowersFor(player->GetGUID()) == 0) return;   // managed party only
+        ObjectGuid const guid = player->GetGUID();
+        player->m_Events.AddEventAtOffset([guid]()
+        {
+            Player* p = ObjectAccessor::FindConnectedPlayer(guid);
+            if (!p) return;
+            Group* grp = p->GetGroup();
+            ObjectGuid const gg = grp ? grp->GetGUID() : ObjectGuid::Empty;
+            lfg::LfgState const pState = sLFGMgr->GetState(guid);
+            lfg::LfgState const gState = gg ? sLFGMgr->GetState(gg) : lfg::LFG_STATE_NONE;
+            LOG_INFO("module",
+                "[WowPsParty BGLeave] {} post-BG: leader={} grp={} isLFGGroup={} isBGGroup={} isRaid={} playerLfg={} groupLfg={}",
+                p->GetName(), grp && grp->IsLeader(guid),
+                gg.GetCounter(), grp && grp->isLFGGroup(), grp && grp->isBGGroup(),
+                grp && grp->isRaidGroup(), int(pState), int(gState));
+            // Clear a stale LFG state when we're NOT actually in an LFG dungeon group, so
+            // the dungeon finder stops treating the party as "in the LFG system". Real
+            // LFG_STATE_QUEUED (still in the finder) is left alone. LeaveLfg also pushes an
+            // LFG update to the client, which re-enables the greyed "Join as Party".
+            bool const inLfgGroup = grp && grp->isLFGGroup();
+            if (!inLfgGroup)
+            {
+                if (pState != lfg::LFG_STATE_NONE && pState != lfg::LFG_STATE_QUEUED)
+                    sLFGMgr->LeaveLfg(guid);
+                if (gg && gState != lfg::LFG_STATE_NONE && gState != lfg::LFG_STATE_QUEUED)
+                    sLFGMgr->LeaveLfg(gg);
+            }
+        }, std::chrono::seconds(2));
+    }
 
     // On entering a dungeon, tell the party leader whether a tank route is recorded
     // for this map — so it's obvious up front whether the tank will lead the pull
