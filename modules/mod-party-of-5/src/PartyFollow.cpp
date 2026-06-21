@@ -1224,11 +1224,12 @@ namespace WowPsParty
             auto it = g_safePull.find(guid.GetCounter());
             if (it != g_safePull.end()) return it->second != 0;
         }
-        // Unset: per-type default. IsHenchman takes a DIFFERENT lock, so this call
-        // is outside the g_safePullMutex scope above (no nested locking). A henchman
-        // BARGES by default (the safe ranged opener is unnecessary for hired fill);
-        // a hero/alt keeps the safe pull.
-        return !IsHenchman(guid);
+        // Unset: OFF by default for EVERYONE — the tank BODY-PULLS (walks in) by default
+        // and only does the ranged-pull-and-step-back opener when safe_pull is explicitly
+        // enabled in the editor (Mill: "taunt/ranged is only for safe-pull, which should
+        // default to disabled"). Previously heroes safe-pulled by default, which made the
+        // opener stand at range and Heroic-Throw instead of walking in.
+        return false;
     }
 
     void SafePullRefreshFromDB(uint32 guidLow)
@@ -1862,16 +1863,17 @@ namespace WowPsParty
         set.push_back(add->GetGUID());
         MarkTankGathering(tankLow, set);
 
-        // The taunt-instead-of-walk optimisation is ONLY for a top-up add once the tank
-        // is ALREADY engaged. The OPENER (engaged==0) is always WALKED in — otherwise a
-        // pack whose social group already fills N makes the opener "final" and the tank
-        // Heroic-Throws it from ~28y then stands waiting for it to walk over (Yltas in
-        // RFK: "tries to range-pull then stands there for ages"). Walking opens cleanly.
+        // BODY-PULL by default: WALK to every add. The taunt-instead-of-walk shortcut is
+        // gated on the per-tank safe_pull toggle (now OFF by default) — Mill: "the tank
+        // should absolutely not taunt on a pull it's going to body-pull anyway; taunt is
+        // only for safe-pull." A tank that simply CAN'T walk (dazed/rooted) still taunts
+        // as the only option. The OPENER (engaged==0) is never "final", so it always walks.
         bool const isFinal = (engaged > 0 && engaged + grp >= targetN);   // a TOP-UP add that reaches the target
         bool const canWalk = TankCanWalkFreely(tank);
+        bool const safePull = WowPsParty::GetSafePull(tank->GetGUID());
 
-        // Final top-up add, or can't walk (dazed) -> taunt it in rather than trekking over.
-        if (isFinal || !canWalk)
+        // Safe-pull final top-up add, or can't walk (dazed) -> taunt it in; else walk.
+        if ((safePull && isFinal) || !canWalk)
         {
             if (TryTankFastRangedPull(tank, add))
             {
@@ -5415,8 +5417,20 @@ namespace WowPsParty
             float const movedSelf = std::sqrt(dxs * dxs + dys * dys);
             s.x = follower->GetPositionX();
             s.y = follower->GetPositionY();
-            if (dist > 8.0f && movedSelf < 1.0f) ++s.idle;
-            else { s.idle = 0; s.unstickAttempts = 0; }   // moved or caught up = recovered
+            // The LEAD TANK legitimately stands STILL several yards AHEAD of the leader
+            // (its lead-distance spot) whenever the leader is stationary — that's leading,
+            // NOT being stuck. Without this the stuck-detector flags it (dist>8, not moving)
+            // and teleports it back onto the leader, which then walks out to its lead spot
+            // and gets teleported again: the "tank stands around, teleports to me, resets
+            // to formation, oscillates" report. Only exempt while it's roughly AT its lead
+            // spot of a STATIONARY leader; a moving leader (it should be following) or a
+            // far gap (a real wedge) still arms the detector.
+            bool const leadTankHolding =
+                leader->GetMap() && leader->GetMap()->IsDungeon()
+                && IsLeadTank(d.followerGuid) && !leader->isMoving()
+                && dist <= float(WowPsParty::BotLeadDistance(d.followerGuid)) + 6.0f;
+            if (dist > 8.0f && movedSelf < 1.0f && !leadTankHolding) ++s.idle;
+            else { s.idle = 0; s.unstickAttempts = 0; }   // moved / caught up / leading = recovered
             // Genuine long-distance gaps are already handled above (the >50y
             // leash re-walks, >100y snaps), so by here dist <= 50: a "stuck" bot
             // is idle-frozen, NOT far. Two distinct causes, two remedies:
@@ -5553,14 +5567,14 @@ namespace WowPsParty
                 auto& la = leadAssert[d.followerGuid.GetCounter()];
                 bool const leadChanged = la.first != leader->GetGUID().GetCounter()
                                       || std::fabs(la.second - leadDist) > 0.01f;
-                // Reassert too when the tank is sitting much CLOSER than the lead
-                // distance: another follow path (the unstick / catch-up code installs a
-                // REAR pet-distance MoveFollow) can leave a FOLLOW generator at the wrong
-                // offset, which the gen+leadChanged dedup alone wouldn't notice — the tank
-                // would then trail BEHIND instead of leading until the next combat. While
-                // the tank is genuinely catching up to the lead spot it's also "too close",
-                // so this keeps driving it forward, which is exactly what we want.
-                bool const tooClose = follower->GetDistance(leader) < leadDist - 4.0f;
+                // Reassert too when the tank is sitting RIGHT ON the leader (< 4y): another
+                // follow path (a catch-up teleport-onto-leader, or a rear pet-distance
+                // MoveFollow) can leave it stacked on the leader with a FOLLOW generator the
+                // gen+leadChanged dedup wouldn't notice — it'd trail behind instead of
+                // leading. An ABSOLUTE small threshold (below the 5y minimum lead distance)
+                // so it only catches that stacked case, NOT the normal walk out to a distant
+                // lead spot (which would otherwise re-issue every tick and stutter).
+                bool const tooClose = follower->GetDistance(leader) < 4.0f;
                 if (lmg != FOLLOW_MOTION_TYPE || leadChanged || tooClose)
                 {
                     follower->GetMotionMaster()->Clear();
