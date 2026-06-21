@@ -659,7 +659,7 @@ namespace
             {
                 std::vector<ObjectGuid> party;
                 WowPsParty::GetPartyGuidsFor(leader->GetGUID(), party);
-                int found = 0, inGrp = 0, inQ = 0, inBg = 0;
+                int found = 0, inGrp = 0, inQ = 0, invited = 0, inBg = 0;
                 Group* const lgrp = leader->GetGroup();
                 for (ObjectGuid const& g : party)
                 {
@@ -670,11 +670,23 @@ namespace
                     if (lgrp && lgrp->IsMember(g)) ++inGrp;
                     if (pb->InBattleground()) { ++inBg; continue; }
                     if (pb->InBattlegroundQueue()) ++inQ;
+                    // Does this hero actually have a PENDING INVITE (vs just sitting in queue)?
+                    // This is THE missing datum: invited=0 => the match never invited them
+                    // (group/queue-info problem); invited>0 but inBg stays 0 => the PORT is
+                    // being rejected (group churn / port-handler), not an invite problem.
+                    for (uint8 qi = 0; qi < PLAYER_MAX_BATTLEGROUND_QUEUES; ++qi)
+                    {
+                        BattlegroundQueueTypeId const qt = pb->GetBattlegroundQueueTypeId(qi);
+                        if (qt == BATTLEGROUND_QUEUE_NONE) continue;
+                        GroupQueueInfo gi;
+                        if (sBattlegroundMgr->GetBattlegroundQueue(qt).GetPlayerGroupInfoData(pb->GetGUID(), &gi)
+                            && gi.IsInvitedToBGInstanceGUID && gi.RemoveInviteTime)
+                        { ++invited; break; }
+                    }
                     if (pb->IsBeingTeleported()) continue;
                     AcceptBgInvite(pb);
                 }
-                // DIAGNOSTIC (throttled): why is it 1v5? Shows whether the heroes are in the
-                // leader's WoW group / in the arena queue at all (no queue => no invite to accept).
+                // DIAGNOSTIC (throttled): why is it 1v5? grp membership + queue + INVITE status.
                 static thread_local std::unordered_map<uint32, uint32> heroLogMs;
                 uint32 const nowL = getMSTime();
                 uint32& hl = heroLogMs[leaderLow];
@@ -682,8 +694,8 @@ namespace
                 {
                     hl = nowL;
                     LOG_INFO("module",
-                        "[WowPsParty ArenaFill] hero-drive leader={} grpSize={} heroesFound={} inLeaderGrp={} inArenaQueue={} inBg={}",
-                        leaderLow, lgrp ? uint32(lgrp->GetMembersCount()) : 0u, found, inGrp, inQ, inBg);
+                        "[WowPsParty ArenaFill] hero-drive leader={} grpSize={} heroesFound={} inLeaderGrp={} inArenaQueue={} invited={} inBg={}",
+                        leaderLow, lgrp ? uint32(lgrp->GetMembersCount()) : 0u, found, inGrp, inQ, invited, inBg);
                 }
             }
 
