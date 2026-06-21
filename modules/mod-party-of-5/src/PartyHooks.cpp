@@ -1004,11 +1004,15 @@ public:
     PartyDamageTrackScript() : UnitScript("PartyDamageTrackScript", true,
         { UNITHOOK_MODIFY_SPELL_DAMAGE_TAKEN, UNITHOOK_MODIFY_PERIODIC_DAMAGE_AURAS_TICK }) { }
 
-    void ModifySpellDamageTaken(Unit* target, Unit* /*attacker*/, int32& /*damage*/, SpellInfo const* spellInfo) override
+    void ModifySpellDamageTaken(Unit* target, Unit* attacker, int32& /*damage*/, SpellInfo const* spellInfo) override
     {
         if (!target || !spellInfo) return;
         if (Player* p = target->ToPlayer())
-            WowPsParty::RecordSpellDamageTaken(p->GetGUID().GetCounter(), spellInfo->Id);
+            WowPsParty::RecordSpellDamageTaken(p->GetGUID().GetCounter(), spellInfo->Id,
+                attacker ? attacker->GetPositionX() : 0.0f,
+                attacker ? attacker->GetPositionY() : 0.0f,
+                attacker ? attacker->GetPositionZ() : 0.0f,
+                attacker != nullptr);
     }
 
     // PERIODIC (DOT / ground-effect aura) ticks go through a SEPARATE damage path the
@@ -1016,11 +1020,15 @@ public:
     // "stand in the fire" mechanic (Coldflame ticks via SPELL_COLDFLAME_PASSIVE, Defile,
     // Consecration, …), which is the most common thing a reposition rule reacts to
     // (Kevin: healer stood in Coldflame, took ticks, never moved). Record these too.
-    void ModifyPeriodicDamageAurasTick(Unit* target, Unit* /*attacker*/, uint32& /*damage*/, SpellInfo const* spellInfo) override
+    void ModifyPeriodicDamageAurasTick(Unit* target, Unit* attacker, uint32& /*damage*/, SpellInfo const* spellInfo) override
     {
         if (!target || !spellInfo) return;
         if (Player* p = target->ToPlayer())
-            WowPsParty::RecordSpellDamageTaken(p->GetGUID().GetCounter(), spellInfo->Id);
+            WowPsParty::RecordSpellDamageTaken(p->GetGUID().GetCounter(), spellInfo->Id,
+                attacker ? attacker->GetPositionX() : 0.0f,
+                attacker ? attacker->GetPositionY() : 0.0f,
+                attacker ? attacker->GetPositionZ() : 0.0f,
+                attacker != nullptr);
     }
 };
 

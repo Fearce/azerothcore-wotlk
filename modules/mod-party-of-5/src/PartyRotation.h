@@ -199,9 +199,12 @@ namespace WowPsParty
     // every UpdateAI tick).
     bool HasRotation(uint32 guid);
 
-    // Record that a player took damage from `spellId` (now). Called from the
-    // ModifySpellDamageTaken UnitScript; read by the took_damage_from:<name> condition.
-    void RecordSpellDamageTaken(uint32 guidLow, uint32 spellId);
+    // Record that a player took damage from `spellId` (now), along with the source
+    // unit's world position (hasSrc=false when the attacker was unknown). Called from
+    // the ModifySpellDamageTaken UnitScript; read by the took_damage_from:<name>
+    // condition and by the walk_away_from_source action (which flees the source pos).
+    void RecordSpellDamageTaken(uint32 guidLow, uint32 spellId,
+                                float srcX, float srcY, float srcZ, bool hasSrc);
 
     // Evaluate the cached rotation rules for the given bot, fire the highest-
     // priority matching rule's action, and return true if anything fired.

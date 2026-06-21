@@ -1358,15 +1358,17 @@ namespace WowPsParty
     // spinning axe — even when that source leaves no debuff aura to test for.
     static constexpr uint32 RECENT_DMG_WINDOW_MS = 1500;   // "JUST took damage"
     static constexpr size_t RECENT_DMG_MAX       = 8;      // ring per player
-    static std::unordered_map<uint32, std::vector<std::pair<uint32, uint32>>> g_recentDamage;  // guidLow -> [{spellId, ms}]
+    struct RecentHit { uint32 spellId; uint32 ms; float sx, sy, sz; bool hasSrc; };
+    static std::unordered_map<uint32, std::vector<RecentHit>> g_recentDamage;  // guidLow -> ring
     static std::mutex g_recentDamageMutex;
 
-    void RecordSpellDamageTaken(uint32 guidLow, uint32 spellId)
+    void RecordSpellDamageTaken(uint32 guidLow, uint32 spellId,
+                                float srcX, float srcY, float srcZ, bool hasSrc)
     {
         if (!spellId) return;
         std::lock_guard<std::mutex> lock(g_recentDamageMutex);
         auto& v = g_recentDamage[guidLow];
-        v.emplace_back(spellId, getMSTime());
+        v.push_back({ spellId, getMSTime(), srcX, srcY, srcZ, hasSrc });
         if (v.size() > RECENT_DMG_MAX) v.erase(v.begin());
     }
 
@@ -1379,10 +1381,34 @@ namespace WowPsParty
         std::lock_guard<std::mutex> lock(g_recentDamageMutex);
         auto it = g_recentDamage.find(guidLow);
         if (it == g_recentDamage.end()) return false;
-        for (auto const& [spellId, ms] : it->second)
-            if (now - ms <= RECENT_DMG_WINDOW_MS
-                && SpellNameOrIdMatches(sSpellMgr->GetSpellInfo(spellId), want))
+        for (auto const& h : it->second)
+            if (now - h.ms <= RECENT_DMG_WINDOW_MS
+                && SpellNameOrIdMatches(sSpellMgr->GetSpellInfo(h.spellId), want))
                 return true;
+        return false;
+    }
+
+    // World position of the source of the MOST RECENT damaging hit within the window
+    // that has a known source. `want` empty = any spell; else only hits matching that
+    // name/id. Backs walk_away_from_source. Returns false if no usable source.
+    static bool RecentDamageSource(uint32 guidLow, std::string const& want,
+                                   float& sx, float& sy, float& sz)
+    {
+        uint32 const now = getMSTime();
+        std::lock_guard<std::mutex> lock(g_recentDamageMutex);
+        auto it = g_recentDamage.find(guidLow);
+        if (it == g_recentDamage.end()) return false;
+        // Walk newest-first so we flee the freshest threat.
+        for (auto rit = it->second.rbegin(); rit != it->second.rend(); ++rit)
+        {
+            if (now - rit->ms > RECENT_DMG_WINDOW_MS) continue;
+            if (!rit->hasSrc) continue;
+            if (!want.empty()
+                && !SpellNameOrIdMatches(sSpellMgr->GetSpellInfo(rit->spellId), want))
+                continue;
+            sx = rit->sx; sy = rit->sy; sz = rit->sz;
+            return true;
+        }
         return false;
     }
 
@@ -3413,7 +3439,7 @@ namespace WowPsParty
                 || verb == "close_to_enemy"   || verb == "move_behind"
                 || verb == "stay_in_front"    || verb == "hold_position"
                 || verb == "move_out_of_los"  || verb == "pull"
-                || verb == "reposition_random"))
+                || verb == "reposition_random" || verb == "walk_away_from_source"))
             return false;
 
         if (verb == "cast" || verb == "cast_self")
@@ -4405,6 +4431,61 @@ namespace WowPsParty
                                                   /*forceDestination=*/false);
             }
             return true;
+        }
+
+        // "walk_away_from_source[:<name>]" — step DIRECTLY AWAY from the source of the
+        // damage that just hit us, instead of the random hop reposition_random does (which
+        // can wander DEEPER into the effect). Pair it with "took_damage_from:<name>" so it
+        // only fires while we're standing in the bad: e.g. "took_damage_from:Flame Sear ->
+        // walk_away_from_source". The source position is whatever the engine billed as the
+        // attacker when it hit us (the casting add / the ground-aura's caster); for a beam
+        // (Sear Beam) that's the caster, for a ground patch it's the patch's owner. Optional
+        // <name> flees only that spell's source; blank flees the freshest hit's source.
+        if (verb == "walk_away_from_source")
+        {
+            float sx, sy, sz;
+            if (!RecentDamageSource(bot->GetGUID().GetCounter(), arg, sx, sy, sz))
+                return false;   // no known source to flee — let a lower rule act
+
+            // Keep AssistTarget off our feet for the whole escape (re-armed each tick the
+            // rule fires) — same reason reposition_random does it: a HEALER gets re-planted
+            // straight back into the fire by AssistTarget's "hold near party" the instant it
+            // moves, so it never actually leaves (Kevin: healer stood in Coldflame).
+            WowPsParty::HoldFollower(bot->GetGUID(), 1500);
+            // Already mid-step? let it finish before issuing another (no per-tick stutter).
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE
+                && bot->isMoving())
+                return true;
+
+            constexpr float STEP = 10.0f;   // yards farther from the source per escape
+            float const dx = bot->GetPositionX() - sx;
+            float const dy = bot->GetPositionY() - sy;
+            float const len = std::sqrt(dx * dx + dy * dy);
+            // Distance from the source we want the destination to sit at: always farther
+            // than we are now, so EVERY candidate moves us OUTWARD (never toward the source
+            // = never deeper into a centred patch).
+            float const outDist = std::max(len, 2.0f) + STEP;
+            float const baseAng = (len > 0.5f) ? std::atan2(dy, dx) : frand(0.0f, 2.0f * 3.14159265f);
+            // Fan around the straight-away bearing so a wall/ledge on the direct line
+            // doesn't block the escape; all offsets keep the SAME outDist from the source.
+            static constexpr float OFFS[] = { 0.0f, 0.35f, -0.35f, 0.7f, -0.7f, 1.05f, -1.05f };
+            for (float off : OFFS)
+            {
+                float const ang = baseAng + off;
+                float const x = sx + std::cos(ang) * outDist;
+                float const y = sy + std::sin(ang) * outDist;
+                float z = bot->GetPositionZ();
+                bot->UpdateAllowedPositionZ(x, y, z);
+                if (!bot->IsWithinLOS(x, y, z)) continue;      // don't aim through a wall
+                float const bx = x - bot->GetPositionX();
+                float const by = y - bot->GetPositionY();
+                if (!NavReachable(bot, x, y, z, std::sqrt(bx * bx + by * by))) continue;
+                bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                                                  0.0f, 0.0f, /*generatePath=*/true,
+                                                  /*forceDestination=*/false);
+                return true;
+            }
+            return true;   // consumed the tick even if every bearing was blocked — retry next
         }
 
         // "reposition_random:N" — hop ~N yards in a random navmesh-reachable
