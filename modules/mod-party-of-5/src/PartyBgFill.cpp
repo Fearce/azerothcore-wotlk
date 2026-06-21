@@ -650,6 +650,25 @@ namespace
                     bots.push_back(b);
             Player* leader = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(leaderLow));
 
+            // Drive the human's OWN heroes/henchmen to ACCEPT the arena pop — they're gated
+            // bots that never click "Enter Battle", so without this only the human ports in
+            // (the reported 1v5). They run the WowPsParty AI inside the arena, so they fight
+            // normally once in; they just need the invite accepted. Runs every tick the
+            // session is live, so it catches the invite whenever the pop lands.
+            if (leader)
+            {
+                std::vector<ObjectGuid> party;
+                WowPsParty::GetPartyGuidsFor(leader->GetGUID(), party);
+                for (ObjectGuid const& g : party)
+                {
+                    if (g == leader->GetGUID()) continue;
+                    Player* pb = ObjectAccessor::FindConnectedPlayer(g);
+                    if (!pb || !sPlayerbotsMgr.GetPlayerbotAI(pb)) continue;   // managed heroes/henchmen only
+                    if (pb->InBattleground() || pb->IsBeingTeleported()) continue;
+                    AcceptBgInvite(pb);
+                }
+            }
+
             if (!s.queued)
             {
                 if (bots.size() < s.members.size())   // still logging in
