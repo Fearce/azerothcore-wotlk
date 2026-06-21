@@ -65,6 +65,7 @@
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "Timer.h"           // getMSTime — grace-retire fill bots that never loaded
+#include "World.h"           // sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL) — never re-level a fill bot past the cap
 #include "WorldPacket.h"
 #include "WorldSession.h"
 
@@ -228,8 +229,13 @@ namespace
 
         PvPDifficultyEntry const* br = GetBattlegroundBracketByLevel(tpl->GetMapId(), human->GetLevel());
         if (!br) { LOG_INFO("module", "[WowPsParty BGFill] no bracket for level {} on map {} — abort", human->GetLevel(), tpl->GetMapId()); return; }
-        uint8 const bmin = uint8(br->minLevel);
-        uint8 const bmax = uint8(br->maxLevel);
+        // Clamp the bracket to the server cap. A bracket whose maxLevel exceeds the cap
+        // (or a stale 85 pool char) would otherwise be selected as "in-bracket" and used
+        // AS-IS — putting a level-85 bot into a WotLK (cap-80) battleground. With bmax
+        // clamped, any >cap char falls into the out-of-bracket query and is re-leveled down.
+        uint8 const cap  = uint8(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL));
+        uint8 const bmin = std::min<uint8>(uint8(br->minLevel), cap);
+        uint8 const bmax = std::min<uint8>(uint8(br->maxLevel), cap);
 
         std::string const acctCsv = RndbotAccountCsv();
         if (acctCsv.empty()) { LOG_INFO("module", "[WowPsParty BGFill] no rndbot pool — abort"); return; }
@@ -272,6 +278,12 @@ namespace
     void RelevelFillBot(Player* bot, uint8 level)
     {
         if (!bot || !bot->IsInWorld() || !sPlayerbotsMgr.GetPlayerbotAI(bot)) return;
+        // Never re-level a fill bot past the server cap. WotLK max is 80; a stale pool
+        // char left at 85 from an old higher-cap config (the "level 85 bots in AV/WG"
+        // bug) would otherwise be re-rolled right back to 85 by a bracket whose maxLevel
+        // exceeds the cap. Clamp at the single shared relevel point so every caller is safe.
+        uint8 const cap = uint8(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL));
+        if (level > cap) level = cap;
         PlayerbotFactory factory(bot, level);
         factory.Randomize(false);
         LOG_INFO("module", "[WowPsParty BGFill] re-leveled fill bot {} to {} for the bracket", bot->GetName(), uint32(level));
@@ -675,7 +687,12 @@ public:
 
             if (!wb.releveled)
             {
-                if (bot->GetLevel() >= 75) { Mark(botLow, true, wb.enrolled); continue; } // already in bracket
+                // "In bracket" = within [75, cap]. A bot ABOVE the cap (a stale level-85
+                // pool char from an old higher-cap config) must be re-leveled DOWN — the
+                // old ">= 75" fast-path kept it as-is, which is exactly how level-85 bots
+                // leaked into Wintergrasp (and got re-drawn into BG fills).
+                uint8 const cap = uint8(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL));
+                if (bot->GetLevel() >= 75 && bot->GetLevel() <= cap) { Mark(botLow, true, wb.enrolled); continue; }
                 if (releveledThisTick) continue;                                          // one heavy re-roll/tick
                 releveledThisTick = true;
                 RelevelFillBot(bot, WG_RELEVEL_TO);
