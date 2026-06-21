@@ -195,6 +195,13 @@ namespace WowPsParty
     void PullCountCacheSet(uint32 guidLow, int val);
     void PullCountRefreshFromDB(uint32 guidLow);
 
+    // A lead tank's configured dungeon lead distance (yards). Default 15,
+    // clamped [5,40]; sourced from the party_loadout.lead_distance column (set
+    // in the rotation editor). TankFollowPath / the lead-tank formation read it.
+    uint32 BotLeadDistance(ObjectGuid guid);
+    void LeadDistCacheSet(uint32 guidLow, int val);
+    void LeadDistRefreshFromDB(uint32 guidLow);
+
     // Returns true if the bot has at least one cached rule (cheap check, called
     // every UpdateAI tick).
     bool HasRotation(uint32 guid);

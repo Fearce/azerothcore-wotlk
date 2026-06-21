@@ -5395,7 +5395,8 @@ namespace WowPsParty
                 // be IN FRONT (the old M_PI put it 12y behind — the "tank trails
                 // far behind" bug). A few yards ahead so it body-pulls.
                 follower->GetMotionMaster()->Clear();
-                follower->GetMotionMaster()->MoveFollow(leader, 8.0f, 0.0f);
+                follower->GetMotionMaster()->MoveFollow(
+                    leader, float(WowPsParty::BotLeadDistance(d.followerGuid)), 0.0f);
                 return true;
             }
 

@@ -1,6 +1,7 @@
 #include "PartyPath.h"
 #include "PartyFollow.h"
 #include "PartyMgr.h"
+#include "PartyRotation.h"   // BotLeadDistance
 
 #include "Cell.h"
 #include "CellImpl.h"
@@ -88,7 +89,9 @@ namespace WowPsParty
         constexpr float  REC_TURN_RAD       = 0.17f;   // ~10 degrees
         constexpr float  REC_PI             = 3.14159265f;
         constexpr float  TANK_LEASH         = 45.0f;   // stop & wait past this from leader
-        constexpr float  LEAD_DISTANCE      = 30.0f;   // aim this far ahead ALONG the path
+        // LEAD_DISTANCE (how far ahead the tank aims ALONG the path) is now per-tank:
+        // a local in TankFollowPath sourced from WowPsParty::BotLeadDistance (set by
+        // the rotation-editor slider, default 15). It used to be a fixed 30y constant.
         constexpr float  WAYPOINT_REACHED   = 3.5f;
         // Vertical step size that pathfinding can't handle (jumps, drops,
         // dropdowns through holes). A genuine drop is a near-vertical PLUNGE: a
@@ -599,6 +602,11 @@ namespace WowPsParty
         // as "stuck" and teleports the tank onto the leader. Refreshed every
         // tick; expires shortly after we stop leading (combat / beyond leash).
         WowPsParty::MarkTankLeading(bot->GetGUID(), 2500);
+
+        // Per-tank lead distance (yds) — how far ahead ALONG the path we aim.
+        // Sourced from the rotation-editor slider (party_loadout.lead_distance),
+        // default 15. Shadows the former file-scope 30y constant.
+        float const LEAD_DISTANCE = float(WowPsParty::BotLeadDistance(bot->GetGUID()));
 
         // Find the leader's nearest waypoint (the "cursor") — FORWARD-ONLY and
         // WINDOWED. Scan from where the leader was last tick onward so the cursor

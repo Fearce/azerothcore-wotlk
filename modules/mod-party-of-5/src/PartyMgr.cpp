@@ -52,6 +52,7 @@ namespace WowPsParty
     void RotationCacheRefreshFromDB(uint32 guid);
     void TargetModeRefreshFromDB(uint32 guidLow);
     void LeadDungeonRefreshFromDB(uint32 guidLow);
+    void LeadDistRefreshFromDB(uint32 guidLow);
     void PushControlledLoadoutTo(Player* requester, int slot);
 }
 
@@ -2168,6 +2169,7 @@ namespace WowPsParty
                 WaitTankThreatRefreshFromDB(guid);
                 SafePullRefreshFromDB(guid);
                 PullCountRefreshFromDB(guid);
+                LeadDistRefreshFromDB(guid);
                 if (guid == activeGuid) continue;
                 if (spawned >= 4) break;
                 ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);

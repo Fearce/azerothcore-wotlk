@@ -3825,6 +3825,77 @@ public:
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Multi-pull count: {}.", n);
         }
+        // REQ_LEADDIST\t<token>  ->  LEADDIST\t<token>\t<5..40>
+        // Reports the EFFECTIVE lead-tank dungeon lead distance (explicit column,
+        // else the default 15) so the editor slider shows the real runtime value.
+        else if (command == "REQ_LEADDIST")
+        {
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            int n = 15;   // default
+            if (guid)
+            {
+                QueryResult q = CharacterDatabase.Query(
+                    "SELECT `lead_distance` FROM `party_loadout` WHERE `guid` = {}", guid);
+                std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+                int const parsed = v.empty() ? 0 : std::atoi(v.c_str());
+                if (parsed >= 5 && parsed <= 40) n = parsed;   // unset/out-of-range -> default 15
+            }
+            std::ostringstream out;
+            out << "LEADDIST\t" << token << '\t' << n;
+            SendWPSP(player, out.str());
+        }
+        // SET_LEADDIST\t<token>\t<5..40>  — the tank's dungeon lead distance (yds)
+        else if (command == "SET_LEADDIST")
+        {
+            std::string rest;
+            std::string const token = WowPsParty::SplitToken(std::string(payload), rest);
+            int const n = rest.empty() ? 0 : std::atoi(rest.c_str());
+            if (n < 5 || n > 40) return;   // strict: ignore an out-of-range value
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            if (!guid) return;
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
+                "`gear_lock_json`, `priority_actions_json`, `lead_distance`) "
+                "VALUES ({}, '', '', '', '', '', '{}') "
+                "ON DUPLICATE KEY UPDATE `lead_distance` = VALUES(`lead_distance`)",
+                guid, n);
+            CharacterDatabase.CommitTransaction(tx);
+            WowPsParty::LeadDistCacheSet(guid, n);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Lead distance: {} yds.", n);
+        }
+        // REQ_ROLE\t<token>  ->  ROLE\t<token>\t<tank|healer|dps>
+        // The bot's effective role, so the editor can gray out controls that don't
+        // apply to it. Prefer the live FOLLOWER directive (RoleForGuid); fall back to
+        // persistent storage with the SAME precedence as MGMT_LIST (account_party.role
+        // -> party_loadout.role -> 'dps') so a bot with no live directive still resolves.
+        else if (command == "REQ_ROLE")
+        {
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            std::string role;
+            if (guid)
+            {
+                role = WowPsParty::RoleForGuid(ObjectGuid::Create<HighGuid::Player>(guid));
+                if (role.empty())
+                {
+                    QueryResult q = CharacterDatabase.Query(
+                        "SELECT COALESCE(ap.role, NULLIF(pl.role, ''), 'dps') AS role "
+                        "FROM `characters` c "
+                        "LEFT JOIN `account_party` ap ON ap.guid = c.guid AND ap.account = c.account "
+                        "LEFT JOIN `party_loadout` pl ON pl.guid = c.guid "
+                        "WHERE c.guid = {}",
+                        guid);
+                    if (q) role = q->Fetch()[0].Get<std::string>();
+                }
+            }
+            if (role != "tank" && role != "healer" && role != "dps") role = "dps";
+            std::ostringstream out;
+            out << "ROLE\t" << token << '\t' << role;
+            SendWPSP(player, out.str());
+        }
         else if (command == "EQUIP")
         {
             HandleEquip(player, payload);

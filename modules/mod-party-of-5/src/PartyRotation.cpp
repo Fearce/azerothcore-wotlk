@@ -259,6 +259,40 @@ namespace WowPsParty
         return DEFAULT_PULL;
     }
 
+    // ---- per-tank lead distance (lead_distance) ----------------------------
+    // First-class per-bot setting (party_loadout.lead_distance), set from the
+    // rotation editor — mirrors pull_count. How far ahead (yards) a lead tank
+    // leads the party in dungeons. Stored as '' (unset -> default 15) or '5'..'40'.
+    static std::unordered_map<uint32, int> g_leadDist;   // guidLow -> 5..40 (explicit only)
+    static std::mutex g_leadDistMutex;
+
+    // val in [5,40] sets it; anything else clears it (back to default 15).
+    void LeadDistCacheSet(uint32 guidLow, int val)
+    {
+        std::lock_guard<std::mutex> lock(g_leadDistMutex);
+        if (val < 5 || val > 40) g_leadDist.erase(guidLow);
+        else                     g_leadDist[guidLow] = val;
+    }
+
+    void LeadDistRefreshFromDB(uint32 guidLow)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `lead_distance` FROM `party_loadout` WHERE `guid` = {}", guidLow);
+        std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+        LeadDistCacheSet(guidLow, v.empty() ? 0 : std::atoi(v.c_str()));   // out-of-range -> clear
+    }
+
+    uint32 BotLeadDistance(ObjectGuid guid)
+    {
+        // Default 15: the lead tank leads ~15y ahead. The editor slider sets
+        // an explicit value in [5,40]; LeadDistCacheSet already clamped it.
+        constexpr uint32 DEFAULT_LEAD = 15;
+        std::lock_guard<std::mutex> lock(g_leadDistMutex);
+        auto it = g_leadDist.find(guid.GetCounter());
+        if (it != g_leadDist.end()) return uint32(it->second);
+        return DEFAULT_LEAD;
+    }
+
     void RotationCacheRefreshFromDB(uint32 guid)
     {
         QueryResult q = CharacterDatabase.Query(
