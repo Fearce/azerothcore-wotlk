@@ -3911,6 +3911,13 @@ public:
             // effects. `player` is the active controlled body the followers track.
             WowPsParty::RecallFollowers(player, 2000);
         }
+        else if (command == "PULL_MORE")
+        {
+            // Send the lead tank to body-pull the nearest out-of-combat mob and hold
+            // that order ~2s — chain-pull micro for M+. Re-armed on each keypress, so
+            // the player spams it to chase a far pull (same 2s window as COME_HITHER).
+            WowPsParty::PullNearestExtra(player, 2000);
+        }
         // REQ_TALENTS\t<token>  → TALENTS\t...  (alt slot OR henchman "h<guid>")
         else if (command == "REQ_TALENTS")
         {

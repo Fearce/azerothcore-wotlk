@@ -289,6 +289,7 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
     extern void WowPsParty_TickGathering_Trampoline(Player* bot);
     extern void WowPsParty_TickHenchmanLoot_Trampoline(Player* bot);
     extern void WowPsParty_TickAcceptBgInvite_Trampoline(Player* bot);
+    extern void WowPsParty_TickTankPullMore_Trampoline(Player* bot);
     bool const isPartyOfFiveBot = WowPsParty_BotHasActiveFollowDirective_Trampoline(bot->GetGUID());
     if (isPartyOfFiveBot)
     {
@@ -313,6 +314,10 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
         // — gold to the leader (party-mirrored), trash into its own bags. Self-
         // gates to henchmen; no-op for alts.
         WowPsParty_TickHenchmanLoot_Trampoline(bot);
+        // Manual "pull one more" (keybind) — dispatched LAST so its MoveChase
+        // overrides the rotation/AssistTarget combat-chase while armed, walking the
+        // lead tank onto the next pack mid-fight. No-op unless armed for this tank.
+        WowPsParty_TickTankPullMore_Trampoline(bot);
         return;
     }
 

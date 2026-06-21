@@ -34,6 +34,7 @@
 #include "LFGMgr.h"
 #include "Log.h"
 #include "MotionMaster.h"
+#include "PathGenerator.h"   // NavReachable: is a recovery spot actually walkable?
 #include "StringFormat.h"
 #include "ObjectAccessor.h"
 #include "Pet.h"
@@ -749,6 +750,39 @@ namespace WowPsParty
                 g_recallUntilMs[g.GetCounter()] = getMSTime() + holdMs;
             }
         }
+    }
+
+    // ===== Manual "pull one more" (keybind) ================================
+    // tankLow -> live pull-more window: run the lead tank to + engage ONE specific
+    // out-of-combat mob until `untilMs`. Re-armed on each keypress; the driver
+    // (TickTankPullMore) reads it every tick and clears it once the mob aggros.
+    struct PullMoreState { uint32 untilMs = 0; ObjectGuid target; };
+    static std::unordered_map<uint32, PullMoreState> g_tankPullMore;
+
+    static void SetTankPullMore(uint32 tankLow, ObjectGuid target, uint32 untilMs)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        PullMoreState& s = g_tankPullMore[tankLow];
+        s.untilMs = untilMs;
+        s.target  = target;
+    }
+
+    // Returns the armed target, or false (erasing the entry) once the window has
+    // lapsed — so a lapsed pull-more stops driving and normal AI resumes.
+    static bool GetTankPullMore(uint32 tankLow, ObjectGuid& targetOut)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_tankPullMore.find(tankLow);
+        if (it == g_tankPullMore.end()) return false;
+        if (getMSTime() >= it->second.untilMs) { g_tankPullMore.erase(it); return false; }
+        targetOut = it->second.target;
+        return true;
+    }
+
+    static void ClearTankPullMore(uint32 tankLow)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_tankPullMore.erase(tankLow);
     }
 
     // followerGuidLow -> ms until which the bot is actively leading the
@@ -2012,6 +2046,107 @@ namespace WowPsParty
         LOG_INFO("module", "[WowPsParty TankLead] guid={} {} mob_guid={} entry={} dist={:.1f} ok={}",
                  bot->GetGUID().GetCounter(), canRangedPull ? "RANGE-PULL" : "PULL",
                  nearest->GetGUID().GetCounter(), nearest->GetEntry(), dist, ok);
+    }
+
+    // ===== Manual "pull one more" (keybind) ================================
+    //
+    // A micro tool for chain-pulling in M+: the player presses a bind and the lead
+    // tank runs to + body-pulls the SINGLE NEAREST out-of-combat mob, overriding
+    // its normal follow/assist/rotation movement for a short window. Unlike the
+    // automatic TankLeadEngagement (which only fires with the whole party out of
+    // combat + rested), this is a deliberate manual override that works MID-FIGHT
+    // — exactly the "grab the next pack now" control a Mythic+ chain-pull needs.
+
+    // The single nearest pull candidate to the tank within `range` — un-aggroed,
+    // attackable, similar-Z, in-LoS (GatherEligible, defined above). Deliberately
+    // the NEAREST mob, not the best-fitting social group: the bind says "pull the
+    // one nearest extra", so neighbours that social-aggro in are the player's call.
+    static Unit* FindNearestPullExtra(Player* tank, float range)
+    {
+        if (!tank) return nullptr;
+        std::list<Unit*> nearby;
+        Acore::AnyUnfriendlyUnitInObjectRangeCheck check(tank, tank, range);
+        Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck> searcher(tank, nearby, check);
+        Cell::VisitObjects(tank, searcher, range);
+        Unit* best = nullptr;
+        float bestD = 0.0f;
+        for (Unit* u : nearby)
+        {
+            if (!GatherEligible(tank, u)) continue;
+            float const d = tank->GetDistance(u);
+            if (!best || d < bestD) { best = u; bestD = d; }
+        }
+        return best;
+    }
+
+    void PullNearestExtra(Player* leader, uint32 holdMs)
+    {
+        if (!leader || !leader->IsInWorld() || !leader->GetSession()) return;
+
+        auto notify = [&](char const* msg)
+        { ChatHandler(leader->GetSession()).PSendSysMessage("%s", msg); };
+
+        // Lead tank in the caller's party (lowest-guid tank-role follower).
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(leader->GetGUID(), party);
+        Player* tank = nullptr;
+        for (ObjectGuid const& g : party)
+            if (g != leader->GetGUID() && IsLeadTank(g))
+            { tank = ObjectAccessor::FindPlayer(g); break; }
+
+        if (!tank || !tank->IsAlive() || !tank->IsInWorld())
+        { notify("|cff66ccff[WowPsParty]|r Pull more: no living bot tank in the party."); return; }
+        if (tank->GetMapId() != leader->GetMapId())
+        { notify("|cff66ccff[WowPsParty]|r Pull more: tank isn't with you."); return; }
+        if (tank->HasUnitFlag(UNIT_FLAG_POSSESSED)) return;   // human is driving the tank
+
+        Unit* mob = FindNearestPullExtra(tank, GATHER_SCAN);
+        if (!mob)
+        {
+            ClearTankPullMore(tank->GetGUID().GetCounter());
+            notify("|cff66ccff[WowPsParty]|r Pull more: no out-of-combat mob in range.");
+            return;
+        }
+
+        // Arm the window, then kick it THIS instant (don't wait for the next AI
+        // tick): engage + run in, and hold the follow ticker / AssistTarget off so
+        // they can't yank the tank back. The driver re-asserts both every tick.
+        SetTankPullMore(tank->GetGUID().GetCounter(), mob->GetGUID(), getMSTime() + holdMs);
+        tank->Attack(mob, true);
+        tank->GetMotionMaster()->MoveChase(mob);
+        HoldFollower(tank->GetGUID(), holdMs);
+        LOG_INFO("module",
+            "[WowPsParty PullMore] leader={} tank={} -> mob_guid={} entry={} dist={:.1f} hold={}ms",
+            leader->GetGUID().GetCounter(), tank->GetGUID().GetCounter(),
+            mob->GetGUID().GetCounter(), mob->GetEntry(), tank->GetDistance(mob), holdMs);
+    }
+
+    void TickTankPullMore(Player* bot)
+    {
+        if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
+        uint32 const low = bot->GetGUID().GetCounter();
+        ObjectGuid targetGuid;
+        if (!GetTankPullMore(low, targetGuid)) return;          // not armed / window lapsed
+
+        // Only the lead tank is ever armed; bail (and disarm) if state ever drifts.
+        if (!IsLeadTank(bot->GetGUID()))           { ClearTankPullMore(low); return; }
+        if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) { ClearTankPullMore(low); return; }
+
+        Unit* target = ObjectAccessor::GetUnit(*bot, targetGuid);
+        if (!target || !target->IsAlive() || !bot->IsValidAttackTarget(target))
+        { ClearTankPullMore(low); return; }
+        // Pull achieved — the mob is now in combat (it aggroed us / a swing landed).
+        // Release so the normal combat AI folds the new add into the fight.
+        if (target->IsInCombat()) { ClearTankPullMore(low); return; }
+
+        // Drive: engage + run in. Attack(true) sets the victim so the tank auto-
+        // melees the instant it's in range; MoveChase walks it there. This runs
+        // LAST in the AI tick (after rotation + AssistTarget), so this MoveChase
+        // wins for the tick; HoldFollower keeps the 1Hz follow re-asserter + the
+        // AssistTarget combat-chase off it while it runs (re-armed every tick).
+        if (bot->GetVictim() != target) bot->Attack(target, true);
+        bot->GetMotionMaster()->MoveChase(target);
+        HoldFollower(bot->GetGUID(), 1000);
     }
 
     // ===== Gathering (mining / herbalism / skinning) =======================
@@ -3493,6 +3628,23 @@ namespace WowPsParty
         return best;
     }
 
+    // Can the bot actually WALK to (x,y,z)? Asks the navmesh — rejects a spot the
+    // path can't reach (NOPATH), only reaches partway (INCOMPLETE — clamped at a
+    // wall/ledge), or is off-mesh (FARFROMPOLY). On a map with NO mmaps every query
+    // is a SHORTCUT straight line, which we ACCEPT (MovePoint falls back to straight-
+    // line there anyway). Used by the no-LoS recovery to tell "behind a corner on my
+    // level" (reachable → close in) from "on a platform a level up" (unreachable →
+    // climb to the party instead of standing blind). Mirrors PartyRotation's copy.
+    static bool NavReachable(Player* bot, float x, float y, float z, float straight)
+    {
+        PathGenerator gen(bot);
+        if (!gen.CalculatePath(x, y, z, false)) return false;
+        PathType const t = gen.GetPathType();
+        if (t & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE | PATHFIND_FARFROMPOLY))
+            return false;
+        return gen.getPathLength() <= straight * 2.5f + 8.0f;
+    }
+
     void AssistTarget(Player* bot)
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
@@ -4212,6 +4364,26 @@ namespace WowPsParty
         if (role == "healer")
         {
             float const leashDist = bot->GetDistance(leader);
+            // No LINE OF SIGHT to the leader = can't actually heal the party, even
+            // though we may be within the straight-line leash (a level/platform gap
+            // reads as "close" through the floor). This is the recurring "healer
+            // stranded a level below while the party fights above" bug: the leash
+            // below saw <30y and the block fell through to MoveIdle, so the healer
+            // stood blind on the lower deck. Climb to the leader's EXACT spot with a
+            // navmesh MovePoint (not the distance-banded MoveFollow, which would
+            // settle directly below them and never round the ramp) until LoS clears.
+            if (!bot->IsWithinLOSInMap(leader, VMAP::ModelIgnoreFlags::M2) && leashDist > 8.0f)
+            {
+                if (mg != POINT_MOTION_TYPE)
+                {
+                    bot->GetMotionMaster()->MovePoint(0, leader->GetPositionX(),
+                        leader->GetPositionY(), leader->GetPositionZ(),
+                        FORCED_MOVEMENT_NONE, 0.0f, 0.0f, /*generatePath=*/true,
+                        /*forceDestination=*/false);
+                    AssistLog(gLow, "healer: no LoS to leader — climbing to rejoin/heal the party");
+                }
+                return;
+            }
             constexpr float HEAL_LEASH_FAR  = 30.0f;   // start catching up past this
             constexpr float HEAL_LEASH_NEAR = 18.0f;   // settle once back within this
             bool const following = (mg == FOLLOW_MOTION_TYPE) && bot->isMoving();
@@ -4327,13 +4499,31 @@ namespace WowPsParty
                     // firing range the instant it does, so it rarely actually reaches melee.
                     desired->GetNearPoint(bot, lx, ly, lz, 0.0f,
                                           4.0f, desired->GetAngle(bot));
-                    // generatePath rounds the corner / climbs the stairs;
-                    // forceDestination=false so an unreachable spot just isn't
-                    // taken (no straight-line dive through geometry).
-                    bot->GetMotionMaster()->MovePoint(0, lx, ly, lz, FORCED_MOVEMENT_NONE,
-                                                      0.0f, 0.0f, /*generatePath=*/true,
-                                                      /*forceDestination=*/false);
-                    AssistLog(gLow, "ranged: no LoS — closing to regain line of sight");
+                    // Corner / staircase on OUR level: the near-target spot is walkable,
+                    // so path to it (generatePath rounds the corner / climbs the stairs;
+                    // forceDestination=false so an unreachable spot just isn't taken — no
+                    // straight-line dive through geometry). But when the target sits on
+                    // geometry we CAN'T reach from here — a platform a level up, the
+                    // shaman-stranded-on-the-web-below-the-fight bug — that MovePoint is
+                    // silently dropped and the bot stands blind forever. Detect the
+                    // unreachable case and climb to the LEADER's exact spot instead: the
+                    // leader is on valid ground in the thick of the fight, so the route
+                    // brings us up to their level where LoS to the pack clears.
+                    if (NavReachable(bot, lx, ly, lz, d))
+                    {
+                        bot->GetMotionMaster()->MovePoint(0, lx, ly, lz, FORCED_MOVEMENT_NONE,
+                                                          0.0f, 0.0f, /*generatePath=*/true,
+                                                          /*forceDestination=*/false);
+                        AssistLog(gLow, "ranged: no LoS — closing to regain line of sight");
+                    }
+                    else
+                    {
+                        bot->GetMotionMaster()->MovePoint(0, leader->GetPositionX(),
+                            leader->GetPositionY(), leader->GetPositionZ(),
+                            FORCED_MOVEMENT_NONE, 0.0f, 0.0f, /*generatePath=*/true,
+                            /*forceDestination=*/false);
+                        AssistLog(gLow, "ranged: no LoS + target unreachable from here — climbing to the leader to rejoin the fight");
+                    }
                 }
                 bot->SetFacingToObject(desired);
                 return;
@@ -5485,6 +5675,13 @@ void WowPsParty_AssistTarget_Trampoline(Player* bot)
 void WowPsParty_TankLeadEngagement_Trampoline(Player* bot)
 {
     WowPsParty::TankLeadEngagement(bot);
+}
+
+// Manual pull-more trampoline — must be dispatched LAST in the party-bot AI tick
+// so its MoveChase overrides rotation/AssistTarget while the window is armed.
+void WowPsParty_TickTankPullMore_Trampoline(Player* bot)
+{
+    WowPsParty::TickTankPullMore(bot);
 }
 
 // Tank path-follow trampoline — walks the tank along the recorded path.

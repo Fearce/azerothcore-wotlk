@@ -188,6 +188,19 @@ namespace WowPsParty
     // re-assert via the rotation, aren't paused.)
     bool IsBeingRecalled(ObjectGuid followerGuid);
 
+    // Manual "pull one more" (keybind). Arm the LEAD TANK of `leader`'s party to
+    // run to + body-pull the single NEAREST out-of-combat mob for holdMs, then
+    // resume normal AI. Re-armed on each keypress, so a mob more than one window
+    // away requires spamming the bind until the tank reaches it (mirrors
+    // RecallFollowers). The window clears the instant the mob enters combat (pull
+    // achieved), dies, or lapses. Messages the caller if there's no tank/mob.
+    void PullNearestExtra(Player* leader, uint32 holdMs);
+
+    // Per-AI-tick driver for an armed pull-more. MUST run LAST in the bot tick so
+    // its MoveChase wins over rotation/AssistTarget. No-op unless this bot is the
+    // lead tank with a live pull-more window.
+    void TickTankPullMore(Player* bot);
+
     // stop_attacking hold. While set, the bot suppresses ALL offence — AssistTarget
     // won't engage/auto-attack and the rotation drops every offensive verb — but heals,
     // buffs and movement still run. The `stop_attacking` rotation action re-arms it each
