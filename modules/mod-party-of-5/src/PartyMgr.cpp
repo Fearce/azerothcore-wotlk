@@ -29,6 +29,7 @@
 #include "RandomPlayerbotMgr.h"
 #include "RandomItemMgr.h"      // sRandomItemMgr.GetAmmo
 #include "PlayerbotFactory.h"   // re-level a widened henchman pick to the player
+#include "PlayerbotAIConfig.h"  // randomClassSpecIndex — map a talent tree to its spec template
 #include "AiObjectContext.h"
 #include "Value.h"
 
@@ -387,6 +388,34 @@ namespace WowPsParty
                 }
         }
         return RoleFromTalents(p->getClass(), known, fallback);
+    }
+
+    // Dominant talent TREE (tabpage 0/1/2) of a LIVE bot from its spent talents, or
+    // -1 if it has none yet. Same point-summing as RoleFromTalents, but returns the
+    // raw tree so a re-level can RESTORE the spec the player picked at the hire screen
+    // (the Ret-paladin-downleveled-into-Holy bug) rather than keep the random re-roll.
+    static int DominantTalentTabLive(Player* p)
+    {
+        if (!p) return -1;
+        uint32 points[3] = { 0, 0, 0 };
+        for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
+        {
+            TalentEntry const* tal = sTalentStore.LookupEntry(i);
+            if (!tal) continue;
+            TalentTabEntry const* tab = sTalentTabStore.LookupEntry(tal->TalentTab);
+            if (!tab || tab->tabpage > 2) continue;
+            for (int rank = int(tal->RankID.size()) - 1; rank >= 0; --rank)
+                if (tal->RankID[rank] && p->HasTalent(tal->RankID[rank], p->GetActiveSpec()))
+                {
+                    points[tab->tabpage] += uint32(rank + 1);
+                    break;
+                }
+        }
+        if (!points[0] && !points[1] && !points[2]) return -1;
+        int tree = 0;
+        if (points[1] > points[uint32(tree)]) tree = 1;
+        if (points[2] > points[uint32(tree)]) tree = 2;
+        return tree;
     }
 
     // Canonical per-class, per-role starter rotation. Built as a priority list
@@ -1633,8 +1662,27 @@ namespace WowPsParty
                 {
                     uint32 const oldLvl = hen->GetLevel();
                     uint32 const target = lead->GetLevel();
+                    // Capture the spec the PLAYER picked at the hire screen BEFORE the
+                    // re-roll. Randomize(false) re-rolls talents to a RANDOM tree, which
+                    // flips the role out from under the player — a Ret paladin hired and
+                    // downleveled came back Holy, invalidating the party (wasted gold).
+                    int const intendedTab = DominantTalentTabLive(hen);
                     PlayerbotFactory factory(hen, target);
                     factory.Randomize(false);
+                    // Restore the picked tree if the re-roll moved off it. randomClassSpecIndex
+                    // maps a tree (0/1/2) to its spec-template index — the same mapping
+                    // InitTalentsTree uses — so InitTalentsBySpecNo re-spends the points into
+                    // the chosen tree. (Druid feral cat vs bear share tree 1, so that one
+                    // edge can still pick the wrong feral build; every other class is exact.)
+                    if (intendedTab >= 0 && DominantTalentTabLive(hen) != intendedTab)
+                    {
+                        int const specNo = int(sPlayerbotAIConfig.randomClassSpecIndex[hen->getClass()][uint32(intendedTab)]);
+                        PlayerbotFactory::InitTalentsBySpecNo(hen, specNo, /*reset=*/true);
+                        hen->SendTalentsInfoData(false);
+                        LOG_INFO("module",
+                            "[WowPsParty Henchmen] re-leveled hench guid={} restored picked spec (tree {})",
+                            henchGuid.GetCounter(), intendedTab);
+                    }
                     hen->SaveToDB(false, false);
                     LOG_INFO("module",
                         "[WowPsParty Henchmen] re-leveled hench guid={} {} -> {} to match leader",
