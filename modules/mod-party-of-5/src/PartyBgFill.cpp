@@ -694,8 +694,10 @@ namespace
                 {
                     hl = nowL;
                     LOG_INFO("module",
-                        "[WowPsParty ArenaFill] hero-drive leader={} grpSize={} heroesFound={} inLeaderGrp={} inArenaQueue={} invited={} inBg={}",
-                        leaderLow, lgrp ? uint32(lgrp->GetMembersCount()) : 0u, found, inGrp, inQ, invited, inBg);
+                        "[WowPsParty ArenaFill] hero-drive leader={} grpSize={} isRaid={} isBGGrp={} heroesFound={} inLeaderGrp={} inArenaQueue={} invited={} inBg={}",
+                        leaderLow, lgrp ? uint32(lgrp->GetMembersCount()) : 0u,
+                        lgrp && lgrp->isRaidGroup(), lgrp && lgrp->isBGGroup(),
+                        found, inGrp, inQ, invited, inBg);
                 }
             }
 
