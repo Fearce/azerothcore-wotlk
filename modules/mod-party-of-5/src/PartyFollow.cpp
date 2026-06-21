@@ -2084,7 +2084,7 @@ namespace WowPsParty
         if (!leader || !leader->IsInWorld() || !leader->GetSession()) return;
 
         auto notify = [&](char const* msg)
-        { ChatHandler(leader->GetSession()).PSendSysMessage("%s", msg); };
+        { ChatHandler(leader->GetSession()).PSendSysMessage("{}", msg); };   // fmt-style, not printf %s
 
         // Lead tank in the caller's party (lowest-guid tank-role follower).
         std::vector<ObjectGuid> party;
