@@ -457,29 +457,22 @@ namespace
             if (!bgQueue.GetPlayerGroupInfoData(bot->GetGUID(), &ginfo)) continue;
             if (!ginfo.IsInvitedToBGInstanceGUID || !ginfo.RemoveInviteTime) continue;
 
-            BattlegroundTypeId const bgTypeId = BattlegroundMgr::BGTemplateId(qt);
             uint8 const arenaType = BattlegroundMgr::BGArenaType(qt);
-            // ARENA port-reject diagnostic (rate-limited): the port is sent but the heroes
-            // never enter — log exactly what HandleBattleFieldPortOpcode checks, so the
-            // rejection cause is visible (it only LOG_DEBUGs, which is off). Grep "arena-port".
+            // Resolve the REAL bgTypeId of the invited INSTANCE. For a BG, BGTemplateId(qt)
+            // already equals it. But for an ARENA the queue's template is BATTLEGROUND_AA
+            // while the live instance is a SPECIFIC arena map (Nagrand / Ruins of Lordaeron /
+            // …). HandleBattleFieldPortOpcode looks the instance up by (instanceId, bgTypeId),
+            // so sending AA made GetBattleground return null (diagnostic: bgFound=false) and
+            // the port was REJECTED — the heroes were invited but never entered (the endless
+            // 1v5). The arena QUEUE id is arena-type-based (BGQueueTypeId ignores bgTypeId for
+            // arenas), so the specific type still resolves the right queue AND finds the
+            // instance. Search ALL types (NONE) for the instance to get its real type.
+            Battleground* const invBg =
+                sBattlegroundMgr->GetBattleground(ginfo.IsInvitedToBGInstanceGUID, BATTLEGROUND_TYPE_NONE);
+            BattlegroundTypeId const bgTypeId = invBg ? invBg->GetBgTypeID() : BattlegroundMgr::BGTemplateId(qt);
             if (arenaType != 0)
-            {
-                static thread_local std::unordered_map<uint32, uint32> dgMs;
-                uint32 const now = getMSTime();
-                uint32& dg = dgMs[bot->GetGUID().GetCounter()];
-                if (now - dg > 3000)
-                {
-                    dg = now;
-                    Battleground* abg = sBattlegroundMgr->GetBattleground(ginfo.IsInvitedToBGInstanceGUID, bgTypeId);
-                    LOG_INFO("module",
-                        "[WowPsParty BGFill] arena-port {} inCombat={} charm={} beingTP={} inQueue={} "
-                        "invitedForQ={} bgFound={} inst={} qt={}",
-                        bot->GetName(), bot->IsInCombat(), bool(bot->GetCharmGUID()),
-                        bot->IsBeingTeleported(), bot->InBattlegroundQueue(),
-                        bot->IsInvitedForBattlegroundQueueType(qt), abg != nullptr,
-                        ginfo.IsInvitedToBGInstanceGUID, uint32(qt));
-                }
-            }
+                LOG_INFO("module", "[WowPsParty BGFill] arena-port {} -> inst={} realBg={} (queued qt={})",
+                         bot->GetName(), ginfo.IsInvitedToBGInstanceGUID, uint32(bgTypeId), uint32(qt));
             // DEFER the port: QUEUE the CMSG_BATTLEFIELD_PORT so the core processes it
             // in the bot's normal session update — do NOT call HandleBattleFieldPortOpcode
             // synchronously here. This runs inside the world OnUpdate tick, and porting a
