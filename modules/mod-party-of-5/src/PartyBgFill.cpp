@@ -659,13 +659,31 @@ namespace
             {
                 std::vector<ObjectGuid> party;
                 WowPsParty::GetPartyGuidsFor(leader->GetGUID(), party);
+                int found = 0, inGrp = 0, inQ = 0, inBg = 0;
+                Group* const lgrp = leader->GetGroup();
                 for (ObjectGuid const& g : party)
                 {
                     if (g == leader->GetGUID()) continue;
                     Player* pb = ObjectAccessor::FindConnectedPlayer(g);
                     if (!pb || !sPlayerbotsMgr.GetPlayerbotAI(pb)) continue;   // managed heroes/henchmen only
-                    if (pb->InBattleground() || pb->IsBeingTeleported()) continue;
+                    ++found;
+                    if (lgrp && lgrp->IsMember(g)) ++inGrp;
+                    if (pb->InBattleground()) { ++inBg; continue; }
+                    if (pb->InBattlegroundQueue()) ++inQ;
+                    if (pb->IsBeingTeleported()) continue;
                     AcceptBgInvite(pb);
+                }
+                // DIAGNOSTIC (throttled): why is it 1v5? Shows whether the heroes are in the
+                // leader's WoW group / in the arena queue at all (no queue => no invite to accept).
+                static thread_local std::unordered_map<uint32, uint32> heroLogMs;
+                uint32 const nowL = getMSTime();
+                uint32& hl = heroLogMs[leaderLow];
+                if (nowL - hl > 3000)
+                {
+                    hl = nowL;
+                    LOG_INFO("module",
+                        "[WowPsParty ArenaFill] hero-drive leader={} grpSize={} heroesFound={} inLeaderGrp={} inArenaQueue={} inBg={}",
+                        leaderLow, lgrp ? uint32(lgrp->GetMembersCount()) : 0u, found, inGrp, inQ, inBg);
                 }
             }
 
