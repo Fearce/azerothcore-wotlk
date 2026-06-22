@@ -1474,6 +1474,82 @@ namespace WowPsParty
         } while (q->NextRow());
     }
 
+    // Prot tanks (warrior & paladin) MUST carry a shield — block, Shield Slam /
+    // Shield of Righteousness, Holy Shield and a large slice of their mitigation
+    // all key off one being equipped. The playerbot gear factory picks the
+    // offhand by stat-weight and can land on a 1H weapon or a holdable frill
+    // (shields aren't guaranteed into its random candidate pool), so a hired prot
+    // tank can arrive shieldless. Guarantee one: when the offhand isn't already a
+    // shield, equip the best vendor-grade shield the bot's level + skill allow.
+    // Gated on role=tank (only prot wants sword-and-board; a fury/arms/ret hire
+    // of this class is left alone) and self-throttled by being a no-op the instant
+    // a shield is on, so it never thrashes equipped gear.
+    static void MaintainTankShield(Player* bot)
+    {
+        uint8 const cls = bot->getClass();
+        if (cls != CLASS_WARRIOR && cls != CLASS_PALADIN) return;
+        if (WowPsParty::RoleForGuid(bot->GetGUID()) != "tank") return;
+
+        Item* off = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
+        if (off && off->GetTemplate()->Class == ITEM_CLASS_ARMOR &&
+            off->GetTemplate()->SubClass == ITEM_SUBCLASS_ARMOR_SHIELD)
+            return;   // already shielded — nothing to do
+
+        // A 2H weapon in the mainhand blocks sword-and-board outright; don't
+        // unequip the offhand chasing a shield we then can't wear (a prot tank
+        // shouldn't be on a 2H — the stat-weight calc penalises it ×0.1 — but
+        // guard anyway so we never strip a 2H build down to a bare offhand).
+        if (Item* mh = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND))
+            if (mh->GetTemplate()->InventoryType == INVTYPE_2HWEAPON)
+                return;
+
+        // class=4 ARMOR, subclass=6 SHIELD, InventoryType=14 INVTYPE_SHIELD.
+        // Common..rare only (no heirloom/artifact). Best item level first; the
+        // final class/skill/level call is CanUseItem + CanEquipNewItem below.
+        QueryResult q = WorldDatabase.Query(
+            "SELECT entry FROM item_template "
+            "WHERE class = 4 AND subclass = 6 AND InventoryType = 14 "
+            "AND RequiredLevel <= {} AND Quality BETWEEN 1 AND 3 "
+            "ORDER BY ItemLevel DESC, RequiredLevel DESC LIMIT 15", uint32(bot->GetLevel()));
+        if (!q) return;
+
+        do
+        {
+            uint32 const entry = (*q)[0].Get<uint32>();
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(entry);
+            if (!proto || bot->CanUseItem(proto) != EQUIP_ERR_OK)
+                continue;   // class/skill/level gate (slot-independent)
+
+            // Stash a non-shield offhand (1H weapon / holdable) into the bags so
+            // the slot is free. If the bags can't take it, bail rather than
+            // destroy a usable item.
+            if (off)
+            {
+                ItemPosCountVec stash;
+                if (bot->CanStoreItem(NULL_BAG, NULL_SLOT, stash, off, false) != EQUIP_ERR_OK)
+                    return;
+                bot->RemoveItem(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND, true);
+                bot->StoreItem(stash, off, true);
+                off = nullptr;
+            }
+
+            uint16 dest = 0;
+            if (bot->CanEquipNewItem(NULL_SLOT, dest, entry, false) != EQUIP_ERR_OK)
+            {
+                // Offhand is empty now and CanUseItem already passed, so reaching
+                // here means a transient block (combat/cast/stun). Next tick retries
+                // cleanly; log it so a persistently shieldless prot bot is diagnosable.
+                LOG_DEBUG("module", "[WowPsParty Provision] shield {} not equippable on prot {} this tick (will retry)",
+                          entry, bot->GetName());
+                return;
+            }
+            bot->EquipNewItem(dest, entry, true);
+            LOG_INFO("module", "[WowPsParty Provision] equipped shield {} on prot {} (lvl {})",
+                     entry, bot->GetName(), uint32(bot->GetLevel()));
+            return;
+        } while (q->NextRow());
+    }
+
     // Trim a bot's Soul Shards down to exactly one. `preferKeep` (when non-null)
     // is the shard to spare — the OnPlayerStoreNewItem hook passes the item it
     // just stored so StoreNewItem's caller still dereferences a live object;
@@ -1522,6 +1598,7 @@ namespace WowPsParty
         uint8 const cls = bot->getClass();
         if (cls == CLASS_ROGUE)   MaintainPoisons(bot);
         if (cls == CLASS_WARRIOR) MaintainTankThrown(bot);   // before ammo: equips the thrown wpn
+        if (cls == CLASS_WARRIOR || cls == CLASS_PALADIN) MaintainTankShield(bot);  // prot tanks always carry a shield
         // Warlock bots only (defensive GetPlayerbotAI guard — a human warlock
         // manages their own shards and must never be trimmed). Catches a bot
         // that reloaded with a pre-existing pile or sits at zero free slots,
