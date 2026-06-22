@@ -2110,10 +2110,13 @@ namespace WowPsParty
         // point of the multi-pull range should be the tank, not the leader"); a
         // leader-centred search missed the pack the tank was standing in and it just
         // single-pulled. The tank can't out-run the party: a 30y leader-leash above
-        // (line ~1636) already blocks a pull while it's far ahead. 28y (was 40y, then
-        // leader-40y) keeps it from opening on a still-distant mob. SelectNearbyTarget
-        // returns the nearest unit `this` considers a valid attack target.
-        Unit* nearest = bot->SelectNearbyTarget(nullptr, 28.0f);
+        // (line ~1636) already blocks a pull while it's far ahead. 22y (was 40y, then
+        // leader-40y, then 28y) keeps it from opening on a still-distant mob — 28y still
+        // reached out far enough that it was "very hard to not clear every single mob"
+        // (Kevin), so the opener radius was tightened. This is the INITIAL-pull scan only;
+        // the during-multi-pull gather range (GATHER_SCAN, FindNextSafeAdd) is unchanged.
+        // SelectNearbyTarget returns the nearest unit `this` considers a valid attack target.
+        Unit* nearest = bot->SelectNearbyTarget(nullptr, 22.0f);
         if (!nearest || !nearest->IsAlive()) return;
         if (!bot->IsValidAttackTarget(nearest)) return;
         if (!nearest->IsHostileTo(bot)) return;   // never auto-engage a PASSIVE/neutral (yellow) mob (Mill)
