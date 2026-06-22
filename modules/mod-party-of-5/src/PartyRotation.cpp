@@ -262,7 +262,7 @@ namespace WowPsParty
     // ---- per-tank lead distance (lead_distance) ----------------------------
     // First-class per-bot setting (party_loadout.lead_distance), set from the
     // rotation editor — mirrors pull_count. How far ahead (yards) a lead tank
-    // leads the party in dungeons. Stored as '' (unset -> default 15) or '5'..'40'.
+    // leads the party in dungeons. Stored as '' (unset -> default 10) or '5'..'40'.
     static std::unordered_map<uint32, int> g_leadDist;   // guidLow -> 5..40 (explicit only)
     static std::mutex g_leadDistMutex;
 
@@ -284,9 +284,10 @@ namespace WowPsParty
 
     uint32 BotLeadDistance(ObjectGuid guid)
     {
-        // Default 15: the lead tank leads ~15y ahead. The editor slider sets
-        // an explicit value in [5,40]; LeadDistCacheSet already clamped it.
-        constexpr uint32 DEFAULT_LEAD = 15;
+        // Default 10: the lead tank leads ~10y ahead (a tighter formation than the
+        // old 15 — Mill). The editor slider sets an explicit value in [5,40];
+        // LeadDistCacheSet already clamped it.
+        constexpr uint32 DEFAULT_LEAD = 10;
         std::lock_guard<std::mutex> lock(g_leadDistMutex);
         auto it = g_leadDist.find(guid.GetCounter());
         if (it != g_leadDist.end()) return uint32(it->second);
