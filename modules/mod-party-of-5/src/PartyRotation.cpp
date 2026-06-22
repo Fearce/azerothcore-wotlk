@@ -631,6 +631,44 @@ namespace WowPsParty
         return uint32(targets.size());
     }
 
+    // Hostiles ACTIVELY MELEEING the bot — units in its melee-attacker set (getAttackers),
+    // i.e. swinging at it in melee right now. Distinct from enemies_in_melee (mere proximity:
+    // a mob near the bot but attacking someone else, or not yet engaged). Backs the
+    // melee_attackers condition so e.g. a mage only Frost Novas when a melee is actually on
+    // it (Mill), not when one merely walks past during the tank's body-pull.
+    static uint32 CountMeleeAttackers(Player* bot)
+    {
+        if (!bot) return 0;
+        uint32 n = 0;
+        for (Unit* a : bot->getAttackers())
+            if (a && a->IsAlive()) ++n;
+        return n;
+    }
+
+    // A DRUID in a shapeshift form (Bear/Cat/Moonkin/Travel) can't cast caster-form buffs
+    // like Mark of the Wild — the cast silently fails the shapeshift gate, so a bear TANK
+    // never buffs the party (Mill). When a friendly buff is blocked ONLY by the current form
+    // and it's SAFE to drop it (out of combat, nothing meleeing us, and NOT mid lead-tank
+    // body-pull/pull — a bear must stay in form to gather), cancel the form this tick and
+    // return true; the rule re-fires next tick in caster form and the buff lands. Once every
+    // member has the buff the rule stops matching and the `always: Bear Form` rule reforms.
+    // Returns false (caller casts normally) for non-druids or any unsafe / non-form-blocked case.
+    static bool TryDropFormForBuff(Player* bot, uint32 spellId)
+    {
+        if (!bot || bot->getClass() != CLASS_DRUID) return false;
+        if (!bot->HasShapeshiftAura()) return false;
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+        if (!info) return false;
+        if (info->CheckShapeshift(uint32(bot->GetShapeshiftForm())) == SPELL_CAST_OK)
+            return false;                                   // current form doesn't block it
+        if (bot->IsInCombat() || !bot->getAttackers().empty()) return false;   // never mid-fight
+        uint32 const low = bot->GetGUID().GetCounter();
+        if (WowPsParty::TankGatherActive(low) || WowPsParty::IsTankPulling(bot->GetGUID()))
+            return false;                                   // a bear must stay in form to body-pull
+        bot->RemoveAurasByType(SPELL_AURA_MOD_SHAPESHIFT);  // drop to caster form; cast next tick
+        return true;
+    }
+
     // True ONLY if the party is already fighting `mob` — it's attacking the bot or a
     // party member (or their pets), or one of them is attacking it. cast_spread uses
     // this so a DoT spread can NEVER land on a neutral / unpulled mob (a DoT is an
@@ -2352,6 +2390,8 @@ namespace WowPsParty
         // doesn't have to spell a radius into the condition name.
         if (name == "enemies_in_melee")
             return cmp(int(CountHostilesWithin(bot, 8.0f)));
+        if (name == "melee_attackers")
+            return cmp(int(CountMeleeAttackers(bot)));
         if (name == "enemies_in_range")
             return cmp(int(CountHostilesWithin(bot, 30.0f)));
 
@@ -3656,6 +3696,7 @@ namespace WowPsParty
             if (!spellId) return false;
             Player* target = FindPartyMemberMissingAura(bot, spellId);
             if (!target) return false;
+            if (TryDropFormForBuff(bot, spellId)) return true;   // druid: drop form to cast it (e.g. Mark of the Wild)
             return castOrApproach(target, spellId, /*friendlyApproach=*/true);
         }
 
@@ -5065,7 +5106,13 @@ namespace WowPsParty
         // spread/scan/pull/shoot/wand rotation verbs (the rule loop below). Once
         // released the rotation runs normally (AoE spilling onto the pack is accepted
         // — a player can't gate that perfectly either).
-        bool const offenseHold = WowPsParty::BotWaitsForHumanTank(bot)
+        // Holds under a human tank-lead (above) AND while THIS bot's BOT-tank is still
+        // body-pulling/locking a pull (PartyPullHoldActive) — so a DPS bot doesn't Blizzard /
+        // Frostbolt the pack the bot-tank is still gathering (Mill: "mage cast Blizzard during
+        // a body pull, before the tank was done pulling"). GetVictim()==nullptr is the release:
+        // genuine self-defence (a mob already meleeing us) hands us a victim and frees offense.
+        bool const offenseHold = (WowPsParty::BotWaitsForHumanTank(bot)
+                               || WowPsParty::PartyPullHoldActive(bot))
                               && bot->GetVictim() == nullptr;
 
         // Keep the hunter's auto-shot running between ability casts, its pet

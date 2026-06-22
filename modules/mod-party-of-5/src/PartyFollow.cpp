@@ -54,6 +54,7 @@
 #include "CellImpl.h"
 #include "Chat.h"
 #include "Creature.h"
+#include "Formulas.h"   // Acore::XP::GetGrayLevel — skip trivially-low (gray) mobs from auto-pull
 #include "DBCStores.h"
 #include "GameObject.h"
 #include "GridNotifiers.h"
@@ -1783,6 +1784,29 @@ namespace WowPsParty
         return n;
     }
 
+    // Any NON-tank party member (DPS/healer/the human leader) currently in combat. During
+    // a body-pull the whole party HOLDS (no casts, no auto-attack — IsPartyPullPending), and
+    // the gather's own mobs aggro the TANK, not them — so a non-tank in combat means a
+    // SEPARATE pack just aggroed the group (a stray proximity pull, a patrol). The gather
+    // must ABORT so the tank stops walking off to its planned cluster and instead peels the
+    // new threat off the party (Mill: "we accidentally pulled a different pack and the tank
+    // ignored it — really hard fight").
+    static bool AnyNonTankPartyMemberInCombat(Player* tank)
+    {
+        if (!tank) return false;
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(tank->GetGUID(), party);
+        for (ObjectGuid const& g : party)
+        {
+            if (g == tank->GetGUID()) continue;
+            Player* m = ObjectAccessor::FindConnectedPlayer(g);
+            if (!m || !m->IsInWorld() || !m->IsAlive()) continue;
+            if (m->GetMapId() != tank->GetMapId()) continue;
+            if (m->IsInCombat()) return true;
+        }
+        return false;
+    }
+
     // Is the tank currently in combat with a boss? Used to suppress the maintain-N
     // gather during a boss fight (Mill: "do not multi-pull into bosses") — a boss is
     // tank-and-spank, never a cluster to grow.
@@ -1797,6 +1821,19 @@ namespace WowPsParty
         return false;
     }
 
+    // A creature so far below the tank that it's GRAY (gives no XP) won't auto-aggro when
+    // the tank walks up — its aggro radius collapses to ~nothing. Scarlet Monastery
+    // Graveyard's lvl-8 "tortured victim" packs are RED (hostile faction) but trivial, so
+    // the body-pull marched into them and stalled forever (Mill). Skip them from any
+    // AUTO-pull (the player can still hit them by hand). Tradeoff: a heavily over-levelled
+    // party (e.g. an 80 in SM) finds all the trash gray too and won't auto-body-pull it —
+    // acceptable, since trivial trash dies to incidental cleave without a formal pull.
+    static bool WontAutoAggro(Player* tank, Unit* u)
+    {
+        if (!tank || !u || !u->ToCreature()) return false;
+        return u->GetLevel() <= Acore::XP::GetGrayLevel(tank->GetLevel());
+    }
+
     // A clean, un-aggroed pull candidate the tank can reach + actually see (not through a
     // wall). Bosses are never gathered (Mill: no multi-pull into bosses). PASSIVE / neutral
     // (yellow) mobs are excluded: a body-pull works by PROXIMITY aggro, but a passive mob
@@ -1807,6 +1844,7 @@ namespace WowPsParty
         if (!u || !u->IsAlive() || u->IsInCombat()) return false;   // un-aggroed only
         if (u->IsTotem() || !u->ToCreature()) return false;
         if (IsBossUnit(u)) return false;                            // never gather a boss
+        if (WontAutoAggro(tank, u)) return false;                  // trivial/gray -> won't aggro (SM GY victims)
         if (!tank->IsValidAttackTarget(u)) return false;
         if (!u->IsHostileTo(tank)) return false;                   // passive/neutral (yellow) -> can't body-pull
         if (std::fabs(u->GetPositionZ() - tank->GetPositionZ()) > PULL_Z_TOLERANCE) return false;
@@ -1874,21 +1912,34 @@ namespace WowPsParty
         return true;
     }
 
-    // Drive a body-pull chase toward `add` WITHOUT re-issuing MoveChase every tick. The
-    // gather runs each AI tick; calling MoveChase(add) unconditionally each tick re-inits
-    // the chase generator and RESETS the spline, so the tank stutters/turns in place and
-    // never actually closes — the "tank spazzes, won't body-pull, stands looking at the
-    // mob" report. Only (re)issue when the target changed or the chase generator was lost.
+    // Drive a body-pull toward `add` by MovePoint, NOT MoveChase. Diagnostics proved a
+    // MoveChase(add) on an OUT-OF-COMBAT player-bot installs a CHASE generator (mg=5) that
+    // emits NO spline — the tank holds at distCur=27.9, movedSelf~0, moveFlags=0x0, never
+    // closing (Mill/Amaenna "stands still looking at the mob", engaged 0/N -> drive-timeout).
+    // MovePoint is the proven walk-to-coordinate primitive for these bots (recall, LoS-
+    // recovery, scout all use it). The opener is stationary while un-aggroed, so one
+    // MovePoint walks the whole way; on arrival proximity-aggro grabs the pack and the
+    // gather re-picks the next add. Re-issuing every tick resets the spline (stutter-in-
+    // place), so only (re)issue when the target add changed, the mob WANDERED off the last
+    // destination, or our point-move generator was lost (rotation/combat took over + back).
     static void DriveTankChase(Player* tank, Unit* add)
     {
-        static thread_local std::unordered_map<uint32, uint64> lastChase;   // tankLow -> add raw guid
+        static thread_local std::unordered_map<uint32, uint64> lastChase;                  // tankLow -> add raw guid
+        static thread_local std::unordered_map<uint32, std::array<float, 3>> lastDest;     // tankLow -> issued dest
+        uint32 const low = tank->GetGUID().GetCounter();
         uint64 const ag = add->GetGUID().GetRawValue();
-        uint64& lc = lastChase[tank->GetGUID().GetCounter()];
+        float const ax = add->GetPositionX(), ay = add->GetPositionY(), az = add->GetPositionZ();
         MovementGeneratorType const mg = tank->GetMotionMaster()->GetCurrentMovementGeneratorType();
-        if (lc == ag && mg == CHASE_MOTION_TYPE) return;    // already chasing this exact target — don't reset
-        tank->SetFacingToObject(add);                       // face it only when (re)issuing the chase
-        tank->GetMotionMaster()->MoveChase(add);
+        uint64& lc = lastChase[low];
+        std::array<float, 3>& ld = lastDest[low];
+        bool const targetChanged = lc != ag;
+        bool const wandered = std::fabs(ld[0] - ax) + std::fabs(ld[1] - ay) > 3.0f;
+        bool const lostGen = mg != POINT_MOTION_TYPE;
+        if (!targetChanged && !wandered && !lostGen) return;   // already walking to it — don't reset the spline
+        tank->SetFacingToObject(add);
+        tank->GetMotionMaster()->MovePoint(0, ax, ay, az);
         lc = ag;
+        ld = { ax, ay, az };
     }
 
     // One tick of an active maintain-N BODY-PULL gather. The tank MOVES only here (the
@@ -1907,6 +1958,9 @@ namespace WowPsParty
         char const* end = nullptr;
         if      (now - d.startMs > GATHER_DRIVE_MAX_MS)     end = "drive-timeout";  // overall safety cap
         else if (tank->GetHealthPct() <= GATHER_LOW_HP_PCT) end = "hp-bail";        // in danger
+        else if (AnyNonTankPartyMemberInCombat(tank))       end = "party-aggro";    // a DPS/healer pulled a DIFFERENT
+                                                                                    // pack -> abort, resume normal AI so
+                                                                                    // the tank peels/grabs it (Mill)
         else if (TankFightingBoss(tank))                    end = "boss";           // never gather into a boss
         else if (engaged >= d.targetN)                      end = "reached-N";      // reached N -> fight
         if (end)
@@ -2063,6 +2117,7 @@ namespace WowPsParty
         if (!nearest || !nearest->IsAlive()) return;
         if (!bot->IsValidAttackTarget(nearest)) return;
         if (!nearest->IsHostileTo(bot)) return;   // never auto-engage a PASSIVE/neutral (yellow) mob (Mill)
+        if (WontAutoAggro(bot, nearest)) return;  // trivial/gray (won't aggro) — don't open on it (SM GY victims)
         // SelectNearbyTarget returns the nearest valid target even if it's NAVMESH-UNREACHABLE
         // (a mob across a gap/ledge). Opening on it locks the tank onto a mob it can never
         // close on — the live "OPEN+GATHER entry=4308 dist=27 -> 18s timeout, engaged=0, no
@@ -3679,6 +3734,13 @@ namespace WowPsParty
         if (!leader || !HumanTankLeadActive(bot, leader)) return false;
         return WaitForHumanTank(bot->GetGUID());
     }
+
+    // Public wrapper over the (file-local) IsPartyPullPending so the rotation engine can
+    // apply the SAME pull-hold to a DPS bot's OFFENSE that the follow layer applies to its
+    // MOVEMENT: while the lead tank is still body-pulling/locking the pull, every offensive
+    // cast holds (else the mage Blizzards/Frostbolts the pack before the tank has threat —
+    // Mill). Releases the instant the tank has the pack (IsPartyPullPending -> false).
+    bool PartyPullHoldActive(Player* bot) { return IsPartyPullPending(bot); }
 
     // ========================================================================
     // VEHICLE behaviour. WotLK has many vehicle fights (Oculus drakes, Malygos P3,

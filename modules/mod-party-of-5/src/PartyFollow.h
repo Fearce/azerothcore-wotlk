@@ -57,6 +57,10 @@ namespace WowPsParty
     // pack closes on it). repositionToCast reads this to refuse chasing a melee
     // ability into the pack during the pull.
     bool   IsTankPulling(ObjectGuid tankGuid);
+    // True while a lead tank is running an active maintain-N BODY-PULL gather (walking the
+    // pack in, building no threat). The rotation engine reads it to keep a bear in form
+    // mid-pull and to hold DPS offense for the whole gather.
+    bool   TankGatherActive(uint32 tankLow);
     // Suppress the group-removal dismiss hook while a (re-)hire moves a henchman
     // between groups (so pulling it out of a stale LFG group doesn't dismiss it).
     void   SetHenchmanRegrouping(ObjectGuid henchGuid, bool on);
@@ -152,6 +156,10 @@ namespace WowPsParty
     // MaintainBotPet uses it to heel a hunter/warlock pet during the hold instead of
     // letting it charge the pull before the tank has aggro.
     bool BotWaitsForHumanTank(Player* bot);
+
+    // True while THIS bot's lead tank is still body-pulling / locking a pull — the rotation
+    // engine holds the bot's offense for the whole window (mirrors the movement pull-hold).
+    bool PartyPullHoldActive(Player* bot);
 
     // Per-TANK "safe pull" toggle. Default ON for every tank (the ranged
     // tag-and-step-back opener); an explicit Rotation-Editor choice can switch a

@@ -879,7 +879,11 @@ namespace WowPsParty
             case 8: // Mage
                 add("target_casting&target_interruptible", "cast:Counterspell", 88);
                 add("self_missing_aura:Ice Barrier", "cast_self:Ice Barrier", 80);
-                add("enemies_in_melee>0", "cast_self:Frost Nova", 76);
+                // Only when a melee is ACTUALLY swinging at the mage (root-and-run defence),
+                // not merely near it — else the mage roots the tank's body-pull mob in place
+                // far from the tank the instant it walks past (Mill). melee_attackers = mobs
+                // in the mage's attacker set, vs enemies_in_melee = mere proximity.
+                add("melee_attackers>0", "cast_self:Frost Nova", 76);
                 add("always", "buff_self:Frost Armor", 72);
                 add("target_missing_aura:Living Bomb", "cast:Living Bomb", 68);
                 add("always", "cast_party_missing:Arcane Intellect", 60);
@@ -981,6 +985,12 @@ namespace WowPsParty
                     add("self_health<50", "buff_self:Barkskin", 89);
                     add("self_health<35", "buff_self:Survival Instincts", 88);
                     add("self_health<35", "buff_self:Frenzied Regeneration", 87);
+                    // Buff Mark of the Wild ABOVE Bear Form (can't be cast in bear form): the
+                    // engine drops the form to cast it when idle+safe (TryDropFormForBuff),
+                    // then this rule stops firing once everyone has it and Bear Form below
+                    // reforms. Gated out_of_combat + the engine's own pull/combat guard so it
+                    // never drops form mid-fight or mid-body-pull (Mill: bear couldn't MotW).
+                    add("out_of_combat", "cast_party_missing:Mark of the Wild", 85);
                     add("always", "buff_self:Bear Form", 84);
                     add("enemies_in_melee>2", "cast:Swipe (Bear)", 70);
                     add("has_target", "cast:Mangle (Bear)", 68);
