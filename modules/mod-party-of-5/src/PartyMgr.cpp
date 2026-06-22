@@ -505,15 +505,20 @@ namespace WowPsParty
                 }
                 else
                 {
-                    // Berserker Stance, not Battle: it's the only stance that
+                    // Berserker Stance is the goal stance: it's the only one that
                     // enables both the interrupt (Pummel) and Whirlwind, and the
                     // core strikes (Mortal Strike/Bloodthirst/Slam/Execute/Heroic
-                    // Strike/Cleave) are stanceless. Battle-only abilities
-                    // (Overpower/Rend/Thunder Clap) are dropped — they'd be dead
-                    // weight here and Pummel is the more valuable pick.
+                    // Strike/Cleave) are stanceless. But it's learned at L30 — until
+                    // then a DPS warrior must hold BATTLE Stance, never Defensive.
+                    // So: keep Berserker at the higher priority (maintained at 30+),
+                    // and a Battle Stance fallback gated !stance_is_berserker — it
+                    // holds Battle while sub-30 (Berserker unknown) or any moment the
+                    // bot isn't in Berserker, WITHOUT a stance-dance: once Berserker
+                    // is up the higher rule keeps it and this one's condition is false.
                     add("target_casting&target_interruptible", "cast:Pummel", 92);
                     add("target_health<20", "cast:Execute", 90);
                     add("always", "buff_self:Berserker Stance", 82);
+                    add("!stance_is_berserker", "buff_self:Battle Stance", 81);
                     add("always", "buff_self:Battle Shout", 80);
                     add("has_target", "cast:Mortal Strike", 72);
                     add("has_target", "cast:Bloodthirst", 71);
