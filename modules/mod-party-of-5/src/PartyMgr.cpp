@@ -18,6 +18,8 @@
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "SpellMgr.h"           // henchman down-level spell sanitize
+#include "SpellInfo.h"          // SpellLevel / LEARN_SPELL effect inspection
 #include "Bag.h"                // henchman inventory clear (GetBagByPos/GetBagSize)
 #include "Unit.h"
 #include "WorldSession.h"
@@ -1636,6 +1638,111 @@ namespace WowPsParty
                     sweep(bag, uint8(s), container->GetItemByPos(uint8(s)));
     }
 
+    // A hired henchman drawn from a higher level is down-leveled to the party
+    // leader (PlayerbotFactory in HireHenchman). That path does NOT strip the
+    // spells/ranks the bot earned at its former level: talent-granted abilities
+    // whose talent it no longer has (e.g. a level-34 Prot warrior keeping
+    // Devastate, a 41+ talent, or Shockwave/Vigilance from the deep tree) and
+    // higher ability ranks (Cleave/Thunder Clap ranks gated above the new level).
+    // Those make a "level 34" bot hit like an 80. resetTalents only clears spells
+    // for talents STILL allocated, so orphans from talents already gone survive —
+    // and an in-band re-hire of a bot that was previously down-leveled and logged
+    // out at the reduced level (we don't restore it) carries the whole bloated
+    // book. This rebuilds the book to match the bot's ACTUAL level + talents.
+    static void SanitizeHenchmanSpells(Player* bot)
+    {
+        uint32 const level = bot->GetLevel();
+        uint8 const  spec  = bot->GetActiveSpec();
+        uint32 const classMask = 1u << (bot->getClass() - 1);
+
+        // Build, over every talent of this class: the full set of talent-grantable
+        // spells (universe) and the subset granted by the bot's CURRENT talents
+        // (justified). A rank's spell, plus any spell it LEARN_SPELLs (Devastate is
+        // learned this way), counts for both sets.
+        std::unordered_set<uint32> universe, justified;
+        for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
+        {
+            TalentEntry const* te = sTalentStore.LookupEntry(i);
+            if (!te) continue;
+            TalentTabEntry const* tab = sTalentTabStore.LookupEntry(te->TalentTab);
+            if (!tab || !(tab->ClassMask & classMask)) continue;
+
+            for (uint8 r = 0; r < MAX_TALENT_RANK; ++r)
+            {
+                uint32 const rankSpell = te->RankID[r];
+                if (!rankSpell) continue;
+                bool const allocated = bot->HasTalent(rankSpell, spec);
+
+                auto note = [&](uint32 s) { universe.insert(s); if (allocated) justified.insert(s); };
+                note(rankSpell);
+                if (SpellInfo const* si = sSpellMgr->GetSpellInfo(rankSpell))
+                    for (uint8 e = 0; e < MAX_SPELL_EFFECTS; ++e)
+                        if (si->Effects[e].Effect == SPELL_EFFECT_LEARN_SPELL && si->Effects[e].TriggerSpell)
+                            note(si->Effects[e].TriggerSpell);
+            }
+        }
+
+        // Remove (a) talent spells not backed by a current talent and (b) ability
+        // ranks whose spell level exceeds the bot's level. Snapshot first — the
+        // map can't be mutated mid-iteration.
+        std::vector<uint32> toRemove;
+        for (auto const& pair : bot->GetSpellMap())
+        {
+            uint32 const spellId = pair.first;
+            if (pair.second->State == PLAYERSPELL_REMOVED) continue;
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId);
+            if (!si) continue;
+
+            bool const isTalentSpell = universe.count(spellId) != 0;
+            if (isTalentSpell)
+            {
+                if (!justified.count(spellId)) toRemove.push_back(spellId);
+            }
+            else if (si->SpellLevel > level)
+            {
+                toRemove.push_back(spellId);
+            }
+        }
+        if (toRemove.empty()) return;
+
+        for (uint32 s : toRemove)
+            bot->removeSpell(s, SPEC_MASK_ALL, false);
+
+        // Removing an over-level rank can leave the bot with NO rank of an ability
+        // (only the highest rank was known). Re-learn the level-appropriate ranks
+        // through the trainer-gated factory init — it only ADDS what CanTeachSpell
+        // permits at the bot's level, so it fills the gaps without re-adding the
+        // stripped over-level ranks or the orphaned talent spells.
+        PlayerbotFactory factory(bot, level);
+        factory.InitClassSpells();
+        factory.InitAvailableSpells();
+        bot->SendTalentsInfoData(false);
+
+        LOG_INFO("module", "[WowPsParty Provision] sanitized {} spells on henchman {} (lvl {})",
+                 toRemove.size(), bot->GetName(), level);
+    }
+
+    // Run the sanitize at most once per (guid, level): on the first sighting of a
+    // henchman this session (heals an already-bloated pool bot) and again whenever
+    // its level changes (a fresh down-level). Cheap no-op otherwise.
+    static void SanitizeHenchmanSpellsIfNeeded(Player* bot)
+    {
+        if (!bot || !bot->IsInWorld()) return;
+        if (!WowPsParty::IsHenchman(bot->GetGUID())) return;   // never touch a player's own alt
+
+        static std::unordered_map<uint32, uint32> sanitizedAtLevel;
+        static std::mutex mtx;
+        uint32 const guid = bot->GetGUID().GetCounter();
+        uint32 const level = bot->GetLevel();
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto it = sanitizedAtLevel.find(guid);
+            if (it != sanitizedAtLevel.end() && it->second == level) return;
+            sanitizedAtLevel[guid] = level;
+        }
+        SanitizeHenchmanSpells(bot);
+    }
+
     void MaintainBotConsumables(Player* bot)
     {
         if (!bot || !bot->IsInWorld() || !bot->IsAlive() || !bot->GetSession()) return;
@@ -1651,6 +1758,10 @@ namespace WowPsParty
             if (last != 0 && now - last < 12000) return;
             last = now;
         }
+
+        // Strip any over-level / orphaned-talent spells a down-leveled henchman
+        // kept from a former higher level (once per guid+level; no-op once clean).
+        SanitizeHenchmanSpellsIfNeeded(bot);
 
         uint8 const cls = bot->getClass();
         if (cls == CLASS_ROGUE)   MaintainPoisons(bot);
@@ -1911,6 +2022,13 @@ namespace WowPsParty
             // junk; Randomize above only refreshes EQUIPPED gear). Keeps ammo /
             // reagents / shards + equipped gear; henchmen only.
             ClearHenchmanInventory(hen);
+
+            // Strip spells/ranks the bot kept from a former higher level (talent
+            // abilities whose talent it no longer has, over-level ranks) so a
+            // down-leveled or previously-bloated pool pick fights at its real
+            // level. Deterministic here for both in-band and re-leveled hires;
+            // the upkeep tick re-checks as a safety net.
+            SanitizeHenchmanSpellsIfNeeded(hen);
 
             Group* g = lead->GetGroup();
             if (!g)
