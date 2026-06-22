@@ -865,6 +865,20 @@ namespace WowPsParty
     // yanked straight into the next group.
     static constexpr uint32 POST_COMBAT_PULL_DELAY_MS = 5000;
 
+    // Mana the pull-pacing gate waits for before the lead tank proactively opens the
+    // next pack ("don't chain-pull on fumes"). NOT "topped off": a healer between
+    // dungeon pulls rarely sits at a literal 99% — it took chip damage, regen lags a
+    // tick, or the player walks the party into the next pack (proximity aggro) before
+    // the bar fills. A 99% bar is unreachable in practice and DEADLOCKED the body-pull
+    // — the tank held forever on "healer mana <99%", OPEN+GATHER never fired, and combat
+    // started by proximity/DPS with no gather (Mill: "no body pulls even with cap 7, it
+    // just engages immediately"). 50% is just a FLOOR against chain-pulling a near-empty
+    // healer: Mill wants the tank to open at 70% without waiting ("should not wait to
+    // engage based on healer mana, i can be 70% and it's still OK"), so the gate must sit
+    // well below that — it only holds a genuinely drained (<50%) healer for a few seconds
+    // of regen, never a healer that's merely below full.
+    static constexpr uint32 PULL_READY_MANA_PCT = 50;
+
     bool IsTankPulling(ObjectGuid tankGuid)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -2083,7 +2097,7 @@ namespace WowPsParty
             {
                 uint32 const maxMana = manaUnit->GetMaxPower(POWER_MANA);
                 if (maxMana > 0 &&
-                    uint64(manaUnit->GetPower(POWER_MANA)) * 100 < uint64(maxMana) * 99)
+                    uint64(manaUnit->GetPower(POWER_MANA)) * 100 < uint64(maxMana) * PULL_READY_MANA_PCT)
                 {
                     static thread_local std::unordered_map<uint32, uint32> manaLogMs;
                     uint32 const now = getMSTime();
@@ -2092,23 +2106,49 @@ namespace WowPsParty
                     {
                         ml = now;
                         LOG_INFO("module",
-                            "[WowPsParty TankLead] guid={} holding next pull — {} mana {}/{} (<99%)",
+                            "[WowPsParty TankLead] guid={} holding next pull — {} mana {}/{} (<{}%)",
                             bot->GetGUID().GetCounter(),
                             (bot->getClass() == CLASS_PALADIN) ? "own" : "healer",
-                            manaUnit->GetPower(POWER_MANA), maxMana);
+                            manaUnit->GetPower(POWER_MANA), maxMana, PULL_READY_MANA_PCT);
                     }
                     return;
                 }
             }
         }
 
-        // Engage the target. AUTO-ATTACK only — the ability ROTATION stays suppressed for the
-        // whole body-pull (TankIsBodyPulling -> TickRotation + AssistTarget skip), so the tank
-        // builds no early RANGED threat; white swings only land once it's in melee (by which
-        // point it's grouping the pack). Attack ALSO detects an EVADING / unreachable mob
-        // (ok==false) so the tank BAILS instead of standing forever on a mob it can't path to
-        // (the "stands still looking at the pack" report) — proximity-aggro alone could never
-        // recover from that. Re-armed each tick, so it self-corrects when the mob is reachable.
+        // Maintain-N BODY-PULL (pull_count >= 2): a TRUE body-pull — the tank WALKS into the
+        // pack (DriveTankChase) and proximity-aggros it, running NO ability rotation and taking
+        // NO ranged swing (TankIsBodyPulling -> TickRotation + AssistTarget skip). Crucially it
+        // does NOT Attack() the opener: an auto-attack from range pulls that mob into combat at
+        // distance, so IT walks to a stationary tank ("the tank did not walk to the mob ... the
+        // mob was the one who walked to the tank", engaged stuck at 1/N -> drive-timeout — Mill,
+        // Amaenna). The opener is registered as the committed add so the gather paces it in
+        // before re-picking, then grabs up to N. Reachability is already guaranteed (the
+        // NavReachable swap above) and re-checked per add by GatherEligible, so Attack()'s
+        // unreachable probe isn't needed here. DPS + healer hold the whole gather
+        // (IsTankGathering); on CONCLUDE the rotation resumes, the tank builds threat, DPS
+        // engage. N==1 (or a BOSS — never multi-pull a boss) falls through to the single-pull
+        // opener below, which DOES open with an auto-attack.
+        uint32 const pullN = WowPsParty::BotInitialPullCount(bot->GetGUID());
+        if (pullN >= 2 && !IsBossUnit(nearest))
+        {
+            uint32 const tankLow = bot->GetGUID().GetCounter();
+            MarkTankGathering(tankLow, { nearest->GetGUID() });                    // DPS hold
+            StartTankGather(tankLow, pullN);
+            UpdateTankGatherProgress(tankLow, nearest->GetGUID(), getMSTime(), 0); // walk THIS one in first
+            bot->SetFacingToObject(nearest);
+            DriveTankChase(bot, nearest);                                          // BODY-PULL: close on it (deduped)
+            LOG_INFO("module",
+                "[WowPsParty TankLead] guid={} OPEN+GATHER target={} on entry={} dist={:.1f}",
+                tankLow, pullN, nearest->GetEntry(), bot->GetDistance(nearest));
+            return;
+        }
+
+        // Single-pull opener (N==1, or a boss). AUTO-ATTACK only — the ability ROTATION stays
+        // suppressed for the pull (TankIsBodyPulling -> TickRotation + AssistTarget skip), so the
+        // tank builds no early RANGED threat; white swings only land once it's in melee. Attack
+        // ALSO detects an EVADING / unreachable mob (ok==false) so the tank BAILS instead of
+        // standing forever on a mob it can't path to. Re-armed each tick, so it self-corrects.
         bool const ok = bot->Attack(nearest, true);
         if (!ok)
         {
@@ -2120,23 +2160,6 @@ namespace WowPsParty
             return;
         }
         bot->SetFacingToObject(nearest);
-
-        // Maintain-N BODY-PULL (pull_count >= 2): the tank walks the pack in (DriveTankChase)
-        // grabbing up to N, running NO ability rotation (TankIsBodyPulling). Once the gather
-        // CONCLUDES (N / nothing pullable / HP-bail) combat resumes, threat builds, DPS engage
-        // (Mill). DPS + healer hold the whole gather. N==1 (or a BOSS — never multi-pull a
-        // boss) falls through to the classic single ranged/barge pull below.
-        uint32 const pullN = WowPsParty::BotInitialPullCount(bot->GetGUID());
-        if (pullN >= 2 && !IsBossUnit(nearest))
-        {
-            MarkTankGathering(bot->GetGUID().GetCounter(), { nearest->GetGUID() });   // DPS hold
-            StartTankGather(bot->GetGUID().GetCounter(), pullN);
-            DriveTankChase(bot, nearest);                 // walk the opener in (deduped)
-            LOG_INFO("module",
-                "[WowPsParty TankLead] guid={} OPEN+GATHER target={} on entry={} dist={:.1f}",
-                bot->GetGUID().GetCounter(), pullN, nearest->GetEntry(), bot->GetDistance(nearest));
-            return;
-        }
 
         // Ranged pull: a tank that can open from range doesn't charge into the
         // pack. It closes only to ability range, then the rotation (Heroic Throw,
@@ -5595,6 +5618,22 @@ namespace WowPsParty
             // never jittered/wandered.
             if (isLeadTank)
             {
+                // Mid pull / body-pull gather: TankLeadEngagement / TankGatherStep own the
+                // tank's feet (DriveTankChase walks it into the pack by proximity). The lead-
+                // ahead MoveFollow below re-Clears that chase every 1 Hz tick and re-pins the
+                // tank ~leadDist in front of the (back-line) leader, so it never advances on
+                // the pack — the "tank won't body-pull, stands still while the MOB walks to
+                // it, engaged stuck at 1/N -> drive-timeout" report (Mill: Amaenna, a wing
+                // with no recorded path so the path-follow ticker doesn't cover it either).
+                // Yield the feet entirely and clear humanize eligibility so the 250 ms tick
+                // can't grab it; the gather drive re-asserts its own chase generator.
+                if (TankGatherActive(d.followerGuid.GetCounter())
+                    || IsTankPulling(d.followerGuid))
+                {
+                    g_humanize[d.followerGuid.GetCounter()].eligible = false;
+                    return true;
+                }
+
                 // The lead tank is driven by TankFollowPath (recorded wing) or the
                 // lead-ahead MoveFollow below — NEVER by the humanize formation tick.
                 // Explicitly clear any stale eligibility: a tank that was a normal
