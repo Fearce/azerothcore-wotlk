@@ -854,8 +854,16 @@ namespace WowPsParty
                     add("party_lowest_health<75&!party_injured_clustered:30>1", "cast_party_lowest:Healing Wave", 60);
                     add("party_lowest_health<85&self_mana>65", "cast_party_lowest:Lesser Healing Wave", 50);
 
-                    // Mana shield + buff + filler.
-                    add("always", "buff_self:Water Shield", 44);   // mana-return shield
+                    // Shield: Water (mana sustain) behind a tank; Lightning Shield only when
+                    // there's no tank holding aggro (Kevin: ranged shamans prefer water with a tank).
+                    add("party_has_tank",  "buff_self:Water Shield", 44);
+                    add("!party_has_tank", "buff_self:Lightning Shield", 43);
+                    // Buff totems — re-dropped at the shaman's feet whenever the old one is gone
+                    // or the party out-ran it (totem_buff_stale), so the aura keeps reaching a
+                    // party that moved up to the next pull. One totem per element slot.
+                    add("totem_buff_stale:water", "cast_self:Mana Spring Totem", 40);   // party mana regen
+                    add("totem_buff_stale:earth", "cast_self:Stoneskin Totem", 39);     // armor / cast pushback
+                    add("totem_buff_stale:air",   "cast_self:Wrath of Air Totem", 38);  // +spell power for the casters
                     add("self_mana>88&target_missing_aura:Flame Shock", "cast:Flame Shock", 34);
                     add("self_mana>88&has_target", "cast:Lightning Bolt", 30);
                 }
@@ -863,8 +871,22 @@ namespace WowPsParty
                 {
                     add("party_lowest_health<30", "cast_party_lowest:Healing Wave", 86);
                     add("target_casting&target_interruptible", "cast:Wind Shear", 82);
-                    add("always", "buff_self:Lightning Shield", 78);
+                    // Shield: Enhancement is in melee, so Lightning Shield (damage-on-hit).
+                    // Ranged Elemental (and the unspecced caster fallback) takes Water Shield
+                    // (mana) while a tank holds aggro, else Lightning Shield (Kevin).
+                    add("primary_tree:1", "buff_self:Lightning Shield", 78);
+                    add("!primary_tree:1&party_has_tank",  "buff_self:Water Shield", 78);
+                    add("!primary_tree:1&!party_has_tank", "buff_self:Lightning Shield", 77);
                     add("target_missing_aura:Flame Shock", "cast:Flame Shock", 72);
+                    // Totems. The attack totem goes IN to the pack (cast_totem_attack walks the
+                    // shaman in and re-places it on each new pack); buff totems drop at the
+                    // shaman's feet and re-drop (totem_buff_stale) once the party out-runs the
+                    // old one, so the aura keeps reaching the group. Air splits by spec.
+                    add("totem_attack_needed:fire", "cast_totem_attack:Searing Totem", 54);     // extra fire damage on the pack
+                    add("totem_buff_stale:earth", "cast_self:Strength of Earth Totem", 50);     // party melee AP
+                    add("totem_buff_stale:water", "cast_self:Mana Spring Totem", 49);           // party mana regen
+                    add("primary_tree:1&totem_buff_stale:air",  "cast_self:Windfury Totem", 48);    // melee haste (Enh)
+                    add("!primary_tree:1&totem_buff_stale:air", "cast_self:Wrath of Air Totem", 48); // spell haste (Ele)
                     // ENHANCEMENT (talent tree 1): melee. Stormstrike/Lava Lash,
                     // Earth Shock as the instant dump, and an INSTANT Lightning
                     // Bolt at 5 stacks of Maelstrom Weapon. The follow layer

@@ -1589,6 +1589,53 @@ namespace WowPsParty
         return false;
     }
 
+    // The live totem creature in `slot` (an element slot), or nullptr if the slot is empty /
+    // its totem died. Lets a rotation MEASURE where a totem sits — to re-place an attack totem
+    // a new pull left behind, or a buff totem the party out-ran.
+    static Creature* LiveTotemInSlot(Player* bot, uint8 slot)
+    {
+        if (!bot || !bot->GetMap() || slot < SUMMON_SLOT_TOTEM_FIRE || slot >= MAX_TOTEM_SLOT)
+            return nullptr;
+        ObjectGuid const g = bot->m_SummonSlot[slot];
+        if (!g) return nullptr;
+        Creature* t = bot->GetMap()->GetCreature(g);
+        return (t && t->IsAlive()) ? t : nullptr;
+    }
+
+    // Nearest hostile within `range` that the PARTY is already fighting (never a neutral /
+    // un-pulled mob — MobEngagedByParty). Backs offensive-totem placement: the shaman walks to
+    // THIS pack to drop Searing/Magma in range, and re-places when a new pack is the live one.
+    static Unit* NearestEngagedEnemy(Player* bot, float range)
+    {
+        if (!bot) return nullptr;
+        std::vector<Player*> party;
+        GatherPartyPlayers(bot, party, /*includeDead=*/false);
+        std::list<Unit*> hostiles;
+        GatherHostilesAround(bot, range, hostiles);
+        Unit* best = nullptr;
+        float bestD = range + 1.0f;
+        for (Unit* u : hostiles)
+        {
+            if (!u || !u->IsAlive()) continue;
+            if (!MobEngagedByParty(bot, u, party)) continue;
+            float const d = bot->GetDistance(u);
+            if (d < bestD) { bestD = d; best = u; }
+        }
+        return best;
+    }
+
+    // ---- Totem PLACEMENT distances ------------------------------------------
+    // An ATTACK totem (Searing ~20y attack, Magma ~8y PBAoE) must sit NEAR the pack to do
+    // anything, but the ranged shaman drops it at its own feet — so we walk to within
+    // ATTACK_TOTEM_PLACE of the pack first, and treat the totem as misplaced (re-drop) once
+    // it's farther than ATTACK_TOTEM_REACH from the pack the party is NOW fighting (a new pull
+    // left it behind). A BUFF totem (Stoneskin/Strength of Earth/Mana Spring/…) pulses its aura
+    // to the party within ~30y of the TOTEM, so it only needs to sit near the shaman; re-drop
+    // once the party has out-run it past BUFF_TOTEM_REACH.
+    static constexpr float ATTACK_TOTEM_PLACE = 12.0f;
+    static constexpr float ATTACK_TOTEM_REACH = 20.0f;
+    static constexpr float BUFF_TOTEM_REACH   = 25.0f;
+
     // ---- Channel commit-lock ------------------------------------------------
     // When a bot casts a CHANNELED spell (Blizzard, Rain of Fire, Volley, Mind
     // Flay, …) we lock its rotation for the channel duration: while the lock
@@ -1991,6 +2038,34 @@ namespace WowPsParty
                 return cname == "self_totem_active" ? active : !active;
             }
 
+            // OFFENSIVE totem placement gate. TRUE when the party is fighting a pack AND this
+            // element's totem is either MISSING or sitting too far from that pack to attack it
+            // (a previous pull left it behind). Pair with cast_totem_attack, which walks the
+            // shaman in and drops it: "totem_attack_needed:fire | cast_totem_attack:Searing Totem".
+            if (cname == "totem_attack_needed")
+            {
+                uint8 const slot = TotemSlotForElement(arg);
+                if (!slot) return false;
+                Unit* const enemy = NearestEngagedEnemy(bot, 40.0f);
+                if (!enemy) return false;                            // no live pack -> don't place
+                Creature* const t = LiveTotemInSlot(bot, slot);
+                if (!t) return true;                                 // missing -> place it
+                return t->GetDistance(enemy) > ATTACK_TOTEM_REACH;   // left behind -> re-place on this pack
+            }
+
+            // BUFF totem refresh gate. TRUE when this element's totem is MISSING or has been
+            // left too far BEHIND the shaman (the party moved up to a new pull), so its aura no
+            // longer reaches the party. Pair with a plain re-drop at the shaman's feet:
+            // "totem_buff_stale:earth | cast_self:Stoneskin Totem".
+            if (cname == "totem_buff_stale")
+            {
+                uint8 const slot = TotemSlotForElement(arg);
+                if (!slot) return false;
+                Creature* const t = LiveTotemInSlot(bot, slot);
+                if (!t) return true;                                 // missing -> drop it
+                return bot->GetDistance(t) > BUFF_TOTEM_REACH;       // out-run -> re-drop near the party
+            }
+
             // target_casting:<spell> / target_channeling:<spell> — fire only while
             // the target is mid-cast of a SPECIFIC spell, by display name or by
             // numeric id. Pair with cast_scan to stun/kick a dangerous off-target
@@ -2018,6 +2093,9 @@ namespace WowPsParty
         }
         if (cond == "in_combat")     return bot->IsInCombat();
         if (cond == "out_of_combat") return !bot->IsInCombat();
+        // True when this bot's party has a live tank-role member — a ranged shaman uses it to
+        // pick Water Shield (mana, it's safe behind the tank) over Lightning Shield.
+        if (cond == "party_has_tank") return WowPsParty::PartyHasLiveTank(bot->GetGUID());
         // Party-wide combat state: true if ANY party member (leader + bots)
         // is fighting. Use these for pull / hold-position / between-pull rules
         // so the tank doesn't "pre-pull" or stand idle while the rest of the
@@ -3552,6 +3630,39 @@ namespace WowPsParty
             return castOrApproach(target, spellId);
         }
 
+        // "cast_totem_attack:<totem>" — drop an OFFENSIVE totem (Searing/Magma) IN RANGE of
+        // the pack. A totem spawns at the caster's feet, but the shaman is ranged, so it would
+        // land far out of attack range — first WALK to within ATTACK_TOTEM_PLACE of the nearest
+        // engaged enemy (suppressing the follow/assist ticker for the approach), THEN summon it.
+        // Pairs with totem_attack_needed:<element>, which also re-fires this on the next pack.
+        // It's an offensive verb (held during the tank's pull, see IsOffensiveEnemyVerb), and
+        // NearestEngagedEnemy only sees mobs the party is already fighting — so it never runs
+        // the shaman into an un-pulled pack.
+        if (verb == "cast_totem_attack")
+        {
+            uint32 const spellId = FindKnownSpellByName(bot, arg);
+            if (!spellId) return false;
+            Unit* const enemy = NearestEngagedEnemy(bot, 40.0f);
+            if (!enemy) return false;
+            if (bot->GetDistance(enemy) > ATTACK_TOTEM_PLACE)
+            {
+                if (bot->IsNonMeleeSpellCast(false, false, true)) return false;
+                WowPsParty::HoldFollower(bot->GetGUID(), 1200);   // own the feet for the approach window
+                if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+                {
+                    float x, y, z;
+                    enemy->GetNearPoint(bot, x, y, z, 0.0f,
+                                        std::max(ATTACK_TOTEM_PLACE - 2.0f, 3.0f), enemy->GetAngle(bot));
+                    bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                                                      0.0f, 0.0f, /*generatePath=*/true,
+                                                      /*forceDestination=*/false);
+                }
+                return true;   // approaching the pack this tick — drop on a later tick once in range
+            }
+            if (!canFireSpellOn(spellId, bot)) return false;
+            return faceAndCast(bot, spellId);   // in range — summon it at our feet, near the pack
+        }
+
         if (verb == "buff_self")
         {
             uint32 const spellId = FindKnownSpellByName(bot, arg);
@@ -5001,6 +5112,7 @@ namespace WowPsParty
             || verb == "cast_combo_spread"
             || verb == "cast_scan"
             || verb == "cast_loose_enemy"
+            || verb == "cast_totem_attack"  // walks into the pack + drops an attack totem
             || verb == "pull"
             || verb == "shoot"
             || verb == "wand";
