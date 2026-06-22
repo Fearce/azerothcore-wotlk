@@ -523,8 +523,14 @@ namespace WowPsParty
                     add("has_target", "cast:Mortal Strike", 72);
                     add("has_target", "cast:Bloodthirst", 71);
                     add("enemies_in_melee>1", "cast:Whirlwind", 62);
-                    add("enemies_in_melee>2&self_rage>45", "cast:Cleave", 50);
-                    add("has_target", "cast:Slam", 40);
+                    // AoE rage dump. Cleave (next-swing, hits 2 / 3 glyphed) is the AoE filler,
+                    // NOT Slam: Slam as a plain has_target filler drained every spare rage point
+                    // each GCD, so Cleave's old self_rage>45 gate was never met and it never fired
+                    // — manually forcing Cleave over Slam did far more AoE damage (Kevin). So drop
+                    // the rage gate (the engine still won't cast it when it can't afford it) and
+                    // gate SLAM to single-target, so in any AoE the rage funnels into Cleave.
+                    add("enemies_in_melee>1", "cast:Cleave", 50);
+                    add("enemies_in_melee<2&has_target", "cast:Slam", 40);
                     add("self_rage>55", "cast:Heroic Strike", 30);
                 }
                 break;
