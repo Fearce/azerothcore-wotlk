@@ -787,9 +787,31 @@ namespace WowPsParty
             }
         }
 
-        // Already at the target waypoint? nothing to do.
         float const distToWp = Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
                                        wp.x, wp.y, wp.z);
+
+        // SMOOTH LEAD on clear ground. A re-issued MovePoint calls StopMoving on EVERY retarget
+        // (PointMovementGenerator::DoInitialize), so chasing the continuously-advancing lead
+        // point with MovePoint lurches in WAYPOINT_REACHED-sized bursts — the interpolation made
+        // the target smooth but the motion stays "snappy between nodes" (Mill). When the tank can
+        // reach the lead point by a DIRECT navmesh line (no obstacle the recorded route is needed
+        // to round), hold the lead with MoveFollow instead: its heartbeat maintains the gap with
+        // NO per-tick StopMoving — exactly the smooth no-recorded-path formation. The recorded
+        // route still drives the genuinely blocked stretches (corners / doors / drops) via the
+        // MovePoint logic below. Install once and leave it; re-assert only if the generator was
+        // lost (combat, a blink, an obstacle stretch that switched us to MovePoint and back).
+        if (NavWalkable(bot, wp.x, wp.y, wp.z, distToWp))
+        {
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != FOLLOW_MOTION_TYPE)
+            {
+                bot->GetMotionMaster()->Clear();
+                bot->GetMotionMaster()->MoveFollow(leader, LEAD_DISTANCE, 0.0f);   // 0 = directly in front
+                tlog("smooth lead: MoveFollow (direct line to lead point is clear)");
+            }
+            return;
+        }
+
+        // Direct line blocked -> drive along the RECORDED route to round the obstacle.
         if (distToWp <= WAYPOINT_REACHED) { tlog("idle: already at lookahead waypoint"); return; }
 
         uint32 const botGuidLow = bot->GetGUID().GetCounter();
