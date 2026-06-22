@@ -2652,6 +2652,12 @@ namespace WowPsParty
         for (auto const& kv : bot->GetSpellMap())
         {
             if (kv.second->State == PLAYERSPELL_REMOVED) continue;
+            // Match Player::HasSpell — a spell whose specMask doesn't cover the
+            // active spec is NOT castable (e.g. a talent ability the bot no longer
+            // has the talent for: removeSpell leaves talent-cost spells in the map
+            // with specMask=0 rather than deleting them). Without this the bot kept
+            // casting an orphaned Devastate/Shockwave after a down-level.
+            if (!kv.second->IsInSpec(bot->GetActiveSpec())) continue;
             SpellInfo const* info = sSpellMgr->GetSpellInfo(kv.first);
             if (!info) continue;
             char const* spellName = info->SpellName[0];  // enUS slot

@@ -258,6 +258,11 @@ namespace WowPsParty
         for (auto const& kv : target->GetSpellMap())
         {
             if (kv.second->State == PLAYERSPELL_REMOVED) continue;
+            // Skip spells not in the active spec (specMask=0) — same rule as
+            // Player::HasSpell. Talent abilities the bot no longer has the talent
+            // for linger in the map with specMask=0 (removeSpell won't delete
+            // talent-cost spells); without this they still showed in the editor.
+            if (!kv.second->IsInSpec(target->GetActiveSpec())) continue;
             SpellInfo const* info = sSpellMgr->GetSpellInfo(kv.first);
             if (!info) continue;
             if (info->IsPassive()) continue;
