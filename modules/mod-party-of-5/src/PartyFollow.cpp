@@ -3418,6 +3418,24 @@ namespace WowPsParty
         return false;
     }
 
+    // Does the party LEADER fight from range (caster / healer / ranged dps)? The
+    // leader has NO follower directive, so FollowerIsMelee's RoleForGuid lookup is
+    // blind to it (a Holy Paladin / Disc Priest healer would be misread by class
+    // alone). Read the leader's configured party role from LeaderRole — the same
+    // cache HumanTankLeadActive uses — for the tank/healer cases, and fall back to
+    // the class + feral-form heuristic only for a "dps" / unset role.
+    static bool LeaderFightsAtRange(Player* leader)
+    {
+        if (!leader) return false;
+        if (leader->GetSession())
+        {
+            std::string const lr = LeaderRole(leader->GetSession()->GetAccountId());
+            if (lr == "tank")   return false;   // melee front-liner
+            if (lr == "healer") return true;    // heals/stands at range regardless of class
+        }
+        return !FollowerIsMelee(leader);        // dps / unset -> class & feral-form heuristic
+    }
+
     // True while the party's lead tank is mid ranged-pull and the pack hasn't
     // reached it yet — the signal every other bot reads to hold fire. False once
     // a hostile is in the tank's melee (pull complete → fight) or there's no
@@ -3471,6 +3489,50 @@ namespace WowPsParty
         float(M_PI) * 0.95f,    // behind, just off-centre (distinct so it can't
                                 // stack on index 0; 7+ followers ring out by dist)
     };
+
+    // Rear-arc follow angle (relative to the tank's facing) on the side the bot is
+    // ALREADY on, so a ranged bot anchoring during a pull never swings across the
+    // tank's FRONT to a fixed formation bearing — the "mage/hunter crosses to the
+    // far side of the tank and proximity-pulls the next pack" bug (Kevin). Mirrors
+    // PULL_REAR_ANGLES' rear cluster (never the ±M_PI/2 flanks) but reads the side
+    // from live geometry; `fi` fans same-side bots a few degrees so they don't stack.
+    static float RearArcAngleOnBotSide(Player* bot, Player* tank, int fi)
+    {
+        // GetRelativeAngle is [0,2pi) in the tank's facing frame: (0,pi)=left (CCW),
+        // (pi,2pi)=right. Map to a bearing just inside "straight behind" on that side.
+        float const rel = tank->GetRelativeAngle(bot->GetPositionX(), bot->GetPositionY());
+        bool const leftSide = rel < float(M_PI);
+        float const fan = 0.05f * float(fi % 3);            // 0 / 0.05pi / 0.10pi outward
+        return leftSide ? float(M_PI) * (0.90f - fan)
+                        : float(M_PI) * (1.10f + fan);
+    }
+
+    // True if standing at (x,y,z) would proximity-pull a FRESH pack — an un-aggroed,
+    // out-of-combat hostile sits within `aggroR` of the spot. Anything already IN
+    // combat is excluded (that's the pull we're part of, not a new pull). Centered on
+    // `center` (the tank) for the grid visit. Only runs when a ranged bot's pull-anchor
+    // is being (re)placed (not every tick), so the grid search is cheap.
+    static bool SpotProximityPulls(Player* center, float x, float y, float z, float aggroR)
+    {
+        if (!center) return false;
+        float const ddx = x - center->GetPositionX();
+        float const ddy = y - center->GetPositionY();
+        float const scanR = std::sqrt(ddx * ddx + ddy * ddy) + aggroR + 2.0f;
+        std::list<Unit*> nearby;
+        Acore::AnyUnfriendlyUnitInObjectRangeCheck check(center, center, scanR);
+        Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck> searcher(center, nearby, check);
+        Cell::VisitObjects(center, searcher, scanR);
+        for (Unit* u : nearby)
+        {
+            if (!u || !u->IsAlive() || u->IsInCombat()) continue;   // fresh packs only
+            if (u->IsTotem() || !u->ToCreature()) continue;
+            float const dx = u->GetPositionX() - x;
+            float const dy = u->GetPositionY() - y;
+            float const dz = u->GetPositionZ() - z;
+            if (dx * dx + dy * dy + dz * dz <= aggroR * aggroR) return true;
+        }
+        return false;
+    }
 
     // True when this party is running a dungeon led by a REAL-PLAYER tank — the
     // case where DPS bots must wait for the human to pull + hold aggro instead of
@@ -4046,6 +4108,11 @@ namespace WowPsParty
                 if (tank && tank != bot)
                 {
                     bool const melee = FollowerIsMelee(bot);
+                    // A ranged bot whose LEADER also fights at range holds WITH the
+                    // human (their safe standoff side), not behind the tank — human
+                    // players don't cross the tank's front to "go to range", and that
+                    // crossing was proximity-pulling the next pack (Kevin).
+                    bool const leaderRanged = leader && leader != tank && LeaderFightsAtRange(leader);
                     float& held = g_pullAnchor[gLow];
                     bool const firstTick = held <= 0.0f;
                     if (firstTick)
@@ -4062,19 +4129,56 @@ namespace WowPsParty
                     if (firstTick || mg != FOLLOW_MOTION_TYPE)
                     {
                         int const fi = FormationIndexFor(bot->GetGUID(), GetLeaderFor(bot->GetGUID()));
-                        // 7+ followers (party-of-5 + henchmen) wrap the 6-bearing
-                        // table; push each extra ring 2.5y further back so they
-                        // don't stack on the inner ring (mirrors the leader-follow).
-                        float const followDist = held + float(fi / 6) * 2.5f;
                         if (bot->getStandState() != UNIT_STAND_STATE_STAND)
                             bot->SetStandState(UNIT_STAND_STATE_STAND);
                         bot->GetMotionMaster()->Clear();
-                        bot->GetMotionMaster()->MoveFollow(tank, followDist, PULL_REAR_ANGLES[fi % 6]);
+                        if (!melee && leaderRanged)
+                        {
+                            // Cluster a few yards off the human so the ranged bot stays at
+                            // range ON THE LEADER'S SIDE — never hugging the tank, never
+                            // crossing its front. Fan the bearing across the leader's REAR
+                            // hemisphere [0.5pi .. 1.5pi] (behind/beside, away from the pack
+                            // the leader faces) so bots arc around the human instead of
+                            // stacking on one line (GetFollowAngle is a flat M_PI/2 for all
+                            // players), and step the distance out by index too.
+                            float const followAngle = float(M_PI) * (0.5f + 0.25f * float(fi % 5));
+                            float const followDist  = 6.0f + float(fi % 4) * 2.5f;   // 6..13.5y off the leader
+                            bot->GetMotionMaster()->MoveFollow(leader, followDist, followAngle);
+                        }
+                        else
+                        {
+                            // Melee (must stay near the tank to engage on release), or a
+                            // ranged bot with no ranged leader to cluster on: backpedal
+                            // BEHIND the tank. 7+ followers wrap the 6-bearing table; push
+                            // each extra ring 2.5y back so they don't stack on the inner ring.
+                            float followDist = held + float(fi / 6) * 2.5f;
+                            float angle = melee ? PULL_REAR_ANGLES[fi % 6]
+                                                : RearArcAngleOnBotSide(bot, tank, fi);   // ranged: keep its own side
+                            // Ranged: if the standoff spot would clip a fresh pack, step
+                            // IN toward the tank (away from the rear pack) until clear. If
+                            // even the floor still clips, tuck in tight behind the tank —
+                            // the tank's own spot is the safest (it holds threat there).
+                            if (!melee)
+                            {
+                                bool clear = false;
+                                for (int t = 0; t < 4; ++t)
+                                {
+                                    float px, py, pz;
+                                    tank->GetNearPoint(bot, px, py, pz, 0.0f, followDist,
+                                                       tank->ToAbsoluteAngle(angle));
+                                    if (!SpotProximityPulls(tank, px, py, pz, 11.0f)) { clear = true; break; }
+                                    followDist -= 4.0f;
+                                    if (followDist < 10.0f) break;
+                                }
+                                if (!clear) followDist = 6.0f;
+                            }
+                            bot->GetMotionMaster()->MoveFollow(tank, followDist, angle);
+                        }
                     }
                 }
                 else if (mg == CHASE_MOTION_TYPE)
                     bot->GetMotionMaster()->Clear();   // no tank found — just hold fire
-                AssistLog(gLow, "pull pending: anchoring behind the tank, holding fire");
+                AssistLog(gLow, "pull pending: anchoring at range (leader side / behind tank), holding fire");
                 return;
             }
         }
