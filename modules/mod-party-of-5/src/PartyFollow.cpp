@@ -1337,6 +1337,27 @@ namespace WowPsParty
         g_lastSpreadMs[guidLow] = nowMs;
     }
 
+    // Throttle for the in-combat ranged back-out's safe-spot grid scan. A bot boxed
+    // in by a fresh pack (no safe retreat → holding) would otherwise re-run the scan
+    // every ~100ms AI tick; the surroundings change slowly, so re-evaluate ~1.4x/s.
+    static constexpr uint32 BACKOUT_SCAN_COOLDOWN_MS = 700;
+    static std::unordered_map<uint32, uint32> g_lastBackoutScanMs;  // guidLow -> ms
+    static std::mutex g_backoutScanMutex;
+
+    static bool BackoutScanReady(uint32 guidLow, uint32 nowMs)
+    {
+        std::lock_guard<std::mutex> lock(g_backoutScanMutex);
+        auto it = g_lastBackoutScanMs.find(guidLow);
+        return it == g_lastBackoutScanMs.end()
+            || (nowMs - it->second) >= BACKOUT_SCAN_COOLDOWN_MS;
+    }
+
+    static void MarkBackoutScan(uint32 guidLow, uint32 nowMs)
+    {
+        std::lock_guard<std::mutex> lock(g_backoutScanMutex);
+        g_lastBackoutScanMs[guidLow] = nowMs;
+    }
+
     // Threat-cap throttle (replaces a fixed timer): even once the tank HAS the
     // mob, a DPS keeps DPSing only while its own threat stays below this fraction
     // of the tank's threat ON THAT MOB. The instant it climbs past, it drops the
@@ -3509,9 +3530,11 @@ namespace WowPsParty
 
     // True if standing at (x,y,z) would proximity-pull a FRESH pack — an un-aggroed,
     // out-of-combat hostile sits within `aggroR` of the spot. Anything already IN
-    // combat is excluded (that's the pull we're part of, not a new pull). Centered on
-    // `center` (the tank) for the grid visit. Only runs when a ranged bot's pull-anchor
-    // is being (re)placed (not every tick), so the grid search is cheap.
+    // combat is excluded (that's the pull we're part of, not a new pull). `center` is
+    // the grid-visit anchor (the tank or the bot itself); the filter is by distance to
+    // the candidate point. Only called when a ranged bot is (re)choosing a standoff
+    // spot — pull anchor, in-combat back-out, spread step — never every tick, so the
+    // grid search stays cheap.
     static bool SpotProximityPulls(Player* center, float x, float y, float z, float aggroR)
     {
         if (!center) return false;
@@ -3532,6 +3555,31 @@ namespace WowPsParty
             if (dx * dx + dy * dy + dz * dz <= aggroR * aggroR) return true;
         }
         return false;
+    }
+
+    // Pick a firing-range retreat spot for a too-close ranged bot that WON'T
+    // proximity-pull a fresh pack. Tries straight back from the mob first (the natural
+    // kite line, preserving the bot's side); if that clips a fresh pack, retreats
+    // TOWARD the leader instead (the party's safe zone). Returns false when neither is
+    // safe — the caller should then hold and fight in place rather than back into the
+    // next group (Kevin: "they should be careful during combat too").
+    static bool SafeRangedBackout(Player* bot, Unit* mob, Player* leader,
+                                  float dist, float& ox, float& oy, float& oz)
+    {
+        if (!bot || !mob) return false;
+        // 1) straight back from the mob.
+        mob->GetNearPoint(bot, ox, oy, oz, 0.0f, dist, mob->GetAngle(bot));
+        if (!SpotProximityPulls(bot, ox, oy, oz, 10.0f)) return true;
+        // 2) toward the leader (their safe standoff) — a point `dist` from the mob on
+        //    the leader's bearing, taken only if reachable and itself clear.
+        if (leader && leader != bot)
+        {
+            mob->GetNearPoint(bot, ox, oy, oz, 0.0f, dist, mob->GetAngle(leader));
+            if (NavReachable(bot, ox, oy, oz, bot->GetExactDist(ox, oy, oz))
+                && !SpotProximityPulls(bot, ox, oy, oz, 10.0f))
+                return true;
+        }
+        return false;   // nowhere safe -> hold in place
     }
 
     // True when this party is running a dungeon led by a REAL-PLAYER tank — the
@@ -4951,12 +4999,26 @@ namespace WowPsParty
                 // Drop any melee.
                 if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
                     bot->Attack(desired, false);
-                if (mg != POINT_MOTION_TYPE)
+                // Re-evaluating the retreat runs a grid scan; throttle it so a boxed-in
+                // bot (no safe spot → holding) doesn't scan every tick.
+                if (mg != POINT_MOTION_TYPE && BackoutScanReady(gLow, nowMs))
                 {
+                    MarkBackoutScan(gLow, nowMs);
                     float bx, by, bz;
-                    desired->GetNearPoint(bot, bx, by, bz, 0.0f, 13.0f, desired->GetAngle(bot));
-                    bot->GetMotionMaster()->MovePoint(0, bx, by, bz);
-                    AssistLog(gLow, "ranged: too close, backing out to firing range");
+                    if (SafeRangedBackout(bot, desired, leader, 13.0f, bx, by, bz))
+                    {
+                        bot->GetMotionMaster()->MovePoint(0, bx, by, bz);
+                        AssistLog(gLow, "ranged: too close, backing out to firing range");
+                    }
+                    else if (mg != IDLE_MOTION_TYPE)
+                    {
+                        // Backing out either way would clip a fresh pack — hold and fight
+                        // in place rather than proximity-pull the next group.
+                        bot->StopMoving();
+                        bot->GetMotionMaster()->Clear();
+                        bot->GetMotionMaster()->MoveIdle();
+                        AssistLog(gLow, "ranged: too close but a back-out would pull a fresh pack — holding");
+                    }
                 }
                 bot->SetFacingToObject(desired);
                 return;
@@ -4980,7 +5042,8 @@ namespace WowPsParty
                     IsBunchedAtStandoff(bot, desired, RANGED_SPREAD_RADIUS))
                 {
                     float sx, sy, sz;
-                    if (ComputeRangedSpreadSpot(bot, desired, hold, sx, sy, sz))
+                    if (ComputeRangedSpreadSpot(bot, desired, hold, sx, sy, sz)
+                        && !SpotProximityPulls(bot, sx, sy, sz, 10.0f))   // don't spread INTO a fresh pack
                     {
                         MarkSpreadStep(gLow, nowMs);
                         bot->GetMotionMaster()->MovePoint(0, sx, sy, sz);
