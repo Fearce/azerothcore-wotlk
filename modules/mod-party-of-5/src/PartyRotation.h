@@ -13,6 +13,8 @@
  * Supported conditions (selection — see PartyRotation.cpp for the full set):
  *     always
  *     in_combat | out_of_combat
+ *     am_tank | am_dps | am_healer       the BOT's own party role (fan a rule out by
+ *                                 job, e.g. am_dps so only DPS chase a caster to kick)
  *     is_moving | is_not_moving
  *     self_health<N|>N  self_mana  self_rage  self_energy  self_power (% 0-100)
  *     self_combo<N|>N                     combo points, RAW 0-5
@@ -66,6 +68,19 @@
  *                                  fight when the gating condition clears. Pair with
  *                                  target_casting:<spell>, e.g.
  *                                  "target_casting:Dark Smash | move_out_of_los | 200".
+ *     cast_scan:<spell>            cast <spell> on the FIRST party-engaged enemy (not
+ *                                  just the victim) matching the rule's target_* gates,
+ *                                  WITHOUT retargeting — off-target stuns/kicks. <spell>
+ *                                  may be "available_stun"/"available_interrupt".
+ *     interrupt_caster:<spell>     RANGED off-target interrupt: kick the first party-
+ *                                  engaged enemy mid an INTERRUPTIBLE cast that the bot
+ *                                  can reach in place, without moving/retargeting. <spell>
+ *                                  empty or "available_interrupt" = this class's ready
+ *                                  interrupt (Counterspell/Wind Shear/Silencing Shot/…).
+ *                                  Pair with am_dps to pick who answers.
+ *     interrupt_caster_melee:<sp>  as above for a MELEE interrupt: RUN to the nearest far
+ *                                  caster (capped, party-engaged only — never into a fresh
+ *                                  pack), kick it, then return to the bot's own target.
  *     use_item:<item name>         use a consumable/trinket from shared bags
  *     pull:<spell name>            ranged opener (Throw/Shoot) for the tank
  *     shoot                        fire the equipped physical ranged weapon

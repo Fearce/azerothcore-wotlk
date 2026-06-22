@@ -2197,6 +2197,18 @@ namespace WowPsParty
         }
         if (cond == "in_combat")     return bot->IsInCombat();
         if (cond == "out_of_combat") return !bot->IsInCombat();
+        // Role of the BOT running this rule (from the Party Roster). Lets a rule
+        // fan out by job — e.g. "am_dps" so only DPS chase a far caster to
+        // interrupt while the tank holds and the healer keeps healing. A bot's
+        // role is always one of tank/healer/dps (defaults to dps), so am_dps is
+        // the catch-all "neither tank nor healer".
+        if (cond == "am_tank")   return WowPsParty::RoleForGuid(bot->GetGUID()) == "tank";
+        if (cond == "am_healer") return WowPsParty::RoleForGuid(bot->GetGUID()) == "healer";
+        if (cond == "am_dps")
+        {
+            std::string const r = WowPsParty::RoleForGuid(bot->GetGUID());
+            return r != "tank" && r != "healer";
+        }
         // True when this bot's party has a live tank-role member — a ranged shaman uses it to
         // pick Water Shield (mana, it's safe behind the tank) over Lightning Shield.
         if (cond == "party_has_tank") return WowPsParty::PartyHasLiveTank(bot->GetGUID());
@@ -3705,6 +3717,7 @@ namespace WowPsParty
                 || verb == "close_to_enemy"   || verb == "move_behind"
                 || verb == "stay_in_front"    || verb == "hold_position"
                 || verb == "move_out_of_los"  || verb == "pull"
+                || verb == "interrupt_caster_melee"   // travels to a far caster
                 || verb == "reposition_random" || verb == "walk_away_from_source"))
             return false;
 
@@ -4100,6 +4113,116 @@ namespace WowPsParty
                     "[WowPsParty Rotation] {} scan-cast {} -> {}",
                     bot->GetName(), arg, pick->GetName());
             return fired;
+        }
+
+        // "interrupt_caster:<spell>" — RANGED off-target interrupt. Scan every enemy
+        // the party is fighting and, WITHOUT retargeting or moving, cast <spell> on the
+        // first one mid an INTERRUPTIBLE cast that the bot can reach right now — so a
+        // caster the bot isn't even targeting gets shut down (and, kicked, closes to
+        // melee). For any class with a ranged interrupt (Counterspell, Wind Shear,
+        // Silencing Shot, Silence, Strangulate, Earth Shock...). <spell> empty or
+        // "available_interrupt" = whatever interrupt this class has ready. Honors the
+        // rule's target_* clauses per enemy; pair with role conditions (am_dps) to pick
+        // who answers. A melee-range interrupt simply never reaches a far caster here —
+        // use interrupt_caster_melee for that.
+        if (verb == "interrupt_caster")
+        {
+            uint32 const spellId = FindKnownSpellByName(bot, arg.empty() ? "available_interrupt" : arg);
+            if (!spellId || bot->HasSpellCooldown(spellId)) return false;
+            std::vector<Player*> party;
+            GatherPartyPlayers(bot, party, /*includeDead=*/false);
+            auto eligible = [&](Unit* u) -> bool
+            {
+                if (!u || !u->IsAlive() || !bot->IsValidAttackTarget(u)) return false;
+                if (!MobEngagedByParty(bot, u, party)) return false;   // never a neutral → no pull
+                bool ch = false, ir = false;
+                SpellInfo const* casting = CurrentCastSpell(u, &ch, &ir);
+                if (!casting || !ir) return false;                     // must be an interruptible cast
+                if (!canFireSpellOn(spellId, u)) return false;         // reachable in place (range/LoS/CD)
+                return EvalCondition(cond, bot, u);                    // rule's target_* per enemy
+            };
+            Unit* pick = nullptr;
+            if (Unit* v = bot->GetVictim())
+                if (eligible(v)) pick = v;                             // our own target first if it qualifies
+            if (!pick)
+            {
+                std::list<Unit*> hostiles;
+                GatherHostilesAround(bot, 41.0f, hostiles);
+                for (Unit* a : hostiles)
+                    if (eligible(a)) { pick = a; break; }
+            }
+            if (!pick) return false;
+            if (!channelClipOk()) return false;
+            bool const fired = faceAndCast(pick, spellId);
+            if (fired)
+                LOG_INFO("module", "[WowPsParty Rotation] {} interrupt(ranged) {} -> {}",
+                    bot->GetName(), spellId, pick->GetName());
+            return fired;
+        }
+
+        // "interrupt_caster_melee:<spell>" — MELEE off-target interrupt with a round
+        // trip. Like interrupt_caster but for a melee interrupt (Pummel, Shield Bash,
+        // Kick, Mind Freeze): the bot RUNS to the nearest far enemy mid an interruptible
+        // cast, kicks it, then returns to its own target via the normal assist (we only
+        // hold the feet while traveling; releasing the hold walks it back). Scans
+        // party-engaged enemies only and caps the run (MELEE_INTERRUPT_SCAN) so it never
+        // chases a caster across the room into a fresh pack. Pair with am_dps so the
+        // tank/healer don't leave their posts.
+        if (verb == "interrupt_caster_melee")
+        {
+            static constexpr float MELEE_INTERRUPT_SCAN = 30.0f;   // travel cap — don't run the room
+            uint32 const spellId = FindKnownSpellByName(bot, arg.empty() ? "available_interrupt" : arg);
+            if (!spellId || bot->HasSpellCooldown(spellId)) return false;
+            std::vector<Player*> party;
+            GatherPartyPlayers(bot, party, /*includeDead=*/false);
+            auto eligible = [&](Unit* u) -> bool
+            {
+                if (!u || !u->IsAlive() || !bot->IsValidAttackTarget(u)) return false;
+                if (!MobEngagedByParty(bot, u, party)) return false;
+                bool ch = false, ir = false;
+                SpellInfo const* casting = CurrentCastSpell(u, &ch, &ir);
+                if (!casting || !ir) return false;
+                if (!bot->IsWithinLOSInMap(u, VMAP::ModelIgnoreFlags::M2)) return false;
+                return EvalCondition(cond, bot, u);
+            };
+            // Nearest qualifying caster — least travel, least pull risk.
+            Unit* pick = nullptr;
+            float best = 0.0f;
+            std::list<Unit*> hostiles;
+            GatherHostilesAround(bot, MELEE_INTERRUPT_SCAN, hostiles);
+            for (Unit* a : hostiles)
+                if (eligible(a))
+                {
+                    float const d = bot->GetDistance(a);
+                    if (!pick || d < best) { best = d; pick = a; }
+                }
+            if (!pick) return false;
+            // In interrupt range now → kick it in place (no retarget), then let the
+            // hold lapse so AssistTarget walks us back to our own target.
+            if (canFireSpellOn(spellId, pick))
+            {
+                if (!channelClipOk()) return false;
+                bool const fired = faceAndCast(pick, spellId);
+                if (fired)
+                    LOG_INFO("module", "[WowPsParty Rotation] {} interrupt(melee) {} -> {}",
+                        bot->GetName(), spellId, pick->GetName());
+                return fired;
+            }
+            if (castBlock != CastBlock::Position) return false;   // CD/power/GCD, not range → don't run
+            // Too far: own the feet and run in; interrupt on a later tick once in range.
+            if (bot->IsNonMeleeSpellCast(false, false, true)) return false;
+            WowPsParty::HoldFollower(bot->GetGUID(), 1200);       // refreshed each travel tick
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+            {
+                float x, y, z;
+                pick->GetNearPoint(bot, x, y, z, 0.0f, 3.0f, pick->GetAngle(bot));
+                bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                                                  0.0f, 0.0f, /*generatePath=*/true,
+                                                  /*forceDestination=*/false);
+            }
+            LOG_INFO("module", "[WowPsParty Rotation] {} interrupt(melee) closing on {} ({}y)",
+                bot->GetName(), pick->GetName(), uint32(best));
+            return true;   // traveling this tick
         }
 
         // "cast_combo_spread:<builder>:<finisher>" — feral/rogue MULTI-DOT with a
@@ -5282,6 +5405,11 @@ namespace WowPsParty
             || verb == "cast_spread"
             || verb == "cast_combo_spread"
             || verb == "cast_scan"
+            // NOTE: interrupt_caster / interrupt_caster_melee are deliberately NOT here.
+            // They must fire REGARDLESS of the tank-threat hold: the tank habitually
+            // ignores ranged casters (never builds threat on them), so gating the kick
+            // on "tank has the mob" would mean the interrupt never fires on exactly the
+            // mobs it exists for (Kevin). Interrupt threat is negligible anyway.
             || verb == "cast_loose_enemy"
             || verb == "cast_cone"          // front-cone AoE
             || verb == "cast_totem_attack"  // walks into the pack + drops an attack totem
@@ -5625,7 +5753,8 @@ namespace WowPsParty
             // perfectly fresh add, and vice versa).
             bool const isSpread = r.action.rfind("cast_spread", 0) == 0
                                || r.action.rfind("cast_combo_spread", 0) == 0
-                               || r.action.rfind("cast_scan", 0) == 0;
+                               || r.action.rfind("cast_scan", 0) == 0
+                               || r.action.rfind("interrupt_caster", 0) == 0;   // covers _melee too
             // For a friendly-target action, evaluate target_* conditions against
             // the unit we'll actually heal/buff (the heal target), not the enemy
             // victim — so "target_missing_my_aura:Rejuvenation" gates on the
