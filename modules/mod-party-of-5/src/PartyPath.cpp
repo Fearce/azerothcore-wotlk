@@ -59,11 +59,15 @@ namespace WowPsParty
         // Per-bot tank-playback cursor: which waypoint index we last advanced
         // toward. Avoids thrashing MovePoint every tick.
         static std::mutex                                           g_tankProgressMutex;
+        // Per-bot ACTIVE steer node: the recorded node the tank is currently walking toward.
+        // We only re-issue MovePoint once she REACHES it (not every tick), so the spline runs a
+        // whole lookahead between StopMoving's instead of restarting constantly. path.size() (an
+        // invalid index) is the sentinel for "no active steer — (re)issue now" (set on halt).
         static std::unordered_map<uint32, uint32>                   g_tankCursor;
-        // Per-bot last-issued CONTINUOUS lead point (interpolated). The MovePoint re-issue
-        // gate compares against it so the tank re-aims only when the smooth lead target has
-        // drifted far enough to matter — re-issuing every tick would reset the spline.
-        static std::unordered_map<uint32, Vec3>                     g_tankLeadPoint;
+        // Per-bot HALT latch: true while the tank is parked because it's already >= lead distance
+        // ahead of the leader. Hysteresis (clears at lead - LEAD_HYSTERESIS) stops walk/halt
+        // flicker right at the boundary. Guarded by g_tankProgressMutex.
+        static std::unordered_map<uint32, bool>                     g_tankHalted;
         // Per-bot LEADER cursor: the leader's nearest waypoint last tick. The
         // per-tick nearest scan starts here so it only ever moves FORWARD along the
         // route — a path that doubles back near itself otherwise let the raw argmin
@@ -97,10 +101,9 @@ namespace WowPsParty
         // a local in TankFollowPath sourced from WowPsParty::BotLeadDistance (set by
         // the rotation-editor slider, default 15). It used to be a fixed 30y constant.
         constexpr float  WAYPOINT_REACHED   = 3.5f;
-        // The interpolated lead target drifts smoothly as the leader walks; re-issue
-        // MovePoint only once it has moved at least this far from the last-issued point, so
-        // a continuously-updating target doesn't reset the spline every tick (stutter).
-        constexpr float  LEAD_REISSUE_DIST  = 2.5f;
+        // Halt hysteresis: once the tank parks at the lead distance, it stays parked until the
+        // leader has closed the gap by this much — so it doesn't flicker walk/halt at the edge.
+        constexpr float  LEAD_HYSTERESIS    = 2.0f;
         // Vertical step size that pathfinding can't handle (jumps, drops,
         // dropdowns through holes). A genuine drop is a near-vertical PLUNGE: a
         // big Z change over almost no horizontal ground. Because recording is
@@ -711,70 +714,41 @@ namespace WowPsParty
             ++targetIdx;
         }
 
-        // CONTINUOUS lead point. The tank should hold a smooth ~LEAD_DISTANCE gap AHEAD of
-        // the leader, not snap to whichever recorded node happens to sit LEAD_DISTANCE out and
-        // then idle there until the leader's cursor jumps a whole node (Mill: the gap swings
-        // with the node spacing + lead slider, "is there no interpolation?"). So: PROJECT the
-        // leader onto the polyline (closest point on the segment touching the cursor, giving a
-        // fractional position), then walk LEAD_DISTANCE forward INTERPOLATING within segments
-        // to a continuous point. Clamps at the route end.
-        auto leadPoint = [&](uint32 nearIdx, float lead) -> Vec3
-        {
-            auto projDist2 = [&](uint32 i, float& outT) -> float
-            {
-                Vec3 const& a = path[i];
-                Vec3 const& b = path[i + 1];
-                float const abx = b.x - a.x, aby = b.y - a.y, abz = b.z - a.z;
-                float const len2 = abx * abx + aby * aby + abz * abz;
-                float t = 0.0f;
-                if (len2 > 1e-4f)
-                    t = ((leader->GetPositionX() - a.x) * abx + (leader->GetPositionY() - a.y) * aby
-                       + (leader->GetPositionZ() - a.z) * abz) / len2;
-                t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
-                outT = t;
-                float const px = a.x + t * abx, py = a.y + t * aby, pz = a.z + t * abz;
-                float const dx = leader->GetPositionX() - px, dy = leader->GetPositionY() - py,
-                            dz = leader->GetPositionZ() - pz;
-                return dx * dx + dy * dy + dz * dz;
-            };
-            // Project onto the better of the two segments meeting at nearIdx.
-            uint32 baseIdx = nearIdx;
-            float baseT = 0.0f, bestD2 = std::numeric_limits<float>::max();
-            if (nearIdx + 1 < path.size()) { float t; float d2 = projDist2(nearIdx, t);     if (d2 < bestD2) { bestD2 = d2; baseIdx = nearIdx;     baseT = t; } }
-            if (nearIdx > 0)               { float t; float d2 = projDist2(nearIdx - 1, t); if (d2 < bestD2) { bestD2 = d2; baseIdx = nearIdx - 1; baseT = t; } }
-            // Walk `lead` yards forward from the projected point (baseIdx, baseT).
-            uint32 i = baseIdx;
-            float segLen = (i + 1 < path.size())
-                ? Dist3D(path[i].x, path[i].y, path[i].z, path[i + 1].x, path[i + 1].y, path[i + 1].z) : 0.0f;
-            float remInSeg = segLen * (1.0f - baseT);   // from the projected point to the end of seg i
-            float remaining = lead;
-            while (i + 1 < path.size() && remaining > remInSeg)
-            {
-                remaining -= remInSeg;
-                ++i;
-                segLen = (i + 1 < path.size())
-                    ? Dist3D(path[i].x, path[i].y, path[i].z, path[i + 1].x, path[i + 1].y, path[i + 1].z) : 0.0f;
-                remInSeg = segLen;
-            }
-            if (i + 1 >= path.size() || segLen < 1e-4f)
-                return path[i < path.size() ? i : uint32(path.size() - 1)];   // clamped at the route end
-            float const startT = (i == baseIdx) ? baseT : 0.0f;
-            float t = startT + remaining / segLen;
-            if (t > 1.0f) t = 1.0f;
-            Vec3 const& a = path[i];
-            Vec3 const& b = path[i + 1];
-            return Vec3{ a.x + t * (b.x - a.x), a.y + t * (b.y - a.y), a.z + t * (b.z - a.z), b.o };
-        };
-        Vec3 const wp = leadPoint(nearestIdx, LEAD_DISTANCE);
+        uint32 const botGuidLow = bot->GetGUID().GetCounter();
 
-        // Leader has walked PAST the end of the recorded route — into an un-recorded
-        // side area like The Singing Grove (Ormorok) in the Nexus. The cursor pins
-        // at the last waypoint and the lookahead can't advance, so the tank would
-        // idle at the route's end while the leader walks off; meanwhile the follow
-        // ticker still defers to us (HasPathForLeader is true within 250y), so the
-        // tank just stands there and has to be dragged. Hand off to plain following:
-        // walk WITH the leader until the recorded route resumes (or it's extended).
-        if (targetIdx + 1 >= path.size())
+        // Tank's own nearest recorded node — its position ON the route. Used by the steer,
+        // halt, stall-blink and cliff-blink logic below.
+        uint32 tankNearest = 0;
+        float  tankNearD   = std::numeric_limits<float>::max();
+        for (uint32 i = 0; i < path.size(); ++i)
+        {
+            float const d = Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                                   path[i].x, path[i].y, path[i].z);
+            if (d < tankNearD) { tankNearD = d; tankNearest = i; }
+        }
+
+        // STEER NODE (Kevin's model): TRACE the recorded line — always head toward a node AHEAD
+        // of the tank, even when it's beyond the lead distance. Walk forward from the tank's own
+        // nearest node by ~LEAD_DISTANCE of path length to pick it: the recorded nodes are only
+        // ~2y apart (closer than WAYPOINT_REACHED), so steering at the LITERAL next node would
+        // read as "already reached" every tick and freeze her — a lookahead gives the spline real
+        // runway and lets her flow node-to-node. The lead is NOT enforced by where we aim (that's
+        // what caused the snappy chase of a moving lead point); it's enforced by the HALT below.
+        uint32 navIdx = tankNearest;
+        {
+            float acc = 0.0f;
+            while (navIdx + 1 < path.size() && acc < LEAD_DISTANCE)
+            {
+                acc += Dist3D(path[navIdx].x, path[navIdx].y, path[navIdx].z,
+                              path[navIdx + 1].x, path[navIdx + 1].y, path[navIdx + 1].z);
+                ++navIdx;
+            }
+        }
+        Vec3 const& wp = path[navIdx];   // the node we steer toward (also the blink/stall target)
+
+        // Leader walked PAST the recorded route end into an un-recorded side area — follow the
+        // leader directly until the route resumes (else the tank idles at the end and is dragged).
+        if (tankNearest + 1 >= path.size())
         {
             float const leaderToEnd = Dist3D(leader->GetPositionX(), leader->GetPositionY(),
                                              leader->GetPositionZ(), wp.x, wp.y, wp.z);
@@ -787,44 +761,28 @@ namespace WowPsParty
             }
         }
 
-        float const distToWp = Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
-                                       wp.x, wp.y, wp.z);
-
-        // SMOOTH LEAD on clear ground. A re-issued MovePoint calls StopMoving on EVERY retarget
-        // (PointMovementGenerator::DoInitialize), so chasing the continuously-advancing lead
-        // point with MovePoint lurches in WAYPOINT_REACHED-sized bursts — the interpolation made
-        // the target smooth but the motion stays "snappy between nodes" (Mill). When the tank can
-        // reach the lead point by a DIRECT navmesh line (no obstacle the recorded route is needed
-        // to round), hold the lead with MoveFollow instead: its heartbeat maintains the gap with
-        // NO per-tick StopMoving — exactly the smooth no-recorded-path formation. The recorded
-        // route still drives the genuinely blocked stretches (corners / doors / drops) via the
-        // MovePoint logic below. Install once and leave it; re-assert only if the generator was
-        // lost (combat, a blink, an obstacle stretch that switched us to MovePoint and back).
-        if (NavWalkable(bot, wp.x, wp.y, wp.z, distToWp))
+        // HALT gate. Only when the tank is genuinely AHEAD on the route (its cursor past the
+        // leader's) AND its straight-line gap to the leader has reached the lead distance: STOP
+        // and wait — never re-issue, never walk back. Resume toward the SAME steer node once the
+        // leader closes the gap (hysteresis avoids walk/halt flicker at the edge). On halt we
+        // also drop the active steer (sentinel) so the resume re-issues a fresh MovePoint.
         {
-            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != FOLLOW_MOTION_TYPE)
+            bool const ahead = tankNearest > nearestIdx;
+            float const gap  = Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                                      leader->GetPositionX(), leader->GetPositionY(), leader->GetPositionZ());
+            std::lock_guard<std::mutex> lock(g_tankProgressMutex);
+            bool& halted = g_tankHalted[botGuidLow];
+            if (ahead && gap >= float(LEAD_DISTANCE))
+                halted = true;
+            else if (!ahead || gap <= float(LEAD_DISTANCE) - LEAD_HYSTERESIS)
+                halted = false;
+            if (halted)
             {
-                bot->GetMotionMaster()->Clear();
-                bot->GetMotionMaster()->MoveFollow(leader, LEAD_DISTANCE, 0.0f);   // 0 = directly in front
-                tlog("smooth lead: MoveFollow (direct line to lead point is clear)");
+                if (bot->isMoving()) bot->StopMoving();
+                g_tankCursor[botGuidLow] = uint32(path.size());   // sentinel: re-issue on resume
+                tlog("halt: leading by >= lead distance — waiting for the leader to close");
+                return;
             }
-            return;
-        }
-
-        // Direct line blocked -> drive along the RECORDED route to round the obstacle.
-        if (distToWp <= WAYPOINT_REACHED) { tlog("idle: already at lookahead waypoint"); return; }
-
-        uint32 const botGuidLow = bot->GetGUID().GetCounter();
-
-        // Tank's own nearest waypoint — used by both the stall-blink and the
-        // cliff-blink below.
-        uint32 tankNearest = 0;
-        float  tankNearD   = std::numeric_limits<float>::max();
-        for (uint32 i = 0; i < path.size(); ++i)
-        {
-            float const d = Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
-                                   path[i].x, path[i].y, path[i].z);
-            if (d < tankNearD) { tankNearD = d; tankNearest = i; }
         }
 
         // Stall -> blink. We have a lookahead target beyond reach but the tank
@@ -955,26 +913,28 @@ namespace WowPsParty
             }
         }
 
-        // Re-issue only when the CONTINUOUS lead point has drifted past LEAD_REISSUE_DIST
-        // (or our move generator was lost). A pure targetIdx-equality gate would freeze the
-        // tank at a stale point WITHIN a node as the interpolated target slides forward —
-        // the whole point of the interpolation. Keep the discrete cursor fresh too, for the
-        // blink logic above.
+        // Re-issue MovePoint ONLY when we've reached our current steer node (so the spline runs
+        // a whole lookahead between StopMoving's, instead of restarting every tick), or the move
+        // generator was lost (combat / blink / a halt that dropped the steer). g_tankCursor holds
+        // the active steer node; the halt sets it to the sentinel so a resume re-issues here.
         {
             std::lock_guard<std::mutex> lock(g_tankProgressMutex);
-            g_tankCursor[botGuidLow] = targetIdx + 1;
-            bool const genOk =
+            uint32& steer = g_tankCursor[botGuidLow];
+            bool const genPoint =
                 bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE;
-            auto it = g_tankLeadPoint.find(botGuidLow);
-            if (genOk && it != g_tankLeadPoint.end()
-                && Dist3D(it->second.x, it->second.y, it->second.z, wp.x, wp.y, wp.z) < LEAD_REISSUE_DIST)
-                return;   // already walking toward ~this point — don't reset the spline
-            g_tankLeadPoint[botGuidLow] = wp;
+            float const distToSteer = (steer < path.size())
+                ? Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                         path[steer].x, path[steer].y, path[steer].z)
+                : std::numeric_limits<float>::max();
+            // Still walking toward a valid node that's ahead of us and not yet reached? leave it.
+            if (genPoint && steer < path.size() && steer >= tankNearest && distToSteer > WAYPOINT_REACHED)
+                return;
+            steer = navIdx;
         }
 
         tlog(Acore::StringFormat(
-            "LEAD: MovePoint to lookahead — cursor={} lookahead={}/{} leaderNearD={:.0f}",
-            nearestIdx, targetIdx, uint32(path.size()) - 1, nearestD).c_str());
+            "LEAD: MovePoint to steer node — tankNearest={} steer={}/{} leaderCursor={}",
+            tankNearest, navIdx, uint32(path.size()) - 1, nearestIdx).c_str());
         bot->GetMotionMaster()->Clear();
         bot->GetMotionMaster()->MovePoint(0, wp.x, wp.y, wp.z);
     }
