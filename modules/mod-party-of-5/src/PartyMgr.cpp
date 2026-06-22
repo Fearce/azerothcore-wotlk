@@ -1440,38 +1440,77 @@ namespace WowPsParty
         imbue(EQUIPMENT_SLOT_OFFHAND,  heldDeadly, heldInstant);
     }
 
-    // Warrior tanks pull from range (see TankLeadEngagement), which needs a
-    // thrown weapon in the ranged slot. Only WARRIORS can equip thrown weapons,
-    // so this is warrior-tank-only. Equips the best vendor-grade thrown weapon
-    // the bot's level allows, ONCE — only when the ranged slot is empty, so a
-    // player-chosen ranged item on an alt is never clobbered.
+    // Level-appropriate gear picks (used by MaintainTankThrown / MaintainTankShield):
+    // WotLK BoP dungeon drops carry RequiredLevel 0 with raid-tier ItemLevels (e.g.
+    // the ilvl-174 "Iron Coffin Lid" shield and ilvl-174 thrown weapons), so a plain
+    // "RequiredLevel <= level ORDER BY ItemLevel DESC" hands a level-34 bot a level-80
+    // item. Both helpers instead EXCLUDE RequiredLevel 0 and take the highest
+    // RequiredLevel the bot's level allows (ItemLevel as tiebreak), keeping the pick
+    // in line with the bot's other factory gear (shield ilvl ~39 / thrown ~27 at
+    // level 34, shield ~200 at 80). Verified no RequiredLevel-1..N item of either
+    // slot has an anomalous ItemLevel, so excluding 0 fully removes the freaks.
+
+    // Warrior tanks pull from range (see TankLeadEngagement), which needs a thrown
+    // weapon in the ranged slot. Only WARRIORS can equip thrown weapons, so this is
+    // warrior-tank-only. Equips the best level-appropriate thrown weapon when the
+    // ranged slot is empty OR holds a freak over-leveled thrown (an earlier bug put
+    // ilvl-174 RequiredLevel-0 throwns on low-level tanks). A player-chosen bow/gun
+    // or a level-appropriate thrown is left untouched.
     static void MaintainTankThrown(Player* bot)
     {
         if (bot->getClass() != CLASS_WARRIOR) return;
         if (WowPsParty::RoleForGuid(bot->GetGUID()) != "tank") return;
-        if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED)) return;
 
         // class=2 weapon, subclass=16 thrown, InventoryType=25 INVTYPE_THROWN.
-        // Common..rare only (no heirloom/artifact). Best item level the bot can
-        // actually use; CanEquipNewItem makes the final class/level call.
+        // Common..rare only (no heirloom/artifact). See the gear-pick note above.
+        uint32 const lvl = bot->GetLevel();
         QueryResult q = WorldDatabase.Query(
             "SELECT entry FROM item_template "
             "WHERE class = 2 AND subclass = 16 AND InventoryType = 25 "
-            "AND RequiredLevel <= {} AND Quality BETWEEN 1 AND 3 "
-            "ORDER BY ItemLevel DESC, RequiredLevel DESC LIMIT 10", uint32(bot->GetLevel()));
+            "AND Quality BETWEEN 1 AND 3 "
+            "AND RequiredLevel BETWEEN 1 AND {} "
+            "ORDER BY RequiredLevel DESC, ItemLevel DESC LIMIT 10", lvl);
         if (!q) return;
+
+        // Best level-appropriate thrown the bot can use (CanUseItem is slot-
+        // independent, so evaluate it before freeing the ranged slot).
+        uint32 bestEntry = 0, bestIl = 0;
         do
         {
             uint32 const entry = (*q)[0].Get<uint32>();
-            uint16 dest = 0;
-            if (bot->CanEquipNewItem(NULL_SLOT, dest, entry, false) == EQUIP_ERR_OK)
-            {
-                bot->EquipNewItem(dest, entry, true);
-                LOG_INFO("module", "[WowPsParty Provision] equipped thrown weapon {} on {} (lvl {})",
-                         entry, bot->GetName(), uint32(bot->GetLevel()));
-                return;
-            }
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(entry);
+            if (!proto || bot->CanUseItem(proto) != EQUIP_ERR_OK)
+                continue;
+            bestEntry = entry;
+            bestIl = proto->ItemLevel;
+            break;
         } while (q->NextRow());
+        if (!bestEntry) return;
+
+        Item* ranged = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+        if (ranged)
+        {
+            ItemTemplate const* rp = ranged->GetTemplate();
+            bool const isThrown = rp->Class == ITEM_CLASS_WEAPON &&
+                                  rp->SubClass == ITEM_SUBCLASS_WEAPON_THROWN;
+            // Leave a player-chosen bow/gun alone, and keep a level-appropriate
+            // thrown; only swap a freak over-leveled thrown (ilvl far above the pick).
+            if (!isThrown) return;
+            if (rp->ItemLevel <= bestIl * 2) return;
+
+            ItemPosCountVec stash;
+            if (bot->CanStoreItem(NULL_BAG, NULL_SLOT, stash, ranged, false) != EQUIP_ERR_OK)
+                return;
+            bot->RemoveItem(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED, true);
+            bot->StoreItem(stash, ranged, true);
+        }
+
+        uint16 dest = 0;
+        if (bot->CanEquipNewItem(NULL_SLOT, dest, bestEntry, false) != EQUIP_ERR_OK)
+            return;
+        bot->EquipNewItem(dest, bestEntry, true);
+        LOG_INFO("module", "[WowPsParty Provision] equipped thrown weapon {} (ilvl {}) on {} (lvl {})",
+                 bestEntry, bestIl, bot->GetName(), lvl);
     }
 
     // Prot tanks (warrior & paladin) MUST carry a shield — block, Shield Slam /
@@ -1479,21 +1518,19 @@ namespace WowPsParty
     // all key off one being equipped. The playerbot gear factory picks the
     // offhand by stat-weight and can land on a 1H weapon or a holdable frill
     // (shields aren't guaranteed into its random candidate pool), so a hired prot
-    // tank can arrive shieldless. Guarantee one: when the offhand isn't already a
-    // shield, equip the best vendor-grade shield the bot's level + skill allow.
-    // Gated on role=tank (only prot wants sword-and-board; a fury/arms/ret hire
-    // of this class is left alone) and self-throttled by being a no-op the instant
-    // a shield is on, so it never thrashes equipped gear.
+    // tank can arrive shieldless. Guarantee a level-appropriate one: equip the
+    // best level-appropriate shield (see the gear-pick note above MaintainTankThrown)
+    // when the offhand is missing,
+    // non-shield, OR a freak over-leveled shield (an earlier provisioning bug put
+    // an ilvl-174 RequiredLevel-0 raid shield on a level-34 tank). Gated on
+    // role=tank (only prot wants sword-and-board; a fury/arms/ret hire of this
+    // class is left alone) and a no-op once an appropriate shield is on, so it
+    // never thrashes equipped gear.
     static void MaintainTankShield(Player* bot)
     {
         uint8 const cls = bot->getClass();
         if (cls != CLASS_WARRIOR && cls != CLASS_PALADIN) return;
         if (WowPsParty::RoleForGuid(bot->GetGUID()) != "tank") return;
-
-        Item* off = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
-        if (off && off->GetTemplate()->Class == ITEM_CLASS_ARMOR &&
-            off->GetTemplate()->SubClass == ITEM_SUBCLASS_ARMOR_SHIELD)
-            return;   // already shielded — nothing to do
 
         // A 2H weapon in the mainhand blocks sword-and-board outright; don't
         // unequip the offhand chasing a shield we then can't wear (a prot tank
@@ -1504,50 +1541,70 @@ namespace WowPsParty
                 return;
 
         // class=4 ARMOR, subclass=6 SHIELD, InventoryType=14 INVTYPE_SHIELD.
-        // Common..rare only (no heirloom/artifact). Best item level first; the
-        // final class/skill/level call is CanUseItem + CanEquipNewItem below.
+        // Common..rare only (no heirloom/artifact). See the gear-pick note above
+        // MaintainTankThrown — excludes RequiredLevel 0 so a freak raid shield
+        // can't land on a low-level tank.
+        uint32 const lvl = bot->GetLevel();
         QueryResult q = WorldDatabase.Query(
             "SELECT entry FROM item_template "
             "WHERE class = 4 AND subclass = 6 AND InventoryType = 14 "
-            "AND RequiredLevel <= {} AND Quality BETWEEN 1 AND 3 "
-            "ORDER BY ItemLevel DESC, RequiredLevel DESC LIMIT 15", uint32(bot->GetLevel()));
+            "AND Quality BETWEEN 1 AND 3 "
+            "AND RequiredLevel BETWEEN 1 AND {} "
+            "ORDER BY RequiredLevel DESC, ItemLevel DESC LIMIT 15", lvl);
         if (!q) return;
 
+        // Best band shield the bot can actually use (highest ItemLevel first).
+        // CanUseItem is slot-independent, so evaluate it before freeing the offhand.
+        uint32 bestEntry = 0, bestIl = 0;
         do
         {
             uint32 const entry = (*q)[0].Get<uint32>();
             ItemTemplate const* proto = sObjectMgr->GetItemTemplate(entry);
             if (!proto || bot->CanUseItem(proto) != EQUIP_ERR_OK)
-                continue;   // class/skill/level gate (slot-independent)
-
-            // Stash a non-shield offhand (1H weapon / holdable) into the bags so
-            // the slot is free. If the bags can't take it, bail rather than
-            // destroy a usable item.
-            if (off)
-            {
-                ItemPosCountVec stash;
-                if (bot->CanStoreItem(NULL_BAG, NULL_SLOT, stash, off, false) != EQUIP_ERR_OK)
-                    return;
-                bot->RemoveItem(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND, true);
-                bot->StoreItem(stash, off, true);
-                off = nullptr;
-            }
-
-            uint16 dest = 0;
-            if (bot->CanEquipNewItem(NULL_SLOT, dest, entry, false) != EQUIP_ERR_OK)
-            {
-                // Offhand is empty now and CanUseItem already passed, so reaching
-                // here means a transient block (combat/cast/stun). Next tick retries
-                // cleanly; log it so a persistently shieldless prot bot is diagnosable.
-                LOG_DEBUG("module", "[WowPsParty Provision] shield {} not equippable on prot {} this tick (will retry)",
-                          entry, bot->GetName());
-                return;
-            }
-            bot->EquipNewItem(dest, entry, true);
-            LOG_INFO("module", "[WowPsParty Provision] equipped shield {} on prot {} (lvl {})",
-                     entry, bot->GetName(), uint32(bot->GetLevel()));
-            return;
+                continue;   // class/skill/level gate
+            bestEntry = entry;
+            bestIl = proto->ItemLevel;
+            break;
         } while (q->NextRow());
+        if (!bestEntry) return;   // nothing usable in band
+
+        Item* off = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
+        if (off && off->GetTemplate()->Class == ITEM_CLASS_ARMOR &&
+            off->GetTemplate()->SubClass == ITEM_SUBCLASS_ARMOR_SHIELD)
+        {
+            // Already shielded — keep it unless it's wildly over-leveled for this
+            // bot (a RequiredLevel-0 raid shield from the old bug, ilvl far above
+            // the band). A real upgrade a notch above the band is fine; only a big
+            // multiple is a freak worth swapping down.
+            if (off->GetTemplate()->ItemLevel <= bestIl * 2)
+                return;
+        }
+
+        // Stash the current offhand (non-shield, or the freak shield) into the
+        // bags so the slot is free. If the bags can't take it, bail rather than
+        // destroy a usable item.
+        if (off)
+        {
+            ItemPosCountVec stash;
+            if (bot->CanStoreItem(NULL_BAG, NULL_SLOT, stash, off, false) != EQUIP_ERR_OK)
+                return;
+            bot->RemoveItem(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND, true);
+            bot->StoreItem(stash, off, true);
+        }
+
+        uint16 dest = 0;
+        if (bot->CanEquipNewItem(NULL_SLOT, dest, bestEntry, false) != EQUIP_ERR_OK)
+        {
+            // Offhand is empty now and CanUseItem already passed, so reaching here
+            // means a transient block (combat/cast/stun). Next tick retries cleanly;
+            // log it so a persistently shieldless prot bot is diagnosable.
+            LOG_DEBUG("module", "[WowPsParty Provision] shield {} not equippable on prot {} this tick (will retry)",
+                      bestEntry, bot->GetName());
+            return;
+        }
+        bot->EquipNewItem(dest, bestEntry, true);
+        LOG_INFO("module", "[WowPsParty Provision] equipped shield {} (ilvl {}) on prot {} (lvl {})",
+                 bestEntry, bestIl, bot->GetName(), lvl);
     }
 
     // Trim a bot's Soul Shards down to exactly one. `preferKeep` (when non-null)
