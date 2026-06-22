@@ -996,6 +996,109 @@ namespace WowPsParty
         return best;
     }
 
+    // How many distinct hostiles within `radius` are LOOSE on the party (attacking an ally,
+    // not the tank). Backs the `loose_enemies` condition: a tank fires its AoE taunt
+    // (Challenging Shout / Roar / Righteous Defense) when >1 mob it doesn't hold is loose
+    // near it, instead of single-taunting them one at a time (Kevin).
+    static uint32 CountLooseEnemies(Player* bot, float radius)
+    {
+        if (!bot) return 0;
+        std::list<Unit*> targets;
+        GatherHostilesAround(bot, radius, targets);
+        std::vector<ObjectGuid> partyGuids;
+        WowPsParty::GetPartyGuidsFor(bot->GetGUID(), partyGuids);
+        uint32 n = 0;
+        for (Unit* enemy : targets)
+        {
+            if (!enemy || !enemy->IsAlive() || !enemy->IsInCombat()) continue;
+            Unit* const victim = enemy->GetVictim();
+            if (!victim || victim == bot || !victim->IsPlayer()) continue;   // none / already ours
+            if (std::find(partyGuids.begin(), partyGuids.end(), victim->GetGUID()) == partyGuids.end())
+                continue;
+            if (!bot->IsValidAttackTarget(enemy)) continue;
+            ++n;
+        }
+        return n;
+    }
+
+    // The party member a loose mob is beating on — the FRIENDLY target for a defend-ally
+    // taunt (Paladin's Righteous Defense taunts up to 3 of the ally's attackers off them).
+    static Player* FindThreatenedAlly(Player* bot, float radius)
+    {
+        Unit* const loose = FindLooseEnemy(bot, radius);
+        if (!loose) return nullptr;
+        Unit* const v = loose->GetVictim();
+        return (v && v->IsPlayer()) ? v->ToPlayer() : nullptr;
+    }
+
+    // AoE THREAT CAP. Would firing an offensive AREA spell here rip the tank off ANY engaged
+    // mob the AoE would touch? Mirrors the single-target cap (0.80 of the tank's threat) but
+    // across the whole cluster, so a DPS doesn't pull the SECONDARY pack members — where the
+    // tank has built almost no threat yet — off it the instant a pull's AoE opens up ("tanks
+    // lose threat when DPS dump AoE at the start", Kevin). NEVER caps the tank itself (it
+    // WANTS to AoE for threat); self-limiting — opens back up as the tank's threat climbs.
+    static constexpr float AOE_THREAT_CAP_RATIO = 0.80f;
+    static bool BotAoeThreatCapped(Player* bot, float radius)
+    {
+        if (!bot) return false;
+        if (WowPsParty::RoleForGuid(bot->GetGUID()) == "tank") return false;
+        std::vector<Player*> party;
+        GatherPartyPlayers(bot, party, /*includeDead=*/false);
+        std::list<Unit*> hostiles;
+        GatherHostilesAround(bot, radius, hostiles);
+        for (Unit* mob : hostiles)
+        {
+            if (!mob || !mob->IsAlive() || !MobEngagedByParty(bot, mob, party)) continue;
+            Unit* const tank = mob->GetVictim();
+            if (!tank || tank == bot) continue;                  // no top-threat / we already hold it
+            // Only protect a mob a real TANK is holding. A loose add whose top-threat is the
+            // HEALER or another DPS must NOT cap us — that's exactly the add we WANT to cleave
+            // off them. (A human tank-lead party is throttled by BotWaitsForHumanTank instead.)
+            if (WowPsParty::RoleForGuid(tank->GetGUID()) != "tank") continue;
+            float const tankThreat = mob->GetThreatMgr().GetThreat(tank);
+            if (tankThreat <= 0.0f) return true;                 // tank has ~no threat -> AoE would rip it
+            if (mob->GetThreatMgr().GetThreat(bot) >= tankThreat * AOE_THREAT_CAP_RATIO)
+                return true;                                     // within the cap on this mob -> hold AoE
+        }
+        return false;
+    }
+
+    // Best facing (orientation) to maximize a front-CONE spell's hits. The core selects cone
+    // targets within ±(M_PI/2)/2 = ±45 deg of the caster's facing (SelectImplicitConeTargets),
+    // so we slide a 90-deg angular window over the engaged enemies' bearings and pick the
+    // densest — keeping the bot's current VICTIM inside the window so the cast still lands on
+    // it. Backs cast_cone (Cone of Cold / Dragon's Breath / Cat-form Swipe). `victim` must be
+    // non-null (the cast anchor). Returns the orientation to face.
+    static float BestConeFacing(Player* bot, Unit* victim, std::vector<Unit*> const& enemies)
+    {
+        float const half = float(M_PI) / 4.0f;          // ±45 deg (core cone is M_PI/2 full)
+        float const vBear = bot->GetAngle(victim);      // [0, 2pi)
+        std::vector<float> ang;
+        for (Unit* e : enemies) ang.push_back(bot->GetAngle(e));
+        if (ang.empty()) return vBear;
+        std::sort(ang.begin(), ang.end());
+        std::vector<float> ext = ang;                    // duplicate +2pi for wrap-around
+        for (float a : ang) ext.push_back(a + 2.0f * float(M_PI));
+        uint32 const n = uint32(ang.size());
+        float const window = 2.0f * half;
+        float bestFacing = vBear;
+        uint32 best = 0;
+        for (uint32 i = 0; i < n; ++i)
+        {
+            float const lo = ang[i], hi = ang[i] + window;
+            bool const vIn = (vBear >= lo && vBear <= hi)
+                          || (vBear + 2.0f * float(M_PI) >= lo && vBear + 2.0f * float(M_PI) <= hi);
+            if (!vIn) continue;                          // window must keep the victim in the cone
+            uint32 c = 0;
+            for (uint32 j = i; j < i + n; ++j) { if (ext[j] <= hi) ++c; else break; }
+            if (c > best) { best = c; bestFacing = ang[i] + half; }   // face the window centre
+        }
+        float f = bestFacing;
+        while (f < 0.0f)               f += 2.0f * float(M_PI);
+        while (f >= 2.0f * float(M_PI)) f -= 2.0f * float(M_PI);
+        return f;
+    }
+
     // ----- shared-inventory food/drink helpers -------------------------------
 
     // Visit every Item in the bags of every member of `bot`'s account_party.
@@ -2471,6 +2574,10 @@ namespace WowPsParty
             return cmp(int(CountHostilesWithin(bot, 8.0f)));
         if (name == "melee_attackers")
             return cmp(int(CountMeleeAttackers(bot)));
+        // Mobs within AoE-taunt range (~10y) that are loose on the party (on an ally, not on
+        // this bot). A tank gates its AoE taunt on `loose_enemies>1`.
+        if (name == "loose_enemies")
+            return cmp(int(CountLooseEnemies(bot, 10.0f)));
         if (name == "enemies_in_range")
             return cmp(int(CountHostilesWithin(bot, 30.0f)));
 
@@ -3600,10 +3707,23 @@ namespace WowPsParty
             uint32 const spellId = FindKnownSpellByName(bot, arg);
             if (!spellId) return false;
 
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            // AoE THREAT CAP: hold an offensive AREA spell (Blizzard / Consecration / Volley /
+            // Whirlwind / …) when firing it would rip the tank off ANY mob it'd hit — so a DPS
+            // doesn't pull the off-tank pack members at the start of a pull. Self-limiting; it
+            // opens back up as the tank's threat climbs. Never holds the tank (BotAoeThreatCapped).
+            if (info && info->IsAffectingArea() && !info->IsPositive())
+            {
+                float aoeR = 0.0f;
+                for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                    aoeR = std::max(aoeR, info->Effects[i].CalcRadius(bot));
+                if (aoeR <= 0.0f) aoeR = 8.0f;
+                if (BotAoeThreatCapped(bot, aoeR)) return false;
+            }
+
             // Ground-targeted AoE: aim at the densest cluster within the
             // spell's own radius (not the victim). Detected via the spell's
             // explicit DEST_LOCATION target flag.
-            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
             if (verb == "cast" && info
                 && (info->GetExplicitTargetMask() & TARGET_FLAG_DEST_LOCATION))
             {
@@ -3828,6 +3948,50 @@ namespace WowPsParty
             Unit* target = FindLooseEnemy(bot, 30.0f);
             if (!target) return false;
             return castOrApproach(target, spellId, /*friendlyApproach=*/false);
+        }
+
+        // "cast_defend_ally:<spell>" — a FRIENDLY-target taunt (Paladin's Righteous Defense):
+        // cast on the party member a mob is beating on; it taunts up to 3 of that ally's
+        // attackers off them. Targets the ALLY, not the enemy. Pair with enemy_loose_in_range /
+        // loose_enemies>1.
+        if (verb == "cast_defend_ally")
+        {
+            uint32 const spellId = FindKnownSpellByName(bot, arg);
+            if (!spellId) return false;
+            Player* ally = FindThreatenedAlly(bot, 30.0f);
+            if (!ally) return false;
+            return castOrApproach(ally, spellId, /*friendlyApproach=*/true);
+        }
+
+        // "cast_cone:<spell>" — a front-CONE spell (Cone of Cold / Dragon's Breath / Cat-form
+        // Swipe). Orient the bot so the ±45-deg cone catches the MOST engaged enemies (keeping
+        // its current victim in the cone so the cast still lands), then cast. Instant cones only
+        // — the cone is resolved from facing at cast time. (No-op idea for Bear Swipe: that's a
+        // 360-deg PBAoE here, facing is irrelevant.)
+        if (verb == "cast_cone")
+        {
+            uint32 const spellId = FindKnownSpellByName(bot, arg);
+            if (!spellId) return false;
+            Unit* const victim = bot->GetVictim();
+            if (!victim) return false;
+            float coneR = 0.0f;
+            if (SpellInfo const* ci = sSpellMgr->GetSpellInfo(spellId))
+                for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                    coneR = std::max(coneR, ci->Effects[i].CalcRadius(bot));
+            if (coneR < 5.0f) coneR = 8.0f;
+            if (BotAoeThreatCapped(bot, coneR)) return false;   // don't rip the tank off the cone's targets
+            std::vector<Player*> party;
+            GatherPartyPlayers(bot, party, /*includeDead=*/false);
+            std::list<Unit*> hostiles;
+            GatherHostilesAround(bot, coneR, hostiles);
+            std::vector<Unit*> enemies;
+            for (Unit* u : hostiles)
+                if (u && u->IsAlive() && MobEngagedByParty(bot, u, party))
+                    enemies.push_back(u);
+            if (enemies.size() > 1)                              // only worth re-aiming for 2+
+                bot->SetOrientation(BestConeFacing(bot, victim, enemies));
+            if (!canFireSpellOn(spellId, victim)) return false;
+            return bot->CastSpell(victim, spellId, false) == SPELL_CAST_OK;
         }
 
         // "cast_spread:<dot>" — MULTI-DOT. Apply <dot> to the current target if it's
@@ -5113,6 +5277,7 @@ namespace WowPsParty
             || verb == "cast_combo_spread"
             || verb == "cast_scan"
             || verb == "cast_loose_enemy"
+            || verb == "cast_cone"          // front-cone AoE
             || verb == "cast_totem_attack"  // walks into the pack + drops an attack totem
             || verb == "pull"
             || verb == "shoot"

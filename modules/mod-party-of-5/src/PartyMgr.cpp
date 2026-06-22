@@ -479,8 +479,14 @@ namespace WowPsParty
                     // healer time. Gated low so they stay dormant until real danger.
                     add("self_health<20", "buff_self:Shield Wall", 95);
                     add("target_casting&target_interruptible", "cast:Shield Bash", 92);
+                    // AoE taunt FIRST when 2+ mobs the tank doesn't hold are loose nearby —
+                    // Challenging Shout grabs them all at once instead of single-Taunting one.
+                    add("loose_enemies>1", "cast_self:Challenging Shout", 91);
                     add("enemy_loose_in_range", "cast_loose_enemy:Taunt", 90);
                     add("self_health<30", "buff_self:Last Stand", 89);
+                    // In-combat rage jump-start so the tank can AoE-threat the pack right away
+                    // (esp. now AoE is threat-capped): Bloodrage when rage is low. 1-min CD.
+                    add("in_combat&self_rage<25", "cast_self:Bloodrage", 86);
                     add("always", "buff_self:Defensive Stance", 84);
                     add("always", "buff_self:Commanding Shout", 80);
                     add("has_target", "cast:Shield Slam", 74);
@@ -583,7 +589,11 @@ namespace WowPsParty
                     // with Divine Protection below, so the <15 gate keeps it as the
                     // true last resort once the 50% DR can't save us).
                     add("self_health<15", "cast_self:Lay on Hands", 95);
-                    add("enemy_loose_in_range", "cast_loose_enemy:Hand of Reckoning", 92);
+                    // Righteous Defense FIRST when 2+ mobs are loose: it's cast on the ALLY
+                    // being beaten on and taunts up to 3 of their attackers off them at once —
+                    // the paladin's multi-taunt. Single loose mob -> Hand of Reckoning on it.
+                    add("loose_enemies>1", "cast_defend_ally:Righteous Defense", 92);
+                    add("enemy_loose_in_range", "cast_loose_enemy:Hand of Reckoning", 91);
                     // Paladins have no true interrupt in 3.3.5a — stun the caster
                     // with Hammer of Justice (no-op on stun-immune bosses).
                     add("target_casting&target_interruptible", "cast:Hammer of Justice", 91);
@@ -1011,6 +1021,9 @@ namespace WowPsParty
                 }
                 else if (isTank)
                 {
+                    // AoE taunt FIRST when 2+ mobs the tank doesn't hold are loose nearby —
+                    // Challenging Roar grabs them all at once instead of single-Growling one.
+                    add("loose_enemies>1", "cast_self:Challenging Roar", 91);
                     add("enemy_loose_in_range", "cast_loose_enemy:Growl", 90);
                     // Barkskin = 20% DR (any form, off the GCD). Survival Instincts
                     // = +30% max health (feral talent). Frenzied Regeneration =
@@ -1018,6 +1031,10 @@ namespace WowPsParty
                     add("self_health<50", "buff_self:Barkskin", 89);
                     add("self_health<35", "buff_self:Survival Instincts", 88);
                     add("self_health<35", "buff_self:Frenzied Regeneration", 87);
+                    // In-combat rage jump-start (the bear's Bloodrage analogue) so it can Swipe
+                    // the pack for threat right away, esp. now AoE is threat-capped. Enrage needs
+                    // bear form (the always-rule below keeps it) and has a 1-min CD.
+                    add("in_combat&self_rage<25", "cast_self:Enrage", 86);
                     // Buff Mark of the Wild ABOVE Bear Form (can't be cast in bear form): the
                     // engine drops the form to cast it when idle+safe (TryDropFormForBuff),
                     // then this rule stops firing once everyone has it and Bear Form below
@@ -1055,6 +1072,9 @@ namespace WowPsParty
                     add("primary_tree:1&self_combo>4&target_missing_aura:Rip&target_ttd>8", "cast:Rip", 73);
                     add("primary_tree:1&self_combo>4", "cast:Ferocious Bite", 70);
                     add("primary_tree:1&target_missing_aura:Rake", "cast:Rake", 66);
+                    // Cat-form Swipe IS a front cone — aim it at the most enemies (cast_cone)
+                    // when there are 3+ in melee, before single-target builders.
+                    add("primary_tree:1&enemies_in_melee>2", "cast_cone:Swipe (Cat)", 62);
                     add("primary_tree:1&has_target", "cast:Mangle (Cat)", 58);
                     add("primary_tree:1&has_target", "cast:Claw", 48);   // pre-Mangle fallback
                     // Leave the form out of combat so the cat can drink/mount/buff
