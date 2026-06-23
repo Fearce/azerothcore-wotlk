@@ -23,6 +23,7 @@
 #include "PathGenerator.h"   // reachability check for the move_out_of_los duck spot
 #include "Pet.h"
 #include "Player.h"
+#include "PlayerbotMgr.h"    // sPlayerbotsMgr — tell a human leader from a managed bot
 #include "Random.h"
 #include "Spell.h"
 #include "SpellAuras.h"
@@ -1306,23 +1307,30 @@ namespace WowPsParty
         if (!bot) return nullptr;
         std::vector<Player*> party;
         GatherPartyPlayers(bot, party, /*includeDead=*/true);
-        // Pick a RANDOM dead member instead of always the first, so several rezzers
-        // spread across different corpses rather than all stacking the same one —
-        // a post-wipe raid stands back up much faster (Kevin). Prefer corpses NOT
-        // already mid-rez (a pending resurrect request means someone's rez already
-        // landed) so we don't pile a second rez on the same target; fall back to any
-        // dead member if every corpse already has a request. (party_has_dead, which
+        // Prioritize HUMAN players over bots, and corpses NOT already mid-rez over
+        // ones that are. Four buckets, in strict preference order:
+        //   1. dead HUMAN, no pending rez   — get the real players up first
+        //   2. dead BOT,   no pending rez   — then do useful work on the bots
+        //   3. dead HUMAN, rez pending      — leftovers (already covered, but human)
+        //   4. dead BOT,   rez pending
+        // A pending resurrect request means someone's rez already landed, so we
+        // don't pile a second on the same target until everything else is covered.
+        // Random WITHIN a bucket so multiple rezzers spread across corpses instead
+        // of all stacking the same one — a post-wipe raid stands back up faster
+        // (Kevin). A human is a member with no playerbot AI. (party_has_dead, which
         // only checks for non-null, is unaffected.)
-        std::vector<Player*> dead, deadNoReq;
+        std::vector<Player*> humanNoReq, botNoReq, humanReq, botReq;
         for (Player* m : party)
         {
             if (m == bot || m->IsAlive()) continue;
-            dead.push_back(m);
-            if (!m->isResurrectRequested()) deadNoReq.push_back(m);
+            bool const isBot = sPlayerbotsMgr.GetPlayerbotAI(m) != nullptr;
+            bool const noReq = !m->isResurrectRequested();
+            if (!isBot) (noReq ? humanNoReq : humanReq).push_back(m);
+            else        (noReq ? botNoReq   : botReq).push_back(m);
         }
-        std::vector<Player*> const& pick = deadNoReq.empty() ? dead : deadNoReq;
-        if (pick.empty()) return nullptr;
-        return pick[urand(0, uint32(pick.size()) - 1)];
+        for (std::vector<Player*> const* v : { &humanNoReq, &botNoReq, &humanReq, &botReq })
+            if (!v->empty()) return (*v)[urand(0, uint32(v->size()) - 1)];
+        return nullptr;
     }
 
     static bool TargetHasNamedAura(Unit* target, std::string const& name,
