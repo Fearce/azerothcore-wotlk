@@ -763,6 +763,37 @@ namespace
             human->GetName(), uint32(arenaType), uint32(arenaType), teamId, uint32(members.size()), humanRating);
     }
 
+    // Self-heal managed party bots (henchmen + enrolled alts) orphaned in a FINISHED
+    // arena/BG. Unlike the rndbot enemy team — which runs mod-playerbots' BG AI and
+    // leaves itself on TIME_TO_AUTOREMOVE — the human's own party bots run only the
+    // WowPsParty AI and have NO bg-leave behaviour. They depend entirely on the core's
+    // hard auto-close to teleport them out, a cross-map far-teleport their bot session
+    // must ack. When that race wedges (commonly: the leader re-queues during the prior
+    // match's WAIT_LEAVE window, so a new arena port collides with the old auto-close),
+    // the bot is stranded in the dead instance — shows offline, frozen, fixable only by
+    // a relog. Leaving promptly the instant the match ends (STATUS_WAIT_LEAVE) closes
+    // that window before it can open AND recovers any already-stranded bot. Runs every
+    // tick independent of any ArenaFill session (that session retires when the ENEMY
+    // team clears, which can be before our henchmen are out). Skips mid-port bots and
+    // never touches an IN_PROGRESS match, so a live arena is never disturbed.
+    void RecoverOrphanedPartyBots()
+    {
+        std::vector<ObjectGuid> followers;
+        WowPsParty::GetAllFollowers(followers);
+        for (ObjectGuid const& g : followers)
+        {
+            Player* pb = ObjectAccessor::FindConnectedPlayer(g);
+            if (!pb || !pb->IsInWorld() || pb->IsBeingTeleported()) continue;
+            if (!sPlayerbotsMgr.GetPlayerbotAI(pb)) continue;   // managed bot only
+            Battleground* bg = pb->GetBattleground();
+            if (!bg || bg->GetStatus() != STATUS_WAIT_LEAVE) continue;
+            LOG_INFO("module",
+                "[WowPsParty ArenaFill] match over — leaving {} out of finished {} (status WAIT_LEAVE)",
+                pb->GetName(), bg->isArena() ? "arena" : "battleground");
+            pb->LeaveBattleground(bg);
+        }
+    }
+
     // World-tick driver: queue the bot team once its members are online, accept the pop,
     // and retire (log out) the bots once the match ends. Reuses AcceptBgInvite (it ports
     // via a deferred CMSG_BATTLEFIELD_PORT, the same crash-safe path the BG fill uses).
@@ -990,6 +1021,11 @@ public:
         // Rated-arena enemy fill runs on the same 1s cadence (its own state map, so it
         // must run BEFORE the BG-fill early-return below).
         DriveArenaFills();
+
+        // Get our own party bots out of any FINISHED match. Independent of the fill
+        // sessions above (they retire when the enemy team clears, our bots may not be
+        // out yet) and runs even when no fill is active, so it self-heals strays too.
+        RecoverOrphanedPartyBots();
 
         std::vector<std::pair<uint32, FillEntry>> fills;
         std::vector<std::pair<uint32, uint32>>    leaders;

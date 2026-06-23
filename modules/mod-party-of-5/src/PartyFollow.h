@@ -104,6 +104,11 @@ namespace WowPsParty
     // managed henchman from a second human sharing the WoW group.
     void GetHenchmanGuidsForAccount(uint32 account, std::vector<uint32>& out);
 
+    // Every tracked follower (hired henchmen AND enrolled alts) across all
+    // leaders. Used by the arena/BG sweep to find managed party bots that got
+    // orphaned in a finished battleground (they have no playerbot BG-leave AI).
+    void GetAllFollowers(std::vector<ObjectGuid>& out);
+
     // Returns the leader guid that this follower is bound to, or an
     // empty ObjectGuid if no directive exists. Used by AssistTarget to
     // mirror the controlled body's target onto the rest of the party.

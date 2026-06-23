@@ -443,6 +443,15 @@ namespace WowPsParty
         return false;
     }
 
+    // Every tracked follower (henchmen + enrolled alts), across all leaders.
+    void GetAllFollowers(std::vector<ObjectGuid>& out)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        out.reserve(out.size() + g_directives.size());
+        for (auto const& d : g_directives)
+            out.push_back(d.followerGuid);
+    }
+
     // Number of hired henchmen currently following the given leader.
     uint32 CountHenchmenFor(ObjectGuid leaderGuid)
     {
