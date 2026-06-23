@@ -27,6 +27,7 @@
 #include "Random.h"
 #include "Spell.h"
 #include "SpellAuras.h"
+#include "SpellAuraEffects.h"   // AuraEffect::GetCasterGUID — detect a self-cast damage cloud
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "Unit.h"
@@ -631,6 +632,56 @@ namespace WowPsParty
         std::list<Unit*> targets;
         GatherHostilesAround(bot, radius, targets);
         return uint32(targets.size());
+    }
+
+    // Nearby DAMAGING GROUND CLOUDS — a unit that SELF-CASTS a periodic damage /
+    // trigger aura it pulses to the area (Grobbulus's poison cloud self-casts
+    // 28158; Sapphiron's blizzard, Loatheb spores, …). The self-cast is the key
+    // discriminator: a DoT on a normal mob has an EXTERNAL caster, so a mob we're
+    // DoTing is NOT flagged (we still stand next to it), and the cloud's own
+    // faction — Grobbulus's cloud is Booty Bay, i.e. "friendly" — is irrelevant.
+    // Used to keep a positional move (move_behind) from strafing a bot into the bad.
+    static void GatherDamagingClouds(Player* bot, float radius, std::vector<Unit*>& out)
+    {
+        if (!bot || !bot->IsInWorld()) return;
+        std::list<Unit*> units;
+        Acore::AnyUnitInObjectRangeCheck check(bot, radius);
+        Acore::UnitListSearcher<Acore::AnyUnitInObjectRangeCheck> searcher(bot, units, check);
+        Cell::VisitObjects(bot, searcher, radius);
+        ObjectGuid const victim = bot->GetVictim() ? bot->GetVictim()->GetGUID() : ObjectGuid::Empty;
+        for (Unit* u : units)
+        {
+            if (!u || u == bot || !u->IsAlive() || u->GetGUID() == victim) continue;
+            // Only NON-attackable props count as ground clouds. A normal enemy mob
+            // can self-cast a periodic aura (a self-DoT / burning / enrage), and we
+            // must NOT treat it as a hazard — that would make a melee bot refuse to
+            // move near a mob it should be fighting. The cloud is a friendly/neutral
+            // prop (Grobbulus's is Booty Bay), so it's not a valid attack target and
+            // still passes.
+            if (bot->IsValidAttackTarget(u)) continue;
+            bool hazard = false;
+            for (AuraType t : { SPELL_AURA_PERIODIC_DAMAGE,
+                                SPELL_AURA_PERIODIC_TRIGGER_SPELL,
+                                SPELL_AURA_PERIODIC_DAMAGE_PERCENT,
+                                SPELL_AURA_PERIODIC_LEECH })
+            {
+                for (AuraEffect* ae : u->GetAuraEffectsByType(t))
+                    if (ae && ae->GetCasterGUID() == u->GetGUID()) { hazard = true; break; }
+                if (hazard) break;
+            }
+            if (hazard) out.push_back(u);
+        }
+    }
+
+    // Is world point (x,y) inside any of the pre-gathered clouds? The cloud's reach
+    // grows with the cloud (Grobbulus), so its live combat reach + margin is the
+    // danger radius.
+    static bool PointInClouds(std::vector<Unit*> const& clouds, float x, float y, float margin = 3.0f)
+    {
+        for (Unit* u : clouds)
+            if (u->GetExactDist2d(x, y) <= u->GetCombatReach() + margin)
+                return true;
+        return false;
     }
 
     // Hostiles ACTIVELY MELEEING the bot — units in its melee-attacker set (getAttackers),
@@ -4701,9 +4752,25 @@ namespace WowPsParty
             if (!v->isInFront(bot)) return false;
             // In the frontal arc: strafe to the target's REAR, PRESERVING our
             // current distance (so a ranged bot just steps to the back at range
-            // instead of being yanked into melee). Block only while clearing the
-            // cone — the check above yields the instant we're out of the front.
-            // Throttled so a rotating mob doesn't restart the spline every tick.
+            // instead of being yanked into melee). Sweep a few rear angles and take
+            // the first spot that ISN'T inside a damaging ground cloud — moving
+            // blindly to the exact back ran bots straight into Grobbulus's poison
+            // cloud. If EVERY rear spot is hazardous, DON'T move (stay put + cast)
+            // rather than strafe into damage. Block only while clearing the cone —
+            // the check above yields the instant we're out of the front.
+            float const baseBack = v->GetOrientation() + 3.14159265f;   // opposite the target's facing
+            float const gap      = bot->GetDistance(v);                 // keep our current range
+            std::vector<Unit*> clouds;
+            GatherDamagingClouds(bot, 45.0f, clouds);
+            float bx, by, bz; bool safe = false;
+            for (float off : { 0.0f, 0.5f, -0.5f, 1.0f, -1.0f })   // rear, then ±29°, ±57°
+            {
+                float tx, ty, tz;
+                v->GetNearPoint(bot, tx, ty, tz, 0.0f, gap, baseBack + off);
+                if (clouds.empty() || !PointInClouds(clouds, tx, ty))
+                { bx = tx; by = ty; bz = tz; safe = true; break; }
+            }
+            if (!safe) return false;   // nowhere safe behind — hold position and cast
             WowPsParty::HoldFollower(bot->GetGUID(), 1500);
             static thread_local std::unordered_map<uint32, uint32> lastMoveMs;
             uint32 const gLow = bot->GetGUID().GetCounter();
@@ -4713,11 +4780,7 @@ namespace WowPsParty
                 || now - last > 400)
             {
                 last = now;
-                float const back = v->GetOrientation() + 3.14159265f;   // opposite the target's facing
-                float const gap  = bot->GetDistance(v);                 // keep our current range
-                float x, y, z;
-                v->GetNearPoint(bot, x, y, z, 0.0f, gap, back);
-                bot->GetMotionMaster()->MovePoint(0, x, y, z);
+                bot->GetMotionMaster()->MovePoint(0, bx, by, bz);
             }
             return true;
         }
