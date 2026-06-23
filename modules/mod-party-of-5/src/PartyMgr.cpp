@@ -1714,32 +1714,83 @@ namespace WowPsParty
                  bestEntry, bestIl, bot->GetName(), lvl);
     }
 
-    // The inverse of MaintainTankShield: a DPS warrior (Arms/Fury) must NEVER
-    // sword-and-board. The factory now keeps shields/holdables out of a DPS
-    // warrior's offhand pool, but a henchman hired BEFORE that fix (or one that
-    // kept a pool char's shield) still has one equipped — strip it to the bags so
-    // the slot is free (Arms uses a 2H; a re-hire fills a Fury's offhand with a
-    // weapon). Gated role!=tank so a Protection warrior keeps its shield, and a
-    // no-op on a legitimate 1H weapon offhand (Fury dual-wield), so it never
-    // thrashes correct gear.
+    // A DPS warrior (Arms/Fury) must NEVER sword-and-board, AND a Fury build must
+    // dual-wield rather than swing a lone 1H. This (a) strips a shield/holdable
+    // offhand to the bags, then (b) FILLS an empty offhand with a weapon so a Fury
+    // hire isn't left single-wielding — the factory keeps shields out of the pool
+    // but an in-band hire (kept gear) or a just-stripped shield can leave the slot
+    // bare. Gated role!=tank (a Protection warrior keeps its shield) and a no-op on
+    // a legitimate weapon offhand, so it never thrashes correct gear.
     static void MaintainDpsWarriorOffhand(Player* bot)
     {
         if (bot->getClass() != CLASS_WARRIOR) return;
         if (WowPsParty::RoleForGuid(bot->GetGUID()) == "tank") return;
 
+        // (a) Strip a NON-weapon offhand (shield / holdable) to the bags.
         Item* off = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
-        if (!off) return;
-        // Only a NON-weapon offhand is wrong here (shield / holdable). A 1H weapon
-        // is a valid Fury dual-wield, so leave weapons alone.
-        if (off->GetTemplate()->Class == ITEM_CLASS_WEAPON) return;
+        if (off && off->GetTemplate()->Class != ITEM_CLASS_WEAPON)
+        {
+            ItemPosCountVec stash;
+            if (bot->CanStoreItem(NULL_BAG, NULL_SLOT, stash, off, false) != EQUIP_ERR_OK)
+                return;   // bags full — bail rather than destroy a usable item
+            bot->RemoveItem(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND, true);
+            bot->StoreItem(stash, off, true);
+            LOG_INFO("module", "[WowPsParty Provision] stripped off-hand {} from DPS warrior {} (lvl {})",
+                     off->GetEntry(), bot->GetName(), bot->GetLevel());
+            off = nullptr;
+        }
+        if (off) return;   // already holding an offhand WEAPON (Fury dual-wield) — done.
 
-        ItemPosCountVec stash;
-        if (bot->CanStoreItem(NULL_BAG, NULL_SLOT, stash, off, false) != EQUIP_ERR_OK)
-            return;   // bags full — bail rather than destroy a usable item
-        bot->RemoveItem(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND, true);
-        bot->StoreItem(stash, off, true);
-        LOG_INFO("module", "[WowPsParty Provision] stripped off-hand {} from DPS warrior {} (lvl {})",
-                 off->GetEntry(), bot->GetName(), bot->GetLevel());
+        // (b) Offhand empty — fill it to match the build:
+        //   2H mainhand + Titan's Grip  -> a 2H offhand (TG Fury wields two 2H)
+        //   1H mainhand + Dual Wield     -> a 1H offhand (standard Fury)
+        //   otherwise (Arms 2H / no dual wield / <20) -> nothing (correct).
+        Item* mh = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+        if (!mh) return;   // no mainhand yet — that gets sorted first
+        bool want2h = false;
+        if (mh->GetTemplate()->InventoryType == INVTYPE_2HWEAPON)
+        {
+            if (!bot->CanTitanGrip()) return;   // Arms / non-TG 2H build — no offhand
+            want2h = true;
+        }
+        else if (!bot->CanDualWield())
+        {
+            return;   // 1H mainhand but can't dual wield yet (sub-20) — leave empty
+        }
+
+        // Best level-appropriate weapon the bot can actually wield in the offhand.
+        // 1H offhand types = INVTYPE_WEAPON(13)/INVTYPE_WEAPONOFFHAND(22); TG 2H = INVTYPE_2HWEAPON(17).
+        // Excludes RequiredLevel 0 (the freak-item signature) like the shield/thrown picks.
+        uint32 const lvl = bot->GetLevel();
+        char const* const invFilter = want2h ? "= 17" : "IN (13, 22)";
+        QueryResult q = WorldDatabase.Query(
+            "SELECT entry FROM item_template "
+            "WHERE class = 2 AND InventoryType {} "
+            "AND Quality BETWEEN 1 AND 3 "
+            "AND RequiredLevel BETWEEN 1 AND {} "
+            "ORDER BY RequiredLevel DESC, ItemLevel DESC LIMIT 30", invFilter, lvl);
+        if (!q) return;
+
+        uint32 bestEntry = 0;
+        uint16 bestDest  = 0;
+        do
+        {
+            uint32 const entry = (*q)[0].Get<uint32>();
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(entry);
+            if (!proto || bot->CanUseItem(proto) != EQUIP_ERR_OK)
+                continue;   // weapon-skill / level gate
+            uint16 dest = 0;
+            if (bot->CanEquipNewItem(EQUIPMENT_SLOT_OFFHAND, dest, entry, false) != EQUIP_ERR_OK)
+                continue;   // dual-wield / Titan's-Grip gate for the offhand slot
+            bestEntry = entry;
+            bestDest  = dest;
+            break;
+        } while (q->NextRow());
+        if (!bestEntry) return;
+
+        bot->EquipNewItem(bestDest, bestEntry, true);
+        LOG_INFO("module", "[WowPsParty Provision] equipped off-hand weapon {} on DPS warrior {} (lvl {})",
+                 bestEntry, bot->GetName(), lvl);
     }
 
     // Trim a bot's Soul Shards down to exactly one. `preferKeep` (when non-null)
