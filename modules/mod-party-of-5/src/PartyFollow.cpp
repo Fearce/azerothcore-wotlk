@@ -284,10 +284,17 @@ namespace WowPsParty
             uint32 teleportDueMs = 0;   // 0 = unarmed; else getMSTime() to snap followers
         };
         static std::unordered_map<uint32, LeaderFallState> g_leaderFall;  // leaderGuidLow -> state
-        static constexpr float  FALL_DROP_Z         = 10.0f;  // >this Z lost in one ~1s pass = a fall
+        // >this Z lost in ONE ~1s pass = a fall. 5y (was 10): smaller jumps strand
+        // bots too — e.g. the Dalaran Sewers arena pipe-to-floor drop (~6-7y) left
+        // them stuck up top. The per-pass sampling is what keeps this from firing on
+        // gradual descents: a jump loses 5y+ in one second, stairs/slopes far less.
+        static constexpr float  FALL_DROP_Z         = 5.0f;
         static constexpr float  FALL_MAX_XY         = 25.0f;  // but ignore big XY jumps (a teleport, not a fall)
         static constexpr uint32 FALL_LAND_GRACE_MS  = 3000;   // wait this long after the drop before snapping
-        static constexpr float  FALL_SNAP_MIN_DIST  = 8.0f;   // only snap a follower this far out (didn't fall along)
+        // Only snap a follower at least this far out (3D) — a bot that fell ALONG is
+        // closer. 6y (was 8) so a bot stranded above a modest drop still qualifies
+        // even when the leader lands right below it.
+        static constexpr float  FALL_SNAP_MIN_DIST  = 6.0f;
 
         // Per-account quick erase by account id.
         void EraseByAccount_NoLock(uint32 account)
