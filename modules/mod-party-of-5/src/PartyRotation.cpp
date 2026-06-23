@@ -1365,11 +1365,14 @@ namespace WowPsParty
         //   3. dead HUMAN, rez pending      — leftovers (already covered, but human)
         //   4. dead BOT,   rez pending
         // A pending resurrect request means someone's rez already landed, so we
-        // don't pile a second on the same target until everything else is covered.
-        // Random WITHIN a bucket so multiple rezzers spread across corpses instead
-        // of all stacking the same one — a post-wipe raid stands back up faster
-        // (Kevin). A human is a member with no playerbot AI. (party_has_dead, which
-        // only checks for non-null, is unaffected.)
+        // don't pile a second on the same target until everything else is covered —
+        // this is what makes rezzers cascade ONE target at a time (rezzer 1 takes
+        // the first corpse, rezzer 2 sees it now has a request and takes the next).
+        // DETERMINISTIC, NOT random: within a bucket pick the lowest-GUID member so
+        // every rezzer agrees on the same order — humans first, then bots one at a
+        // time, in a stable sequence (Kevin: "resses can't be random, prioritize
+        // humans then 1 bot at a time"). A human is a member with no playerbot AI.
+        // (party_has_dead, which only checks for non-null, is unaffected.)
         std::vector<Player*> humanNoReq, botNoReq, humanReq, botReq;
         for (Player* m : party)
         {
@@ -1379,8 +1382,15 @@ namespace WowPsParty
             if (!isBot) (noReq ? humanNoReq : humanReq).push_back(m);
             else        (noReq ? botNoReq   : botReq).push_back(m);
         }
+        auto lowestGuid = [](std::vector<Player*> const& v) -> Player*
+        {
+            Player* best = nullptr;
+            for (Player* m : v)
+                if (!best || m->GetGUID() < best->GetGUID()) best = m;
+            return best;
+        };
         for (std::vector<Player*> const* v : { &humanNoReq, &botNoReq, &humanReq, &botReq })
-            if (!v->empty()) return (*v)[urand(0, uint32(v->size()) - 1)];
+            if (!v->empty()) return lowestGuid(*v);
         return nullptr;
     }
 
