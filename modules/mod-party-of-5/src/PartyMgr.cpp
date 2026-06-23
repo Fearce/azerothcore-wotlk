@@ -559,6 +559,15 @@ namespace WowPsParty
                 break;
 
             case 2: // Paladin
+                // Blessings — maintained by EVERY paladin spec. Out of combat only
+                // (don't burn a GCD re-buffing mid-fight) and high priority so a
+                // fresh/expired party gets blessed before the pull. buff-fall-through
+                // means each rule no-ops once its targets already have the blessing,
+                // so the high priority is free. Might on the physical classes (attack
+                // power), Kings on the casters (stats), Kings on the paladin itself.
+                add("out_of_combat", "cast_class_missing:warrior,rogue,deathknight,hunter:Blessing of Might", 85);
+                add("out_of_combat", "cast_class_missing:priest,mage,warlock,druid:Blessing of Kings", 85);
+                add("out_of_combat", "buff_self:Blessing of Kings", 85);
                 if (isHealer)
                 {
                     // Holy paladin: a SINGLE-TARGET healer (no AoE heal in 3.3.5a).
