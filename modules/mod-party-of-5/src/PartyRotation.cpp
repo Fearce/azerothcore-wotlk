@@ -1828,6 +1828,30 @@ namespace WowPsParty
         return false;
     }
 
+    // True once a committed channel is past its ~1.5s start grace. The empty-
+    // patch abandon (TickRotation) waits for this so a ground AoE dropped an
+    // instant before a charging pack reaches the spot isn't false-cancelled
+    // while the mobs are still closing in.
+    static bool ChannelCommitPastGrace(Player* bot)
+    {
+        std::lock_guard<std::mutex> lock(g_channelLockMutex);
+        auto it = g_channelLocks.find(bot->GetGUID().GetCounter());
+        if (it == g_channelLocks.end()) return false;
+        return getMSTime() >= it->second.graceUntilMs;
+    }
+
+    // Drop the channel-commit lock WITHOUT arming the cut-short backoff. Use when
+    // we DELIBERATELY end a channel (empty-patch abandon): a plain
+    // InterruptNonMeleeSpells leaves the lock, and the next ChannelCommitActive
+    // would see the channel gone with duration remaining and misclassify it as
+    // melee pushback — backing the spell off 5s and blocking a re-place on a
+    // fresh cluster. Erasing the lock here makes that a clean, backoff-free end.
+    static void ClearChannelCommit(Player* bot)
+    {
+        std::lock_guard<std::mutex> lock(g_channelLockMutex);
+        g_channelLocks.erase(bot->GetGUID().GetCounter());
+    }
+
     // Forward decls: EvalCondition recurses through AND-chains, and the
     // aura/cooldown conditions resolve spells by name (defined further down).
     static bool EvalSingleCondition(std::string const& cond, Player* bot,
@@ -3767,7 +3791,22 @@ namespace WowPsParty
                 Unit* anchor = BestClusterAnchor(bot, radius);
                 if (!anchor) anchor = bot->GetVictim();   // no cluster → victim spot
                 if (!anchor) return false;
-                if (!canFireSpellOn(spellId, anchor)) return false;
+                if (!canFireSpellOn(spellId, anchor))
+                {
+                    // Out of range of the cluster — WALK toward it. AssistTarget
+                    // positions a ranged bot at firing range of its VICTIM, never at
+                    // the AoE cluster, so a ground AoE whose densest knot sits beyond
+                    // the victim's band (or whose victim isn't even in the pack) was
+                    // never cast: the bot just stood while this rule silently failed
+                    // every tick ("hunter won't get in range to Volley"). Single-target
+                    // shots are closed by AssistTarget; give the AoE the same closing.
+                    // Only on a POSITIONAL block (range/LoS) — a hard block (cooldown/
+                    // power/threat-cap) falls through. repositionToCast uses MoveFollow
+                    // for a non-victim anchor, so no MoveChase HasLostTarget stall.
+                    if (castBlock == CastBlock::Position)
+                        return repositionToCast(anchor, spellId);
+                    return false;
+                }
                 if (!channelClipOk()) return false;
                 return faceAndCastAt(anchor, spellId);
             }
@@ -5760,6 +5799,48 @@ namespace WowPsParty
                 break;
             }
         }
+
+        // Ground-AoE channel (Blizzard / Rain of Fire / Volley) whose patch has gone
+        // EMPTY — every mob in it died, was pulled away, or walked out — but the bot
+        // keeps channeling into bare ground for the full duration: no damage, and it
+        // stands locked in place doing nothing (the "Volley keeps channelling after
+        // the mobs leave" report). Cancel it so the rotation re-places / retargets
+        // THIS tick. Gated past the channel's ~1.5s start grace so an AoE dropped an
+        // instant before a charging pack arrives isn't false-cancelled. Unit-target
+        // channels (Mind Flay) have no dst and a positive channel (a HoT) is never
+        // cancelled here.
+        if (ChannelCommitPastGrace(bot))
+            if (Spell* ch = bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL))
+            {
+                SpellInfo const* ci = ch->GetSpellInfo();
+                WorldLocation const* dst = ch->m_targets.HasDst() ? ch->m_targets.GetDstPos() : nullptr;
+                if (ci && !ci->IsPositive() && dst)
+                {
+                    float radius = 0.0f;
+                    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                        radius = std::max(radius, ci->Effects[i].CalcRadius(bot));
+                    if (radius <= 0.0f) radius = 8.0f;
+                    std::list<Unit*> hostiles;
+                    GatherHostilesAround(bot, 60.0f, hostiles);   // covers max AoE range + patch
+                    bool anyInPatch = false;
+                    for (Unit* u : hostiles)
+                        if (u && u->IsAlive() && u->IsInCombat()
+                            && bot->IsValidAttackTarget(u)
+                            && u->GetExactDist(dst) <= radius)
+                        { anyInPatch = true; break; }
+                    if (!anyInPatch)
+                    {
+                        bot->InterruptNonMeleeSpells(false);
+                        // Clear the commit WITHOUT the cut-short backoff: this is a
+                        // deliberate abandon, so the bot must be free to re-place the
+                        // SAME AoE on a fresh cluster this very tick.
+                        ClearChannelCommit(bot);
+                        LOG_INFO("module",
+                            "[WowPsParty Rotation] {} abandons an empty ground-AoE channel — retargeting",
+                            bot->GetName());
+                    }
+                }
+            }
 
         // Committed to a channel we just started? Then only a clip-flagged rule
         // (the explicit "interrupt my own cast" opt-in) may run this tick —

@@ -491,11 +491,17 @@ namespace WowPsParty
                     add("in_combat&self_rage<25", "cast_self:Bloodrage", 86);
                     add("always", "buff_self:Defensive Stance", 84);
                     add("always", "buff_self:Commanding Shout", 80);
+                    // Thunder Clap LEADS the AoE pull: with 3+ in melee it's the
+                    // first threat ability (above Shield Slam), hitting the whole
+                    // pack at once for immediate snap-aggro — was 70, beneath Shield
+                    // Slam, so the tank single-target-slammed first and loose adds
+                    // slipped to the casters. Single-target pulls still open on
+                    // Shield Slam (Thunder Clap gated enemies_in_melee>2).
+                    add("enemies_in_melee>2", "cast:Thunder Clap", 76);
                     add("has_target", "cast:Shield Slam", 74);
                     // Maintain Shield Block for steady mitigation (skips while the
                     // block buff is up; refreshes when it lapses and is off CD).
                     add("has_target", "buff_self:Shield Block", 72);
-                    add("enemies_in_melee>2", "cast:Thunder Clap", 70);
                     add("has_target", "cast:Revenge", 66);
                     add("enemies_in_melee>2&target_missing_aura:Demoralizing Shout", "cast:Demoralizing Shout", 58);
                     add("has_target", "cast:Devastate", 52);
@@ -933,13 +939,25 @@ namespace WowPsParty
                     // treats tree-1 shamans as melee so they close to contact.
                     add("primary_tree:1&has_target", "cast:Stormstrike", 70);
                     add("primary_tree:1&has_target", "cast:Lava Lash", 64);
+                    // Enh is a MELEE spec: its only nukes are the INSTANT Maelstrom-
+                    // Weapon procs (5 stacks). A hard-cast Lightning Bolt / Chain
+                    // Lightning would make the cast resolver pull the shaman out to
+                    // cast range and stay there — the bug where enh "fights at range".
+                    // So enh casts CL (cluster) / LB (single) ONLY with the proc, and
+                    // the ranged fillers below are gated !enh. Everything enh casts is
+                    // instant (Stormstrike/Lava Lash/Earth Shock/proc'd LB-CL), so it
+                    // never leaves melee.
+                    add("primary_tree:1&self_aura_stacks:Maelstrom Weapon>4&enemies_clustered:8>2", "cast:Chain Lightning", 61);
                     add("primary_tree:1&self_aura_stacks:Maelstrom Weapon>4", "cast:Lightning Bolt", 60);
                     // ELEMENTAL (tree 0): ranged nuker.
                     add("primary_tree:0&has_target", "cast:Lava Burst", 66);
-                    // Cluster-gated AoE (both specs cast it from range).
-                    add("enemies_clustered:8>2", "cast:Chain Lightning", 56);
+                    // Ranged cluster AoE — ELE / unspecced only (enh uses the instant
+                    // Maelstrom Chain Lightning above); !enh so a melee shaman never
+                    // hard-casts it from range.
+                    add("enemies_clustered:8>2&!primary_tree:1", "cast:Chain Lightning", 56);
                     add("has_target", "cast:Earth Shock", 46);     // enh dump / ele instant
-                    add("has_target", "cast:Lightning Bolt", 38);  // filler
+                    // Ranged filler — ELE / unspecced only; enh weaves melee + Earth Shock.
+                    add("!primary_tree:1&has_target", "cast:Lightning Bolt", 38);
                 }
                 break;
 
@@ -2209,6 +2227,25 @@ namespace WowPsParty
                         WowPsParty::TargetModeCacheSet(guidLow,
                             freshRole == "tank" ? "loose" : "master");
                     }
+                }
+                else
+                {
+                    // In-band hire keeps the pool char's LEVEL and TALENTS — but its
+                    // gear may have been itemized for a DIFFERENT spec (e.g. a Prot
+                    // paladin pool char found wearing healer cloth + spellpower). The
+                    // out-of-band path above re-rolls gear via Randomize; an in-band
+                    // hire never did, so the mismatched loadout survived. Re-roll just
+                    // the EQUIPMENT against the bot's actual spec — the same stat-
+                    // weighted picker the factory uses — so the gear matches what the
+                    // henchman is. Non-incremental: it replaces each slot with the best
+                    // spec item (moving the old one to bags, which ClearHenchmanInventory
+                    // below purges) and leaves a slot untouched only if nothing fits.
+                    PlayerbotFactory factory(hen, hen->GetLevel());
+                    factory.InitEquipment(false, false);
+                    hen->SaveToDB(false, false);
+                    LOG_INFO("module",
+                        "[WowPsParty Henchmen] in-band hire guid={} re-rolled gear to match spec",
+                        henchGuid.GetCounter());
                 }
             }
 
