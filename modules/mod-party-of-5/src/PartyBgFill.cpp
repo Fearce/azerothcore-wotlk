@@ -86,6 +86,7 @@
 #include "GridNotifiers.h"      // GameObjectListSearcher
 #include "GridNotifiersImpl.h"
 
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -178,11 +179,13 @@ namespace
     }
 
     // Spawn up to `count` parked rndbot chars of the given races as independent bots
-    // (master 0) and register them as fill bots for this leader's BG. Draws IN-BRACKET
-    // chars first (no re-level needed); any shortfall is backfilled from out-of-bracket
-    // chars (closest level first) flagged for a re-level to the bracket on the world
-    // tick — so a small flat pool serves every bracket. Returns how many were spawned
-    // (pool may be short — logged, never silently capped).
+    // (master 0) and register them as fill bots for this leader's BG. Draws a
+    // CLASS-BALANCED spread — round-robin across classes, one char per account — so a
+    // 40v40 isn't a wall of one class. In-bracket chars are preferred WITHIN each class
+    // (no re-level); a class that's short in-bracket pulls out-of-bracket chars flagged
+    // for a re-level to the bracket on the world tick, so a small flat pool serves every
+    // bracket. Returns how many were spawned (pool may be short — logged, never silently
+    // capped).
     uint32 SpawnFillTeam(PlayerbotMgr* mgr, uint32 leaderLow, uint32 bgTypeId,
                          std::string const& acctCsv, char const* races,
                          uint8 bmin, uint8 bmax, uint32 count, bool ally, char const* sideLabel)
@@ -197,47 +200,71 @@ namespace
         // `GROUP BY account` yields one char per account; the NOT IN excludes claimed ones.
         std::string const exclAccts = ActiveFillAccountCsv();
         std::vector<std::tuple<uint32, uint32, bool>> picks;   // {guid, account, needsRelevel}
-        std::vector<uint32> usedAccts;
-        auto accExclude = [&]() {
-            std::string s = exclAccts;
-            for (uint32 a : usedAccts) { s += ','; s += std::to_string(a); }
-            return s;
-        };
-        auto take = [&](QueryResult& r, bool needsRelevel) {
-            do {
-                Field* f = r->Fetch();
-                uint32 const guid = f[0].Get<uint32>();
-                uint32 const acct = f[1].Get<uint32>();
-                usedAccts.push_back(acct);
-                picks.emplace_back(guid, acct, needsRelevel);
-            } while (r->NextRow() && picks.size() < count);
-        };
 
-        // 1) In-bracket parked chars — usable as-is, no re-level. One per distinct account.
-        //    The inner "account NOT IN (online chars)" also skips accounts busy with an
-        //    online char from ANOTHER path (a hired henchman, a prior fill) — those are
-        //    rndbot accounts too, and one online char per account is the hard limit.
-        if (QueryResult q = CharacterDatabase.Query(
-                "SELECT MIN(`guid`), `account` FROM `characters` WHERE `account` IN ({}) "
-                "AND `account` NOT IN ({}) AND `account` NOT IN (SELECT `account` FROM `characters` WHERE `online` = 1) "
-                "AND `online` = 0 AND `race` IN ({}) "
-                "AND `level` BETWEEN {} AND {} GROUP BY `account` ORDER BY RAND() LIMIT {}",
-                acctCsv, accExclude(), races, uint32(bmin), uint32(bmax), count))
-            take(q, false);
-
-        // 2) Out-of-bracket backfill, re-leveled on spawn — from accounts not already taken.
-        //    (No "closest level" ordering: RelevelFillBot does a FULL re-roll to the bracket,
-        //    so the starting level is irrelevant; distinct accounts are what matter.)
-        if (picks.size() < count)
+        // Pull ALL eligible parked chars (any level) and pick a CLASS-BALANCED spread —
+        // one char per account, evenly across classes. The old query took MIN(guid) per
+        // account, which ALWAYS chose the warrior (created first => lowest guid), and it
+        // preferred already-in-bracket chars (mostly warriors get leveled), so a 40v40
+        // came out a wall of warriors even though the pool itself is class-even. We now
+        // balance by class and prefer in-bracket chars only WITHIN a class — re-leveling
+        // out-of-bracket ones (RelevelFillBot full re-roll) to fill classes short at this
+        // bracket. The "account NOT IN (online)" still enforces one online char/account.
         {
-            uint32 const remaining = count - uint32(picks.size());
-            if (QueryResult q2 = CharacterDatabase.Query(
-                    "SELECT MIN(`guid`), `account` FROM `characters` WHERE `account` IN ({}) "
+            struct Cand { uint32 guid; uint32 acct; };
+            std::unordered_map<uint8, std::vector<Cand>> inb, oob;   // per class; ORDER BY RAND() order
+            std::vector<uint8> classes;
+            if (QueryResult q = CharacterDatabase.Query(
+                    "SELECT `guid`, `account`, `class`, `level` FROM `characters` WHERE `account` IN ({}) "
                     "AND `account` NOT IN ({}) AND `account` NOT IN (SELECT `account` FROM `characters` WHERE `online` = 1) "
-                    "AND `online` = 0 AND `race` IN ({}) "
-                    "AND (`level` < {} OR `level` > {}) GROUP BY `account` ORDER BY RAND() LIMIT {}",
-                    acctCsv, accExclude(), races, uint32(bmin), uint32(bmax), remaining))
-                take(q2, true);
+                    "AND `online` = 0 AND `race` IN ({}) ORDER BY RAND()",
+                    acctCsv, exclAccts, races))
+            {
+                do {
+                    Field* f = q->Fetch();
+                    uint32 const g   = f[0].Get<uint32>();
+                    uint32 const a   = f[1].Get<uint32>();
+                    uint8  const cls = f[2].Get<uint8>();
+                    uint8  const lvl = f[3].Get<uint8>();
+                    bool const inBand = (lvl >= bmin && lvl <= bmax);
+                    auto& bucket = inBand ? inb : oob;
+                    if (inb.find(cls) == inb.end() && oob.find(cls) == oob.end())
+                        classes.push_back(cls);
+                    bucket[cls].push_back({ g, a });
+                } while (q->NextRow());
+            }
+
+            // Round-robin across classes, one pick per class per round, in-bracket
+            // preferred, one char per account, until we hit `count` or run dry.
+            std::unordered_map<uint32, bool> usedAccts;
+            std::unordered_map<uint8, size_t> iIdx, oIdx;
+            auto pickFrom = [&](uint8 cls, std::unordered_map<uint8, std::vector<Cand>>& m,
+                                std::unordered_map<uint8, size_t>& idx, bool needRelevel) -> bool
+            {
+                auto it = m.find(cls);
+                if (it == m.end()) return false;
+                std::vector<Cand>& v = it->second;
+                size_t& k = idx[cls];
+                while (k < v.size())
+                {
+                    Cand const c = v[k++];
+                    if (usedAccts.count(c.acct)) continue;
+                    usedAccts[c.acct] = true;
+                    picks.emplace_back(c.guid, c.acct, needRelevel);
+                    return true;
+                }
+                return false;
+            };
+            bool progress = true;
+            while (picks.size() < count && progress)
+            {
+                progress = false;
+                for (uint8 cls : classes)
+                {
+                    if (picks.size() >= count) break;
+                    if (pickFrom(cls, inb, iIdx, false) || pickFrom(cls, oob, oIdx, true))
+                        progress = true;
+                }
+            }
         }
 
         if (picks.empty())
