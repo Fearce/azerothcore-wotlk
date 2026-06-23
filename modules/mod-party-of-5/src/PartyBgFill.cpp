@@ -679,7 +679,23 @@ namespace
     {
         if (!human || !human->GetSession()) return;
         uint32 const leaderLow = human->GetGUID().GetCounter();
-        { std::lock_guard<std::mutex> lk(g_mutex); if (g_arenaFills.count(leaderLow)) return; }   // one session per leader
+        {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            auto const it = g_arenaFills.find(leaderLow);
+            // Skip ONLY a fill still being fielded for the CURRENT queue (created moments
+            // ago, hasn't entered a match) — guards a double-fire of the join hook. Any
+            // OTHER leftover must be cleared below so this fresh queue gets its own enemy
+            // team: re-queuing right after a WIN landed here while the spent session's
+            // teardown grace (BG_OUT_GRACE_MS) hadn't fired yet, so the old bare
+            // "one session per leader" guard returned and NO enemy team was ever fielded —
+            // "the queue never pops until I leave the queue and requeue".
+            if (it != g_arenaFills.end() && !it->second.entered
+                && getMSTime() - it->second.spawnMs < 3000)
+                return;
+        }
+        // Clear a spent (already played its match) or stale prior session so it can't
+        // block this queue. No-op when there's nothing to retire.
+        RetireArenaFill(leaderLow);
 
         uint8 const slot = ArenaTeam::GetSlotByType(arenaType);
         uint32 const humanTeamId = human->GetArenaTeamId(slot);
@@ -696,8 +712,12 @@ namespace
         bool const allianceHuman = human->GetTeamId() == TEAM_ALLIANCE;
         char const* const oppRaces = RaceCsv(!allianceHuman);   // bot CAPTAIN must be opposite faction (queue bucket)
 
-        // Nearest-rating, FULL, opposite-faction bot team with NO member currently online
-        // (a busy member can't log in for the match — one char per account).
+        // FULL, opposite-faction bot teams with NO member currently online (a busy
+        // member can't log in for the match — one char per account), ordered by
+        // rating proximity. We pull the nearest BAND (not just the single closest)
+        // and pick a RANDOM one for matchup VARIANCE — otherwise the human faces the
+        // exact same nearest-rated team every queue. The whole band is a fair match
+        // (the bot team is queued at the human's MMR regardless of its own rating).
         QueryResult q = CharacterDatabase.Query(
             "SELECT at.arenaTeamId, at.captainGuid FROM arena_team at "
             "JOIN characters cap ON cap.guid = at.captainGuid "
@@ -705,7 +725,7 @@ namespace
             "AND (SELECT COUNT(*) FROM arena_team_member m WHERE m.arenaTeamId = at.arenaTeamId) = {} "
             "AND NOT EXISTS (SELECT 1 FROM arena_team_member m JOIN characters mc ON mc.guid = m.guid "
             "WHERE m.arenaTeamId = at.arenaTeamId AND mc.online = 1) "
-            "ORDER BY ABS(CAST(at.rating AS SIGNED) - {}) ASC LIMIT 1",
+            "ORDER BY ABS(CAST(at.rating AS SIGNED) - {}) ASC LIMIT 12",
             uint32(arenaType), oppRaces, humanTeamId, uint32(arenaType), humanRating);
         if (!q)
         {
@@ -715,8 +735,12 @@ namespace
                      human->GetName(), uint32(arenaType), uint32(arenaType));
             return;
         }
-        uint32 const teamId     = q->Fetch()[0].Get<uint32>();
-        uint32 const captainLow = q->Fetch()[1].Get<uint32>();
+        std::vector<std::pair<uint32, uint32>> teamCands;
+        do { Field* tf = q->Fetch(); teamCands.emplace_back(tf[0].Get<uint32>(), tf[1].Get<uint32>()); }
+        while (q->NextRow());
+        auto const& chosen = teamCands[urand(0, uint32(teamCands.size()) - 1)];
+        uint32 const teamId     = chosen.first;
+        uint32 const captainLow = chosen.second;
 
         std::vector<uint32> members;
         members.push_back(captainLow);
