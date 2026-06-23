@@ -5423,6 +5423,18 @@ namespace WowPsParty
             // currently being teleported themselves; we'll retry next tick.
             if (follower->GetMapId() != leader->GetMapId())
             {
+                // NEVER pull a follower OUT of a battleground/arena to a leader who
+                // isn't in one. On an arena pop the hero bots are driven to accept and
+                // enter the instance immediately; if the human dawdles ~5s before
+                // clicking Enter Battle, this teleport would yank every hero back to the
+                // still-in-world leader, emptying the human's side so the bot team wins
+                // instantly (Kevin's "wait 5s -> instant loss", 100% repro). The leader
+                // joins within the prep window and they converge on the same map; if the
+                // leader declines, the BG removes the heroes on match end. (The reverse —
+                // follower in the world, leader already in the arena — is NOT guarded, so
+                // a lagging hero still gets pulled INTO the leader's arena.)
+                if (follower->InBattleground() && !leader->InBattleground())
+                    return true;
                 if (follower->IsBeingTeleported()) return true;
                 if (follower->IsNonMeleeSpellCast(false, false, true)) return true;
                 follower->TeleportTo(
