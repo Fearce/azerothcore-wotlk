@@ -4956,13 +4956,22 @@ namespace WowPsParty
             // than we are now, so EVERY candidate moves us OUTWARD (never toward the source
             // = never deeper into a centred patch).
             float const outDist = std::max(len, 2.0f) + STEP;
-            float const baseAng = (len > 0.5f) ? std::atan2(dy, dx) : frand(0.0f, 2.0f * 3.14159265f);
-            // Fan around the straight-away bearing so a wall/ledge on the direct line
-            // doesn't block the escape; all offsets keep the SAME outDist from the source.
-            static constexpr float OFFS[] = { 0.0f, 0.35f, -0.35f, 0.7f, -0.7f, 1.05f, -1.05f };
-            for (float off : OFFS)
+            float const awayAng = (len > 0.5f) ? std::atan2(dy, dx) : frand(0.0f, 2.0f * 3.14159265f);
+
+            // Sweep candidate spots on the RING of radius outDist around the source —
+            // every one is the same (outward) distance from the source, so none is
+            // deeper into a centred patch. Among the navmesh-reachable ones, pick the
+            // spot CLOSEST to the bot's enemy target: that moves us AROUND the source
+            // toward the enemy and keeps it in range, instead of straight away (which
+            // overshot out of range, so the bot ran back IN -> the back-and-forth loop
+            // Kevin saw). With no target, fall back to the straight-away bearing.
+            Unit* const foeTar = bot->GetVictim();
+            constexpr int N = 16;   // 22.5° steps around the full circle
+            float bestX = 0.0f, bestY = 0.0f, bestZ = 0.0f, bestScore = 0.0f;
+            bool  haveBest = false;
+            for (int i = 0; i < N; ++i)
             {
-                float const ang = baseAng + off;
+                float const ang = awayAng + (2.0f * 3.14159265f * float(i) / float(N));
                 float const x = sx + std::cos(ang) * outDist;
                 float const y = sy + std::sin(ang) * outDist;
                 float z = bot->GetPositionZ();
@@ -4971,11 +4980,24 @@ namespace WowPsParty
                 float const bx = x - bot->GetPositionX();
                 float const by = y - bot->GetPositionY();
                 if (!NavReachable(bot, x, y, z, std::sqrt(bx * bx + by * by))) continue;
-                bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                // Higher score = better. With a target, prefer the spot nearest it
+                // (stay in range). Without one, prefer the earliest = straight-away.
+                float score;
+                if (foeTar)
+                {
+                    float const vdx = x - foeTar->GetPositionX();
+                    float const vdy = y - foeTar->GetPositionY();
+                    score = -std::sqrt(vdx * vdx + vdy * vdy);
+                }
+                else
+                    score = -float(i);
+                if (!haveBest || score > bestScore)
+                { haveBest = true; bestScore = score; bestX = x; bestY = y; bestZ = z; }
+            }
+            if (haveBest)
+                bot->GetMotionMaster()->MovePoint(0, bestX, bestY, bestZ, FORCED_MOVEMENT_NONE,
                                                   0.0f, 0.0f, /*generatePath=*/true,
                                                   /*forceDestination=*/false);
-                return true;
-            }
             return true;   // consumed the tick even if every bearing was blocked — retry next
         }
 
