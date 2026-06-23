@@ -1880,6 +1880,25 @@ static Item* WowPsParty_FindOwnGem(Player* p, uint32 gemEntry)
     return nullptr;
 }
 
+// Find ONE <gemEntry> gem anywhere in the connected party's bags (the SHARED pool),
+// returning the owning member in `outOwner`. Party inventory is pooled across all
+// members, so a gem on ANY member is usable — the requester needn't personally carry
+// it (the bot alts hold most of the loot).
+static Item* WowPsParty_FindPartyGem(uint32 account, uint32 gemEntry, Player*& outOwner)
+{
+    outOwner = nullptr;
+    if (!gemEntry) return nullptr;
+    for (uint8 slot = 0; slot < WowPsParty::PARTY_SIZE; ++slot)
+    {
+        uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+        if (!guid) continue;
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid));
+        if (!p || WowPsParty::MemberStorageUnstable(p)) continue;
+        if (Item* hit = WowPsParty_FindOwnGem(p, gemEntry)) { outOwner = p; return hit; }
+    }
+    return nullptr;
+}
+
 // REQ_GEMS\t<targetPartySlot>\t<targetItemGuidLow> — reply with GEMS, the target
 // item's 3 socket colors and the list of gems in the REQUESTER's OWN bags whose
 // color fits at least one of those sockets (so the picker only shows gems the user
@@ -1907,8 +1926,9 @@ static void HandleReqGems(Player* requester, std::string_view payload)
     for (uint8 i = 0; i < MAX_GEM_SOCKETS; ++i)
         sockColors[i] = uint8(tgtProto->Socket[i].Color);
 
-    // Collect, from the requester's OWN bags, every distinct gem ITEM whose gem color
-    // fits at least one real socket. The requester owns/pays for these gems.
+    // Collect every distinct gem ITEM in the SHARED PARTY pool whose color fits at least
+    // one real socket — party inventory is pooled, so a gem on ANY member (usually a bot
+    // alt, which holds most loot) counts, not just the requester's own bags.
     std::vector<std::pair<uint32, uint8>> gems; // (gemEntry, gemColor)
     std::unordered_set<uint32> seen;
     auto consider = [&](Item* it)
@@ -1927,18 +1947,28 @@ static void HandleReqGems(Player* requester, std::string_view payload)
         seen.insert(proto->ItemId);
         gems.emplace_back(proto->ItemId, uint8(gp->color));
     };
-    for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
-        consider(requester->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
-    for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
-        if (Bag* bag = requester->GetBagByPos(b))
-            for (uint32 j = 0; j < bag->GetBagSize(); ++j)
-                consider(requester->GetItemByPos(b, uint8(j)));
+    auto scanPlayer = [&](Player* p)
+    {
+        if (!p || WowPsParty::MemberStorageUnstable(p)) return;
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            consider(p->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = p->GetBagByPos(b))
+                for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                    consider(p->GetItemByPos(b, uint8(j)));
+    };
+    for (uint8 slot = 0; slot < WowPsParty::PARTY_SIZE; ++slot)
+    {
+        uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+        if (!guid) continue;
+        scanPlayer(ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid)));
+    }
 
-    // DIAGNOSTIC: how many of the requester's own gems fit this item. 0 here with real
-    // sockets = the user simply owns no fitting gem, not a bug.
+    // DIAGNOSTIC: fitting gems found across the whole party pool. 0 with real sockets =
+    // nobody in the party owns a fitting gem, not a bug.
     uint32 const sockCount = (sockColors[0] ? 1u : 0u) + (sockColors[1] ? 1u : 0u) + (sockColors[2] ? 1u : 0u);
     LOG_INFO("module",
-        "[WowPsParty Gem] REQ_GEMS by {} for item entry={} ({} socket(s)) -> {} fitting gem(s) in own bags",
+        "[WowPsParty Gem] REQ_GEMS by {} for item entry={} ({} socket(s)) -> {} fitting gem(s) in the party pool",
         requester->GetName(), tgtProto->ItemId, sockCount, uint32(gems.size()));
 
     std::ostringstream out;
@@ -1991,11 +2021,13 @@ static void HandleGem(Player* requester, std::string_view payload)
         return;
     }
 
-    // The gem must be one the REQUESTER actually owns (they pay for it).
-    Item* gemItem = WowPsParty_FindOwnGem(requester, gemEntry);
-    if (!gemItem)
+    // The gem may sit in ANY party member's bags (shared pool) — find it and the member
+    // who holds it; we consume it from THAT member, not necessarily the requester.
+    Player* gemOwner = nullptr;
+    Item* gemItem = WowPsParty_FindPartyGem(account, gemEntry, gemOwner);
+    if (!gemItem || !gemOwner)
     {
-        ch.PSendSysMessage("|cffff5555[WowPsParty]|r You don't have that gem.");
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r Nobody in the party has that gem.");
         return;
     }
     ItemTemplate const* gemProto = WowPsParty::SafeItemTemplate(gemItem);
@@ -2039,10 +2071,10 @@ static void HandleGem(Player* requester, std::string_view payload)
     if (gemItem->GetCount() > 1)
     {
         gemItem->SetCount(gemItem->GetCount() - 1);
-        gemItem->SetState(ITEM_CHANGED, requester);
+        gemItem->SetState(ITEM_CHANGED, gemOwner);
     }
     else
-        requester->DestroyItem(gemItem->GetBagSlot(), gemItem->GetSlot(), true);
+        gemOwner->DestroyItem(gemItem->GetBagSlot(), gemItem->GetSlot(), true);
 
     ch.PSendSysMessage("|cff66ccff[WowPsParty]|r Socketed |cffffffff{}|r into |cffffffff{}|r ({}'s).",
         gemName, itemName, owner->GetName());
