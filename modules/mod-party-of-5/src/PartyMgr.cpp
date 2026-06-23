@@ -1276,6 +1276,87 @@ namespace WowPsParty
             out.push_back(std::move(c));
         }
 
+        // Tank-CLASS coverage: a player should always be able to pick from at
+        // least TWO different tank classes, even when the nearby pool is thin or
+        // the nearest char of every tank class happens to be DPS-specced (the
+        // per-class coverage above only guarantees a class APPEARS, in whatever
+        // role its nearest char is). Pull the nearest genuinely TANK-specced pool
+        // char of each tank-capable class — any level, re-leveled to the player on
+        // hire (the hire path preserves the picked tank tree) — until two distinct
+        // tank classes are offered.
+        std::unordered_set<uint8>  tankClassesShown;
+        std::unordered_set<uint32> shownGuids;
+        for (auto const& c : out)
+        {
+            shownGuids.insert(c.guid);
+            if (c.role == "tank" && c.cls < 12) tankClassesShown.insert(c.cls);
+        }
+        static uint8 const kTankClasses[] = { 1, 2, 6, 11 };  // Warrior/Paladin/DK/Druid → Prot/Prot/Blood/Bear
+        for (uint8 cls : kTankClasses)
+        {
+            if (tankClassesShown.size() >= 2) break;
+            if (tankClassesShown.count(cls)) continue;   // this tank class already offered
+            if (cls == 6 && L < 55) continue;            // Death Knights start at level 55
+
+            // Nearest-level pool chars of this class; pick the closest one that is
+            // actually tank-specced. Batch one talent read for the slice.
+            QueryResult cq = CharacterDatabase.Query(
+                "SELECT `guid`,`name`,`level` FROM `characters` "
+                "WHERE `account` IN ({}) AND `online` = 0 AND `class` = {} AND `race` IN ({}) "
+                "ORDER BY ABS(CAST(`level` AS SIGNED) - {}) ASC LIMIT 60",
+                acctCsv, uint32(cls), raceCsv, uint32(L));
+            if (!cq) continue;
+
+            struct TRaw { uint32 guid; std::string name; };
+            std::vector<TRaw> traws;
+            std::string tcsv;
+            do {
+                Field* tf = cq->Fetch();
+                uint32 const g = tf[0].Get<uint32>();
+                if (WowPsParty::IsHenchman(ObjectGuid::Create<HighGuid::Player>(g)))
+                    continue;                 // busy
+                if (shownGuids.count(g))
+                    continue;                 // already on the list
+                if (!tcsv.empty()) tcsv += ',';
+                tcsv += std::to_string(g);
+                traws.push_back(TRaw{ g, tf[1].Get<std::string>() });
+            } while (cq->NextRow());
+            if (traws.empty()) continue;
+
+            std::unordered_map<uint32, std::unordered_set<uint32>> ttal;
+            QueryResult ttq = CharacterDatabase.Query(
+                "SELECT `guid`,`spell` FROM `character_talent` WHERE `guid` IN ({})", tcsv);
+            if (ttq) do {
+                Field* tf = ttq->Fetch();
+                ttal[tf[0].Get<uint32>()].insert(tf[1].Get<uint32>());
+            } while (ttq->NextRow());
+
+            // traws is nearest-level-first — take the first genuine tank.
+            for (TRaw const& t : traws)
+            {
+                auto const it = ttal.find(t.guid);
+                std::unordered_set<uint32> const& known = (it != ttal.end()) ? it->second : noTalents;
+                if (RoleFromTalents(cls, known, ClassDefaultRole(cls)) != "tank")
+                    continue;
+                HenchmanCandidate c;
+                c.guid  = t.guid;
+                c.name  = t.name;
+                c.cls   = cls;
+                c.level = L;            // shown + costed at the player's level; re-leveled on hire
+                c.role  = "tank";
+                c.spec  = SpecAbbrevFromTalents(cls, known);
+                out.push_back(std::move(c));
+                tankClassesShown.insert(cls);
+                shownGuids.insert(t.guid);
+                break;
+            }
+        }
+        if (tankClassesShown.size() < 2)
+            LOG_INFO("module",
+                "[WowPsParty Henchmen] tank-class coverage only found {} tank class(es) for guid={} level={} "
+                "(pool may lack tank-specced chars of a second tank class)",
+                uint32(tankClassesShown.size()), requester->GetGUID().GetCounter(), uint32(L));
+
         // Sort for the hire screen: tanks first, then healers, then dps; within
         // a role by class id, then spec. (Kevin's requested ordering.)
         auto roleRank = [](std::string const& role) -> int {
