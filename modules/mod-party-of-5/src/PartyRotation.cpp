@@ -1300,12 +1300,23 @@ namespace WowPsParty
         if (!bot) return nullptr;
         std::vector<Player*> party;
         GatherPartyPlayers(bot, party, /*includeDead=*/true);
+        // Pick a RANDOM dead member instead of always the first, so several rezzers
+        // spread across different corpses rather than all stacking the same one —
+        // a post-wipe raid stands back up much faster (Kevin). Prefer corpses NOT
+        // already mid-rez (a pending resurrect request means someone's rez already
+        // landed) so we don't pile a second rez on the same target; fall back to any
+        // dead member if every corpse already has a request. (party_has_dead, which
+        // only checks for non-null, is unaffected.)
+        std::vector<Player*> dead, deadNoReq;
         for (Player* m : party)
         {
             if (m == bot || m->IsAlive()) continue;
-            return m;
+            dead.push_back(m);
+            if (!m->isResurrectRequested()) deadNoReq.push_back(m);
         }
-        return nullptr;
+        std::vector<Player*> const& pick = deadNoReq.empty() ? dead : deadNoReq;
+        if (pick.empty()) return nullptr;
+        return pick[urand(0, uint32(pick.size()) - 1)];
     }
 
     static bool TargetHasNamedAura(Unit* target, std::string const& name,
