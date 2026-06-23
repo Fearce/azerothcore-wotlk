@@ -1746,6 +1746,7 @@ static void HandleEnchant(Player* requester, std::string_view payload)
     if (!tgtGuid) return;
     Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(tgtGuid));
     if (!owner) return;
+    if (WowPsParty::MemberStorageUnstable(owner)) return;  // mid-logout: don't mutate a tearing-down inventory
     Item* item = owner->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(tgtItemGuidLow));
     if (!item) return;
 
@@ -1840,6 +1841,211 @@ static void HandleEnchant(Player* requester, std::string_view payload)
         ChatHandler(requester->GetSession()).PSendSysMessage(
             "|cff66ccff[WowPsParty]|r {} enchanted |cffffffff{}|r ({}'s).",
             enchanter->GetName(), itemName, owner->GetName());
+
+    WowPsParty::SendGearTo(requester, tgtSlot);
+    WowPsParty::SendStatsTo(requester, tgtSlot);
+    WowPsParty::SendInventoryTo(requester);
+}
+
+// Does a gem of GemColor fit a socket of SocketColor? Mirrors AC's native rules
+// (HandleSocketOpcode / Item::GemsFitSockets): a META socket takes ONLY a meta gem
+// and vice-versa; otherwise a gem fits if its color bitmask-overlaps the socket's.
+static bool WowPsParty_GemColorFitsSocket(uint8 gemColor, uint8 socketColor)
+{
+    if (!socketColor) return false;
+    if (socketColor == SOCKET_COLOR_META || gemColor == SOCKET_COLOR_META)
+        return socketColor == SOCKET_COLOR_META && gemColor == SOCKET_COLOR_META;
+    return (gemColor & socketColor) != 0;
+}
+
+// Find ONE gem item of <gemEntry> in this player's bags (backpack + the 4 bags).
+// Returns the Item* (caller consumes it), or nullptr if none. Confirms the item is
+// actually a gem (proto Class == ITEM_CLASS_GEM) before returning.
+static Item* WowPsParty_FindOwnGem(Player* p, uint32 gemEntry)
+{
+    if (!p || !gemEntry) return nullptr;
+    auto check = [&](Item* it) -> Item*
+    {
+        if (!it) return nullptr;
+        ItemTemplate const* proto = WowPsParty::SafeItemTemplate(it);
+        if (!proto || proto->ItemId != gemEntry || proto->Class != ITEM_CLASS_GEM) return nullptr;
+        return it;
+    };
+    for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+        if (Item* hit = check(p->GetItemByPos(INVENTORY_SLOT_BAG_0, i))) return hit;
+    for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+        if (Bag* bag = p->GetBagByPos(b))
+            for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                if (Item* hit = check(p->GetItemByPos(b, uint8(j)))) return hit;
+    return nullptr;
+}
+
+// REQ_GEMS\t<targetPartySlot>\t<targetItemGuidLow> — reply with GEMS, the target
+// item's 3 socket colors and the list of gems in the REQUESTER's OWN bags whose
+// color fits at least one of those sockets (so the picker only shows gems the user
+// owns AND that can actually go in this item). Distinct gem entries only.
+static void HandleReqGems(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const tgtSlot        = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const tgtItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    uint32 const tgtGuid = WowPsParty::GuidForAccountSlot(account, tgtSlot);
+    if (!tgtGuid) return;
+    Player* tgtChar = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(tgtGuid));
+    if (!tgtChar) return;
+    if (WowPsParty::MemberStorageUnstable(tgtChar)) return;
+    Item* tgtItem = tgtChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(tgtItemGuidLow));
+    if (!tgtItem) return;
+    ItemTemplate const* tgtProto = WowPsParty::SafeItemTemplate(tgtItem);
+    if (!tgtProto) return;
+
+    uint8 sockColors[MAX_GEM_SOCKETS];
+    for (uint8 i = 0; i < MAX_GEM_SOCKETS; ++i)
+        sockColors[i] = uint8(tgtProto->Socket[i].Color);
+
+    // Collect, from the requester's OWN bags, every distinct gem ITEM whose gem color
+    // fits at least one real socket. The requester owns/pays for these gems.
+    std::vector<std::pair<uint32, uint8>> gems; // (gemEntry, gemColor)
+    std::unordered_set<uint32> seen;
+    auto consider = [&](Item* it)
+    {
+        if (!it) return;
+        ItemTemplate const* proto = WowPsParty::SafeItemTemplate(it);
+        if (!proto || proto->Class != ITEM_CLASS_GEM || !proto->GemProperties) return;
+        if (seen.count(proto->ItemId)) return;
+        GemPropertiesEntry const* gp = sGemPropertiesStore.LookupEntry(proto->GemProperties);
+        if (!gp) return;
+        bool fits = false;
+        for (uint8 i = 0; i < MAX_GEM_SOCKETS && !fits; ++i)
+            if (WowPsParty_GemColorFitsSocket(uint8(gp->color), sockColors[i]))
+                fits = true;
+        if (!fits) return;
+        seen.insert(proto->ItemId);
+        gems.emplace_back(proto->ItemId, uint8(gp->color));
+    };
+    for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+        consider(requester->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
+    for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+        if (Bag* bag = requester->GetBagByPos(b))
+            for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                consider(requester->GetItemByPos(b, uint8(j)));
+
+    // DIAGNOSTIC: how many of the requester's own gems fit this item. 0 here with real
+    // sockets = the user simply owns no fitting gem, not a bug.
+    uint32 const sockCount = (sockColors[0] ? 1u : 0u) + (sockColors[1] ? 1u : 0u) + (sockColors[2] ? 1u : 0u);
+    LOG_INFO("module",
+        "[WowPsParty Gem] REQ_GEMS by {} for item entry={} ({} socket(s)) -> {} fitting gem(s) in own bags",
+        requester->GetName(), tgtProto->ItemId, sockCount, uint32(gems.size()));
+
+    std::ostringstream out;
+    out << "GEMS\t" << tgtSlot << '\t' << tgtItemGuidLow << '\t'
+        << uint32(sockColors[0]) << ',' << uint32(sockColors[1]) << ',' << uint32(sockColors[2]) << '\t';
+    for (size_t i = 0; i < gems.size(); ++i)
+        out << (i ? ";" : "") << gems[i].first << ':' << uint32(gems[i].second);
+    SendWPSP(requester, out.str());
+}
+
+// GEM\t<targetPartySlot>\t<targetItemGuidLow>\t<socketIndex 0-2>\t<gemEntry> — socket
+// one of the REQUESTER's OWN gems into a shared bot item. Validates the socket exists
+// and the gem color fits (native rules), applies on the OWNER, recomputes the socket
+// bonus exactly like the native handler, then consumes ONE gem AFTER the apply landed
+// (so a failed apply can never eat a gem — same dupe-safety the enchant flow has).
+static void HandleGem(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    std::string s(payload);
+    auto t1 = s.find('\t');               if (t1 == std::string::npos) return;
+    auto t2 = s.find('\t', t1 + 1);       if (t2 == std::string::npos) return;
+    auto t3 = s.find('\t', t2 + 1);       if (t3 == std::string::npos) return;
+    uint32 const tgtSlot        = std::strtoul(s.substr(0, t1).c_str(), nullptr, 10);
+    uint32 const tgtItemGuidLow = std::strtoul(s.substr(t1 + 1, t2 - t1 - 1).c_str(), nullptr, 10);
+    uint32 const socketIndex    = std::strtoul(s.substr(t2 + 1, t3 - t2 - 1).c_str(), nullptr, 10);
+    uint32 const gemEntry       = std::strtoul(s.substr(t3 + 1).c_str(), nullptr, 10);
+
+    ChatHandler ch(requester->GetSession());
+    if (socketIndex >= MAX_GEM_SOCKETS)
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r Invalid gem socket.");
+        return;
+    }
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    uint32 const tgtGuid = WowPsParty::GuidForAccountSlot(account, tgtSlot);
+    if (!tgtGuid) return;
+    Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(tgtGuid));
+    if (!owner) return;
+    if (WowPsParty::MemberStorageUnstable(owner)) return;  // mid-logout: don't mutate a tearing-down inventory
+    Item* item = owner->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(tgtItemGuidLow));
+    if (!item) return;
+    ItemTemplate const* proto = WowPsParty::SafeItemTemplate(item);
+    if (!proto) return;
+
+    uint8 const socketColor = uint8(proto->Socket[socketIndex].Color);
+    if (!socketColor)
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r That item has no socket there.");
+        return;
+    }
+
+    // The gem must be one the REQUESTER actually owns (they pay for it).
+    Item* gemItem = WowPsParty_FindOwnGem(requester, gemEntry);
+    if (!gemItem)
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r You don't have that gem.");
+        return;
+    }
+    ItemTemplate const* gemProto = WowPsParty::SafeItemTemplate(gemItem);
+    GemPropertiesEntry const* gemProps = gemProto ? sGemPropertiesStore.LookupEntry(gemProto->GemProperties) : nullptr;
+    if (!gemProps || !gemProps->spellitemenchantement || !sSpellItemEnchantmentStore.LookupEntry(gemProps->spellitemenchantement))
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r That isn't a usable gem.");
+        return;
+    }
+    if (!WowPsParty_GemColorFitsSocket(uint8(gemProps->color), socketColor))
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r That gem's colour doesn't fit that socket.");
+        return;
+    }
+
+    // Apply on the OWNER so equipped stats take effect. Remove the old gem enchant in
+    // this socket, set the new one, reapply — mirrors the native socket handler.
+    EnchantmentSlot const eslot = EnchantmentSlot(SOCK_ENCHANTMENT_SLOT + socketIndex);
+    bool const bonusWas = item->GemsFitSockets();
+    owner->ApplyEnchantment(item, eslot, false);
+    item->SetEnchantment(eslot, gemProps->spellitemenchantement, 0, 0, requester->GetGUID());
+    owner->ApplyEnchantment(item, eslot, true);
+
+    // Recompute the socket bonus exactly like HandleSocketOpcode (~ItemHandler 1387):
+    // if whether ALL sockets are now satisfied flipped, apply or remove the item's
+    // socketBonus enchant in the BONUS slot.
+    bool const bonusNow = item->GemsFitSockets();
+    if (bonusWas ^ bonusNow)
+    {
+        owner->ApplyEnchantment(item, BONUS_ENCHANTMENT_SLOT, false);
+        item->SetEnchantment(BONUS_ENCHANTMENT_SLOT, (bonusNow ? proto->socketBonus : 0), 0, 0, requester->GetGUID());
+        owner->ApplyEnchantment(item, BONUS_ENCHANTMENT_SLOT, true);
+    }
+    item->SetState(ITEM_CHANGED, owner);
+    item->SendUpdateSockets();
+
+    // Consume ONE gem AFTER the socket landed — a failed apply above returned early and
+    // never reached here, so a gem is never eaten for a failed socket.
+    std::string const gemName = gemProto ? gemProto->Name1 : "gem";
+    std::string const itemName = proto->Name1;
+    if (gemItem->GetCount() > 1)
+    {
+        gemItem->SetCount(gemItem->GetCount() - 1);
+        gemItem->SetState(ITEM_CHANGED, requester);
+    }
+    else
+        requester->DestroyItem(gemItem->GetBagSlot(), gemItem->GetSlot(), true);
+
+    ch.PSendSysMessage("|cff66ccff[WowPsParty]|r Socketed |cffffffff{}|r into |cffffffff{}|r ({}'s).",
+        gemName, itemName, owner->GetName());
 
     WowPsParty::SendGearTo(requester, tgtSlot);
     WowPsParty::SendStatsTo(requester, tgtSlot);
@@ -4017,6 +4223,14 @@ public:
         else if (command == "ENCHANT")
         {
             HandleEnchant(player, payload);
+        }
+        else if (command == "REQ_GEMS")
+        {
+            HandleReqGems(player, payload);
+        }
+        else if (command == "GEM")
+        {
+            HandleGem(player, payload);
         }
         else if (command == "DISENCHANT")
         {
