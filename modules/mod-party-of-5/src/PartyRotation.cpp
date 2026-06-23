@@ -5394,6 +5394,21 @@ namespace WowPsParty
             || verb == "rez_party";
     }
 
+    // "Dodge a mechanic NOW" movement verbs. These exist to MOVE the bot out of a
+    // deadly effect ("keep moving or you freeze/burn") — Intense Cold, Coldflame,
+    // a frontal cast — so they MUST be able to override a cast-in-flight and break
+    // it, exactly like a reactive heal does. Without that a hard-casting ranged bot
+    // (perpetually in castTimeInFlight on a long Frostbolt) never gets to reposition
+    // and just stacks Intense Cold to death (Kevin). NOT the kiting verbs
+    // (keep_distance_*): those are positioning, not emergencies, and intentionally
+    // wait for a cast gap rather than self-interrupting.
+    static bool IsReactiveMoveVerb(std::string const& verb)
+    {
+        return verb == "reposition_random"
+            || verb == "walk_away_from_source"
+            || verb == "move_out_of_los";
+    }
+
     // Verbs that deal damage to / pull an ENEMY (generate threat). Used to hold a
     // healer's offense while the human tank is still locking a pull — the single-
     // target gate in AssistTarget only governs the bot's VICTIM, but these (spread/
@@ -5714,7 +5729,12 @@ namespace WowPsParty
                 continue;
             }
 
-            if (committed && !CsvContains(Lower(r.flags), "clip"))
+            std::string const verb = r.action.substr(0, r.action.find(':'));
+
+            // A survival-dodge movement verb (reposition_random / walk_away_from_source
+            // / move_out_of_los) overrides a cast OR channel in flight — see
+            // IsReactiveMoveVerb. So it's exempt from both suppressions below.
+            if (committed && !IsReactiveMoveVerb(verb) && !CsvContains(Lower(r.flags), "clip"))
             {
                 if (trace)
                     LOG_INFO("module",
@@ -5737,7 +5757,8 @@ namespace WowPsParty
             // fix (no need to audit every movement caller for an IsNonMeleeSpellCast
             // guard).
             if (castTimeInFlight
-                && !IsReactiveHealVerb(r.action.substr(0, r.action.find(':')))
+                && !IsReactiveHealVerb(verb)
+                && !IsReactiveMoveVerb(verb)
                 && !CsvContains(Lower(r.flags), "clip"))
             {
                 if (trace)
@@ -5779,7 +5800,6 @@ namespace WowPsParty
             // instant the tank has the lead (or, for heals, the pack is locked /
             // someone drops low). Gated behind the wait-tank-threat toggle.
             {
-                std::string const verb = r.action.substr(0, r.action.find(':'));
                 bool const skip =
                     (healerHold  && (verb == "cast_party_lowest" || verb == "cast_party_lowest_hot"))
                  || (offenseHold && IsOffensiveEnemyVerb(verb));
@@ -5798,12 +5818,21 @@ namespace WowPsParty
             // NOW so the heal lands this tick, not 1-2s later when the cast bar
             // would have finished. One-shot: clear the flag so a heal that fails
             // to land (out of range, on CD) can't re-interrupt every tick.
-            if (castingHarmfulFiller
-                && IsReactiveHealVerb(r.action.substr(0, r.action.find(':'))))
+            if (castingHarmfulFiller && IsReactiveHealVerb(verb))
             {
                 bot->InterruptNonMeleeSpells(false);
                 castingHarmfulFiller = false;
             }
+            // A survival dodge that matched mid cast/channel: break the spell so the
+            // bot actually MOVES (the movement is the whole point — it sheds Intense
+            // Cold / leaves the fire). Otherwise the launched move-spline would
+            // self-cancel the cast at ~1% anyway, a messier version of the same thing.
+            // No per-tick stutter: once the hop spline is live the verb's own
+            // "already mid-hop -> return true" guard stops re-issuing, and with the
+            // cast already killed this branch is a no-op next tick — so every verb in
+            // IsReactiveMoveVerb MUST keep that mid-move self-skip or this would thrash.
+            if ((castTimeInFlight || committed) && IsReactiveMoveVerb(verb))
+                bot->InterruptNonMeleeSpells(false);
             bool const execOk = ExecAction(r.action, bot, r.flags, r.condition);
             if (trace)
                 LOG_INFO("module",
