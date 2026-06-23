@@ -609,15 +609,23 @@ namespace WowPsParty
                     // Holy Shield: block-chance + holy-damage shield. Core prot
                     // ability that was missing — both steady mitigation AND threat.
                     add("has_target", "buff_self:Holy Shield", 76);
+                    // Consecration LEADS the AoE pull: dropped at the paladin's feet
+                    // for immediate threat across the whole pack, ahead of the
+                    // single-target threat abilities below (was 66, beneath Avenger's
+                    // Shield — so it landed several GCDs in and loose adds slipped to
+                    // the casters).
+                    add("enemies_in_melee>2", "cast:Consecration", 75);
                     add("party_has_magic", "cure_party:Cleanse", 74);
                     add("has_target", "cast:Avenger's Shield", 70);
-                    add("enemies_in_melee>2", "cast:Consecration", 66);
                     // Shield of Righteousness (lvl 75): big single-target threat,
                     // scales with block value — was missing entirely. Falls through
                     // harmlessly below 75 / with no shield equipped.
                     add("has_target", "cast:Shield of Righteousness", 63);
                     add("has_target", "cast:Hammer of the Righteous", 60);
                     add("enemies_in_melee>2", "cast:Holy Wrath", 56);
+                    // Prefer Judgement of Wisdom (returns mana to the pack's attackers)
+                    // when trained; fall through to Judgement of Light if it isn't known.
+                    add("has_target", "cast:Judgement of Wisdom", 49);
                     add("has_target", "cast:Judgement of Light", 48);
                     add("has_target", "cast:Crusader Strike", 40);
                 }
@@ -690,6 +698,11 @@ namespace WowPsParty
 
             case 4: // Rogue
                 add("target_casting&target_interruptible", "cast:Kick", 92);
+                // Blade Flurry: the combat cleave cooldown — pop it whenever 3+ mobs
+                // are in melee so every strike hits a second target. buff_self falls
+                // through while it's active or on cooldown, so the high priority is
+                // free (it only wins the tick it actually fires).
+                add("enemies_in_melee>2", "buff_self:Blade Flurry", 84);
                 add("out_of_combat&self_missing_aura:Stealth", "cast_self:Stealth", 80);
                 // Execute finisher: a dying target gets Eviscerated NOW with as few
                 // as 3 combo points rather than waiting for 5 (or wasting a bleed) —
@@ -935,14 +948,21 @@ namespace WowPsParty
                 // Placed AoE keys off the densest mob CLUSTER (3+ enemies within
                 // ~8y of each OTHER), not hostiles near the mage — a ranged mage
                 // stands well back, so a bot-centred count reads 0 on a pack it
-                // could nuke. Blizzard leads by default; a Fire-specced mage
-                // (primary_tree:1) prefers Flamestrike. The lower Blizzard rule
-                // doubles as a Fire mage's fallback when Flamestrike is on CD.
+                // could nuke. Fire leads Flamestrike; everyone else leads Blizzard.
+                // The Flamestrike fallback is gated !Frost (primary_tree:2) so a
+                // Frost mage never casts it when Blizzard is briefly unavailable.
                 add("enemies_clustered:8>2&primary_tree:1", "cast:Flamestrike", 60);
                 add("enemies_clustered:8>2", "cast:Blizzard", 58);
-                add("enemies_clustered:8>2", "cast:Flamestrike", 56);
-                add("has_target", "cast:Frostbolt", 44);
-                add("has_target", "cast:Fireball", 42);
+                add("enemies_clustered:8>2&!primary_tree:2", "cast:Flamestrike", 56);
+                // Single-target nuke LEADS with the spec's own school: Fire -> Fireball,
+                // Frost -> Frostbolt (this used to be a flat Frostbolt-first list, so a
+                // Fire mage frost-bolted and a Frost mage could drop to Fireball). The
+                // generic fallbacks EXCLUDE the opposing spec, so Frost never Fireballs
+                // and Fire never Frostbolts; Arcane / unspecced keep the Frostbolt-led order.
+                add("primary_tree:1&has_target", "cast:Fireball", 46);
+                add("primary_tree:2&has_target", "cast:Frostbolt", 46);
+                add("!primary_tree:1&has_target", "cast:Frostbolt", 44);
+                add("!primary_tree:2&has_target", "cast:Fireball", 42);
                 add("has_target", "cast:Arcane Blast", 40);
                 // Disabled by default: henchmen recover for free (eat/drink
                 // below) and don't need conjured items, and a henchman mage
@@ -963,8 +983,12 @@ namespace WowPsParty
                 add("pet_missing", "cast_self:Summon Imp", 88);
                 add("self_health<35", "cast:Death Coil", 82);
                 add("self_missing_aura:Demon Armor", "cast_self:Demon Armor", 76);
-                add("target_missing_aura:Immolate", "cast:Immolate", 72);
-                add("target_missing_aura:Corruption", "cast:Corruption", 70);
+                // Immolate disabled by default (kept in the list so a Destro player
+                // can tick it back on in the editor). Corruption is a SPREAD dot now —
+                // cast_spread keeps the whole pull dotted (self-gates on who's missing
+                // it) instead of stacking it on the tank's single target.
+                add("target_missing_aura:Immolate", "cast:Immolate", 72, "disabled");
+                add("has_target", "cast_spread:Corruption", 70);
                 add("target_missing_aura:Curse of Agony", "cast:Curse of Agony", 66);
                 add("target_missing_aura:Unstable Affliction", "cast:Unstable Affliction", 62);
                 // AoE on the densest mob CLUSTER, not hostiles near the warlock
