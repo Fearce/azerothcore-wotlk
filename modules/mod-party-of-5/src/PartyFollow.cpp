@@ -262,6 +262,33 @@ namespace WowPsParty
         static std::atomic<bool>         g_tickerInstalled{false};
         static constexpr uint32          TICK_INTERVAL_MS = 1000;
 
+        // ---- Leader-fall detection ------------------------------------------
+        // When the leader jumps off a ledge / into a hole there's often NO navmesh
+        // path down, so MoveFollow can't reach and followers stall at the rim —
+        // and the >100y leash never fires because the drop is closer than that.
+        // The 1 Hz pass samples each leader's Z; a sudden drop arms a delayed
+        // teleport (a landing grace, re-armed while the leader keeps falling), and
+        // when it comes due ApplyDirective snaps any STRANDED follower onto the
+        // leader. g_leaderFall is touched ONLY on the world thread (OnUpdate +
+        // ApplyDirective, which OnUpdate calls), so it needs no lock.
+        struct LeaderFallState
+        {
+            float  lastX        = 0.0f;
+            float  lastY        = 0.0f;
+            float  lastZ        = 0.0f;
+            // Sentinel (no real map id) so the FIRST sample always takes the
+            // re-baseline branch — map 0 IS a real map (Eastern Kingdoms), so a
+            // default 0 here would skip re-baselining and read a spurious drop
+            // from lastZ=0 at a negative-Z spot.
+            uint32 lastMapId    = 0xFFFFFFFFu;
+            uint32 teleportDueMs = 0;   // 0 = unarmed; else getMSTime() to snap followers
+        };
+        static std::unordered_map<uint32, LeaderFallState> g_leaderFall;  // leaderGuidLow -> state
+        static constexpr float  FALL_DROP_Z         = 10.0f;  // >this Z lost in one ~1s pass = a fall
+        static constexpr float  FALL_MAX_XY         = 25.0f;  // but ignore big XY jumps (a teleport, not a fall)
+        static constexpr uint32 FALL_LAND_GRACE_MS  = 3000;   // wait this long after the drop before snapping
+        static constexpr float  FALL_SNAP_MIN_DIST  = 8.0f;   // only snap a follower this far out (didn't fall along)
+
         // Per-account quick erase by account id.
         void EraseByAccount_NoLock(uint32 account)
         {
@@ -5408,6 +5435,40 @@ namespace WowPsParty
                 return true;
             }
 
+            // ---- Leader-fall snap ------------------------------------------
+            // The leader jumped off a ledge / into a hole (detected in OnUpdate,
+            // which armed a teleport once the landing grace elapsed). MoveFollow
+            // often can't path down, and the >100y leash never fires because the
+            // drop is closer than that — so snap any STRANDED follower onto the
+            // leader. A 3D distance > FALL_SNAP_MIN_DIST means it didn't fall
+            // along (the vertical drop alone exceeds that), so a bot that DID come
+            // down with the leader is left to follow normally. Runs before the
+            // combat / leash yields so a stranded bot rejoins even mid-fight.
+            if (follower->IsAlive() && !follower->IsInFlight()
+                && !follower->IsBeingTeleported() && !follower->GetVehicleBase())
+            {
+                auto fit = g_leaderFall.find(d.leaderGuid.GetCounter());
+                if (fit != g_leaderFall.end() && fit->second.teleportDueMs != 0
+                    && getMSTime() >= fit->second.teleportDueMs
+                    && follower->GetExactDist(leader) > FALL_SNAP_MIN_DIST)
+                {
+                    if (follower->GetVictim()) follower->AttackStop();
+                    if (follower->IsInCombat()) follower->CombatStop();
+                    if (follower->getStandState() != UNIT_STAND_STATE_STAND)
+                        follower->SetStandState(UNIT_STAND_STATE_STAND);
+                    follower->GetMotionMaster()->Clear();
+                    follower->StopMoving();
+                    ClearGatherNode(d.followerGuid.GetCounter());
+                    follower->TeleportTo(leader->GetMapId(),
+                        leader->GetPositionX(), leader->GetPositionY(),
+                        leader->GetPositionZ(), leader->GetOrientation());
+                    LOG_INFO("module",
+                        "[WowPsParty Follow] leader-fall snap: {} -> leader {} (dropped out of reach)",
+                        follower->GetName(), leader->GetName());
+                    return true;
+                }
+            }
+
             // Persistently disable mod-playerbots' follow strategy on each
             // tick. UpdateAIGroupMaster (called from PlayerbotAI::UpdateAI
             // during combat) re-enables "+follow" via FindNewMaster, so a
@@ -6179,8 +6240,63 @@ namespace WowPsParty
                 snapshot = g_directives;
             }
 
+            // Leader-fall detection: sample each distinct leader's Z ONCE this
+            // pass. A drop > FALL_DROP_Z (with only a small XY move, so a teleport
+            // can't masquerade as a fall) arms a teleport FALL_LAND_GRACE_MS out;
+            // re-arming while the leader keeps falling means it fires that long
+            // after it actually lands. ApplyDirective consumes the arm below.
+            {
+                uint32 const now = getMSTime();
+                std::unordered_set<uint32> seenLeaders;
+                for (auto const& d : snapshot)
+                {
+                    uint32 const llow = d.leaderGuid.GetCounter();
+                    if (!seenLeaders.insert(llow).second) continue;   // once per leader
+                    Player* leader = ObjectAccessor::FindConnectedPlayer(d.leaderGuid);
+                    if (!leader || !leader->IsInWorld()) continue;
+                    LeaderFallState& s = g_leaderFall[llow];
+                    float const x = leader->GetPositionX();
+                    float const y = leader->GetPositionY();
+                    float const z = leader->GetPositionZ();
+                    uint32 const mapId = leader->GetMapId();
+                    // A map change or an in-flight teleport makes the deltas
+                    // meaningless — re-baseline and don't arm.
+                    if (s.lastMapId != mapId || leader->IsBeingTeleported())
+                    {
+                        s.lastX = x; s.lastY = y; s.lastZ = z; s.lastMapId = mapId;
+                        continue;
+                    }
+                    float const drop = s.lastZ - z;   // positive = fell
+                    float const dx = x - s.lastX, dy = y - s.lastY;
+                    float const horiz = std::sqrt(dx * dx + dy * dy);
+                    s.lastX = x; s.lastY = y; s.lastZ = z;
+                    // A fall is a big Z loss with only a small horizontal move; a
+                    // same-map teleport/blink jumps far in XY too, so the horiz gate
+                    // keeps it from masquerading as a fall.
+                    if (drop > FALL_DROP_Z && horiz < FALL_MAX_XY)
+                        s.teleportDueMs = now + FALL_LAND_GRACE_MS;
+                }
+                // GC leaders that vanished from the directive set this pass.
+                for (auto it = g_leaderFall.begin(); it != g_leaderFall.end(); )
+                {
+                    if (seenLeaders.count(it->first)) ++it;
+                    else it = g_leaderFall.erase(it);
+                }
+            }
+
             for (auto const& d : snapshot)
                 (void)ApplyDirective(d);
+
+            // Disarm any fall-teleport whose window came due this pass — every
+            // follower has now had its chance to snap in ApplyDirective above, so
+            // only a NEW drop re-arms it. (Re-running the snap every pass would
+            // keep yanking a bot that legitimately walked back to the leader.)
+            {
+                uint32 const now = getMSTime();
+                for (auto& kv : g_leaderFall)
+                    if (kv.second.teleportDueMs != 0 && now >= kv.second.teleportDueMs)
+                        kv.second.teleportDueMs = 0;
+            }
         }
 
     private:
