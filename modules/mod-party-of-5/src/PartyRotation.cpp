@@ -4676,15 +4676,42 @@ namespace WowPsParty
         {
             Unit* v = bot->GetVictim();
             if (!v || !v->IsAlive()) return false;
-            if (v->isInBack(bot) && bot->IsWithinMeleeRange(v))
-                return false;   // already behind + in melee -> let the back attack fire
-            float const back = v->GetOrientation() + 3.14159265f;   // opposite the target's facing
-            float x, y, z;
-            v->GetNearPoint(bot, x, y, z, 0.0f,
-                            std::max(v->GetCombatReach() + 1.0f, 2.0f), back);
+            bool const inMelee = bot->IsWithinMeleeRange(v);
+            bool const behind  = v->isInBack(bot);
+            // Own positioning while this rule is active so AssistTarget doesn't
+            // drag us back to the front.
             WowPsParty::HoldFollower(bot->GetGUID(), 1500);
-            bot->GetMotionMaster()->MovePoint(0, x, y, z);
-            return true;
+            // Strafe to a spot at the target's BACK, at contact range, until we're
+            // behind AND in melee. distance2d=0: GetNearPoint already adds both
+            // combat reaches, so 0 lands at melee contact — the old combatReach+1
+            // OVERSHOT past melee range, so IsWithinMeleeRange never passed and the
+            // rule never completed. Throttled so a mob that keeps rotating to face
+            // its tank doesn't make us restart the spline every tick.
+            if (!(behind && inMelee))
+            {
+                static thread_local std::unordered_map<uint32, uint32> lastMoveMs;
+                uint32 const gLow = bot->GetGUID().GetCounter();
+                uint32 const now  = getMSTime();
+                uint32& last = lastMoveMs[gLow];
+                if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE
+                    || now - last > 400)
+                {
+                    last = now;
+                    float const back = v->GetOrientation() + 3.14159265f;   // opposite the target's facing
+                    float x, y, z;
+                    v->GetNearPoint(bot, x, y, z, 0.0f, 0.0f, back);
+                    bot->GetMotionMaster()->MovePoint(0, x, y, z);
+                }
+            }
+            // KEY: block the rotation ONLY while still closing from OUTSIDE melee
+            // (can't attack from there anyway). Once in melee, YIELD (return false)
+            // so the bot actually attacks — auto-attack and non-positional abilities
+            // fire even before we're perfectly behind, while the strafe above keeps
+            // working us around; the back-only ability's own facing check gates it
+            // until we land behind. The old code returned true until behind &&
+            // in-melee, which never converged on a mob that rotates to face its
+            // tank, so the hero "kept moving behind and never cast anything".
+            return !inMelee;
         }
 
         // "stay_in_front:N" — hold the target's FRONTAL arc, N yards out (the direction it
