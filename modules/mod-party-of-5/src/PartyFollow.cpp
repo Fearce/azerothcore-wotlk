@@ -5414,30 +5414,51 @@ namespace WowPsParty
                 return true;
             }
 
-            // Party-wipe regroup: no healer offered a res (the whole party can be
-            // dead, including the healer), so a dead follower would lie there
-            // forever. Once the LEADER is alive and OUT OF COMBAT — the fight is
-            // over — revive the follower at full health beside the leader. Gated on
-            // leader-not-in-combat so we never battle-rez mid-pull (which would
-            // just feed the same fight); the player kills what's on them, then the
-            // party stands back up and reforms.
-            if (!follower->IsAlive() && !follower->isResurrectRequested()
-                && leader->IsAlive() && !leader->IsInCombat()
-                && leader->GetMapId() == follower->GetMapId())
+            // DELAYED party-wipe regroup auto-rez. A dead follower is revived at the
+            // leader ONLY after the leader has been alive + OUT OF COMBAT continuously
+            // for AUTO_REZ_DELAY_MS (Kevin: don't autorez immediately — delay ~1 min
+            // out of combat as a safety net). This keeps the no-stuck-after-a-wipe
+            // backstop while removing the instant rez-and-teleport the moment combat
+            // drops, and it never battle-rezzes mid-pull. The timer resets the instant
+            // eligibility lapses (leader re-enters combat, bot gets rezzed by a healer,
+            // map changes), so it only fires after a genuine full minute of calm. A
+            // living healer's rez_party still revives the bot at its corpse immediately
+            // (auto-accepted above) — this is purely the last-resort whole-party-dead path.
+            static constexpr uint32 AUTO_REZ_DELAY_MS = 60000;
             {
-                follower->ResurrectPlayer(1.0f, false);   // full HP/mana, no sickness
-                follower->SpawnCorpseBones();
-                follower->TeleportTo(leader->GetMapId(),
-                    leader->GetPositionX(), leader->GetPositionY(),
-                    leader->GetPositionZ(), leader->GetOrientation());
-                ForceMovableState(follower);
-                follower->GetMotionMaster()->Clear();
-                follower->GetMotionMaster()->MoveIdle();
-                follower->StopMoving();
-                LOG_INFO("module",
-                    "[WowPsParty Follow] {} auto-revived at leader (party regroup)",
-                    follower->GetName());
-                return true;
+                static thread_local std::unordered_map<uint32, uint32> deadCalmSinceMs;
+                uint32 const gl = d.followerGuid.GetCounter();
+                bool const eligible =
+                    !follower->IsAlive() && !follower->isResurrectRequested()
+                    && leader->IsAlive() && !leader->IsInCombat()
+                    && leader->GetMapId() == follower->GetMapId();
+                if (!eligible)
+                {
+                    deadCalmSinceMs.erase(gl);
+                }
+                else
+                {
+                    uint32 const now = getMSTime();
+                    uint32& since = deadCalmSinceMs[gl];
+                    if (since == 0) since = now;          // first calm tick — start the clock
+                    if (now - since >= AUTO_REZ_DELAY_MS)
+                    {
+                        deadCalmSinceMs.erase(gl);
+                        follower->ResurrectPlayer(1.0f, false);   // full HP/mana, no sickness
+                        follower->SpawnCorpseBones();
+                        follower->TeleportTo(leader->GetMapId(),
+                            leader->GetPositionX(), leader->GetPositionY(),
+                            leader->GetPositionZ(), leader->GetOrientation());
+                        ForceMovableState(follower);
+                        follower->GetMotionMaster()->Clear();
+                        follower->GetMotionMaster()->MoveIdle();
+                        follower->StopMoving();
+                        LOG_INFO("module",
+                            "[WowPsParty Follow] {} auto-revived at leader (party regroup, "
+                            "after {}s out of combat)", follower->GetName(), AUTO_REZ_DELAY_MS / 1000);
+                        return true;
+                    }
+                }
             }
 
             // Universal dead->alive scrub. ResurrectPlayer / ResurectUsingRequestData
