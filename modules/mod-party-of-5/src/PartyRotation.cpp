@@ -914,12 +914,17 @@ namespace WowPsParty
     }
 
     // Dominant talent tree (tabpage 0/1/2) of a LIVE bot, by points spent.
-    // Mirrors PartyMgr's offline InferHenchmanRole but reads learned talent
-    // ranks straight from the player in memory (HasSpell), so it tracks the
-    // bot's CURRENT spec. Cached per-bot with a short TTL — the walk over the
-    // talent DBC is cheap but pointless to repeat every tick, and a spec rarely
+    // Reads the bot's TALENT MAP for the ACTIVE spec — the same source the
+    // playerbots engine's own AiFactory::GetPlayerSpecTabs uses. The previous
+    // implementation counted via bot->HasSpell(rankID), which is UNRELIABLE for
+    // a bot: a learned talent lives in GetTalentMap(), but its m_spells entry
+    // (what HasSpell reads, gated by IsInSpec) may be absent or off-spec — so an
+    // enhancement shaman read as 0 points everywhere and defaulted to tree 0
+    // (Elemental), making it cast ranged Lightning Bolt/Chain Lightning and
+    // stand at range instead of meleeing (Merirah). The talent map is the
+    // authoritative source. Cached per-bot with a short TTL — a spec rarely
     // changes mid-pull. Returns 0 (the benign default) when the bot has no
-    // talents yet. Mage trees: 0=Arcane, 1=Fire, 2=Frost.
+    // talents. Mage trees: 0=Arcane, 1=Fire, 2=Frost; Shaman: 0=Ele,1=Enh,2=Resto.
     uint8 PrimaryTalentTree(Player* bot)   // declared in PartyRotation.h (used by the follow layer too)
     {
         static std::mutex mtx;
@@ -934,18 +939,19 @@ namespace WowPsParty
         }
 
         uint32 points[3] = { 0, 0, 0 };
-        for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
+        uint8 const activeMask = bot->GetActiveSpecMask();
+        for (auto const& kv : bot->GetTalentMap())
         {
-            TalentEntry const* tal = sTalentStore.LookupEntry(i);
+            PlayerTalent const* pt = kv.second;
+            if (!pt || (activeMask & pt->specMask) == 0) continue;   // active spec only
+            TalentSpellPos const* pos = GetTalentSpellPos(kv.first);
+            if (!pos) continue;
+            TalentEntry const* tal = sTalentStore.LookupEntry(pos->talent_id);
             if (!tal) continue;
             TalentTabEntry const* tab = sTalentTabStore.LookupEntry(tal->TalentTab);
             if (!tab || tab->tabpage > 2) continue;
-            for (int rank = int(tal->RankID.size()) - 1; rank >= 0; --rank)
-                if (tal->RankID[rank] && bot->HasSpell(tal->RankID[rank]))
-                {
-                    points[tab->tabpage] += uint32(rank + 1);
-                    break;
-                }
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(kv.first);
+            points[tab->tabpage] += uint32(si ? si->GetRank() : 1);
         }
         uint8 tree = 0;
         if (points[1] > points[tree]) tree = 1;
