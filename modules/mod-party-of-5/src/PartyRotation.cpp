@@ -3878,8 +3878,17 @@ namespace WowPsParty
                     // Only on a POSITIONAL block (range/LoS) — a hard block (cooldown/
                     // power/threat-cap) falls through. repositionToCast uses MoveFollow
                     // for a non-victim anchor, so no MoveChase HasLostTarget stall.
+                    // HoldFollower FIRST (like cast_totem_attack): AssistTarget keeps a
+                    // ranged bot at firing range of its VICTIM, and when the victim is
+                    // already in range it issues StopMoving+MoveIdle ("holding position")
+                    // every tick — which CANCELLED this approach toward the farther
+                    // cluster, leaving the bot standing still mid-pull (Mynya). Holding
+                    // the feet makes AssistTarget yield so the approach actually runs.
                     if (castBlock == CastBlock::Position)
+                    {
+                        WowPsParty::HoldFollower(bot->GetGUID(), 1200);   // own the feet for the approach window
                         return repositionToCast(anchor, spellId);
+                    }
                     return false;
                 }
                 if (!channelClipOk()) return false;
