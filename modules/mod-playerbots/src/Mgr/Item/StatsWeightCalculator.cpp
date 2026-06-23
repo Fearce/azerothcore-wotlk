@@ -647,6 +647,17 @@ void StatsWeightCalculator::CalculateItemTypePenalty(ItemTemplate const* proto)
         {
             weight_ *= 1.1;
         }
+        // General rogue weapon-type preference: daggers and swords are the rogue
+        // synergy types (daggers enable Mutilate/Backstab/Ambush; swords have
+        // Sword Specialization), so weigh them above the off-type maces/fists/axes
+        // for EVERY spec. Stacks with the spec-specific bonuses above (Assa/Sub
+        // daggers ×1.5, Combat sword-spec proc ×1.1) as an extra lean, and applies
+        // to both the main hand and off hand.
+        if (cls == CLASS_ROGUE &&
+            (proto->SubClass == ITEM_SUBCLASS_WEAPON_DAGGER || proto->SubClass == ITEM_SUBCLASS_WEAPON_SWORD))
+        {
+            weight_ *= 1.2;
+        }
         if (cls == CLASS_WARRIOR && player_->HasAura(12785) &&
             (proto->SubClass == ITEM_SUBCLASS_WEAPON_POLEARM || proto->SubClass == ITEM_SUBCLASS_WEAPON_AXE2))
         {

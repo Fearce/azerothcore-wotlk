@@ -1633,6 +1633,34 @@ namespace WowPsParty
                  bestEntry, bestIl, bot->GetName(), lvl);
     }
 
+    // The inverse of MaintainTankShield: a DPS warrior (Arms/Fury) must NEVER
+    // sword-and-board. The factory now keeps shields/holdables out of a DPS
+    // warrior's offhand pool, but a henchman hired BEFORE that fix (or one that
+    // kept a pool char's shield) still has one equipped — strip it to the bags so
+    // the slot is free (Arms uses a 2H; a re-hire fills a Fury's offhand with a
+    // weapon). Gated role!=tank so a Protection warrior keeps its shield, and a
+    // no-op on a legitimate 1H weapon offhand (Fury dual-wield), so it never
+    // thrashes correct gear.
+    static void MaintainDpsWarriorOffhand(Player* bot)
+    {
+        if (bot->getClass() != CLASS_WARRIOR) return;
+        if (WowPsParty::RoleForGuid(bot->GetGUID()) == "tank") return;
+
+        Item* off = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
+        if (!off) return;
+        // Only a NON-weapon offhand is wrong here (shield / holdable). A 1H weapon
+        // is a valid Fury dual-wield, so leave weapons alone.
+        if (off->GetTemplate()->Class == ITEM_CLASS_WEAPON) return;
+
+        ItemPosCountVec stash;
+        if (bot->CanStoreItem(NULL_BAG, NULL_SLOT, stash, off, false) != EQUIP_ERR_OK)
+            return;   // bags full — bail rather than destroy a usable item
+        bot->RemoveItem(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND, true);
+        bot->StoreItem(stash, off, true);
+        LOG_INFO("module", "[WowPsParty Provision] stripped off-hand {} from DPS warrior {} (lvl {})",
+                 off->GetEntry(), bot->GetName(), bot->GetLevel());
+    }
+
     // Trim a bot's Soul Shards down to exactly one. `preferKeep` (when non-null)
     // is the shard to spare — the OnPlayerStoreNewItem hook passes the item it
     // just stored so StoreNewItem's caller still dereferences a live object;
@@ -1791,6 +1819,7 @@ namespace WowPsParty
         if (cls == CLASS_ROGUE)   MaintainPoisons(bot);
         if (cls == CLASS_WARRIOR) MaintainTankThrown(bot);   // before ammo: equips the thrown wpn
         if (cls == CLASS_WARRIOR || cls == CLASS_PALADIN) MaintainTankShield(bot);  // prot tanks always carry a shield
+        if (cls == CLASS_WARRIOR) MaintainDpsWarriorOffhand(bot);  // Arms/Fury never sword-and-board
         // Warlock bots only (defensive GetPlayerbotAI guard — a human warlock
         // manages their own shards and must never be trimmed). Catches a bot
         // that reloaded with a pre-existing pile or sits at zero free slots,

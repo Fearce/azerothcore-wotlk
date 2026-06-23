@@ -2082,7 +2082,12 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool second_chance)
     }
 
     std::unordered_map<uint8, std::vector<uint32>> items;
-    // int tab = AiFactory::GetPlayerSpecTab(bot);
+    // A DPS warrior (Arms/Fury) must never be handed a shield or holdable in the
+    // offhand — that's a Protection-only item. Fury dual-wields a weapon and Arms
+    // takes a 2H (mainhand, with AutoUnequipOffhandIfNeed clearing the offhand), so
+    // the offhand pool is restricted to weapons just like a rogue's below.
+    bool const isDpsWarrior =
+        bot->getClass() == CLASS_WARRIOR && AiFactory::GetPlayerSpecTab(bot) != WARRIOR_TAB_PROTECTION;
 
     uint32 blevel = bot->GetLevel();
     int32 delta = std::min(blevel, 10u);
@@ -2225,8 +2230,8 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool second_chance)
                         if (proto->Class == ITEM_CLASS_WEAPON && !CanEquipWeapon(proto))
                             continue;
 
-                        if (slot == EQUIPMENT_SLOT_OFFHAND && bot->getClass() == CLASS_ROGUE &&
-                            proto->Class != ITEM_CLASS_WEAPON)
+                        if (slot == EQUIPMENT_SLOT_OFFHAND && proto->Class != ITEM_CLASS_WEAPON &&
+                            (bot->getClass() == CLASS_ROGUE || isDpsWarrior))
                             continue;
                         items[slot].push_back(itemId);
                     }
