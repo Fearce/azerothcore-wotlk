@@ -528,6 +528,15 @@ namespace WowPsParty
                     add("always", "buff_self:Berserker Stance", 82);
                     add("!stance_is_berserker", "buff_self:Battle Stance", 81);
                     add("always", "buff_self:Battle Shout", 80);
+                    // Bloodrage: free rage on demand once in combat (off the GCD, 1-min
+                    // CD enforced by the engine; buff_self skips while its aura is up).
+                    add("in_combat", "buff_self:Bloodrage", 78);
+                    // Sweeping Strikes (Arms only — no-ops if untalented): lead an AoE
+                    // pull with it so the following strikes cleave a second target.
+                    add("in_combat&enemies_in_melee>2", "buff_self:Sweeping Strikes", 76);
+                    // Victory Rush: a big free hit, only castable in its post-kill proc
+                    // window (engine-gated), so fire it the instant it lights up.
+                    add("has_target", "cast:Victory Rush", 74);
                     add("has_target", "cast:Mortal Strike", 72);
                     add("has_target", "cast:Bloodthirst", 71);
                     add("enemies_in_melee>1", "cast:Whirlwind", 62);

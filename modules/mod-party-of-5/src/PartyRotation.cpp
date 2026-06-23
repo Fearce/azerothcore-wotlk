@@ -4142,33 +4142,70 @@ namespace WowPsParty
             if (!spellId || bot->HasSpellCooldown(spellId)) return false;
             std::vector<Player*> party;
             GatherPartyPlayers(bot, party, /*includeDead=*/false);
-            auto eligible = [&](Unit* u) -> bool
+            // Interruptible, party-engaged, passes the rule's target_* clause. Does NOT
+            // require in-place fireability, so the same predicate feeds both the in-place
+            // pass and the short-walk fallback below.
+            auto qualifies = [&](Unit* u) -> bool
             {
                 if (!u || !u->IsAlive() || !bot->IsValidAttackTarget(u)) return false;
                 if (!MobEngagedByParty(bot, u, party)) return false;   // never a neutral → no pull
                 bool ch = false, ir = false;
                 SpellInfo const* casting = CurrentCastSpell(u, &ch, &ir);
                 if (!casting || !ir) return false;                     // must be an interruptible cast
-                if (!canFireSpellOn(spellId, u)) return false;         // reachable in place (range/LoS/CD)
                 return EvalCondition(cond, bot, u);                    // rule's target_* per enemy
             };
+            std::list<Unit*> hostiles;
+            GatherHostilesAround(bot, 41.0f, hostiles);
+
+            // 1) Prefer a caster we can interrupt RIGHT NOW without moving (our own
+            //    target first) — a free in-place kick never costs a step.
             Unit* pick = nullptr;
             if (Unit* v = bot->GetVictim())
-                if (eligible(v)) pick = v;                             // our own target first if it qualifies
+                if (qualifies(v) && canFireSpellOn(spellId, v)) pick = v;
             if (!pick)
-            {
-                std::list<Unit*> hostiles;
-                GatherHostilesAround(bot, 41.0f, hostiles);
                 for (Unit* a : hostiles)
-                    if (eligible(a)) { pick = a; break; }
+                    if (qualifies(a) && canFireSpellOn(spellId, a)) { pick = a; break; }
+            if (pick)
+            {
+                if (!channelClipOk()) return false;
+                bool const fired = faceAndCast(pick, spellId);
+                if (fired)
+                    LOG_INFO("module", "[WowPsParty Rotation] {} interrupt(ranged) {} -> {}",
+                        bot->GetName(), spellId, pick->GetName());
+                return fired;
             }
-            if (!pick) return false;
-            if (!channelClipOk()) return false;
-            bool const fired = faceAndCast(pick, spellId);
-            if (fired)
-                LOG_INFO("module", "[WowPsParty Rotation] {} interrupt(ranged) {} -> {}",
-                    bot->GetName(), spellId, pick->GetName());
-            return fired;
+
+            // 2) None reachable in place: a ranged interrupt is long-range, so a caster
+            //    that qualifies but can't be hit is almost always a LINE-OF-SIGHT block a
+            //    step or two fixes. Allow a SMALL walk toward the nearest such caster
+            //    (capped so it never abandons its spot to cross the room), then kick on a
+            //    later tick once LoS clears. Position block only — never chase a CD/power
+            //    block, and never self-cancel our own cast to do it.
+            static constexpr float RANGED_INTERRUPT_WALK_CAP = 12.0f;  // "a little"
+            Unit* walkTo = nullptr; float best = 0.0f;
+            for (Unit* a : hostiles)
+            {
+                if (!qualifies(a)) continue;
+                float const d = bot->GetDistance(a);
+                if (d > RANGED_INTERRUPT_WALK_CAP) continue;           // keep the walk short
+                if (canFireSpellOn(spellId, a)) continue;              // would have fired in place
+                if (castBlock != CastBlock::Position) continue;        // CD/power/GCD → don't move
+                if (!walkTo || d < best) { best = d; walkTo = a; }
+            }
+            if (!walkTo) return false;
+            if (bot->IsNonMeleeSpellCast(false, false, true)) return false;
+            WowPsParty::HoldFollower(bot->GetGUID(), 1200);            // hold our spot while stepping
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+            {
+                float x, y, z;
+                walkTo->GetNearPoint(bot, x, y, z, 0.0f, 5.0f, walkTo->GetAngle(bot));
+                bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                                                  0.0f, 0.0f, /*generatePath=*/true,
+                                                  /*forceDestination=*/false);
+            }
+            LOG_INFO("module", "[WowPsParty Rotation] {} interrupt(ranged) stepping toward {} ({}y)",
+                bot->GetName(), walkTo->GetName(), uint32(best));
+            return true;   // stepping this tick
         }
 
         // "interrupt_caster_melee:<spell>" — MELEE off-target interrupt with a round
@@ -5698,6 +5735,30 @@ namespace WowPsParty
                     bot->GetName(), bot->GetHealth(), bot->GetMaxHealth(),
                     bot->GetPower(POWER_MANA), bot->GetMaxPower(POWER_MANA));
             return true;
+        }
+
+        // Target died mid-cast: a hard cast (Frostbolt, Shadow Bolt...) or a single-
+        // target channel keeps pouring into the corpse and only retargets once the
+        // cast bar finishes — wasted GCDs. Cancel a HARMFUL cast/channel whose unit
+        // target is now dead so the assist (which already reselects a live victim each
+        // tick) can be used THIS tick. Done before the in-flight bools below so they
+        // re-read the freed slot. Ground-targeted AoE (Blizzard) has no unit target →
+        // skipped; a positive cast (a heal) is never cancelled here.
+        for (CurrentSpellTypes cst : { CURRENT_GENERIC_SPELL, CURRENT_CHANNELED_SPELL })
+        {
+            Spell* sp = bot->GetCurrentSpell(cst);
+            if (!sp) continue;
+            SpellInfo const* si = sp->GetSpellInfo();
+            if (!si || si->IsPositive()) continue;
+            Unit* castTgt = sp->m_targets.GetUnitTarget();
+            if (castTgt && castTgt != bot && !castTgt->IsAlive())
+            {
+                bot->InterruptNonMeleeSpells(false);
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] {} cancels a cast on a dead target — retargeting",
+                    bot->GetName());
+                break;
+            }
         }
 
         // Committed to a channel we just started? Then only a clip-flagged rule

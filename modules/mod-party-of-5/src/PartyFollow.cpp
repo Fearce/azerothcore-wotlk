@@ -1392,6 +1392,28 @@ namespace WowPsParty
         g_lastBackoutScanMs[guidLow] = nowMs;
     }
 
+    // Ranged DPS in a tight corner / tiny room oscillate: step in to regain LoS to the
+    // target, the fire-band backs them out, LoS drops, repeat — pacing forever. Track
+    // how long a bot has been unable to settle WITH LoS; past the give-up window it
+    // stands its ground instead of pacing. Cleared the instant LoS returns.
+    static constexpr uint32 LOS_SEEK_GIVEUP_MS = 2000;   // no LoS spot this long -> hold
+    static std::unordered_map<uint32, uint32> g_losSeekStartMs;  // guidLow -> ms first seeking
+    static std::mutex g_losSeekMutex;
+
+    // Elapsed ms since this bot started seeking LoS (0 on the first call; starts the clock).
+    static uint32 LosSeekElapsed(uint32 guidLow, uint32 nowMs)
+    {
+        std::lock_guard<std::mutex> lock(g_losSeekMutex);
+        auto it = g_losSeekStartMs.find(guidLow);
+        if (it == g_losSeekStartMs.end()) { g_losSeekStartMs[guidLow] = nowMs; return 0; }
+        return nowMs - it->second;
+    }
+    static void ClearLosSeek(uint32 guidLow)
+    {
+        std::lock_guard<std::mutex> lock(g_losSeekMutex);
+        g_losSeekStartMs.erase(guidLow);
+    }
+
     // Threat-cap throttle (replaces a fixed timer): even once the tank HAS the
     // mob, a DPS keeps DPSing only while its own threat stays below this fraction
     // of the tank's threat ON THAT MOB. The instant it climbs past, it drops the
@@ -4935,6 +4957,7 @@ namespace WowPsParty
             // read "no LoS" and never settled to fire though the spell would land.
             bool  const los = bot->IsWithinLOSInMap(desired, VMAP::ModelIgnoreFlags::M2);
             float const hold = WowPsParty::BotRangedCastHold(bot);
+            if (los) ClearLosSeek(gLow);   // settled with LoS -> reset the give-up clock
 
             // A mob is in melee on us → STAND and fight/heal, NEVER kite, no matter
             // where `desired` is (could be the tank's far target). Kiting drags the
@@ -4982,35 +5005,53 @@ namespace WowPsParty
             // than retreating out of LoS.
             if (!los)
             {
-                if (mg != POINT_MOTION_TYPE)
+                // Where we'd step to regain LoS: ~4y PAST the target's edge (a near-point
+                // still ~10y out usually sits on the SAME blind side of the corner, so the
+                // bot paths there, STILL has no LoS, and settles — the old "caster stuck
+                // behind a corner" bug). 4y is past the edge: LoS clears en route and the
+                // fire-bands back it out to firing range the instant it does.
+                float lx, ly, lz;
+                desired->GetNearPoint(bot, lx, ly, lz, 0.0f, 4.0f, desired->GetAngle(bot));
+                bool const reachable = NavReachable(bot, lx, ly, lz, d);
+
+                if (reachable)
                 {
-                    float lx, ly, lz;
-                    // Aim RIGHT IN (~4y), not ~10y: a near-point still 10y out usually sits
-                    // on the SAME blind side of the corner, so the bot paths there, STILL
-                    // has no LoS, and settles — the recurring "caster stuck behind a corner,
-                    // never joins the fight" bug. A point ~4y from the target is past the
-                    // edge; the bot regains LoS en route and the ranged bands back it out to
-                    // firing range the instant it does, so it rarely actually reaches melee.
-                    desired->GetNearPoint(bot, lx, ly, lz, 0.0f,
-                                          4.0f, desired->GetAngle(bot));
-                    // Corner / staircase on OUR level: the near-target spot is walkable,
-                    // so path to it (generatePath rounds the corner / climbs the stairs;
-                    // forceDestination=false so an unreachable spot just isn't taken — no
-                    // straight-line dive through geometry). But when the target sits on
-                    // geometry we CAN'T reach from here — a platform a level up, the
-                    // shaman-stranded-on-the-web-below-the-fight bug — that MovePoint is
-                    // silently dropped and the bot stands blind forever. Detect the
-                    // unreachable case and climb to the LEADER's exact spot instead: the
-                    // leader is on valid ground in the thick of the fight, so the route
-                    // brings us up to their level where LoS to the pack clears.
-                    if (NavReachable(bot, lx, ly, lz, d))
+                    // Tight corner / tiny room: if we've been unable to settle with LoS
+                    // for a while, STOP pacing in-and-out — stand our ground and hold,
+                    // facing the target, until LoS opens (clock cleared the moment it
+                    // does). Without this the fire-band backs us out the instant we round
+                    // the corner, LoS drops, and we oscillate forever (Kevin).
+                    if (LosSeekElapsed(gLow, nowMs) >= LOS_SEEK_GIVEUP_MS)
+                    {
+                        if (mg != IDLE_MOTION_TYPE)
+                        {
+                            bot->StopMoving();
+                            bot->GetMotionMaster()->Clear();
+                            bot->GetMotionMaster()->MoveIdle();
+                            AssistLog(gLow, "ranged: no quick LoS spot in tight space — standing ground, not pacing");
+                        }
+                        bot->SetFacingToObject(desired);
+                        return;
+                    }
+                    // Corner / staircase on OUR level: path to the walkable near-target
+                    // spot (generatePath rounds the corner / climbs stairs;
+                    // forceDestination=false so an unreachable spot just isn't taken).
+                    if (mg != POINT_MOTION_TYPE)
                     {
                         bot->GetMotionMaster()->MovePoint(0, lx, ly, lz, FORCED_MOVEMENT_NONE,
                                                           0.0f, 0.0f, /*generatePath=*/true,
                                                           /*forceDestination=*/false);
                         AssistLog(gLow, "ranged: no LoS — closing to regain line of sight");
                     }
-                    else
+                }
+                else
+                {
+                    // Target on geometry we CAN'T reach from here — a platform a level up,
+                    // the shaman-stranded-on-the-web-below-the-fight bug. Climb to the
+                    // LEADER's exact spot (valid ground in the thick of the fight) so the
+                    // route brings us up where LoS clears. NOT subject to the stand-ground
+                    // give-up above — else a bot would strand itself a level below.
+                    if (mg != POINT_MOTION_TYPE)
                     {
                         bot->GetMotionMaster()->MovePoint(0, leader->GetPositionX(),
                             leader->GetPositionY(), leader->GetPositionZ(),
