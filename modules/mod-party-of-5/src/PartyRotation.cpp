@@ -4044,6 +4044,27 @@ namespace WowPsParty
                     y += std::sin(aimAt->GetOrientation()) * lead;
                 }
             }
+            // Keep the FINAL aim point within the spell's range of the bot. The dispatch
+            // vetted RANGE against the cluster anchor, but the mean-shift above and — far
+            // bigger — the predictive lead (up to 18y ahead of a pack CHARGING the party at
+            // the pull) can push the actual cast point past maxRange. The anchor being in
+            // range meant the bot never repositioned, yet the led point overshot, so the
+            // cast failed SPELL_FAILED_OUT_OF_RANGE every tick and the caster idled (Egoreno
+            // the fire mage on a Maraudon pull — Flamestrike 8423 result=97). Pull the point
+            // back along the bot->point line to just inside range, still aimed as far
+            // downrange as the cast allows, so it lands instead of failing.
+            if (SpellInfo const* ci = sSpellMgr->GetSpellInfo(spellId))
+            {
+                float const mr = ci->GetMaxRange(ci->IsPositive(), bot);
+                float const d  = bot->GetExactDist2d(x, y);
+                float const lim = mr - 2.0f;
+                if (mr > 0.0f && d > lim && d > 0.1f)
+                {
+                    float const t = lim / d;
+                    x = bot->GetPositionX() + (x - bot->GetPositionX()) * t;
+                    y = bot->GetPositionY() + (y - bot->GetPositionY()) * t;
+                }
+            }
             bot->UpdateAllowedPositionZ(x, y, z);   // settle the final aim point onto the ground
             SpellCastResult const r = bot->CastSpell(x, y, z, spellId, false);
             if (r != SPELL_CAST_OK)
