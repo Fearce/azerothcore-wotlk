@@ -2335,6 +2335,23 @@ namespace WowPsParty
                 return cname == "party_has_aura" ? has : !has;
             }
 
+            // enemy_has_aura / enemy_missing_aura — true if ANY in-combat enemy the party is
+            // fighting has / lacks the named aura. For a single-target-limited DEBUFF you must
+            // not double-apply: a priest gates Devouring Plague on
+            // "!enemy_has_my_aura:Devouring Plague" so it isn't re-cast onto a fresh target
+            // while it's still ticking on another (only one DP per caster exists). Use the
+            // _my_ form for per-caster-unique debuffs; the plain form for any caster's.
+            if (cname == "enemy_has_aura" || cname == "enemy_missing_aura")
+            {
+                std::list<Unit*> hostiles;
+                GatherHostilesAround(bot, 60.0f, hostiles);
+                bool has = false;
+                for (Unit* u : hostiles)
+                    if (u && u->IsAlive() && u->IsInCombat() && bot->IsValidAttackTarget(u)
+                        && TargetHasNamedAura(u, arg, auraCaster)) { has = true; break; }
+                return cname == "enemy_has_aura" ? has : !has;
+            }
+
             // --- Aura timing / stacks / cooldown (the min-max primitives) ---
             // These all share an arg of the form "<spell name><op><number>",
             // where <op> is the first '<' or '>' in the arg. Spell names have
