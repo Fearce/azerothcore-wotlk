@@ -5925,6 +5925,14 @@ namespace WowPsParty
             if (castTgt && castTgt != bot && !castTgt->IsAlive())
             {
                 bot->InterruptNonMeleeSpells(false);
+                // A single-target CHANNEL (Mind Flay / Drain Soul / Drain Life) cut here
+                // would otherwise be misread as melee-pushback by the next
+                // ChannelCommitActive and backed off 5s — so the channeler idled for
+                // seconds before re-firing on a fresh target. Clear the commit lock
+                // (backoff-free) so it re-acquires and re-channels immediately, the same
+                // way the empty-patch ground-AoE abandon below does. No-op for a hard
+                // cast (no commit lock was set).
+                ClearChannelCommit(bot);
                 LOG_INFO("module",
                     "[WowPsParty Rotation] {} cancels a cast on a dead target — retargeting",
                     bot->GetName());

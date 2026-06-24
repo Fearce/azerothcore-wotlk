@@ -543,6 +543,11 @@ namespace WowPsParty
                     // Victory Rush: a big free hit, only castable in its post-kill proc
                     // window (engine-gated), so fire it the instant it lights up.
                     add("has_target", "cast:Victory Rush", 74);
+                    // AoE (3+ in melee): Whirlwind LEADS over Mortal Strike / Bloodthirst —
+                    // it hits the whole pack each swing, the bigger total throughput on a
+                    // cluster. Single-target keeps MS/BT first (this gate is false at <=2 in
+                    // melee); the lower Whirlwind at 62 still fires it with exactly 2 in melee.
+                    add("enemies_in_melee>2", "cast:Whirlwind", 73);
                     add("has_target", "cast:Mortal Strike", 72);
                     add("has_target", "cast:Bloodthirst", 71);
                     add("enemies_in_melee>1", "cast:Whirlwind", 62);
@@ -985,6 +990,11 @@ namespace WowPsParty
 
             case 8: // Mage
                 add("target_casting&target_interruptible", "cast:Counterspell", 88);
+                // Out of mana mid-fight: channel Evocation to refill — high priority,
+                // since a dry mage contributes nothing anyway. Mage-only (cooldown
+                // enforced by the engine); gated <10% so it fires only when genuinely
+                // empty, never as a filler. Sits just under the interrupt.
+                add("in_combat&self_mana<10", "cast_self:Evocation", 87);
                 add("self_missing_aura:Ice Barrier", "cast_self:Ice Barrier", 80);
                 // Only when a melee is ACTUALLY swinging at the mage (root-and-run defence),
                 // not merely near it — else the mage roots the tank's body-pull mob in place
@@ -1140,7 +1150,13 @@ namespace WowPsParty
                     // / buff out of combat. Savage Roar gated to elites for the
                     // same reason rogue Slice and Dice is — on trash it just eats
                     // the combo the damage finishers need (see LESSONS).
-                    add("primary_tree:1&has_target&self_missing_aura:Cat Form", "buff_self:Cat Form", 82);
+                    // Shift into the combat form on IN_COMBAT, not has_target: a target
+                    // isn't always set the instant a fight starts (esp. for an AoE opener
+                    // keyed off a cluster, not a single victim), which left the druid
+                    // un-shifted and unable to act. cancel_form below drops it back out of
+                    // combat. The form-up still won't fire out of combat, so it can still
+                    // mount/buff/drink between pulls.
+                    add("primary_tree:1&in_combat&self_missing_aura:Cat Form", "buff_self:Cat Form", 82);
                     add("primary_tree:1&has_target&self_energy<35", "cast_self:Tiger's Fury", 79);
                     add("primary_tree:1&self_missing_aura:Savage Roar&self_combo>0&target_is_elite", "cast:Savage Roar", 77);
                     add("primary_tree:1&target_health<25&self_combo>2", "cast:Ferocious Bite", 75);
@@ -1159,7 +1175,11 @@ namespace WowPsParty
                     // so a no-talent low-level druid OR one a user manually flips
                     // to dps while Resto-specced still nukes instead of standing
                     // idle. Moonkin Form falls through harmlessly if untalented.
-                    add("!primary_tree:1&has_target&self_missing_aura:Moonkin Form", "buff_self:Moonkin Form", 80);
+                    // Moonkin on IN_COMBAT, not has_target (Kevin): a balance druid opening
+                    // with an AoE keys off a cluster, not a single victim, so has_target was
+                    // often false at the pull and it fought caster-form / didn't shift at all.
+                    // cancel_form below reverts it out of combat.
+                    add("!primary_tree:1&in_combat&self_missing_aura:Moonkin Form", "buff_self:Moonkin Form", 80);
                     add("!primary_tree:1&target_missing_aura:Moonfire", "cast:Moonfire", 72);
                     add("!primary_tree:1&target_missing_aura:Insect Swarm", "cast:Insect Swarm", 68);
                     // Cluster-gated ground AoE: balance casts from range.
