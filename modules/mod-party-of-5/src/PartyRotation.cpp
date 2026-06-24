@@ -2108,6 +2108,18 @@ namespace WowPsParty
         {
             return tOverride ? tOverride : BotTarget(bot);
         };
+        // For reactive ENEMY-cast watching (target_casting/target_channeling), a healer or
+        // support bot usually has NO victim of its own, so theTarget() is null and the
+        // condition never matched — that's why "target_casting:Smash | move_out_of_los" in
+        // Common made the DPS/tank duck but the HEALER stood in it (Kevin/Ingvar). Fall back
+        // to the nearest enemy the PARTY is fighting so the healer watches the boss's cast
+        // too. Only kicks in when there's no victim AND no override (the spread/scan path
+        // always passes an override, so it's unaffected).
+        auto watchTarget = [bot, &theTarget]() -> Unit*
+        {
+            Unit* t = theTarget();
+            return t ? t : NearestEngagedEnemy(bot, 60.0f);
+        };
         if (cond == "always") return true;
         // Conditions with a string arg: `<name>:<spell-name>`.
         // target_has_aura:Hamstring / target_missing_aura:Mortal Strike /
@@ -2408,7 +2420,7 @@ namespace WowPsParty
             if (cname == "target_casting" || cname == "target_channeling")
             {
                 bool ch = false, ir = false;
-                SpellInfo const* casting = CurrentCastSpell(theTarget(), &ch, &ir);
+                SpellInfo const* casting = CurrentCastSpell(watchTarget(), &ch, &ir);
                 if (!casting) return false;
                 if (cname == "target_casting"    &&  ch) return false;  // a channel isn't a cast bar
                 if (cname == "target_channeling" && !ch) return false;
@@ -2627,12 +2639,12 @@ namespace WowPsParty
         if (cond == "target_casting")
         {
             bool ch = false, ir = false;
-            return CurrentCastSpell(theTarget(), &ch, &ir) != nullptr && !ch;
+            return CurrentCastSpell(watchTarget(), &ch, &ir) != nullptr && !ch;
         }
         if (cond == "target_channeling")
         {
             bool ch = false, ir = false;
-            return CurrentCastSpell(theTarget(), &ch, &ir) != nullptr && ch;
+            return CurrentCastSpell(watchTarget(), &ch, &ir) != nullptr && ch;
         }
         if (cond == "target_interruptible")
         {
@@ -5095,7 +5107,13 @@ namespace WowPsParty
         // open ground with no cover to reach, rather than freezing in place.
         if (verb == "move_out_of_los")
         {
+            // A healer/support bot has no victim of its own — fall back to the nearest
+            // enemy the party is fighting so it ducks the boss's cast too (it's the whole
+            // point of pairing this with target_casting, which now also watches that enemy
+            // for a victimless bot). Without this the healer stood in Ingvar's Smash while
+            // the DPS/tank ducked (Kevin).
             Unit* enemy = bot->GetVictim();
+            if (!enemy || !enemy->IsAlive()) enemy = NearestEngagedEnemy(bot, 60.0f);
             if (!enemy || !enemy->IsAlive()) return false;
 
             // M2 = ignore decorative doodads, matching Spell::CheckCast's own LoS — so

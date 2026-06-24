@@ -478,6 +478,19 @@ namespace WowPsParty
         std::lock_guard<std::mutex> lock(g_mutex);
         for (auto const& d : g_directives)
             if (d.followerGuid == botGuid) return d.role;
+        // No FOLLOWER directive: this guid may be the LEADER, which gets none (only its
+        // role is stashed in g_leaderRole). A follower's directive records its account +
+        // leaderGuid, so find any directive that points at this guid as the leader and
+        // return that account's leader role. WITHOUT this, a role condition misclassifies
+        // the leader as roleless → am_tank=false / am_dps=true / !am_tank=true: a tank that
+        // is (even briefly, mid control-switch) the leader fires !am_tank rules like
+        // move_behind that it should be excluded from (Kevin: "the tank walks behind").
+        for (auto const& d : g_directives)
+            if (d.leaderGuid == botGuid)
+            {
+                auto it = g_leaderRole.find(d.account);
+                return it == g_leaderRole.end() ? std::string() : it->second;
+            }
         return std::string();
     }
 
