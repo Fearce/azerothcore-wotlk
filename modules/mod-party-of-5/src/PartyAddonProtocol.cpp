@@ -1600,6 +1600,98 @@ static void HandleBuyback(Player* requester, std::string_view payload)
     SendBuybackTo(requester);
 }
 
+// Stream the REQUESTER's BANK contents — the 28 main bank slots AND the items inside
+// every bank bag — so the panel's Bank view can SHOW (and let the user withdraw) what
+// was deposited. Without this, banking was a one-way trip: you could deposit but never
+// see or retrieve it. The bank is the requester's own (used as shared storage), so there
+// is no party loop / partySlot. Mirrors SendBuybackTo's chunked, AV-safe stream. The bag
+// CONTAINERS themselves aren't emitted here (those live in the BANKBAG strip); this is
+// strictly their contents + the loose bank items.
+static void SendBankTo(Player* requester)
+{
+    if (!requester || !requester->GetSession()) return;
+
+    std::vector<std::string> records;
+    auto emit = [&](Item* it)
+    {
+        if (!it) return;
+        WowPsParty::PartyItemFields f;
+        if (!WowPsParty::SafeReadItemFields(it, f))
+        {
+            LOG_ERROR("module", "[WowPsParty] SendBankTo: SKIPPED a bad item ptr=0x{:x} owner={}",
+                reinterpret_cast<uintptr_t>(it), requester->GetGUID().GetCounter());
+            return;
+        }
+        std::ostringstream r;
+        r << f.entry << ':' << f.count << ':' << f.guidLow << ':'
+          << f.randProp << ':' << f.suffix << ':' << f.enchant;
+        records.push_back(r.str());
+    };
+
+    for (uint8 s = BANK_SLOT_ITEM_START; s < BANK_SLOT_ITEM_END; ++s)
+        emit(requester->GetItemByPos(INVENTORY_SLOT_BAG_0, s));
+    for (uint8 b = BANK_SLOT_BAG_START; b < BANK_SLOT_BAG_END; ++b)
+        if (Bag* bag = requester->GetBagByPos(b))
+            for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                emit(requester->GetItemByPos(b, j));
+
+    SendWPSP(requester, "BANK_BEGIN");
+    constexpr size_t MAX_PAYLOAD = 220;
+    std::string chunk;
+    auto flush = [&]()
+    {
+        if (!chunk.empty()) { SendWPSP(requester, "BANKVIEW\t" + chunk); chunk.clear(); }
+    };
+    for (std::string const& rec : records)
+    {
+        if (!chunk.empty() && chunk.size() + 1 + rec.size() > MAX_PAYLOAD) flush();
+        if (!chunk.empty()) chunk += ';';
+        chunk += rec;
+    }
+    flush();
+    SendWPSP(requester, "BANK_END");
+}
+
+// WITHDRAW\t<bankItemGuidLow> — pull one item OUT of the requester's bank back into their
+// own bags. The mirror of HandleBankDeposit: canonical same-player move (RemoveItem from
+// the bank slot, then StoreItem into the bags). Validates the item is actually in a bank
+// slot so this can't be used to teleport a worn/bagged item.
+static void HandleWithdraw(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    uint32 const itemGuidLow = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+    if (!itemGuidLow) return;
+
+    Item* item = requester->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(itemGuidLow));
+    if (!item || !Player::IsBankPos(item->GetPos()))
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r That item is no longer in your bank.");
+        WowPsParty::SendInventoryTo(requester);
+        SendBankTo(requester);
+        return;
+    }
+    ItemTemplate const* t = item->GetTemplate();
+    std::string const itemName = t ? t->Name1 : "item";
+
+    ItemPosCountVec dest;
+    if (requester->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false) != EQUIP_ERR_OK)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Your bags are full — couldn't withdraw |cffffffff{}|r.", itemName);
+        return;
+    }
+    // RemoveItem BEFORE StoreItem (same double-reference hazard HandleBankDeposit guards).
+    requester->RemoveItem(item->GetBagSlot(), item->GetSlot(), true);
+    requester->ItemAddedQuestCheck(item->GetEntry(), item->GetCount());
+    requester->StoreItem(dest, item, true);
+    ChatHandler(requester->GetSession()).PSendSysMessage(
+        "|cff66ccff[WowPsParty]|r Withdrew |cffffffff{}|r from your bank.", itemName);
+
+    WowPsParty::SendInventoryTo(requester);
+    SendBankTo(requester);
+}
+
 // The permanent-enchant id a spell applies (SPELL_EFFECT_ENCHANT_ITEM MiscValue),
 // or 0 if the spell isn't a permanent item-enchant. Used to list/apply enchants.
 static uint32 PermEnchantIdOfSpell(SpellInfo const* spell)
@@ -4219,6 +4311,14 @@ public:
         else if (command == "BANK")
         {
             HandleBankDeposit(player, payload);
+        }
+        else if (command == "REQ_BANK")
+        {
+            SendBankTo(player);
+        }
+        else if (command == "WITHDRAW")
+        {
+            HandleWithdraw(player, payload);
         }
         else if (command == "GBANK")
         {
