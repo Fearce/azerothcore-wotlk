@@ -4161,7 +4161,14 @@ namespace WowPsParty
     //     mobs (and the victim, which is one of them, stays meleeable).
     // Returns true when it owns the tank's feet/facing this tick (caller returns), false to
     // fall through to the normal formation chase (0/1 attacker, or boxed against a wall).
-    static bool TankAntiFlankStep(Player* tank, Unit* victim)
+    // Anti-flank funnel NUDGE. Returns true ONLY on the brief tick it issues a reposition
+    // step; otherwise false so the tank fights NORMALLY (chases + auto-swings) — the v1 that
+    // planted/idled when "not flanked" and fired with 2 attackers froze the tank mid-pull and
+    // stopped its swings (Kevin: "Nissedaza just stands still, doesn't swing"). Now it only
+    // acts on a genuine SURROUND (4+ melee attackers spanning >180°), nudges at most once every
+    // couple seconds (lets the mobs collapse + the tank keep swinging between nudges), and never
+    // idles the tank.
+    static bool TankAntiFlankNudge(Player* tank)
     {
         if (!tank) return false;
         std::vector<float> angs;   // world angle tank -> each melee attacker
@@ -4171,80 +4178,45 @@ namespace WowPsParty
             if (tank->GetExactDist2d(a) > 10.0f) continue;   // only the melee ring matters
             angs.push_back(tank->GetAngle(a));
         }
-        if (angs.size() < 2) return false;   // 0/1 attacker — nothing to funnel
+        if (angs.size() < 4) return false;   // not a real surround — fight normally
 
         std::sort(angs.begin(), angs.end());
-        // Largest gap between adjacent attacker bearings, including the wrap-around.
         float maxGap   = (2.0f * float(M_PI) - angs.back()) + angs.front();
-        float gapStart = angs.back();   // the wrap gap runs from the last bearing forward
+        float gapStart = angs.back();
         for (size_t i = 1; i < angs.size(); ++i)
         {
             float const g = angs[i] - angs[i - 1];
             if (g > maxGap) { maxGap = g; gapStart = angs[i - 1]; }
         }
-        float const openDir    = Position::NormalizeOrientation(gapStart + maxGap * 0.5f); // empty side
-        float const clusterDir = Position::NormalizeOrientation(openDir + float(M_PI));    // toward the pack
-        bool  const flanked    = maxGap < float(M_PI);   // span > 180° -> a mob is behind us
+        if (maxGap >= float(M_PI)) return false;   // not flanked: all within a half-plane -> fight
 
-        // Re-face only when meaningfully off (avoid a facing packet every 30Hz tick).
-        auto faceCluster = [&]()
-        {
-            float d = clusterDir - tank->GetOrientation();
-            while (d >  float(M_PI)) d -= 2.0f * float(M_PI);
-            while (d < -float(M_PI)) d += 2.0f * float(M_PI);
-            if (std::fabs(d) > 0.2f) tank->SetFacingTo(clusterDir);
-        };
+        uint32 const gLow = tank->GetGUID().GetCounter();
+        uint32 const now  = getMSTime();
+        // Let an in-flight nudge finish (and don't re-path / re-navmesh every tick).
+        if (tank->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE
+            && tank->isMoving())
+            return true;
+        // Throttle: one nudge, then fight (return false) for ~2s so the chasing pack collapses
+        // onto the open side and the tank keeps swinging — instead of shuffling every tick.
+        static thread_local std::unordered_map<uint32, uint32> nextNudgeMs;
+        uint32& next = nextNudgeMs[gLow];
+        if (now < next) return false;
 
-        uint8 const mg = tank->GetMotionMaster()->GetCurrentMovementGeneratorType();
-
-        if (flanked)
-        {
-            // Let an in-flight funnel step finish before re-pathing — this also keeps the
-            // per-tick navmesh query (NavReachable) from firing 30Hz while surrounded.
-            if (mg == POINT_MOTION_TYPE && tank->isMoving())
-                return true;
-            // Back into the empty side so the pack funnels to the front. Small step so the
-            // tank stays inside AoE-threat range; it repeats (every step, not every tick)
-            // until the pack is within 180°. A perfectly even surround has no real gap, so
-            // it takes a couple of nudges to break — that's expected, not a stall.
-            constexpr float STEP = 4.0f;
-            float ox = tank->GetPositionX() + std::cos(openDir) * STEP;
-            float oy = tank->GetPositionY() + std::sin(openDir) * STEP;
-            float oz = tank->GetPositionZ();
-            tank->UpdateAllowedPositionZ(ox, oy, oz);
-            if (NavReachable(tank, ox, oy, oz, STEP))
-            {
-                // clusterDir as the ARRIVAL orientation (MovePoint's own facing) — NOT a
-                // separate SetFacingTo, which would relaunch a stand-still movespline and
-                // cancel the step (the tank would spin in place and never back off). While
-                // travelling it faces its path (backing toward the open side); on arrival
-                // it snaps to face the pack.
-                tank->GetMotionMaster()->MovePoint(0, ox, oy, oz, FORCED_MOVEMENT_NONE,
-                                                   0.0f, clusterDir, /*generatePath=*/true,
-                                                   /*forceDestination=*/false);
-                return true;
-            }
-            // Boxed against a wall on the open side — face the pack and let the normal
-            // chase run (better than freezing); a wall behind us is itself good cover.
-            faceCluster();
-            return false;
-        }
-
-        // Not flanked: every attacker already fits in the frontal arc. Face the pack centre;
-        // close if the victim drifted out of melee, else hold so we don't orbit and
-        // re-scatter the pack we just funnelled.
-        faceCluster();
-        if (victim && !tank->IsWithinMeleeRange(victim))
-        {
-            if (mg != CHASE_MOTION_TYPE)
-                tank->GetMotionMaster()->MoveChase(victim);
-        }
-        else if (mg != IDLE_MOTION_TYPE)
-        {
-            tank->StopMoving();
-            tank->GetMotionMaster()->Clear();
-            tank->GetMotionMaster()->MoveIdle();
-        }
+        float const openDir    = Position::NormalizeOrientation(gapStart + maxGap * 0.5f);
+        float const clusterDir = Position::NormalizeOrientation(openDir + float(M_PI));
+        constexpr float STEP = 4.0f;
+        float ox = tank->GetPositionX() + std::cos(openDir) * STEP;
+        float oy = tank->GetPositionY() + std::sin(openDir) * STEP;
+        float oz = tank->GetPositionZ();
+        tank->UpdateAllowedPositionZ(ox, oy, oz);
+        if (!NavReachable(tank, ox, oy, oz, STEP))
+            return false;   // boxed against a wall — fight in place (the wall is cover anyway)
+        next = now + 2000;
+        // clusterDir as MovePoint's ARRIVAL facing — a separate SetFacingTo would relaunch a
+        // stand-still spline and cancel the step.
+        tank->GetMotionMaster()->MovePoint(0, ox, oy, oz, FORCED_MOVEMENT_NONE,
+                                           0.0f, clusterDir, /*generatePath=*/true,
+                                           /*forceDestination=*/false);
         return true;
     }
 
@@ -5323,10 +5295,11 @@ namespace WowPsParty
 
         // MELEE — close to contact, fanned out by formation angle so the melee
         // companions surround the mob (orbiting is fine when you're in contact).
-        // TANK first: keep every attacker in the frontal arc (anti-flank) instead of
-        // orbiting a single victim into the middle of the pack. Only takes over with 2+
-        // melee attackers; single-target / non-tanks use the formation chase below.
-        if (RoleForGuid(bot->GetGUID()) == "tank" && TankAntiFlankStep(bot, desired))
+        // TANK anti-flank: when SURROUNDED by 4+ on a spread AoE pull, nudge into the open
+        // side so the pack funnels to the front (back hits ignore block/dodge/parry). It
+        // returns true ONLY on the brief nudge tick; otherwise the tank fights normally
+        // (chases + swings) via the formation chase below. Non-tanks never enter it.
+        if (RoleForGuid(bot->GetGUID()) == "tank" && TankAntiFlankNudge(bot))
             return;
         int const fi = FormationIndexFor(bot->GetGUID(), GetLeaderFor(bot->GetGUID()));
         float const chaseAngle = float(fi) * (2.0f * float(M_PI) / 5.0f);
