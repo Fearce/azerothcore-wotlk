@@ -422,6 +422,21 @@ namespace WowPsParty
         return tree;
     }
 
+    // The talent TREE (tabpage 0/1/2) a class must be in to FILL a given role, or -1 when
+    // the role doesn't pin a spec (dps takes any dps tree) or this class can't do the role.
+    // Used to FORCE a tank/healer hire onto the right spec: a pool char picked for a
+    // tank/healer slot can be DPS-specced (or, with no saved talents, default to the slot's
+    // role while actually spawning DPS) — e.g. a warrior shown as tank that fights Arms
+    // (Kevin: "arms warrior with the tank role"). Inverse of RoleFromTalents' tree→role map.
+    static int DesiredTalentTabForRole(uint8 cls, std::string const& role)
+    {
+        if (role == "tank")
+            switch (cls) { case 1: return 2; case 2: return 1; case 6: return 0; case 11: return 1; default: return -1; }
+        if (role == "healer")
+            switch (cls) { case 2: return 0; case 5: return 1; case 7: return 2; case 11: return 2; default: return -1; }
+        return -1;   // dps (any dps spec is fine), or this class can't fill the role
+    }
+
     // Canonical per-class, per-role starter rotation. Built as a priority list
     // (the engine fires the highest-priority rule whose conditions pass and whose
     // spell is castable, falling through on cooldown/unknown). Two properties make
@@ -2188,7 +2203,7 @@ namespace WowPsParty
         // (drop the directive, refund the gold) so we never leak a directive or
         // charge the player for a no-show.
         ObjectGuid const leaderGuid = requester->GetGUID();
-        requester->m_Events.AddEventAtOffset([leaderGuid, henchGuid, cost, refundAmt, cls, hadCustomRotation]()
+        requester->m_Events.AddEventAtOffset([leaderGuid, henchGuid, cost, refundAmt, cls, hadCustomRotation, useRole]()
         {
             Player* lead = ObjectAccessor::FindConnectedPlayer(leaderGuid);
             Player* hen  = ObjectAccessor::FindConnectedPlayer(henchGuid);
@@ -2288,6 +2303,35 @@ namespace WowPsParty
                     LOG_INFO("module",
                         "[WowPsParty Henchmen] in-band hire guid={} re-rolled gear to match spec",
                         henchGuid.GetCounter());
+                }
+            }
+
+            // A TANK/HEALER hire must actually BE that spec. A pool char picked for the
+            // slot can spawn DPS: a warrior with no readable talents is shown (and hired)
+            // as tank by the class default, then fights Arms (Kevin: "arms warrior with
+            // the tank role"); an out-of-band Randomize can also roll the wrong tree. Force
+            // the role's tree so the henchman performs the job. DPS roles take any DPS spec
+            // (DesiredTalentTabForRole returns -1 → no force), so a manually-picked DPS is
+            // never re-specced. Re-rolls gear for the new spec + rebuilds the role rotation;
+            // the SanitizeHenchmanSpells below then strips any off-spec leftovers.
+            if (useRole == "tank" || useRole == "healer")
+            {
+                int const wantTab = DesiredTalentTabForRole(cls, useRole);
+                if (wantTab >= 0 && DominantTalentTabLive(hen) != wantTab)
+                {
+                    int const specNo = int(sPlayerbotAIConfig.randomClassSpecIndex[cls][uint32(wantTab)]);
+                    PlayerbotFactory::InitTalentsBySpecNo(hen, specNo, /*reset=*/true);
+                    hen->SendTalentsInfoData(false);
+                    PlayerbotFactory(hen, hen->GetLevel()).InitEquipment(false, false);
+                    hen->SaveToDB(false, false);
+                    WowPsParty::SetHenchmanRole(henchGuid, useRole);
+                    WowPsParty::RotationCacheSet(henchGuid.GetCounter(),
+                        WowPsParty::ParseRotationString(DefaultRotationForClass(cls, useRole)));
+                    WowPsParty::TargetModeCacheSet(henchGuid.GetCounter(),
+                        useRole == "tank" ? "loose" : "master");
+                    LOG_INFO("module",
+                        "[WowPsParty Henchmen] guid={} forced to {} spec (tree {}) to match its hired role",
+                        henchGuid.GetCounter(), useRole, wantTab);
                 }
             }
 
