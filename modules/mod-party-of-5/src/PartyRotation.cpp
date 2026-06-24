@@ -1053,6 +1053,90 @@ namespace WowPsParty
         return best;
     }
 
+    // Refine a ground-AoE aim point from the anchor's FEET to the CLUSTER CENTRE — the
+    // average position of the mobs the spell would actually hit — so it covers the MOST
+    // enemies instead of landing on whichever mob happened to be the densest anchor
+    // (Kevin). Mean-shift: start at (x,y), average the in-combat hostiles within the
+    // spell's effect radius, repeat a couple of times so the centre slides toward the
+    // densest knot. Updates x,y in place (z is re-settled onto the ground by the caller).
+    static void AoeClusterCenter(Player* bot, uint32 spellId, float& x, float& y)
+    {
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+        if (!info) return;
+        float er = 0.0f;
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            er = std::max(er, info->Effects[i].CalcRadius(bot));
+        if (er <= 0.0f) er = 8.0f;
+        float const ax = x, ay = y;        // anchor feet — range + ground-LoS were vetted HERE
+        std::list<Unit*> hostiles;
+        GatherHostilesAround(bot, 45.0f, hostiles);
+        float cx = x, cy = y;
+        for (int iter = 0; iter < 3; ++iter)
+        {
+            float sx = 0.0f, sy = 0.0f; uint32 n = 0;
+            for (Unit* u : hostiles)
+                if (u && u->IsAlive() && u->IsInCombat() && bot->IsValidAttackTarget(u)
+                    && u->GetExactDist2d(cx, cy) <= er)
+                { sx += u->GetPositionX(); sy += u->GetPositionY(); ++n; }
+            if (n == 0) return;            // nothing in the disc — keep the anchor point
+            float const nx = sx / float(n), ny = sy / float(n);
+            if (std::fabs(nx - cx) < 0.5f && std::fabs(ny - cy) < 0.5f) { cx = nx; cy = ny; break; }
+            cx = nx; cy = ny;
+        }
+        // Clamp the shifted centre to within ONE effect radius of the anchor: mean-shift can
+        // otherwise walk several radii across a strung-out pack, past the range/ground-LoS the
+        // cast branch already vetted against the anchor — which the engine then rejects, so the
+        // AoE silently re-fails every tick. Within er the anchor's range/LoS still holds.
+        {
+            float const ddx = cx - ax, ddy = cy - ay;
+            float const d = std::sqrt(ddx * ddx + ddy * ddy);
+            if (d > er) { cx = ax + ddx / d * er; cy = ay + ddy / d * er; }
+        }
+        x = cx; y = cy;
+    }
+
+    // For a CASTER-CENTRED melee AoE (Whirlwind / Swipe), find a SHORT reachable step that
+    // puts MORE in-combat enemies inside the AoE radius `er` than the bot's current spot —
+    // i.e. stand where the omni-swing hits the most of the pack (Kevin). Returns false if
+    // already optimal, the pack is <2, or the better spot isn't reachable. Bounded to one
+    // AoE-radius step so it never sprints into a far pack.
+    static bool BestMeleeAoeSpot(Player* bot, float er, float& ox, float& oy, float& oz)
+    {
+        std::list<Unit*> hostiles;
+        GatherHostilesAround(bot, er + 12.0f, hostiles);
+        auto coverAt = [&](float x, float y) -> uint32
+        {
+            uint32 c = 0;
+            for (Unit* u : hostiles)
+                if (u && u->IsAlive() && u->IsInCombat() && bot->IsValidAttackTarget(u)
+                    && u->GetExactDist2d(x, y) <= er)
+                    ++c;
+            return c;
+        };
+        uint32 const cur = coverAt(bot->GetPositionX(), bot->GetPositionY());
+        // Centroid of the LOCAL pack (mobs within ~one radius beyond the bot) = the omni
+        // sweet spot. Ignore far stragglers so a lone distant add can't drag the bot off.
+        float sx = 0.0f, sy = 0.0f; uint32 n = 0;
+        for (Unit* u : hostiles)
+            if (u && u->IsAlive() && u->IsInCombat() && bot->IsValidAttackTarget(u)
+                && bot->GetExactDist2d(u) <= er + 8.0f)
+            { sx += u->GetPositionX(); sy += u->GetPositionY(); ++n; }
+        if (n < 2) return false;
+        float cx = sx / float(n), cy = sy / float(n);
+        float dx = cx - bot->GetPositionX(), dy = cy - bot->GetPositionY();
+        float const dist = std::sqrt(dx * dx + dy * dy);
+        if (dist < 1.5f) return false;                       // already centred
+        float const step = std::min(dist, er);               // never lunge more than one radius
+        float tx = bot->GetPositionX() + dx / dist * step;
+        float ty = bot->GetPositionY() + dy / dist * step;
+        float tz = bot->GetPositionZ();
+        bot->UpdateAllowedPositionZ(tx, ty, tz);
+        if (coverAt(tx, ty) <= cur) return false;            // no real gain — don't shuffle
+        if (!NavReachable(bot, tx, ty, tz, step)) return false;
+        ox = tx; oy = ty; oz = tz;
+        return true;
+    }
+
     // The largest cluster of INJURED party members all within `radius` of one of
     // them — the friendly mirror of MaxEnemyCluster, for "is a Chain Heal / Wild
     // Growth / Prayer of Healing worth it" gating. "Injured" = below hpPct of max.
@@ -3726,21 +3810,26 @@ namespace WowPsParty
                 bot->SetOrientation(bot->GetAngle(aimAt));
             float x, y, z;
             aimAt->GetPosition(x, y, z);
+            // Aim at the CLUSTER CENTRE (average of the mobs the AoE would hit), not just
+            // the anchor mob's feet — covers the most enemies. Only shifts within the
+            // spell's own radius, so range/LoS (vetted vs the anchor) stays valid.
+            AoeClusterCenter(bot, spellId, x, y);
             // Predictive placement: a mob group charging the casters walks out of a
             // Flamestrike dropped on its CURRENT spot before the ~2s cast lands. Aim
             // where the cluster WILL be when the cast ends — `lead` yards ahead along
             // the anchor's facing (= its move direction), like a real player leading
-            // the throw. Capped so a sudden turn can't fling the AoE across the map;
-            // GetNearPoint settles z onto the ground at the lead point.
+            // the throw. Capped so a sudden turn can't fling the AoE across the map.
             if (castMs > 0 && aimAt->isMoving())
             {
                 float lead = aimAt->GetSpeed(MOVE_RUN) * (float(castMs) / 1000.0f);
                 if (lead > 1.0f)
                 {
                     lead = std::min(lead, 18.0f);
-                    aimAt->GetNearPoint(nullptr, x, y, z, 0.0f, lead, aimAt->GetOrientation());
+                    x += std::cos(aimAt->GetOrientation()) * lead;
+                    y += std::sin(aimAt->GetOrientation()) * lead;
                 }
             }
+            bot->UpdateAllowedPositionZ(x, y, z);   // settle the final aim point onto the ground
             SpellCastResult const r = bot->CastSpell(x, y, z, spellId, false);
             if (r != SPELL_CAST_OK)
             {
@@ -4165,6 +4254,35 @@ namespace WowPsParty
                 }
                 if (!channelClipOk()) return false;
                 return faceAndCastAt(anchor, spellId);
+            }
+
+            // CASTER-CENTRED MELEE AoE (Whirlwind / Swipe-bear): an omni swing around the
+            // BOT, not a ground point or a single victim, at melee range. Before swinging,
+            // step to where it hits the MOST of the pack. DPS only — a tank's feet are owned
+            // by the anti-flank positioner (which already centres it on the pack), and only
+            // when the AoE is actually ready (not on cooldown) so it never shuffles for a
+            // swing it can't make.
+            if (verb == "cast" && info && info->IsAffectingArea() && !info->IsPositive()
+                && !(info->GetExplicitTargetMask() & TARGET_FLAG_DEST_LOCATION)
+                && info->GetMaxRange(false, bot) <= 10.0f
+                && !bot->HasSpellCooldown(spellId)
+                && !bot->GetGlobalCooldownMgr().HasGlobalCooldown(info)
+                && !bot->isMoving()
+                && WowPsParty::RoleForGuid(bot->GetGUID()) != "tank")
+            {
+                float er = 0.0f;
+                for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                    er = std::max(er, info->Effects[i].CalcRadius(bot));
+                if (er <= 0.0f) er = 8.0f;
+                float sx, sy, sz;
+                if (BestMeleeAoeSpot(bot, er, sx, sy, sz))
+                {
+                    WowPsParty::HoldFollower(bot->GetGUID(), 800);
+                    if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+                        bot->GetMotionMaster()->MovePoint(0, sx, sy, sz);
+                    return true;   // step to the best spot; swing the AoE next tick
+                }
+                // already optimal → fall through and swing now
             }
 
             Unit* target = (verb == "cast_self") ? bot : bot->GetVictim();
