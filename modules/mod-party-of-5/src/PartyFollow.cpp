@@ -4562,16 +4562,23 @@ namespace WowPsParty
             if (leaderTargetValid)
                 desired = leaderTarget;            // the leader is ACTUALLY attacking -> assist
             else
-                // The leader isn't attacking — only DEFEND (a mob already swinging
-                // at the bot or an ally). We deliberately do NOT engage the mob the
-                // leader has merely SELECTED: a left-click is just targeting, and
-                // pulling on it broke following / dragged the party into combat
-                // (Kevin: "the party should not stop following just because the
-                // tank selects an enemy"). pickPartyDefenseTarget is combat-only,
-                // so a mere selection now produces NO target -> the bot keeps
-                // following until the leader actually engages (attacks/casts, which
-                // puts the mob in combat and the assist/defense paths pick it up).
-                desired = pickPartyDefenseTarget();
+            {
+                // The leader isn't attacking a valid target — common when Kevin plays
+                // HEALER (mouseover-macro heals, no enemy selected). The bots must NOT
+                // idle: assist the TANK's current kill, else the nearest enemy the party
+                // is ALREADY fighting, else defend (a mob swinging at us/an ally). All
+                // three are COMBAT-ONLY (TankVictim = the tank's live victim;
+                // PickNearestEngagedTarget gates on IsInCombat; pickPartyDefenseTarget is
+                // combat-only), so this still never engages a mob the leader has merely
+                // SELECTED — a left-click is just targeting and pulling on it broke
+                // following (Kevin: "the party should not stop following just because the
+                // tank selects an enemy"). Only things already in combat are picked up.
+                Unit* tv = TankVictim(bot, leader);
+                if (tv && tv->IsAlive() && bot->IsValidAttackTarget(tv))
+                    desired = tv;
+                if (!desired) desired = PickNearestEngagedTarget(bot);
+                if (!desired) desired = pickPartyDefenseTarget();
+            }
         }
         // Final safety: never hand back a dead/invalid target.
         if (desired && (!desired->IsAlive() || !bot->IsValidAttackTarget(desired)))
