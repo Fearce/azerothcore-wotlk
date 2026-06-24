@@ -2512,16 +2512,39 @@ namespace WowPsParty
             // Empty arg = any cast (same as the bare target_casting condition).
             if (cname == "target_casting" || cname == "target_channeling")
             {
-                bool ch = false, ir = false;
-                SpellInfo const* casting = CurrentCastSpell(watchTarget(), &ch, &ir);
-                if (!casting) return false;
-                if (cname == "target_casting"    &&  ch) return false;  // a channel isn't a cast bar
-                if (cname == "target_channeling" && !ch) return false;
-                if (arg.empty()) return true;
-                // Curated registries (grown over time) vs a single spell name/id.
-                if (arg == "known_dangerous")                 return IsKnownDangerousCast(casting, false);
-                if (arg == "known_dangerous_uninterruptible") return IsKnownDangerousCast(casting, true);
-                return SpellNameOrIdMatches(casting, arg);
+                bool const wantChannel = (cname == "target_channeling");
+                auto castMatches = [&](Unit* u) -> bool
+                {
+                    if (!u) return false;
+                    bool ch = false, ir = false;
+                    SpellInfo const* c = CurrentCastSpell(u, &ch, &ir);
+                    if (!c) return false;
+                    if (wantChannel != ch) return false;        // cast-bar vs channel must match
+                    if (arg.empty()) return true;
+                    if (arg == "known_dangerous")                 return IsKnownDangerousCast(c, false);
+                    if (arg == "known_dangerous_uninterruptible") return IsKnownDangerousCast(c, true);
+                    return SpellNameOrIdMatches(c, arg);
+                };
+                // First the bot's own watch target (victim, or nearest engaged enemy for a
+                // victimless healer).
+                if (castMatches(watchTarget())) return true;
+                // A SPECIFIC named/dangerous cast must trigger no matter WHICH enemy the bot
+                // is currently on — the boss casting Smash has to make a DPS nuking an ADD
+                // dodge too (Kevin: the DPS stood in it because target_casting only checked
+                // their own victim, an add, while the healer with no victim correctly saw the
+                // boss). Scan every party-engaged hostile for the named cast. The BARE "any
+                // cast" form stays target-specific. And NEVER scan when a per-candidate
+                // override is in play (cast_scan / interrupt_caster check ONE enemy).
+                if (!arg.empty() && !tOverride)
+                {
+                    std::list<Unit*> hostiles;
+                    GatherHostilesAround(bot, 45.0f, hostiles);
+                    for (Unit* u : hostiles)
+                        if (u && u->IsAlive() && u->IsInCombat()
+                            && bot->IsValidAttackTarget(u) && castMatches(u))
+                            return true;
+                }
+                return false;
             }
 
             // took_damage_from:<spell> — true if THIS bot took damage from a spell
