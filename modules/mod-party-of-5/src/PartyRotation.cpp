@@ -153,10 +153,29 @@ namespace WowPsParty
     static std::string Lower(std::string s);
     static bool CsvContains(std::string const& csv, std::string const& kw);
 
+    // The account whose COMMON (shared) rotation applies to this bot — the party LEADER's
+    // account (henchmen are rndbot-pool chars on OTHER accounts; the human leader owns the
+    // shared rotation), falling back to the bot's own account. Mirrors TickRotation's
+    // sharedAccount resolution. The rotation ACCESSORS (BotFocusNames, BotIsKiting) use it
+    // so a rule placed in the Common tab is honoured, not just one in the bot's own tab —
+    // the firing path already prepends Common, but the accessors used to read ONLY the
+    // per-bot cache (the "focus rule works per-DPS but not in Common" bug).
+    static uint32 SharedAccountFor(ObjectGuid guid)
+    {
+        uint32 acct = 0;
+        if (Player* self = ObjectAccessor::FindConnectedPlayer(guid))
+            if (self->GetSession()) acct = self->GetSession()->GetAccountId();
+        if (ObjectGuid const lg = GetLeaderFor(guid))
+            if (Player* leader = ObjectAccessor::FindConnectedPlayer(lg))
+                if (leader->GetSession()) acct = leader->GetSession()->GetAccountId();
+        return acct;
+    }
+
     // True if the bot's rotation opts into rotation-driven positioning — a
-    // keep_distance_enemy (kite) or keep_distance_healer rule. AssistTarget reads
-    // this to STOP installing its chase/dead-zone movement, handing the feet to
-    // the rotation so the two don't fight (only one mover at a time).
+    // keep_distance_enemy (kite) or keep_distance_healer rule, in its OWN rotation OR the
+    // account's COMMON rotation. AssistTarget reads this to STOP installing its chase/
+    // dead-zone movement, handing the feet to the rotation so the two don't fight (only
+    // one mover at a time).
     bool BotIsKiting(ObjectGuid guid)
     {
         // A live tank in the party means STAND at range and let it hold — don't
@@ -166,45 +185,69 @@ namespace WowPsParty
         // feet as before. Checked first, outside g_rotationCacheMutex, so it can't
         // nest locks.
         if (WowPsParty::PartyHasLiveTank(guid)) return false;
-        std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
-        auto it = g_rotationCache.find(guid.GetCounter());
-        if (it == g_rotationCache.end()) return false;
-        for (RotationRule const& r : it->second)
-            if ((r.action.rfind("keep_distance", 0) == 0
-                 || r.action.rfind("close_to_enemy", 0) == 0)
-                && !CsvContains(Lower(r.flags), "disabled"))
-                return true;
+        auto hasKite = [](std::vector<RotationRule> const& rules) -> bool
+        {
+            for (RotationRule const& r : rules)
+                if ((r.action.rfind("keep_distance", 0) == 0
+                     || r.action.rfind("close_to_enemy", 0) == 0)
+                    && !CsvContains(Lower(r.flags), "disabled"))
+                    return true;
+            return false;
+        };
+        {
+            std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
+            auto it = g_rotationCache.find(guid.GetCounter());
+            if (it != g_rotationCache.end() && hasKite(it->second)) return true;
+        }
+        if (uint32 const acct = SharedAccountFor(guid))   // COMMON tab (lock released above)
+            if (hasKite(GetSharedRotation(acct))) return true;
         return false;
     }
 
-    // Collect the comma-separated names from every enabled "focus:<a>,<b>,…" rule
-    // in the bot's cached rotation. These are must-kill adds (Chaos Rift on
-    // Anomalus, Frost Tomb in Utgarde Keep) the party should switch to on sight;
-    // AssistTarget overrides target selection onto the nearest match.
+    // Collect the comma-separated names from every enabled "focus:<a>,<b>,…" rule the
+    // bot runs. These are must-kill adds (Chaos Rift on Anomalus, Frost Tomb in Utgarde
+    // Keep) the party should switch to on sight; AssistTarget overrides target selection
+    // onto the nearest match. Scans BOTH the bot's OWN rotation AND the account's COMMON
+    // (shared) rotation — keyed off the LEADER's account exactly like TickRotation — so a
+    // focus: rule placed in the Common tab works (heroes AND henchmen). Before this, the
+    // accessor read ONLY the per-bot cache, so a focus rule moved from a DPS's own tab
+    // into Common was silently ignored: the party kept hitting the boss and ignored the
+    // Frost Tomb (Kevin's report).
     void BotFocusNames(ObjectGuid guid, std::vector<std::string>& out)
     {
         out.clear();
-        std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
-        auto it = g_rotationCache.find(guid.GetCounter());
-        if (it == g_rotationCache.end()) return;
-        for (RotationRule const& r : it->second)
+        auto scan = [&out](std::vector<RotationRule> const& rules)
         {
-            if (r.action.rfind("focus:", 0) != 0) continue;
-            if (CsvContains(Lower(r.flags), "disabled")) continue;
-            std::string const list = r.action.substr(6);   // after "focus:"
-            size_t start = 0;
-            while (start <= list.size())
+            for (RotationRule const& r : rules)
             {
-                size_t const comma = list.find(',', start);
-                std::string token = list.substr(
-                    start, comma == std::string::npos ? std::string::npos : comma - start);
-                size_t const a = token.find_first_not_of(" \t");
-                size_t const b = token.find_last_not_of(" \t");
-                if (a != std::string::npos) out.push_back(token.substr(a, b - a + 1));
-                if (comma == std::string::npos) break;
-                start = comma + 1;
+                if (r.action.rfind("focus:", 0) != 0) continue;
+                if (CsvContains(Lower(r.flags), "disabled")) continue;
+                std::string const list = r.action.substr(6);   // after "focus:"
+                size_t start = 0;
+                while (start <= list.size())
+                {
+                    size_t const comma = list.find(',', start);
+                    std::string token = list.substr(
+                        start, comma == std::string::npos ? std::string::npos : comma - start);
+                    size_t const a = token.find_first_not_of(" \t");
+                    size_t const b = token.find_last_not_of(" \t");
+                    if (a != std::string::npos) out.push_back(token.substr(a, b - a + 1));
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
             }
+        };
+
+        // The bot's own per-bot rotation (lock released before touching the shared one).
+        {
+            std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
+            auto it = g_rotationCache.find(guid.GetCounter());
+            if (it != g_rotationCache.end()) scan(it->second);
         }
+        // The COMMON shared rotation (leader's account) — so a focus: rule in the Common
+        // tab works for heroes AND henchmen, not just one in the bot's own tab.
+        if (uint32 const acct = SharedAccountFor(guid))
+            scan(GetSharedRotation(acct));
     }
 
     // ---- per-tank multi-pull count (pull_count) ----------------------------
