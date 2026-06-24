@@ -1727,8 +1727,10 @@ namespace WowPsParty
     // World position of the source of the MOST RECENT damaging hit within the window
     // that has a known source. `want` empty = any spell; else only hits matching that
     // name/id. Backs walk_away_from_source. Returns false if no usable source.
+    // `outAgeMs` (optional) receives how long ago that hit landed, so the caller can tell
+    // "still being hit RIGHT NOW" from "took a hit a moment ago but have since cleared".
     static bool RecentDamageSource(uint32 guidLow, std::string const& want,
-                                   float& sx, float& sy, float& sz)
+                                   float& sx, float& sy, float& sz, uint32* outAgeMs = nullptr)
     {
         uint32 const now = getMSTime();
         std::lock_guard<std::mutex> lock(g_recentDamageMutex);
@@ -1743,6 +1745,7 @@ namespace WowPsParty
                 && !SpellNameOrIdMatches(sSpellMgr->GetSpellInfo(rit->spellId), want))
                 continue;
             sx = rit->sx; sy = rit->sy; sz = rit->sz;
+            if (outAgeMs) *outAgeMs = now - rit->ms;
             return true;
         }
         return false;
@@ -5311,28 +5314,46 @@ namespace WowPsParty
         // <name> flees only that spell's source; blank flees the freshest hit's source.
         if (verb == "walk_away_from_source")
         {
-            float sx, sy, sz;
-            if (!RecentDamageSource(bot->GetGUID().GetCounter(), arg, sx, sy, sz))
+            float sx, sy, sz; uint32 ageMs = 0;
+            if (!RecentDamageSource(bot->GetGUID().GetCounter(), arg, sx, sy, sz, &ageMs))
                 return false;   // no known source to flee — let a lower rule act
 
-            // Keep AssistTarget off our feet for the whole escape (re-armed each tick the
-            // rule fires) — same reason reposition_random does it: a HEALER gets re-planted
-            // straight back into the fire by AssistTarget's "hold near party" the instant it
-            // moves, so it never actually leaves (Kevin: healer stood in Coldflame).
-            WowPsParty::HoldFollower(bot->GetGUID(), 1500);
-            // Already mid-step? let it finish before issuing another (no per-tick stutter).
+            // Already mid-step? let the (small) step finish before re-evaluating — no
+            // per-tick stutter, and the residual movement is at most one STEP.
             if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE
                 && bot->isMoving())
                 return true;
 
-            constexpr float STEP = 10.0f;   // yards farther from the source per escape
+            // Step out ONLY as long as we're STILL being hit. took_damage_from keeps the
+            // rule matching for the whole 1.5 s window even after a single tick, so without
+            // this the bot kept creeping outward (and re-planting AssistTarget) for over a
+            // second after it had already left the effect — overshooting far out of cast
+            // range, then running back in to re-take the damage = the "walks around all
+            // fight, never casts" loop (Nissemichael). Once no fresh hit has landed for
+            // ~under a patch-tick we've cleared the edge: yield so casts resume.
+            constexpr uint32 STILL_IN_IT_MS = 600;
+            if (ageMs > STILL_IN_IT_MS) return false;
+
+            // Keep AssistTarget off our feet for THIS step — a HEALER gets re-planted
+            // straight back into the fire by AssistTarget's "hold near party" the instant
+            // it moves, so it never actually leaves (Kevin: healer stood in Coldflame).
+            // Short hold (one step), not the whole window, so positioning hands the feet
+            // back the moment we've cleared and start casting again.
+            WowPsParty::HoldFollower(bot->GetGUID(), 800);
+
+            // JUST BARELY step out, like a real player — a small hop, then re-check next
+            // tick and hop again only if STILL standing in it. A big fixed step overshot
+            // the edge by ~10y (out of range -> run back -> loop) and, in a tight room,
+            // put the whole escape ring behind walls so no spot was reachable and the bot
+            // just froze (Nissemichael "finished positioning, stood there not casting").
+            constexpr float STEP = 3.0f;    // yards farther from the source per hop
             float const dx = bot->GetPositionX() - sx;
             float const dy = bot->GetPositionY() - sy;
             float const len = std::sqrt(dx * dx + dy * dy);
             // Distance from the source we want the destination to sit at: always farther
             // than we are now, so EVERY candidate moves us OUTWARD (never toward the source
             // = never deeper into a centred patch).
-            float const outDist = std::max(len, 2.0f) + STEP;
+            float const outDist = std::max(len, 1.0f) + STEP;
             float const awayAng = (len > 0.5f) ? std::atan2(dy, dx) : frand(0.0f, 2.0f * 3.14159265f);
 
             // Sweep candidate spots on the RING of radius outDist around the source —
@@ -5371,11 +5392,13 @@ namespace WowPsParty
                 if (!haveBest || score > bestScore)
                 { haveBest = true; bestScore = score; bestX = x; bestY = y; bestZ = z; }
             }
-            if (haveBest)
-                bot->GetMotionMaster()->MovePoint(0, bestX, bestY, bestZ, FORCED_MOVEMENT_NONE,
-                                                  0.0f, 0.0f, /*generatePath=*/true,
-                                                  /*forceDestination=*/false);
-            return true;   // consumed the tick even if every bearing was blocked — retry next
+            if (!haveBest)
+                return false;   // boxed in (tight room, every bearing walled/blind) —
+                                // fight in place rather than freeze doing nothing
+            bot->GetMotionMaster()->MovePoint(0, bestX, bestY, bestZ, FORCED_MOVEMENT_NONE,
+                                              0.0f, 0.0f, /*generatePath=*/true,
+                                              /*forceDestination=*/false);
+            return true;
         }
 
         // "reposition_random:N" — hop ~N yards in a random navmesh-reachable
