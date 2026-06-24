@@ -234,6 +234,14 @@ namespace WowPsParty
     void MarkOffensiveHold(ObjectGuid followerGuid, uint32 holdMs);
     bool IsOffensiveHeld(ObjectGuid guid);
 
+    // Cleanse hold. While set, the bot suppresses its dispel/cure (cure_party) — heals,
+    // buffs, DPS and movement still run. The `stop_cleansing` rotation action re-arms it
+    // each tick its condition holds, so ONE Common-tab rule (e.g. gated on
+    // party_aura_clustered:Mutating Injection<21) stops the WHOLE party from cleansing a
+    // dispel-explodes debuff until it's safe, with no per-character cure edits.
+    void MarkCleanseHold(ObjectGuid followerGuid, uint32 holdMs);
+    bool IsCleanseHeld(ObjectGuid guid);
+
     // Vehicle behaviour (Oculus drakes, etc.). Both are gated behind a vehicle scenario by
     // their callers, so normal follow/rotation is untouched otherwise.
     //  - TickBotVehicleMovement: from the follow ticker — board/acquire a vehicle when the

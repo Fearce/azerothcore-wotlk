@@ -727,6 +727,30 @@ namespace WowPsParty
         return true;
     }
 
+    // Cleanse hold (mirror of the offensive hold): while live the bot suppresses its
+    // dispel/cure (cure_party) but everything else runs. The `stop_cleansing` rotation
+    // action re-arms it each tick its condition holds, so ONE Common rule can stop the
+    // WHOLE party from cleansing a debuff that explodes on dispel (Mutating Injection)
+    // until it's safe — no per-character cure rule edits.
+    static std::unordered_map<uint32, uint32> g_cleanseHoldUntilMs;
+    void MarkCleanseHold(ObjectGuid followerGuid, uint32 holdMs)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_cleanseHoldUntilMs[followerGuid.GetCounter()] = getMSTime() + holdMs;
+    }
+    bool IsCleanseHeld(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_cleanseHoldUntilMs.find(guid.GetCounter());
+        if (it == g_cleanseHoldUntilMs.end()) return false;
+        if (getMSTime() >= it->second)
+        {
+            g_cleanseHoldUntilMs.erase(it);
+            return false;
+        }
+        return true;
+    }
+
     // Force a freshly-revived / stuck bot back into a MOVABLE state.
     //
     // Root/stun/etc. live in two places: the unit-state mask (m_state, gated by

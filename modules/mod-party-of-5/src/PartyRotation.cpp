@@ -3502,6 +3502,19 @@ namespace WowPsParty
             return false;
         }
 
+        // "stop_cleansing": arm the cleanse hold (re-armed each tick its condition holds),
+        // so the bot's cure_party is suppressed while everything else keeps running. ONE
+        // Common rule — "party_aura_clustered:Mutating Injection<21 | stop_cleansing" — then
+        // stops the WHOLE party (every healer henchman included, since each evaluates Common)
+        // from dispelling a debuff that explodes on cleanse until the afflicted has run clear.
+        // Returns false so the tick still falls through to other (non-cure) rules.
+        if (verb == "stop_cleansing")
+        {
+            static constexpr uint32 STOP_CLEANSE_HOLD_MS = 2000;   // > one rotation tick
+            WowPsParty::MarkCleanseHold(bot->GetGUID(), STOP_CLEANSE_HOLD_MS);
+            return false;
+        }
+
         // "clip" flag: let this cast interrupt the bot's own in-progress
         // cast/channel. Without it, a rule is skipped while the bot is
         // mid-cast (the default — don't clip your own Frostbolt). With it,
@@ -5051,6 +5064,11 @@ namespace WowPsParty
         // itself is the cure; we just need to pick the right target.
         if (verb == "cure_party")
         {
+            // A stop_cleansing hold (armed from Common while a dispel-explodes debuff like
+            // Mutating Injection sits on a clustered ally) suppresses ALL cures this window —
+            // they resume the instant it lapses (the afflicted ran clear), and the cleanse
+            // then lands safely.
+            if (WowPsParty::IsCleanseHeld(bot->GetGUID())) return false;
             uint32 const spellId = FindKnownSpellByName(bot, arg);
             if (!spellId) return false;
             SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
