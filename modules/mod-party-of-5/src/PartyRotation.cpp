@@ -4025,27 +4025,31 @@ namespace WowPsParty
 
                 float dx, dy, dz;
                 bool haveDest;
-                if (haveGroundLos)
+                if (ignoresLos)
                 {
-                    // Only the range blocked us — close toward the cluster to a COMFORTABLE
-                    // in-range distance. NOT maxRange-3 (the very edge): GetNearPoint adds
-                    // the target's combat reach, so maxRange-3 parked the bot AT/just past
-                    // the real cast range, where the cast kept failing "out of range" and it
-                    // never actually closed — and for a long-range AoE that edge is FARTHER
-                    // than the bot already is, so it even drifted OUTWARD (Vanii/Hellenata,
-                    // flat ground: dist crept 30→39 and stuck). Aim ~60% of max range, and
-                    // never pick a spot farther than we already are (a range block means
-                    // we're at/over the edge, so this only ever closes inward).
+                    // LoS is irrelevant for this spell — only range blocked us. Close toward
+                    // the cluster to a COMFORTABLE in-range distance (~60% of max range, never
+                    // farther than we already are so it only ever closes inward). NOT
+                    // maxRange-3: GetNearPoint adds the target's reach so that edge parks the
+                    // bot just out of the real cast range.
                     float const curDist  = bot->GetExactDist2d(target);
                     float const wantDist = std::max(std::min(maxRange * 0.60f, curDist), 5.0f);
                     target->GetNearPoint(bot, dx, dy, dz, 0.0f, wantDist, target->GetAngle(bot));
                     haveDest = true;
                 }
                 else
+                    // Find a reachable spot that is BOTH in range AND has true ground-LoS to
+                    // the cluster — ALWAYS, even when we currently have ground-LoS but are out
+                    // of range. The old "have LoS, just close radially" shortcut moved the bot
+                    // straight in and could walk it BEHIND cover (lost LoS mid-approach), then
+                    // it failed the cast forever without re-seeking a LoS spot (Kruthkes:
+                    // Blizzard dist 38→27, groundLos 1→0, idle). PickGroundCastLosPoint vets
+                    // LoS at the destination, so the bot only commits to a spot it can cast from.
                     haveDest = PickGroundCastLosPoint(bot, target, maxRange, dx, dy, dz);
 
                 if (!haveDest)
-                    return false;   // nowhere reachable sees the cluster ground
+                    return false;   // nothing reachable can reach AND see the cluster — yield
+                                    // (no hold) so AssistTarget closes for single-target LoS
 
                 WowPsParty::HoldFollower(bot->GetGUID(), 1200);
                 uint32 const gLow = bot->GetGUID().GetCounter();
