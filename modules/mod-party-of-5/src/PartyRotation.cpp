@@ -6465,19 +6465,21 @@ namespace WowPsParty
         // mount-sync then re-mounts, and the rule re-fires: an endless mount/cast
         // flicker. So out of combat we just skip and stay mounted.
         //
-        // IN COMBAT, dismount — but ONLY once the party is genuinely engaging, i.e.
-        // the leader has dismounted or a member got knocked off by damage (see
-        // PartyEngagedDismounted). A bot that entered combat mounted and never got
-        // HIT (a mob merely chasing — it can't catch a mounted unit, which also
-        // can't attack back) would otherwise sit stuck mounted, spamming failed
-        // ENGAGEs, with the follow ticker's dismount-sync yielding in combat. But
-        // if EVERYONE is still riding (mounted fly-by, incidental aggro/damage in
-        // transit), stay mounted and keep moving — don't commit the party to a fight
-        // it's trying to ride past. No re-mount flicker: the mount-sync only
-        // re-mounts out of combat.
+        // Otherwise dismount the instant the party is genuinely engaging on foot —
+        // the leader has dismounted (fighting) or a member got knocked off by damage
+        // (PartyEngagedDismounted). Do NOT gate this on the BOT's own combat state: a
+        // mounted unit can't be hit (a mob merely chases, never lands a blow) so it
+        // never enters combat on its own — and requiring it to deadlocked the bot
+        // mounted beside the leader for an ENTIRE fight (AssistTarget skips a mounted
+        // bot, so it never swings, so it never enters combat, so it never dismounts).
+        // A mounted fly-by stays mounted because there the LEADER is still riding too,
+        // so PartyEngagedDismounted is false. No re-mount flicker: the mount-sync only
+        // re-mounts while the leader is mounted (i.e. never during a foot fight). The
+        // follow ticker's mountedFlyby guard is written to flip the moment we dismount
+        // here and yield to AssistTarget.
         if (bot->IsMounted())
         {
-            if (!bot->IsInCombat() || !PartyEngagedDismounted(bot))
+            if (!PartyEngagedDismounted(bot))
                 return false;   // idle travel, or a mounted fly-by — stay mounted
             bot->Dismount();    // the party is fighting on foot — get off and engage
         }
