@@ -2649,6 +2649,10 @@ namespace WowPsParty
     {
         Map* const m = bot->GetMap();
         if (!m || !m->IsDungeon()) return false;
+        // Already AT the node (within 10y) — just grab it; the gate is about not
+        // CHARGING through a pack to reach a far vein, not abandoning one we've reached
+        // (Kevin). Stops a bot that walked to a node from idling when a mob wanders by.
+        if (bot->IsWithinDist(node, 10.0f)) return false;
         struct HostileNearCheck
         {
             HostileNearCheck(WorldObject const* c, Player const* v, float r)
