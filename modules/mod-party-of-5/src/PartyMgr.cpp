@@ -604,10 +604,8 @@ namespace WowPsParty
                         // Victory Rush: big free hit, only castable in its post-kill proc window
                         // (engine-gated) — fire it the instant it lights up.
                         add("has_target", "cast:Victory Rush", 74);
-                        // Whirlwind LEADS the AoE (hits the whole pack each swing); the lower
-                        // copy still fires it with exactly 2 in melee.
+                        // Whirlwind LEADS the AoE (hits the whole pack each swing), 3+ in melee.
                         add("enemies_in_melee>2", "cast:Whirlwind", 73);
-                        add("enemies_in_melee>1", "cast:Whirlwind", 62);
                         // Cleave (next-swing, hits 2/3 glyphed) is the AoE rage dump, NOT Slam:
                         // Slam as a plain filler drained every spare rage each GCD so Cleave
                         // never fired (Kevin). Gate Slam to single-target so AoE rage funnels
@@ -839,10 +837,9 @@ namespace WowPsParty
                     // 3 combo rather than waiting for 5 — above Slice and Dice so we don't
                     // refresh a buff on a corpse.
                     add("target_health<20&self_combo>2", "cast:Eviscerate", 78);
-                    // Slice and Dice only on ELITES (long fights). On trash it just burns
-                    // the first 2 combo each time the short buff lapses and the mob dies
-                    // before combo banks to 5, so the finishers never fire.
-                    add("self_missing_aura:Slice and Dice&self_combo>1&target_is_elite", "cast:Slice and Dice", 76);
+                    // Slice and Dice: keep it up at all times (the haste buff is worth more
+                    // than the combo). Needs 3+ combo so it isn't refreshed off a single point.
+                    add("self_missing_aura:Slice and Dice&self_combo>2", "cast:Slice and Dice", 76);
                     // Rupture only if the bleed has time to pay off (target_ttd>8 = a long-
                     // lived/boss mob; FALSE for trash about to die).
                     add("self_combo>4&target_missing_aura:Rupture&target_ttd>8", "cast:Rupture", 70);
@@ -1189,9 +1186,10 @@ namespace WowPsParty
                     mageShared();
                     add("always", "buff_self:Molten Armor", 72);
                     add("!spell_ready:Molten Armor", "buff_self:Frost Armor", 71);
-                    // Arcane's only AoE is the PBAoE Arcane Explosion — gate on mobs
-                    // ACTUALLY in melee on the mage (it has no ranged AoE; we never walk
-                    // a ranged arcane mage into a pack just to AoE).
+                    // Arcane has no ranged AoE of its own, so it borrows Blizzard (Kevin)
+                    // — high priority so it LEADS in AoE situations from range. Arcane
+                    // Explosion (PBAoE) only when mobs are ACTUALLY in melee on the mage.
+                    add("enemies_clustered:8>2", "cast:Blizzard", 60);
                     add("enemies_in_melee>2", "cast:Arcane Explosion", 58);
                     add("has_target", "cast:Arcane Blast", 46);    // primary nuke (ramps)
                     add("has_target", "cast:Arcane Missiles", 44); // Missile Barrage proc / filler
@@ -1371,8 +1369,9 @@ namespace WowPsParty
                         // harmlessly if untalented. cancel_form reverts it out of combat.
                         add("in_combat&self_missing_aura:Moonkin Form", "buff_self:Moonkin Form", 80);
                         add("target_missing_aura:Moonfire", "cast:Moonfire", 72);
+                        // Hurricane (ranged ground AoE) above Insect Swarm so it LEADS in AoE.
+                        add("enemies_clustered:8>2", "cast:Hurricane", 70);
                         add("target_missing_aura:Insect Swarm", "cast:Insect Swarm", 68);
-                        add("enemies_clustered:8>2", "cast:Hurricane", 58);   // ranged ground AoE
                         add("has_target", "cast:Starfire", 46);
                         add("has_target", "cast:Wrath", 44);
                         add("out_of_combat&no_target&self_has_aura:Moonkin Form", "cancel_form", 16);
