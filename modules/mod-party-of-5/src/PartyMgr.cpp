@@ -1164,6 +1164,11 @@ namespace WowPsParty
                     // armor has no cooldown), so it never overwrites an active Molten Armor.
                     add("always", "buff_self:Molten Armor", 72);
                     add("!spell_ready:Molten Armor", "buff_self:Frost Armor", 71);
+                    // Hot Streak (two crits in a row) makes the next Pyroblast INSTANT &
+                    // free — fire it the instant the proc is up (before the 10s buff lapses).
+                    // Gated on the proc aura so the 5s hard-cast Pyroblast never clogs the
+                    // rotation; no proc → no Pyroblast, fall through to Fireball.
+                    add("self_has_aura:Hot Streak", "cast:Pyroblast", 69);
                     add("target_missing_aura:Living Bomb", "cast:Living Bomb", 68);
                     // Ground AoE on the densest CLUSTER (a ranged mage stands back, so a
                     // bot-centred melee count reads 0 on a pack it could nuke).
