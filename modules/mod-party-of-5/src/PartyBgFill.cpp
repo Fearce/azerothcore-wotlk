@@ -44,8 +44,11 @@
  *    tick so a 40v40 spin-up never stalls the world thread.
  *  - OnPlayerJoinBG fires at QUEUE time (BattleGroundHandler), per group member, so
  *    we react when the human queues — not after the (empty) match already formed.
- *  - Random BG (BATTLEGROUND_RB) and arenas are skipped: the real BG isn't known
- *    until pop, so it can't be pre-filled.
+ *  - Random BG (BATTLEGROUND_RB) IS supported: it has no real map at queue time, but
+ *    its own template capacity (10v10, level 80) governs the RB queue, so we fill the
+ *    RB queue itself to 10v10. It pops a randomly-chosen real BG, then TopUpBgInPrep
+ *    reads that live instance's true capacity and backfills it (e.g. an AV to 40v40)
+ *    during the pre-gate countdown. Only ARENAS are skipped here (separate rated flow).
  */
 
 #include "PartyMgr.h"
@@ -559,11 +562,16 @@ namespace
         }
     }
 
-    // Can this BG type be FILLED with bots — a normal, specific battleground? NOT
-    // Random BG (real BG unknown until pop) and NOT an arena.
+    // Can this BG type be FILLED with bots? Any non-arena battleground, INCLUDING
+    // Random BG. RB doesn't pick its real map until the queue pops, but it has its OWN
+    // template capacity (battleground_template ID 32: 10v10, level 80) and the fills go
+    // into the RB QUEUE — not a specific BG — so we top BOTH RB-queue sides to RB's
+    // MaxPlayersPerTeam, it pops a real BG at 10v10, then TopUpBgInPrep reads the LIVE
+    // instance's (real BG's) capacity and backfills it to its true N-v-N during the
+    // pre-gate countdown. RB's MaxPlayersPerTeam (10) is <= every rollable BG's cap
+    // (WSG's 10 is the smallest), so the initial pop is never over-invited.
     bool IsFillableBg(uint32 bgTypeId)
     {
-        if (bgTypeId == BATTLEGROUND_RB) return false;
         Battleground* tpl = sBattlegroundMgr->GetBattlegroundTemplate(BattlegroundTypeId(bgTypeId));
         return tpl && !tpl->isArena() && tpl->GetMaxPlayersPerTeam() > 0;
     }
@@ -1016,14 +1024,14 @@ public:
             if (g_activeLeaders.count(player->GetGUID().GetCounter())) return;
             g_activeLeaders[player->GetGUID().GetCounter()] = bgTypeId;
         }
-        // Always drive the heroes to accept (the world tick handles that via
-        // g_activeLeaders). Only spawn enemy fills for a specific, fillable BG —
-        // Random BG resolves its real BG at pop, so it can't be pre-filled.
+        // Spawn both-team fills for any fillable BG — Random BG included (it fills the
+        // RB queue to RB's 10v10, then TopUpBgInPrep tops the rolled instance to its real
+        // cap). The world tick always drives the heroes to accept via g_activeLeaders.
         if (IsFillableBg(bgTypeId))
             StartFill(player, bgTypeId);
         else
             LOG_INFO("module",
-                "[WowPsParty BGFill] {} queued bg {} (random/unfillable) — driving heroes to accept the pop, no enemy fill",
+                "[WowPsParty BGFill] {} queued bg {} (unfillable) — driving heroes to accept the pop, no enemy fill",
                 player->GetName(), bgTypeId);
     }
     // NB: deliberately NO OnPlayerRemoveFromBattleground. Retiring (logging out) a
