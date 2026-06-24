@@ -1072,7 +1072,12 @@ namespace WowPsParty
                 if (b && b->IsAlive() && b->IsInCombat() && bot->IsValidAttackTarget(b)
                     && a->GetDistance(b) <= radius)
                     ++c;
-            if (c > bestCount) { bestCount = c; best = a; }
+            // Deterministic tiebreak (lower guid) so the anchor doesn't FLIP between
+            // equally-dense pack members every tick — a flipping anchor restarted the
+            // approach each tick and the bot never moved (Kruthkes). Stable anchor =
+            // stable destination = the bot actually walks to it.
+            if (c > bestCount || (c == bestCount && best && a->GetGUID() < best->GetGUID()))
+            { bestCount = c; best = a; }
         }
         return best;
     }
@@ -4052,22 +4057,19 @@ namespace WowPsParty
                                     // (no hold) so AssistTarget closes for single-target LoS
 
                 WowPsParty::HoldFollower(bot->GetGUID(), 1200);
-                uint32 const gLow = bot->GetGUID().GetCounter();
-                uint32 const tLow = target->GetGUID().GetCounter();
-                uint32 const now  = getMSTime();
-                bool reissue = true;
-                {
-                    std::lock_guard<std::mutex> lock(g_useThrottleMutex);
-                    auto& e = g_approachState[gLow];
-                    bool const moving = bot->GetMotionMaster()
-                        ->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE;
-                    if (e.first == tLow && (now - e.second) < 700 && moving)
-                        reissue = false;
-                    else { e.first = tLow; e.second = now; }
-                }
-                if (reissue)
+                // Issue the move ONCE and let it RUN to the spot — do NOT re-path every tick.
+                // The anchor (BestClusterAnchor) flips between equidistant pack members tick
+                // to tick, and the old throttle keyed on the anchor guid, so each flip reset
+                // it and re-issued MovePoint to a fresh spot EVERY tick — restarting the
+                // movespline before the bot actually travelled, so it never moved and just
+                // timed out (Kruthkes/Bunuhr: "doesn't move at all"). Re-issue only once the
+                // previous hop has finished (no longer on a POINT spline); on arrival the rule
+                // re-evaluates and either casts or hops again.
+                if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
                     bot->GetMotionMaster()->MovePoint(0, dx, dy, dz);
 
+                uint32 const gLow = bot->GetGUID().GetCounter();
+                uint32 const now  = getMSTime();
                 static thread_local std::unordered_map<uint32, uint32> gLog;
                 uint32& gl = gLog[gLow];
                 if (now - gl > 3000)
