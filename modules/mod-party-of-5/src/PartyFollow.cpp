@@ -2572,6 +2572,7 @@ namespace WowPsParty
     static constexpr float GATHER_ARRIVED_REACH = 18.0f; // harvest-from-here cap once the navmesh can't get any closer (veins up rocks/ledges)
     static constexpr uint32 GATHER_APPROACH_TIMEOUT_MS = 6000; // give up if stuck
     static constexpr uint32 GATHER_AVOID_MS = 30000;   // ignore an unreachable node
+    static constexpr float GATHER_DUNGEON_ENEMY_CLEAR = 100.0f; // in a dungeon, don't gather a node with a live enemy this close
 
     // Per-bot gather state. Committing to one node stops the bot oscillating
     // between two equidistant nodes; the avoid slot remembers a node we gave up
@@ -2638,9 +2639,37 @@ namespace WowPsParty
         return false;
     }
 
+    // In a DUNGEON, treat a node as ungatherable while any live enemy is within
+    // GATHER_DUNGEON_ENEMY_CLEAR of it — otherwise the miner charges straight through
+    // the pack guarding the vein and pulls the room (Kevin). Open world is unchanged:
+    // a roaming mob near a node out there is fine to gather past. Checked per node so a
+    // committed node also drops the instant a patrol wanders near it (IsHarvestableBy
+    // re-validates every tick → re-scan, which finds nothing gatherable and follows).
+    static bool NodeBlockedByDungeonEnemies(Player* bot, WorldObject* node)
+    {
+        Map* const m = bot->GetMap();
+        if (!m || !m->IsDungeon()) return false;
+        struct HostileNearCheck
+        {
+            HostileNearCheck(WorldObject const* c, Player const* v, float r)
+                : center(c), viewer(v), range(r) {}
+            bool operator()(Creature* u) const
+            {
+                return u && u->IsAlive() && !u->IsCritter() && !u->IsTotem()
+                    && center->IsWithinDist(u, range) && viewer->IsValidAttackTarget(u);
+            }
+            WorldObject const* center; Player const* viewer; float range;
+        };
+        std::list<Creature*> crs;
+        HostileNearCheck check(node, bot, GATHER_DUNGEON_ENEMY_CLEAR);
+        Acore::CreatureListSearcher<HostileNearCheck> searcher(node, crs, check);
+        Cell::VisitObjects(node, searcher, GATHER_DUNGEON_ENEMY_CLEAR);
+        return !crs.empty();
+    }
+
     // True if `bot` can gather `go` right now: spawned, ready (not mid-harvest),
-    // a mining/herb node, bot has the profession AND enough skill, and hasn't
-    // already harvested this spawn.
+    // a mining/herb node, bot has the profession AND enough skill, hasn't already
+    // harvested this spawn, and (in a dungeon) no enemy is camped on it.
     static bool IsGatherableBy(Player* bot, GameObject* go)
     {
         if (!go || !go->isSpawned()) return false;
@@ -2650,6 +2679,7 @@ namespace WowPsParty
         if (!bot->HasSkill(skillId)) return false;
         if (uint32(bot->GetSkillValue(skillId)) < req) return false;
         if (go->IsInSkillupList(bot->GetGUID())) return false;
+        if (NodeBlockedByDungeonEnemies(bot, go)) return false;
         return true;
     }
 
