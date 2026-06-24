@@ -34,10 +34,12 @@
 #include "Log.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
+#include "Random.h"           // urand — randomise + diversify the LFG-fill hire picks
 #include "ScriptMgr.h"
 #include "ScriptedGossip.h"
 #include "TemporarySummon.h"
 
+#include <algorithm>
 #include <chrono>
 #include <mutex>
 #include <set>
@@ -145,14 +147,14 @@ namespace
             return;
         }
 
-        // Bucket candidates by role.
+        // Bucket candidates by role (keep class so we can diversify the picks).
         std::vector<WowPsParty::HenchmanCandidate> const cands = WowPsParty::BuildHenchmanCandidates(player);
-        std::vector<uint32> tanks, heals, dps;
+        std::vector<WowPsParty::HenchmanCandidate> tanks, heals, dps;
         for (auto const& c : cands)
         {
-            if (c.role == "tank")        tanks.push_back(c.guid);
-            else if (c.role == "healer") heals.push_back(c.guid);
-            else                         dps.push_back(c.guid);
+            if (c.role == "tank")        tanks.push_back(c);
+            else if (c.role == "healer") heals.push_back(c);
+            else                         dps.push_back(c);
         }
         if (tanks.size() < pf.needTank || heals.size() < pf.needHeal || dps.size() < pf.needDps)
         {
@@ -163,6 +165,24 @@ namespace
 
         // Charge the discounted total ONCE; the per-bot hires skip their own charge.
         player->ModifyMoney(-int32(pf.totalCost));
+
+        // Order a role's pool for the hire: SHUFFLE (so the same fill doesn't recur), then
+        // float ONE candidate of each distinct class to the front, then the rest. hireFrom
+        // takes the first N that hire — so 3 dps come out as 3 DIFFERENT classes when the
+        // pool allows, picked at random (Kevin got 3 warriors + a hunter; now it varies).
+        auto orderForVariety = [](std::vector<WowPsParty::HenchmanCandidate> bucket) -> std::vector<uint32>
+        {
+            for (size_t i = bucket.size(); i > 1; --i)
+                std::swap(bucket[i - 1], bucket[urand(0, uint32(i - 1))]);   // Fisher-Yates
+            std::vector<uint32> out;
+            std::set<uint8>  usedCls;
+            std::set<uint32> picked;
+            for (auto const& c : bucket)                       // pass 1: one per class
+                if (usedCls.insert(c.cls).second) { out.push_back(c.guid); picked.insert(c.guid); }
+            for (auto const& c : bucket)                       // pass 2: remaining (spare specs/classes)
+                if (!picked.count(c.guid)) out.push_back(c.guid);
+            return out;
+        };
 
         auto hireFrom = [&](std::vector<uint32> const& pool, char const* role, uint8 count) -> uint8
         {
@@ -176,9 +196,9 @@ namespace
             }
             return done;
         };
-        uint8 const ht = hireFrom(tanks, "tank",   pf.needTank);
-        uint8 const hh = hireFrom(heals, "healer", pf.needHeal);
-        uint8 const hd = hireFrom(dps,   "dps",    pf.needDps);
+        uint8 const ht = hireFrom(orderForVariety(tanks), "tank",   pf.needTank);
+        uint8 const hh = hireFrom(orderForVariety(heals), "healer", pf.needHeal);
+        uint8 const hd = hireFrom(orderForVariety(dps),   "dps",    pf.needDps);
 
         if (ht < pf.needTank || hh < pf.needHeal || hd < pf.needDps)
         {
