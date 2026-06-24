@@ -886,6 +886,80 @@ namespace WowPsParty
         return false;
     }
 
+    // Would the bot, standing at (cx,cy,cz), have line of sight to the GROUND
+    // POINT a ground-targeted AoE actually lands on — the dirt at (gx,gy,gz)?
+    // This replicates Spell::CheckCast's dst-LoS EXACTLY: both endpoints are
+    // bumped by the CASTER's collision height and the M2 flag is used (see
+    // WorldObject::IsWithinLOS + Spell::CheckCast). It is STRICTER than the
+    // rotation's normal gate, which tests LoS to the anchor's HIT SPHERE (centred
+    // a creature-height up and pulled toward the bot). Over a low lip or around a
+    // corner the body ray clears while the ground ray is still blocked — so the
+    // gate passes, CastSpell(x,y,z) fails SPELL_FAILED_LINE_OF_SIGHT (result 97),
+    // and the bot re-fires the doomed cast forever ("stands in a corner doing
+    // nothing"). Use this to decide whether the ground cast can really land here.
+    static bool GroundPointInLosFrom(Player* bot, float cx, float cy, float cz,
+                                     float gx, float gy, float gz)
+    {
+        float const h = bot->GetCollisionHeight();
+        return bot->GetMap()->isInLineOfSight(cx, cy, cz + h, gx, gy, gz + h,
+            bot->GetPhaseMask(), LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::M2);
+    }
+
+    // Find the nearest reachable spot the bot can stand to actually LAND a
+    // ground-targeted AoE on `aimAt` — one with true line of sight to the anchor's
+    // GROUND point (GroundPointInLosFrom), within `maxRange` of it, and not
+    // point-blank in the pack (kept past CAST_SAFE so a channelled AoE's own
+    // melee-guard won't then block it). Samples rings around the bot fanned from
+    // the bot->anchor bearing (rounding a corner or stepping past a lip toward the
+    // cluster is what usually clears the ground ray), nearest-first, mirroring
+    // PickLosBreakPoint. Returns false (caller falls through to a single-target
+    // filler) when nothing in reach can see the cluster ground.
+    static bool PickGroundCastLosPoint(Player* bot, Unit* aimAt, float maxRange,
+                                       float& ox, float& oy, float& oz)
+    {
+        if (!bot || !aimAt) return false;
+        float gx, gy, gz;
+        aimAt->GetPosition(gx, gy, gz);
+
+        float const MELEE_GUARD = 8.0f;                // matches faceAndCastAt's channel guard
+        float const CAST_SAFE = 10.0f;                 // keep the anchor past the guard radius
+        float const reachMax  = std::max(maxRange - 2.0f, CAST_SAFE + 2.0f);
+        float const toward    = bot->GetAngle(aimAt);  // bot -> anchor
+        // The pack near the anchor, gathered once: a candidate that lands within the
+        // channel melee-guard of ANY hostile would be rejected at cast time (a
+        // channelled AoE won't start with a mob in melee), so don't burn a sample on
+        // it. Distance to the anchor alone doesn't catch a spread pack.
+        std::list<Unit*> hostiles;
+        GatherHostilesAround(bot, 45.0f, hostiles);
+        static float const radii[]   = { 6.0f, 10.0f, 14.0f, 18.0f, 24.0f };
+        static float const offsets[] = { 0.0f, 0.5f, -0.5f, 1.0f, -1.0f, 1.5f, -1.5f,
+                                         2.1f, -2.1f, 3.14159265f };  // toward, fan out, finally behind
+        for (float r : radii)
+        {
+            for (float off : offsets)
+            {
+                float x, y, z;
+                bot->GetNearPoint(bot, x, y, z, 0.0f, r, toward + off);
+                float const da = std::sqrt((x - gx) * (x - gx) + (y - gy) * (y - gy));
+                if (da > reachMax || da < CAST_SAFE) continue;   // out of range / point-blank
+                bool crowded = false;
+                for (Unit* h : hostiles)
+                {
+                    if (!h || !h->IsAlive()) continue;
+                    float const hx = h->GetPositionX() - x;
+                    float const hy = h->GetPositionY() - y;
+                    if (hx * hx + hy * hy < MELEE_GUARD * MELEE_GUARD) { crowded = true; break; }
+                }
+                if (crowded) continue;
+                if (!GroundPointInLosFrom(bot, x, y, z, gx, gy, gz)) continue;
+                if (!NavReachable(bot, x, y, z, r)) continue;
+                ox = x; oy = y; oz = z;
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Size of the densest cluster of hostiles that are all within `radius` of
     // ONE of them — i.e. "how many enemies are within R of each other". This
     // is the metric AoE placement wants (Blizzard / Flamestrike): a high value
@@ -3630,6 +3704,78 @@ namespace WowPsParty
                 if (maxR > 0.0f && maxR <= 6.0f) return false;   // melee spell: hold, don't approach
             }
 
+            // GROUND-TARGETED AoE (Rain of Fire / Hurricane / Blizzard / Volley):
+            // the cast lands on the dirt at the anchor's feet and needs LoS to THAT
+            // point — which the rotation's body-LoS gate does NOT guarantee (it tests
+            // the mob's hit sphere, higher and pulled toward the bot). So a bot in
+            // range with body-LoS but no GROUND-LoS used to re-fire a cast that fails
+            // result=97 every tick and never move (Hellenata/Mynya on Maraudon vines).
+            // Seek a reachable spot that can actually see the cluster ground; if none
+            // exists, fall through (return false, no feet-hold) so AssistTarget keeps
+            // the bot doing single-target damage instead of freezing.
+            if (SpellInfo const* gi = sSpellMgr->GetSpellInfo(spellId);
+                gi && (gi->GetExplicitTargetMask() & TARGET_FLAG_DEST_LOCATION))
+            {
+                float gx, gy, gz;
+                target->GetPosition(gx, gy, gz);
+                float const maxRange = gi->GetMaxRange(gi->IsPositive(), bot);
+                // A spell that ignores ground LoS (SPELL_ATTR2_IGNORE_LINE_OF_SIGHT /
+                // SPELL_ATTR5_ALWAYS_AOE_LINE_OF_SIGHT) is never LoS-blocked by the
+                // engine — mirror Spell::CheckCast and treat LoS as satisfied so we
+                // only ever close for range, never chase a corner needlessly.
+                bool const ignoresLos =
+                    gi->HasAttribute(SPELL_ATTR2_IGNORE_LINE_OF_SIGHT)
+                    || gi->HasAttribute(SPELL_ATTR5_ALWAYS_AOE_LINE_OF_SIGHT);
+                bool const haveGroundLos = ignoresLos || GroundPointInLosFrom(
+                    bot, bot->GetPositionX(), bot->GetPositionY(),
+                    bot->GetPositionZ(), gx, gy, gz);
+
+                float dx, dy, dz;
+                bool haveDest;
+                if (haveGroundLos)
+                {
+                    // Only the range blocked us — close radially to just inside
+                    // max range (the gate's "out of range" path lands here).
+                    target->GetNearPoint(bot, dx, dy, dz, 0.0f,
+                        std::max(maxRange - 3.0f, 5.0f), target->GetAngle(bot));
+                    haveDest = true;
+                }
+                else
+                    haveDest = PickGroundCastLosPoint(bot, target, maxRange, dx, dy, dz);
+
+                if (!haveDest)
+                    return false;   // nowhere reachable sees the cluster ground
+
+                WowPsParty::HoldFollower(bot->GetGUID(), 1200);
+                uint32 const gLow = bot->GetGUID().GetCounter();
+                uint32 const tLow = target->GetGUID().GetCounter();
+                uint32 const now  = getMSTime();
+                bool reissue = true;
+                {
+                    std::lock_guard<std::mutex> lock(g_useThrottleMutex);
+                    auto& e = g_approachState[gLow];
+                    bool const moving = bot->GetMotionMaster()
+                        ->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE;
+                    if (e.first == tLow && (now - e.second) < 700 && moving)
+                        reissue = false;
+                    else { e.first = tLow; e.second = now; }
+                }
+                if (reissue)
+                    bot->GetMotionMaster()->MovePoint(0, dx, dy, dz);
+
+                static thread_local std::unordered_map<uint32, uint32> gLog;
+                uint32& gl = gLog[gLow];
+                if (now - gl > 3000)
+                {
+                    gl = now;
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation] {} seeking ground-AoE LoS for spell={} "
+                        "(dist={:.1f} groundLos={})", bot->GetName(), spellId,
+                        bot->GetDistance(target), haveGroundLos ? 1 : 0);
+                }
+                return true;
+            }
+
             // Suppress the follow/assist ticker for the approach window.
             WowPsParty::HoldFollower(bot->GetGUID(), 1200);
 
@@ -3905,6 +4051,29 @@ namespace WowPsParty
                         return repositionToCast(anchor, spellId);
                     }
                     return false;
+                }
+                // Gate passed using LoS to the mob's BODY, but a ground AoE lands on
+                // the dirt at the anchor's FEET and Spell::CheckCast tests LoS to THAT
+                // (stricter) point. If the ground ray is blocked here (a lip/corner the
+                // body ray cleared), the cast would fail SPELL_FAILED_LINE_OF_SIGHT
+                // every tick — so MOVE to a spot that can see the cluster ground rather
+                // than re-firing a doomed cast in place (Hellenata/Mynya "standing in a
+                // corner doing nothing" on Maraudon Constrictor Vines). repositionToCast
+                // owns the ground-LoS seek for a DEST_LOCATION spell; returning its
+                // result means: if it walks us toward a LoS spot we fired (true), and if
+                // nothing reachable can see the cluster it yields (false) so the rotation
+                // falls through to a single-target filler — never the doomed cast. Skip
+                // for a spell the engine doesn't LoS-check on the ground (ATTR2/5).
+                {
+                    bool const ignoresLos =
+                        info->HasAttribute(SPELL_ATTR2_IGNORE_LINE_OF_SIGHT)
+                        || info->HasAttribute(SPELL_ATTR5_ALWAYS_AOE_LINE_OF_SIGHT);
+                    float gx, gy, gz;
+                    anchor->GetPosition(gx, gy, gz);
+                    if (!ignoresLos
+                        && !GroundPointInLosFrom(bot, bot->GetPositionX(),
+                               bot->GetPositionY(), bot->GetPositionZ(), gx, gy, gz))
+                        return repositionToCast(anchor, spellId);
                 }
                 if (!channelClipOk()) return false;
                 return faceAndCastAt(anchor, spellId);
