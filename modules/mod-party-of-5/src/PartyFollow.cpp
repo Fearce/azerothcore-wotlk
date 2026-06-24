@@ -154,8 +154,17 @@ namespace WowPsParty
         static bool HenchClaimable(Creature const* c, ObjectGuid self, Group const* grp)
         {
             Loot const& loot = c->loot;
-            if (loot.gold > 0) return true;
-            if (loot.roundRobinPlayer != self) return false;   // trash assigned to another member
+            // Only walk to a corpse that round-robin assigned to THIS henchman. The old
+            // `if (gold>0) return true` made EVERY henchman (and the player's corpses)
+            // claimable to all of them just for the shared gold, so they swarmed and
+            // walked on top of the corpse the human was trying to loot (Kevin). Each
+            // member loots its OWN assigned corpses and WoW splits the gold to the party
+            // regardless of who opens it, so nothing is stranded — and a henchman never
+            // crowds the player's (or another bot's) corpse. An UNASSIGNED gold corpse
+            // (no round-robin owner) is still fair game so loose gold isn't left behind.
+            if (loot.roundRobinPlayer != self)
+                return loot.roundRobinPlayer.IsEmpty() && loot.gold > 0;
+            if (loot.gold > 0) return true;                    // our corpse: take the gold
             uint32 const threshold = grp ? uint32(grp->GetLootThreshold())
                                          : uint32(ITEM_QUALITY_UNCOMMON);
             for (LootItem const& li : loot.items)
@@ -3168,6 +3177,8 @@ namespace WowPsParty
     // party-of-5 flow is untouched.
 
     static constexpr float HENCH_LOOT_REACH = 4.5f;   // inside INTERACTION_DISTANCE (5.5)
+    static constexpr float HENCH_LOOT_STANDOFF = 2.0f; // walk to ~2y off the corpse, not on top of it
+    static constexpr float HENCH_LOOT_STEPOFF  = 3.0f; // after the last corpse, nudge this far clear of it
 
     static Creature* FindNearestLootableCorpse(Player* bot, float range,
                                                ObjectGuid avoid, Group* grp)
@@ -3357,25 +3368,51 @@ namespace WowPsParty
         {
             LootCorpseForHenchman(bot, target);
             ObjectGuid const tg = target->GetGUID();
-            std::lock_guard<std::mutex> lock(g_gatherMutex);
-            auto& st = g_gather[gLow];
-            st.node = ObjectGuid::Empty;
-            st.commitMs = 0;
-            // Park it: a partially-looted corpse keeps UNIT_DYNFLAG_LOOTABLE (its
-            // remaining loot belongs to other members / pending rolls), so without
-            // this we'd re-pick it every tick and stop following. We've taken our
-            // share; a fully-emptied corpse already lost the flag and won't recur.
-            st.avoid = tg; st.avoidUntil = now + GATHER_AVOID_MS;
+            float const cx = target->GetPositionX();
+            float const cy = target->GetPositionY();
+            float const cz = target->GetPositionZ();
+            {
+                std::lock_guard<std::mutex> lock(g_gatherMutex);
+                auto& st = g_gather[gLow];
+                st.node = ObjectGuid::Empty;
+                st.commitMs = 0;
+                // Park it: a partially-looted corpse keeps UNIT_DYNFLAG_LOOTABLE (its
+                // remaining loot belongs to other members / pending rolls), so without
+                // this we'd re-pick it every tick and stop following. We've taken our
+                // share; a fully-emptied corpse already lost the flag and won't recur.
+                st.avoid = tg; st.avoidUntil = now + GATHER_AVOID_MS;
+            }
+            // No more corpses queued → step a few yards CLEAR of this one at a random
+            // angle so the henchman doesn't sit and drink ON the corpse and block the
+            // player from looting it (Kevin). Party isn't in combat here (checked above),
+            // so a brief reposition is safe; the follow ticker brings it back after.
+            if (!FindNearestLootableCorpse(bot, GATHER_SCAN_RANGE, tg, grp))
+            {
+                float const ang = float((gLow * 2654435761u + now) % 6283u) / 1000.0f;  // ~0..2pi, varies per bot/time
+                float ex = cx + std::cos(ang) * HENCH_LOOT_STEPOFF;
+                float ey = cy + std::sin(ang) * HENCH_LOOT_STEPOFF;
+                float ez = cz;
+                bot->UpdateAllowedPositionZ(ex, ey, ez);
+                HoldFollower(bot->GetGUID(), 1500);   // let the step finish before the follow ticker re-asserts
+                bot->GetMotionMaster()->MovePoint(0xA18, ex, ey, ez);
+            }
         }
         else
         {
-            // Walk to the corpse; keep the 1Hz follow re-asserter and the 250ms
-            // humanize tick off us (HoldFollower + the committed-node yield) so
-            // neither yanks us back to the leader mid-approach.
+            // Walk to a STANDOFF ~2y off the corpse, not on top of it (Kevin: bots
+            // stood ON corpses, blocking the player from looting). The loot reach is
+            // 4.5y so this still loots fine. Aim for a point HENCH_LOOT_STANDOFF out
+            // from the corpse along the corpse->bot line (the side we're approaching
+            // from). Keep the 1Hz follow re-asserter and the 250ms humanize tick off
+            // us (HoldFollower + the committed-node yield) so neither yanks us back.
             HoldFollower(bot->GetGUID(), 2500);
             bot->SetFacingToObject(target);
-            bot->GetMotionMaster()->MovePoint(0xA17,
-                target->GetPositionX(), target->GetPositionY(), target->GetPositionZ());
+            float const sang = target->GetAngle(bot);   // corpse -> bot (our approach side)
+            float wx = target->GetPositionX() + std::cos(sang) * HENCH_LOOT_STANDOFF;
+            float wy = target->GetPositionY() + std::sin(sang) * HENCH_LOOT_STANDOFF;
+            float wz = target->GetPositionZ();
+            bot->UpdateAllowedPositionZ(wx, wy, wz);
+            bot->GetMotionMaster()->MovePoint(0xA17, wx, wy, wz);
         }
     }
 
