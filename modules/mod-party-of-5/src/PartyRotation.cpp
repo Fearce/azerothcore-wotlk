@@ -895,19 +895,23 @@ namespace WowPsParty
 
     // Find the NEAREST reachable spot from which `enemy` has NO line of sight to the
     // bot — i.e. a piece of cover to duck behind. Samples rings around the bot from
-    // close to far, fanning each ring from the away-from-enemy direction outward, and
-    // returns the first candidate that (a) breaks the enemy's LoS to the spot and
-    // (b) is on a reachable navmesh path. Nearest-first keeps the bot from sprinting
-    // across the room when a closer pillar would do. Returns false in open ground with
-    // no cover, so the caller skips (a duck that hides nothing must not reserve the tick).
+    // close to far, fanning each ring through MANY angles, and returns the first
+    // candidate that (a) breaks the enemy's LoS to the spot and (b) is on a reachable
+    // navmesh path. Rings start TIGHT (2.5y) and step finely, and we go ring-by-ring
+    // (all equidistant within a ring), so the FIRST hit is the genuinely nearest spot —
+    // just slipping around the corner edge, NOT 10-15y deep behind the wall (Kevin: "the
+    // yellow spot is good enough, they don't have to go to the purple"). The wide angle
+    // fan matters because cover is often to the SIDE (around a corner), not straight back
+    // from the enemy. Returns false in open ground with no cover, so the caller skips.
     static bool PickLosBreakPoint(Player* bot, Unit* enemy,
                                   float& ox, float& oy, float& oz)
     {
         if (!bot || !enemy) return false;
         float const awayAngle = enemy->GetAngle(bot);   // enemy -> bot, i.e. away from enemy
-        static float const radii[]   = { 8.0f, 12.0f, 16.0f, 20.0f, 25.0f };
-        static float const offsets[] = { 0.0f, 0.6f, -0.6f, 1.2f, -1.2f, 1.8f, -1.8f,
-                                         2.4f, -2.4f, 3.14159265f };   // away, fan out, finally toward-past
+        static float const radii[]   = { 2.5f, 4.0f, 5.5f, 7.0f, 9.0f, 11.5f, 15.0f, 19.0f, 24.0f };
+        static float const offsets[] = { 0.0f, 0.4f, -0.4f, 0.8f, -0.8f, 1.2f, -1.2f,
+                                         1.6f, -1.6f, 2.0f, -2.0f, 2.5f, -2.5f,
+                                         3.14159265f };   // away, fan out either side, finally toward-past
         for (float r : radii)
         {
             for (float off : offsets)
@@ -918,8 +922,13 @@ namespace WowPsParty
                 // M2 so "out of LoS" here means the SAME thing the move_out_of_los gate
                 // (and Spell::CheckCast) mean — else a spot shadowed only by an M2 doodad
                 // passes here but the M2 gate still reads in-LoS, and the bot re-picks it
-                // every tick and never settles.
-                if (enemy->IsWithinLOS(x, y, z, VMAP::ModelIgnoreFlags::M2)) continue;
+                // every tick and never settles. Test at the bot's BODY height (z + collision
+                // height), not the ground: a tight spot at the corner edge can hide the feet
+                // while the enemy still sees the upper body over a low wall — checking at body
+                // height (matching the unit-to-unit gate) rejects those so the bot doesn't
+                // pick a too-shallow spot and then sit re-exposed.
+                if (enemy->IsWithinLOS(x, y, z + bot->GetCollisionHeight(),
+                                       VMAP::ModelIgnoreFlags::M2)) continue;
                 // Only then pay for the navmesh query (out-of-LoS candidates are few).
                 if (!NavReachable(bot, x, y, z, r)) continue;
                 ox = x; oy = y; oz = z;
