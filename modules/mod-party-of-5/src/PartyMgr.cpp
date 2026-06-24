@@ -946,7 +946,9 @@ namespace WowPsParty
                     add("target_casting&target_interruptible", "cast:Silence", 80);
                     add("always", "buff_self:Shadowform", 76);
                     add("always", "cast_party_missing:Power Word: Fortitude", 56);
-                    add("target_missing_aura:Shadow Word: Pain", "cast:Shadow Word: Pain", 70);
+                    // SW:P is a SPREAD dot — keep the whole pull dotted. in_combat (not
+                    // has_target) so it fires with no specific victim, like warlock Corruption.
+                    add("in_combat", "cast_spread:Shadow Word: Pain", 70);
                     add("target_missing_aura:Vampiric Touch", "cast:Vampiric Touch", 66);
                     add("target_missing_aura:Devouring Plague", "cast:Devouring Plague", 62);
                     add("has_target", "cast:Mind Blast", 54);
@@ -1223,9 +1225,11 @@ namespace WowPsParty
                     // not known; armor has no cooldown, so it never overwrites Fel Armor).
                     add("always", "buff_self:Fel Armor", 76);
                     add("!spell_ready:Fel Armor", "buff_self:Demon Armor", 75);
+                    // AoE on the densest mob CLUSTER (a ranged warlock stands well back) —
+                    // above Curse of Agony so a pack gets Rain of Fire before the single-
+                    // target curse (Kevin). Still below Corruption (the spread dot, 70).
+                    add("enemies_clustered:8>2", "cast:Rain of Fire", 68);   // placed ground AoE
                     add("target_missing_aura:Curse of Agony", "cast:Curse of Agony", 66);
-                    // AoE on the densest mob CLUSTER (a ranged warlock stands well back).
-                    add("enemies_clustered:8>2", "cast:Rain of Fire", 56);   // placed ground AoE
                     add("has_target", "cast:Shadow Bolt", 42);               // universal filler
                 };
 
@@ -1234,7 +1238,10 @@ namespace WowPsParty
                     wlShared();
                     // Corruption is a SPREAD dot — cast_spread keeps the whole pull dotted
                     // (self-gates on who's missing it) instead of stacking it on the tank.
-                    add("has_target", "cast_spread:Corruption", 70);
+                    // Gated on in_combat, NOT has_target: a spread dot needs no specific
+                    // victim, and has_target was false when the bot had no target so it
+                    // fell straight to Rain of Fire and never dotted (Kevin).
+                    add("in_combat", "cast_spread:Corruption", 70);
                     add("target_missing_aura:Unstable Affliction", "cast:Unstable Affliction", 62);
                     add("enemies_clustered:8>2&target_missing_aura:Seed of Corruption", "cast:Seed of Corruption", 58);
                     add("target_health<25", "cast:Drain Soul", 54);   // execute drain
@@ -1247,7 +1254,7 @@ namespace WowPsParty
                     add("pet_missing", "cast_self:Summon Felguard", 89);
                     wlShared();
                     add("target_missing_aura:Immolate", "cast:Immolate", 72);
-                    add("has_target", "cast_spread:Corruption", 70);
+                    add("in_combat", "cast_spread:Corruption", 70);
                 }
                 else if (tree == 2)   // DESTRUCTION — direct fire
                 {
