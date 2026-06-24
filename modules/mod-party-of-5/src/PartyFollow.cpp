@@ -3596,27 +3596,45 @@ namespace WowPsParty
 
         Player* tank = PartyLeadTank(bot);
         if (!tank || tank == bot) return false;
+        uint32 const tankLow = tank->GetGUID().GetCounter();
 
+        bool pending;
         // BODY-PULL gather active: HOLD the whole time the lead tank is gathering the pack
         // (it runs no rotation / builds no threat during this — see TankIsBodyPulling). The
         // DPS must not engage until the gather CONCLUDES and the tank starts building threat,
         // else they'd rip the not-yet-threatened pack off it. Once the gather ends the tank
         // fights and the threat gate (TankLeadActive / THREAT_CAP) governs the real release.
-        if (TankGatherActive(tank->GetGUID().GetCounter())) return true;
-
+        if (TankGatherActive(tankLow)) pending = true;
         // (Legacy) multi-pull gather mark — held until the tank has a threat lead; self-
         // releases per mob. Kept for the non-gather mark path.
-        if (IsTankGathering(tank)) return true;
+        else if (IsTankGathering(tank)) pending = true;
+        else if (!IsTankPulling(tank->GetGUID())) pending = false;
+        else
+        {
+            // Single-mob pull: engaged the instant a hostile reaches the tank's melee
+            // (victim or any attacker) — that's "the tank has the pack", so the party is free.
+            pending = true;
+            if (Unit* tv = tank->GetVictim())
+                if (tank->IsWithinMeleeRange(tv)) pending = false;
+            if (pending)
+                for (Unit* a : tank->getAttackers())
+                    if (a && tank->IsWithinMeleeRange(a)) { pending = false; break; }
+        }
 
-        if (!IsTankPulling(tank->GetGUID())) return false;
-
-        // Single-mob pull: engaged the instant a hostile reaches the tank's melee
-        // (victim or any attacker) — that's "the tank has the pack", so the party is
-        // free to go.
-        if (Unit* tv = tank->GetVictim())
-            if (tank->IsWithinMeleeRange(tv)) return false;
-        for (Unit* a : tank->getAttackers())
-            if (a && tank->IsWithinMeleeRange(a)) return false;
+        // HARD CAP on how long the party holds fire. The releases above are reach-based
+        // ("the pack reached the tank") — but a STATIONARY pack (Maraudon's Constrictor
+        // Vines, totems, rooted casters) NEVER walks to the tank, so the reach release never
+        // fires and ranged DPS stood holding fire forever (Kruthkes idle while the party
+        // "fought" 3 vines). A tank grabs a pack in a few seconds; past that, engage anyway —
+        // a little early threat beats the whole party idling. Per-tank timer, thread_local
+        // (a tank lives on one map thread); cleared the moment the pull genuinely ends.
+        static constexpr uint32 PULL_HOLD_MAX_MS = 6000;
+        static thread_local std::unordered_map<uint32, uint32> s_pullPendStartMs;
+        if (!pending) { s_pullPendStartMs.erase(tankLow); return false; }
+        uint32 const now = getMSTime();
+        uint32& start = s_pullPendStartMs[tankLow];
+        if (start == 0) start = now;
+        if (now - start > PULL_HOLD_MAX_MS) return false;   // capped — release the DPS
         return true;
     }
 
