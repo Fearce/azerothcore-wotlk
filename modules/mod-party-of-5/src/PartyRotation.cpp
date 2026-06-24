@@ -3454,7 +3454,29 @@ namespace WowPsParty
                     castBlock = CastBlock::Position;
                     return reject("too close");
                 }
-                if (!bot->IsWithinLOSInMap(target, VMAP::ModelIgnoreFlags::M2))  // M2: match Spell::CheckCast (ignore doodad clutter)
+                // LoS: a GROUND-targeted AoE (DEST_LOCATION — Volley/Rain of Fire/Blizzard)
+                // lands on the dirt at the target's FEET, so the engine checks LoS to that
+                // GROUND point, NOT the mob's body sphere (the two disagree over a lip/lump,
+                // and the body sphere is higher + pulled toward the bot). Checking body-LoS
+                // here wrongly rejected a bot that HAS clear ground-LoS, sending it to
+                // reposition forever. Match the engine: ground-LoS for DEST spells, body-LoS
+                // otherwise; spells flagged ignore-LoS skip the check entirely.
+                bool const isGroundAoe = (info->GetExplicitTargetMask() & TARGET_FLAG_DEST_LOCATION) != 0;
+                bool const ignoresLos  = info->HasAttribute(SPELL_ATTR2_IGNORE_LINE_OF_SIGHT)
+                                      || info->HasAttribute(SPELL_ATTR5_ALWAYS_AOE_LINE_OF_SIGHT);
+                bool losOk = true;
+                if (!ignoresLos)
+                {
+                    if (isGroundAoe)
+                    {
+                        float gx, gy, gz; target->GetPosition(gx, gy, gz);
+                        losOk = GroundPointInLosFrom(bot, bot->GetPositionX(),
+                            bot->GetPositionY(), bot->GetPositionZ(), gx, gy, gz);
+                    }
+                    else
+                        losOk = bot->IsWithinLOSInMap(target, VMAP::ModelIgnoreFlags::M2);  // M2: match Spell::CheckCast
+                }
+                if (!losOk)
                 {
                     castBlock = CastBlock::Position;
                     return reject("no line of sight");
@@ -3792,10 +3814,18 @@ namespace WowPsParty
                 bool haveDest;
                 if (haveGroundLos)
                 {
-                    // Only the range blocked us — close radially to just inside
-                    // max range (the gate's "out of range" path lands here).
-                    target->GetNearPoint(bot, dx, dy, dz, 0.0f,
-                        std::max(maxRange - 3.0f, 5.0f), target->GetAngle(bot));
+                    // Only the range blocked us — close toward the cluster to a COMFORTABLE
+                    // in-range distance. NOT maxRange-3 (the very edge): GetNearPoint adds
+                    // the target's combat reach, so maxRange-3 parked the bot AT/just past
+                    // the real cast range, where the cast kept failing "out of range" and it
+                    // never actually closed — and for a long-range AoE that edge is FARTHER
+                    // than the bot already is, so it even drifted OUTWARD (Vanii/Hellenata,
+                    // flat ground: dist crept 30→39 and stuck). Aim ~60% of max range, and
+                    // never pick a spot farther than we already are (a range block means
+                    // we're at/over the edge, so this only ever closes inward).
+                    float const curDist  = bot->GetExactDist2d(target);
+                    float const wantDist = std::max(std::min(maxRange * 0.60f, curDist), 5.0f);
+                    target->GetNearPoint(bot, dx, dy, dz, 0.0f, wantDist, target->GetAngle(bot));
                     haveDest = true;
                 }
                 else
@@ -3828,8 +3858,8 @@ namespace WowPsParty
                     gl = now;
                     LOG_INFO("module",
                         "[WowPsParty Rotation] {} seeking ground-AoE LoS for spell={} "
-                        "(dist={:.1f} groundLos={})", bot->GetName(), spellId,
-                        bot->GetDistance(target), haveGroundLos ? 1 : 0);
+                        "(dist={:.1f} maxRange={:.1f} groundLos={})", bot->GetName(), spellId,
+                        bot->GetDistance(target), maxRange, haveGroundLos ? 1 : 0);
                 }
                 return true;
             }
