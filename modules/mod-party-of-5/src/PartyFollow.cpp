@@ -3199,6 +3199,56 @@ namespace WowPsParty
         return best;
     }
 
+    // Items a HENCHMAN can't USE — only a player can: dungeon KEYS (ITEM_CLASS_KEY)
+    // open doors / gates / cages / event objects the bot can't click, plus a few oddly-
+    // classed dungeon "use" keys (the Executioner's Key in Zul'Farrak is a CONSUMABLE,
+    // class 0, so the class check alone misses it). A bot hoarding one soft-locked the
+    // dungeon (Kevin: "bots pick up keys, can't use them"). These are round-robin loot
+    // (not free-for-all), so just SKIPPING the bot's own-corpse key would STRAND it
+    // (no one else may loot that corpse) — instead the bot loots it and hands it to the
+    // human (GiveLootedItemToLeader). Add more oddly-classed ones by id; every class-13
+    // key is already covered. (acore_world.item_template: class=13 OR name LIKE '%Key%'.)
+    static bool ItemIsPlayerOnly(uint32 itemid)
+    {
+        switch (itemid)
+        {
+            case 8444:   // Executioner's Key — Zul'Farrak (frees the captured prisoners)
+                return true;
+            default: break;
+        }
+        ItemTemplate const* t = sObjectMgr->GetItemTemplate(itemid);
+        return t && t->Class == ITEM_CLASS_KEY;
+    }
+
+    // Hand an item the henchman just looted to the HUMAN party leader (the hirer), so a
+    // dungeon key the bot can't use reaches a player. Direct server-side transfer — no
+    // trade window. If there's no connected leader or its bags are full, the bot simply
+    // KEEPS the item (still not stranded: the player can trade/loot it off the bot).
+    static void GiveLootedItemToLeader(Player* hench, uint32 itemid, uint32 count)
+    {
+        ObjectGuid const leaderGuid = GetLeaderFor(hench->GetGUID());
+        Player* leader = leaderGuid ? ObjectAccessor::FindConnectedPlayer(leaderGuid) : nullptr;
+        if (!leader || !leader->IsInWorld() || leader == hench) return;
+        Item* held = hench->GetItemByEntry(itemid);
+        if (!held) return;
+        uint32 const move = std::min<uint32>(count, held->GetCount());
+        ItemPosCountVec dest;
+        if (leader->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemid, move) != EQUIP_ERR_OK)
+            return;   // leader's bags full — leave it on the bot (player can trade for it)
+        hench->DestroyItemCount(itemid, move, true);
+        if (Item* given = leader->StoreNewItem(dest, itemid, true))
+        {
+            leader->SendNewItem(given, move, true, false);
+            if (leader->GetSession())
+            {
+                ItemTemplate const* t = sObjectMgr->GetItemTemplate(itemid);
+                ChatHandler(leader->GetSession()).PSendSysMessage(
+                    "|cff66ccff[WowPsParty]|r %s handed you %s — a key for you to use.",
+                    hench->GetName().c_str(), t ? t->Name1.c_str() : "an item");
+            }
+        }
+    }
+
     // Loot a reached corpse via the engine, like a player right-click + auto-loot:
     // open it, let the built-in money handler split the gold across the party,
     // then store each item slot under the group's loot rules, then release.
@@ -3236,8 +3286,17 @@ namespace WowPsParty
                 LootItem const& li = c->loot.items[i];
                 if (li.is_looted || li.freeforall || li.is_blocked || !li.is_underthreshold)
                     continue;
+                // Capture before looting — StoreLootItem flips li.is_looted.
+                uint32 const itemid = li.itemid;
+                uint32 const count  = li.count;
+                bool const playerOnly = ItemIsPlayerOnly(itemid);
                 InventoryResult msg = EQUIP_ERR_OK;
-                hench->StoreLootItem(uint8(i), &c->loot, msg);
+                if (!hench->StoreLootItem(uint8(i), &c->loot, msg))
+                    continue;
+                // A dungeon KEY the bot can't use: loot it (so round-robin doesn't strand
+                // it on the bot's corpse) then hand it straight to the human leader.
+                if (playerOnly)
+                    GiveLootedItemToLeader(hench, itemid, count);
             }
         }
 
