@@ -2852,6 +2852,28 @@ namespace WowPsParty
             return CurrentCastSpell(theTarget(), &ch, &ir) != nullptr && ir;
         }
 
+        // "target_enraged" — the target has an ENRAGE effect, the kind a hunter's
+        // Tranquilizing Shot (or a druid's Soothe) strips: an aura whose Dispel type is
+        // ENRAGE or whose mechanic is ENRAGED. Enrages are POSITIVE auras on the MOB, so
+        // the normal !IsPositive debuff check misses them — hence the dedicated scan. Pair:
+        // "target_enraged | cast:Tranquilizing Shot".
+        if (cond == "target_enraged")
+        {
+            Unit* const t = theTarget();
+            if (!t) return false;
+            for (auto const& kv : t->GetAppliedAuras())
+            {
+                Aura const* aura = kv.second ? kv.second->GetBase() : nullptr;
+                SpellInfo const* si = aura ? aura->GetSpellInfo() : nullptr;
+                if (!si) continue;
+                if (si->Dispel == DISPEL_ENRAGE || si->Mechanic == MECHANIC_ENRAGED)
+                    return true;
+                for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                    if (si->Effects[i].Mechanic == MECHANIC_ENRAGED) return true;
+            }
+            return false;
+        }
+
         // --- Target movement ---------------------------------------------
         // For snares (Hamstring / Wing Clip / Concussive Shot) you only want
         // to spend the GCD when the target is actually running.
