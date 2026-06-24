@@ -299,6 +299,46 @@ namespace WowPsParty
         }
     }
 
+    // Dominant talent TREE (tabpage 0/1/2) from a set of learned talent-rank
+    // spell ids, or -1 when the char has spent no talents yet (low level). Same
+    // point-summing as RoleFromTalents; returns the raw tree so a per-spec
+    // default rotation can be BAKED at hire time (mage Arcane/Fire/Frost etc.).
+    static int TreeFromTalents(std::unordered_set<uint32> const& known)
+    {
+        if (known.empty()) return -1;
+        uint32 points[3] = { 0, 0, 0 };
+        for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
+        {
+            TalentEntry const* tal = sTalentStore.LookupEntry(i);
+            if (!tal) continue;
+            TalentTabEntry const* tab = sTalentTabStore.LookupEntry(tal->TalentTab);
+            if (!tab || tab->tabpage > 2) continue;
+            for (int rank = int(tal->RankID.size()) - 1; rank >= 0; --rank)
+                if (tal->RankID[rank] && known.count(tal->RankID[rank]))
+                {
+                    points[tab->tabpage] += uint32(rank + 1);
+                    break;
+                }
+        }
+        if (!points[0] && !points[1] && !points[2]) return -1;
+        int tree = 0;
+        if (points[1] > points[uint32(tree)]) tree = 1;
+        if (points[2] > points[uint32(tree)]) tree = 2;
+        return tree;
+    }
+
+    // Dominant talent tree of an OFFLINE candidate, read from character_talent.
+    // Used pre-hire (the bot isn't in world yet) to bake its per-spec rotation.
+    static int DominantTalentTabDB(uint32 guid)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `spell` FROM `character_talent` WHERE `guid` = {}", guid);
+        if (!q) return -1;
+        std::unordered_set<uint32> known;
+        do { known.insert(q->Fetch()[0].Get<uint32>()); } while (q->NextRow());
+        return TreeFromTalents(known);
+    }
+
     // Short spec abbreviation for the hire screen (e.g. "Holy", "Resto", "Frost").
     // Same dominant-tree resolution as RoleFromTalents; "" when the char has no
     // talents yet (very low level — the screen then shows just the role).
@@ -437,23 +477,35 @@ namespace WowPsParty
         return -1;   // dps (any dps spec is fine), or this class can't fill the role
     }
 
-    // Canonical per-class, per-role starter rotation. Built as a priority list
+    // Dominant talent tree (0/1/2) for baking a per-spec rotation, -1 if none.
+    // Public wrapper: a connected bot's live talents win (authoritative right
+    // after a re-spec), else the offline character_talent table.
+    int DominantTreeForGuid(uint32 guid)
+    {
+        if (Player* p = ObjectAccessor::FindConnectedPlayer(
+                ObjectGuid::Create<HighGuid::Player>(guid)))
+            return DominantTalentTabLive(p);
+        return DominantTalentTabDB(guid);
+    }
+
+    // Canonical per-class, per-SPEC starter rotation. Built as a priority list
     // (the engine fires the highest-priority rule whose conditions pass and whose
     // spell is castable, falling through on cooldown/unknown). Two properties make
-    // these robust without knowing the bot's spec or level:
+    // these robust:
     //   * spell NAMES, so the engine resolves the highest rank the bot knows;
-    //   * unknown spells fall through (FindKnownSpellByName == 0), so a single
-    //     rotation can list EVERY spec's key abilities and degrade gracefully —
-    //     a low-level or off-spec bot simply skips what it hasn't learned and
-    //     drops to the filler it does know.
-    // The melee-vs-ranged hybrid DPS specs (enhancement shaman, feral cat vs
-    // balance druid) additionally gate rules on `primary_tree:N` so a melee spec
-    // doesn't try to stand and cast (and the follow layer kites/closes to match);
-    // each such branch keeps a non-spec-gated filler so no spec is left ruleless.
-    // `role` ("tank"/"healer"/"dps") tunes the warrior/DK stance/presence, the
-    // hybrids' heal aggressiveness, and tank threat/taunt rules. Empty role →
-    // the class's default role. Shared by `.party preset` and henchman hire.
-    std::string DefaultRotationForClass(uint8 cls, std::string const& role)
+    //   * unknown spells fall through (FindKnownSpellByName == 0), so a low-level
+    //     bot simply skips what it hasn't learned and drops to a filler it knows.
+    // A class with multiple DPS specs is BAKED per spec from `tree` (the dominant
+    // talent tab, see DominantTreeForGuid): each spec lists ONLY its own abilities
+    // — a Frost mage never sees a Fire spell, an Arcane mage gets its own rotation
+    // — instead of one cross-school list gated at runtime by `primary_tree:N`
+    // (which leaked the opposing school whenever the spec's own spell was briefly
+    // unavailable, the "frost mage casting Fireball" bug). `tree < 0` (pre-10 / no
+    // talents / the spec-less `.party preset`) → a simple basic rotation.
+    // `role` ("tank"/"healer"/"dps") still selects the tank/healer branch and
+    // tunes warrior/DK stance/presence. Empty role → the class's default role.
+    // Shared by `.party preset`, henchman hire, and the editor's Generate button.
+    std::string DefaultRotationForClass(uint8 cls, std::string const& role, int tree)
     {
         std::string r = role.empty() ? std::string(ClassDefaultRole(cls)) : role;
         bool const isTank   = (r == "tank");
@@ -532,49 +584,61 @@ namespace WowPsParty
                     add("has_target", "cast:Heroic Throw", 42);
                     add("self_rage>45", "cast:Heroic Strike", 30);
                 }
-                else
+                else   // DPS — Arms(0) / Fury(1), baked per spec.
                 {
-                    // Berserker Stance is the goal stance: it's the only one that
-                    // enables both the interrupt (Pummel) and Whirlwind, and the
-                    // core strikes (Mortal Strike/Bloodthirst/Slam/Execute/Heroic
-                    // Strike/Cleave) are stanceless. But it's learned at L30 — until
-                    // then a DPS warrior must hold BATTLE Stance, never Defensive.
-                    // So: keep Berserker at the higher priority (maintained at 30+),
-                    // and a Battle Stance fallback gated !stance_is_berserker — it
-                    // holds Battle while sub-30 (Berserker unknown) or any moment the
-                    // bot isn't in Berserker, WITHOUT a stance-dance: once Berserker
-                    // is up the higher rule keeps it and this one's condition is false.
-                    add("target_casting&target_interruptible", "cast:Pummel", 92);
-                    add("target_health<20", "cast:Execute", 90);
-                    add("always", "buff_self:Berserker Stance", 82);
-                    add("!stance_is_berserker", "buff_self:Battle Stance", 81);
-                    add("always", "buff_self:Battle Shout", 80);
-                    // Bloodrage: free rage on demand once in combat (off the GCD, 1-min
-                    // CD enforced by the engine; buff_self skips while its aura is up).
-                    add("in_combat", "buff_self:Bloodrage", 78);
-                    // Sweeping Strikes (Arms only — no-ops if untalented): lead an AoE
-                    // pull with it so the following strikes cleave a second target.
-                    add("in_combat&enemies_in_melee>2", "buff_self:Sweeping Strikes", 76);
-                    // Victory Rush: a big free hit, only castable in its post-kill proc
-                    // window (engine-gated), so fire it the instant it lights up.
-                    add("has_target", "cast:Victory Rush", 74);
-                    // AoE (3+ in melee): Whirlwind LEADS over Mortal Strike / Bloodthirst —
-                    // it hits the whole pack each swing, the bigger total throughput on a
-                    // cluster. Single-target keeps MS/BT first (this gate is false at <=2 in
-                    // melee); the lower Whirlwind at 62 still fires it with exactly 2 in melee.
-                    add("enemies_in_melee>2", "cast:Whirlwind", 73);
-                    add("has_target", "cast:Mortal Strike", 72);
-                    add("has_target", "cast:Bloodthirst", 71);
-                    add("enemies_in_melee>1", "cast:Whirlwind", 62);
-                    // AoE rage dump. Cleave (next-swing, hits 2 / 3 glyphed) is the AoE filler,
-                    // NOT Slam: Slam as a plain has_target filler drained every spare rage point
-                    // each GCD, so Cleave's old self_rage>45 gate was never met and it never fired
-                    // — manually forcing Cleave over Slam did far more AoE damage (Kevin). So drop
-                    // the rage gate (the engine still won't cast it when it can't afford it) and
-                    // gate SLAM to single-target, so in any AoE the rage funnels into Cleave.
-                    add("enemies_in_melee>1", "cast:Cleave", 50);
-                    add("enemies_in_melee<2&has_target", "cast:Slam", 40);
-                    add("self_rage>55", "cast:Heroic Strike", 30);
+                    // SHARED by both DPS warrior specs (and the low-level fallback).
+                    auto warDpsShared = [&]
+                    {
+                        // Berserker is the goal stance (enables Pummel + Whirlwind; the core
+                        // strikes are stanceless) but it's L30 — until then hold BATTLE, never
+                        // Defensive. Keep Berserker high, and a Battle fallback gated
+                        // !stance_is_berserker so once Berserker is up this stops firing (no
+                        // stance-dance).
+                        add("target_casting&target_interruptible", "cast:Pummel", 92);
+                        add("target_health<20", "cast:Execute", 90);
+                        add("always", "buff_self:Berserker Stance", 82);
+                        add("!stance_is_berserker", "buff_self:Battle Stance", 81);
+                        add("always", "buff_self:Battle Shout", 80);
+                        // Bloodrage: free rage in combat (off the GCD; buff_self skips while up).
+                        add("in_combat", "buff_self:Bloodrage", 78);
+                        // Victory Rush: big free hit, only castable in its post-kill proc window
+                        // (engine-gated) — fire it the instant it lights up.
+                        add("has_target", "cast:Victory Rush", 74);
+                        // Whirlwind LEADS the AoE (hits the whole pack each swing); the lower
+                        // copy still fires it with exactly 2 in melee.
+                        add("enemies_in_melee>2", "cast:Whirlwind", 73);
+                        add("enemies_in_melee>1", "cast:Whirlwind", 62);
+                        // Cleave (next-swing, hits 2/3 glyphed) is the AoE rage dump, NOT Slam:
+                        // Slam as a plain filler drained every spare rage each GCD so Cleave
+                        // never fired (Kevin). Gate Slam to single-target so AoE rage funnels
+                        // into Cleave; the engine still won't cast either when it can't afford it.
+                        add("enemies_in_melee>1", "cast:Cleave", 50);
+                        add("enemies_in_melee<2&has_target", "cast:Slam", 40);
+                        add("self_rage>55", "cast:Heroic Strike", 30);
+                    };
+
+                    if (tree == 0)   // ARMS — Mortal Strike + bleeds + cleave
+                    {
+                        warDpsShared();
+                        // Sweeping Strikes (Arms talent): lead an AoE pull so the next strikes
+                        // cleave a second target. No-ops if untalented.
+                        add("in_combat&enemies_in_melee>2", "buff_self:Sweeping Strikes", 76);
+                        add("has_target", "cast:Mortal Strike", 72);   // signature
+                        add("target_missing_aura:Rend", "cast:Rend", 64);
+                        add("has_target", "cast:Overpower", 60);       // dodge-proc'd (engine-gated)
+                    }
+                    else if (tree == 1)   // FURY — Bloodthirst + Whirlwind/Slam (shared)
+                    {
+                        warDpsShared();
+                        add("has_target", "cast:Bloodthirst", 71);   // signature
+                        // (Fury skips Rend on purpose — it lives in Berserker stance and
+                        // funnels rage into Whirlwind/Slam/Heroic Strike, not a bleed.)
+                    }
+                    else   // low level / no talents — basic warrior (shared + Rend)
+                    {
+                        warDpsShared();
+                        add("target_missing_aura:Rend", "cast:Rend", 64);
+                    }
                 }
                 break;
 
@@ -708,69 +772,109 @@ namespace WowPsParty
                 }
                 break;
 
-            case 3: // Hunter
-                // Pet summon/revive only out of combat: both fail in combat
-                // (SPELL_FAILED_DONT_REPORT) and, left ungated, fire every tick —
-                // holding the hunter mid-fight while it tries to re-summon.
-                add("out_of_combat&pet_missing", "cast_self:Call Pet", 90);
-                add("out_of_combat&pet_dead", "cast_self:Revive Pet", 88);
-                add("target_casting&target_interruptible", "cast:Silencing Shot", 87);
-                add("target_health<20", "cast:Kill Shot", 86);
-                add("pet_health<50", "cast_pet:Mend Pet", 78);
-                add("always", "buff_self:Aspect of the Hawk", 74);
-                add("target_missing_aura:Hunter's Mark", "cast:Hunter's Mark", 70);
-                add("target_missing_aura:Serpent Sting", "cast:Serpent Sting", 66);
-                add("has_target", "cast:Chimera Shot", 62);
-                add("has_target", "cast:Explosive Shot", 61);
-                add("has_target", "cast:Aimed Shot", 56);
-                // AoE on the densest mob CLUSTER, not hostiles near the hunter
-                // (who stands at range). Volley (placed ground AoE) leads on a
-                // pack; Multi-Shot is the instant fallback.
-                add("enemies_clustered:8>2", "cast:Volley", 54);
-                add("enemies_clustered:8>2", "cast:Multi-Shot", 52);
-                // Forced into melee (no tank peeled the mob off us, so we stand
-                // our ground): a hunter can't shoot in the dead zone, so weave
-                // the melee strikes. Gate on target_attacking_me (we have AGGRO)
-                // as well as a mob in melee range — otherwise, when the victim is
-                // our far ranged target, Raptor Strike fails out-of-range and the
-                // cast path walks us INTO melee, then we back out, forever.
-                add("enemies_in_melee>0&target_attacking_me", "cast:Raptor Strike", 51);
-                add("enemies_in_melee>0&target_attacking_me", "cast:Mongoose Bite", 50);
-                add("has_target", "cast:Arcane Shot", 46);
-                add("has_target", "cast:Steady Shot", 36);
-                break;
+            case 3: // Hunter — Beast Mastery(0) / Marksmanship(1) / Survival(2), baked per spec.
+            {
+                // SHARED by every hunter spec (and the low-level fallback).
+                auto hunterShared = [&]
+                {
+                    // Pet summon/revive only OUT OF COMBAT: both fail in combat and, left
+                    // ungated, fire every tick — holding the hunter while it re-summons.
+                    add("out_of_combat&pet_missing", "cast_self:Call Pet", 90);
+                    add("out_of_combat&pet_dead", "cast_self:Revive Pet", 88);
+                    add("target_casting&target_interruptible", "cast:Silencing Shot", 87);
+                    add("target_health<20", "cast:Kill Shot", 86);
+                    add("pet_health<50", "cast_pet:Mend Pet", 78);
+                    add("always", "buff_self:Aspect of the Hawk", 74);
+                    add("target_missing_aura:Hunter's Mark", "cast:Hunter's Mark", 70);
+                    add("target_missing_aura:Serpent Sting", "cast:Serpent Sting", 66);
+                    // AoE on the densest CLUSTER (a ranged hunter stands back). Volley
+                    // (placed ground AoE) leads; Multi-Shot is the instant fallback.
+                    add("enemies_clustered:8>2", "cast:Volley", 54);
+                    add("enemies_clustered:8>2", "cast:Multi-Shot", 52);
+                    // Forced into melee (no tank peeled the mob): a hunter can't shoot in
+                    // the dead zone, so weave the strikes. Gate on target_attacking_me (we
+                    // have AGGRO) + a mob in melee range — else, with a far ranged victim,
+                    // Raptor Strike fails out-of-range and the cast path walks us INTO
+                    // melee, then back out, forever.
+                    add("enemies_in_melee>0&target_attacking_me", "cast:Raptor Strike", 51);
+                    add("enemies_in_melee>0&target_attacking_me", "cast:Mongoose Bite", 50);
+                    add("has_target", "cast:Arcane Shot", 46);
+                    add("has_target", "cast:Steady Shot", 36);   // signature-shot filler (all specs)
+                };
 
-            case 4: // Rogue
-                add("target_casting&target_interruptible", "cast:Kick", 92);
-                // Blade Flurry: the combat cleave cooldown — pop it whenever 3+ mobs
-                // are in melee so every strike hits a second target. buff_self falls
-                // through while it's active or on cooldown, so the high priority is
-                // free (it only wins the tick it actually fires).
-                add("enemies_in_melee>2", "buff_self:Blade Flurry", 84);
-                add("out_of_combat&self_missing_aura:Stealth", "cast_self:Stealth", 80);
-                // Execute finisher: a dying target gets Eviscerated NOW with as few
-                // as 3 combo points rather than waiting for 5 (or wasting a bleed) —
-                // above Slice and Dice so we don't refresh a buff on a corpse.
-                add("target_health<20&self_combo>2", "cast:Eviscerate", 78);
-                // Slice and Dice only on ELITES/bosses (long fights). On normal
-                // trash, maintaining SnD just burns the first 2 combo every time
-                // the short buff lapses, and with rogue energy being slow the mob
-                // dies before combo ever banks to 5 — so Rupture/Eviscerate never
-                // fire. Gating SnD to elites lets trash combo flow to the finisher
-                // (the <20% execute above, or a full Eviscerate) instead.
-                add("self_missing_aura:Slice and Dice&self_combo>1&target_is_elite", "cast:Slice and Dice", 76);
-                // Rupture only if the bleed has time to pay off: target_ttd>8 is
-                // TRUE for an unmeasured/long-lived mob (fresh boss) and FALSE for a
-                // trash mob about to die — so we never waste a finisher's combo on a
-                // DoT that won't tick. (The <20% execute above already pre-empts it
-                // for dying targets at 3+ combo.)
-                add("self_combo>4&target_missing_aura:Rupture&target_ttd>8", "cast:Rupture", 70);
-                add("self_combo>4", "cast:Eviscerate", 66);
-                add("enemies_in_melee>2", "cast:Fan of Knives", 58);
-                add("has_target", "cast:Mutilate", 46);
-                add("has_target", "cast:Hemorrhage", 44);
-                add("has_target", "cast:Sinister Strike", 40);
+                if (tree == 0)   // BEAST MASTERY — pet burst
+                {
+                    hunterShared();
+                    add("has_target", "buff_self:Bestial Wrath", 60);   // damage CD (off the GCD)
+                    add("has_target", "cast:Kill Command", 58);         // signature
+                }
+                else if (tree == 1)   // MARKSMANSHIP — aimed/chimera shots
+                {
+                    hunterShared();
+                    add("has_target", "cast:Chimera Shot", 62);   // signature (refreshes Serpent Sting)
+                    add("has_target", "cast:Aimed Shot", 56);
+                }
+                else if (tree == 2)   // SURVIVAL — explosive/black arrow
+                {
+                    hunterShared();
+                    add("target_missing_aura:Black Arrow", "cast:Black Arrow", 62);   // signature DoT (talent)
+                    add("has_target", "cast:Explosive Shot", 60);                     // signature (Lock and Load)
+                }
+                else   // low level / no talents — basic hunter (shared shots cover it)
+                {
+                    hunterShared();
+                }
                 break;
+            }
+
+            case 4: // Rogue — Assassination(0) / Combat(1) / Subtlety(2), baked per spec.
+            {
+                // SHARED by every rogue spec: utility, finishers, AoE. The combo
+                // BUILDER differs per spec (added in the branch).
+                auto rogueShared = [&]
+                {
+                    add("target_casting&target_interruptible", "cast:Kick", 92);
+                    add("out_of_combat&self_missing_aura:Stealth", "cast_self:Stealth", 80);
+                    // Execute finisher: a dying target gets Eviscerated NOW with as few as
+                    // 3 combo rather than waiting for 5 — above Slice and Dice so we don't
+                    // refresh a buff on a corpse.
+                    add("target_health<20&self_combo>2", "cast:Eviscerate", 78);
+                    // Slice and Dice only on ELITES (long fights). On trash it just burns
+                    // the first 2 combo each time the short buff lapses and the mob dies
+                    // before combo banks to 5, so the finishers never fire.
+                    add("self_missing_aura:Slice and Dice&self_combo>1&target_is_elite", "cast:Slice and Dice", 76);
+                    // Rupture only if the bleed has time to pay off (target_ttd>8 = a long-
+                    // lived/boss mob; FALSE for trash about to die).
+                    add("self_combo>4&target_missing_aura:Rupture&target_ttd>8", "cast:Rupture", 70);
+                    add("self_combo>4", "cast:Eviscerate", 66);
+                    add("enemies_in_melee>2", "cast:Fan of Knives", 58);   // AoE
+                    add("has_target", "cast:Sinister Strike", 40);          // universal builder fallback
+                };
+
+                if (tree == 0)   // ASSASSINATION — Mutilate builder, Envenom finisher
+                {
+                    rogueShared();
+                    add("self_combo>4", "cast:Envenom", 67);   // poison finisher (above the Eviscerate fallback)
+                    add("has_target", "cast:Mutilate", 46);    // signature builder (needs daggers)
+                }
+                else if (tree == 1)   // COMBAT — Sinister Strike + Blade Flurry cleave
+                {
+                    rogueShared();
+                    // Blade Flurry: cleave CD whenever 3+ are in melee. buff_self falls
+                    // through while active / on cooldown, so the high priority is free.
+                    add("enemies_in_melee>2", "buff_self:Blade Flurry", 84);
+                }
+                else if (tree == 2)   // SUBTLETY — Hemorrhage builder
+                {
+                    rogueShared();
+                    add("has_target", "cast:Hemorrhage", 44);   // signature builder (above Sinister Strike)
+                }
+                else   // low level / no talents — basic rogue (Sinister Strike + finishers)
+                {
+                    rogueShared();
+                }
+                break;
+            }
 
             case 5: // Priest
                 if (isHealer)
@@ -876,21 +980,42 @@ namespace WowPsParty
                     add("has_target", "cast:Rune Strike", 44);
                     add("has_target", "cast:Death Coil", 38);
                 }
-                else
+                else   // DPS — Blood(0) / Frost(1) / Unholy(2), baked per spec.
                 {
-                    add("target_casting&target_interruptible", "cast:Mind Freeze", 86);
-                    add("self_health<50", "cast:Death Strike", 80);
-                    add("always", "buff_self:Unholy Presence", 74);
-                    add("target_missing_aura:Frost Fever", "cast:Icy Touch", 70);
-                    add("target_missing_aura:Blood Plague", "cast:Plague Strike", 69);
-                    add("enemies_in_melee>2", "cast:Death and Decay", 64);
-                    add("enemies_in_melee>2", "cast:Pestilence", 58);
-                    add("has_target", "cast:Scourge Strike", 54);
-                    add("has_target", "cast:Obliterate", 53);
-                    add("has_target", "cast:Heart Strike", 50);
-                    add("has_target", "cast:Blood Strike", 46);
-                    add("has_target", "cast:Frost Strike", 42);
-                    add("has_target", "cast:Death Coil", 40);
+                    // SHARED by every DPS DK spec (and the low-level fallback): interrupt,
+                    // self-heal strike, the two diseases, AoE, rune builder + RP dump.
+                    auto dkDpsShared = [&]
+                    {
+                        add("target_casting&target_interruptible", "cast:Mind Freeze", 86);
+                        add("self_health<50", "cast:Death Strike", 80);   // self-heal strike
+                        add("target_missing_aura:Frost Fever", "cast:Icy Touch", 70);
+                        add("target_missing_aura:Blood Plague", "cast:Plague Strike", 69);
+                        add("enemies_in_melee>2", "cast:Death and Decay", 64);   // ground AoE
+                        add("enemies_in_melee>2", "cast:Pestilence", 58);        // spread diseases
+                        add("has_target", "cast:Blood Strike", 46);   // rune builder
+                        add("has_target", "cast:Death Coil", 40);     // runic-power dump
+                    };
+
+                    if (tree == 1)   // FROST — Obliterate + Frost Strike
+                    {
+                        dkDpsShared();
+                        add("always", "buff_self:Blood Presence", 74);   // the DPS presence (+damage)
+                        add("enemies_in_melee>2", "cast:Howling Blast", 56);   // frost AoE (talent)
+                        add("has_target", "cast:Obliterate", 54);              // signature
+                        add("has_target", "cast:Frost Strike", 42);            // RP dump (above Death Coil)
+                    }
+                    else if (tree == 2)   // UNHOLY — Scourge Strike + Death Coil
+                    {
+                        dkDpsShared();
+                        add("always", "buff_self:Unholy Presence", 74);   // +haste
+                        add("has_target", "cast:Scourge Strike", 54);     // signature
+                    }
+                    else   // BLOOD dps(0) — Heart Strike; also the low-level fallback.
+                    {
+                        dkDpsShared();
+                        add("always", "buff_self:Blood Presence", 74);   // +damage
+                        add("has_target", "cast:Heart Strike", 52);      // signature
+                    }
                 }
                 break;
 
@@ -946,136 +1071,196 @@ namespace WowPsParty
                     add("self_mana>88&target_missing_aura:Flame Shock", "cast:Flame Shock", 34);
                     add("self_mana>88&has_target", "cast:Lightning Bolt", 30);
                 }
-                else
+                else   // DPS — Elemental(0) / Enhancement(1), baked per spec.
                 {
-                    add("party_lowest_health<30", "cast_party_lowest:Healing Wave", 86);
-                    add("target_casting&target_interruptible", "cast:Wind Shear", 82);
-                    // Shield: Enhancement is in melee, so Lightning Shield (damage-on-hit).
-                    // Ranged Elemental (and the unspecced caster fallback) takes Water Shield
-                    // (mana) while a tank holds aggro, else Lightning Shield (Kevin).
-                    add("primary_tree:1", "buff_self:Lightning Shield", 78);
-                    add("!primary_tree:1&party_has_tank",  "buff_self:Water Shield", 78);
-                    add("!primary_tree:1&!party_has_tank", "buff_self:Lightning Shield", 77);
-                    // Weapon imbue — OUT OF COMBAT, high prio (buff_self detects the weapon
-                    // temp-enchant and skips once imbued, so the priority is free). Enh ->
-                    // Windfury Weapon, falling back to Rockbiter Weapon while Windfury isn't
-                    // trained yet (sub-30: !spell_ready means "not known" — imbues have no
-                    // cooldown — so this stops overwriting Windfury once it IS known). Ele /
-                    // unspecced -> Flametongue Weapon.
-                    add("out_of_combat&primary_tree:1", "buff_self:Windfury Weapon", 85);
-                    add("out_of_combat&primary_tree:1&!spell_ready:Windfury Weapon", "buff_self:Rockbiter Weapon", 84);
-                    add("out_of_combat&!primary_tree:1", "buff_self:Flametongue Weapon", 85);
-                    add("target_missing_aura:Flame Shock", "cast:Flame Shock", 72);
-                    // Totems — IN COMBAT only (Kevin). The attack totem goes IN to the pack
-                    // (cast_totem_attack walks the shaman in and re-places it on each new
-                    // pack); buff totems drop at the shaman's feet and re-drop (totem_buff_stale)
-                    // once the party out-runs the old one. Air splits by spec.
-                    add("in_combat&totem_attack_needed:fire", "cast_totem_attack:Searing Totem", 54);     // extra fire damage on the pack
-                    add("in_combat&totem_buff_stale:earth", "cast_self:Strength of Earth Totem", 50);     // party melee AP
-                    add("in_combat&totem_buff_stale:water", "cast_self:Mana Spring Totem", 49);           // party mana regen
-                    add("in_combat&primary_tree:1&totem_buff_stale:air",  "cast_self:Windfury Totem", 48);    // melee haste (Enh)
-                    add("in_combat&!primary_tree:1&totem_buff_stale:air", "cast_self:Wrath of Air Totem", 48); // spell haste (Ele)
-                    // ENHANCEMENT (talent tree 1): melee. Stormstrike/Lava Lash,
-                    // Earth Shock as the instant dump, and an INSTANT Lightning
-                    // Bolt at 5 stacks of Maelstrom Weapon. The follow layer
-                    // treats tree-1 shamans as melee so they close to contact.
-                    add("primary_tree:1&has_target", "cast:Stormstrike", 70);
-                    add("primary_tree:1&has_target", "cast:Lava Lash", 64);
-                    // Enh is a MELEE spec: its only nukes are the INSTANT Maelstrom-
-                    // Weapon procs (5 stacks). A hard-cast Lightning Bolt / Chain
-                    // Lightning would make the cast resolver pull the shaman out to
-                    // cast range and stay there — the bug where enh "fights at range".
-                    // So enh casts CL (cluster) / LB (single) ONLY with the proc, and
-                    // the ranged fillers below are gated !enh. Everything enh casts is
-                    // instant (Stormstrike/Lava Lash/Earth Shock/proc'd LB-CL), so it
-                    // never leaves melee.
-                    add("primary_tree:1&self_aura_stacks:Maelstrom Weapon>4&enemies_clustered:8>2", "cast:Chain Lightning", 61);
-                    add("primary_tree:1&self_aura_stacks:Maelstrom Weapon>4", "cast:Lightning Bolt", 60);
-                    // ELEMENTAL (tree 0): ranged nuker.
-                    add("primary_tree:0&has_target", "cast:Lava Burst", 66);
-                    // Ranged cluster AoE — ELE / unspecced only (enh uses the instant
-                    // Maelstrom Chain Lightning above); !enh so a melee shaman never
-                    // hard-casts it from range.
-                    add("enemies_clustered:8>2&!primary_tree:1", "cast:Chain Lightning", 56);
-                    add("has_target", "cast:Earth Shock", 46);     // enh dump / ele instant
-                    // Ranged filler — ELE / unspecced only; enh weaves melee + Earth Shock.
-                    add("!primary_tree:1&has_target", "cast:Lightning Bolt", 38);
+                    // SHARED by both DPS shaman specs (and the low-level fallback).
+                    auto shaDpsShared = [&]
+                    {
+                        add("party_lowest_health<30", "cast_party_lowest:Healing Wave", 86);
+                        add("target_casting&target_interruptible", "cast:Wind Shear", 82);
+                        add("target_missing_aura:Flame Shock", "cast:Flame Shock", 72);
+                        // Totems — IN COMBAT only (Kevin). The attack totem walks IN to
+                        // the pack and re-places on each new pack; buff totems drop at the
+                        // shaman's feet and re-drop (totem_buff_stale) once the party out-
+                        // runs them. The air totem is spec-specific (added per branch).
+                        add("in_combat&totem_attack_needed:fire", "cast_totem_attack:Searing Totem", 54); // pack fire damage
+                        add("in_combat&totem_buff_stale:earth", "cast_self:Strength of Earth Totem", 50); // party melee AP
+                        add("in_combat&totem_buff_stale:water", "cast_self:Mana Spring Totem", 49);       // party mana regen
+                        add("has_target", "cast:Earth Shock", 46);   // ele instant / enh dump
+                    };
+
+                    if (tree == 1)   // ENHANCEMENT — melee
+                    {
+                        shaDpsShared();
+                        add("always", "buff_self:Lightning Shield", 78);   // damage-on-hit (in melee)
+                        // Windfury Weapon imbue OOC; Rockbiter only while Windfury isn't
+                        // trained yet (!spell_ready == not known; imbues have no cooldown,
+                        // so it never overwrites a known Windfury).
+                        add("out_of_combat", "buff_self:Windfury Weapon", 85);
+                        add("out_of_combat&!spell_ready:Windfury Weapon", "buff_self:Rockbiter Weapon", 84);
+                        add("in_combat&totem_buff_stale:air", "cast_self:Windfury Totem", 48);  // melee haste
+                        add("has_target", "cast:Stormstrike", 70);
+                        add("has_target", "cast:Lava Lash", 64);
+                        // Enh's only nukes are the INSTANT Maelstrom-Weapon procs (5 stacks)
+                        // — a hard cast would pull the shaman to range and keep it there
+                        // (the "enh fights at range" bug). So CL (cluster) / LB (single)
+                        // ONLY with the proc; everything else enh casts is instant.
+                        add("self_aura_stacks:Maelstrom Weapon>4&enemies_clustered:8>2", "cast:Chain Lightning", 61);
+                        add("self_aura_stacks:Maelstrom Weapon>4", "cast:Lightning Bolt", 60);
+                    }
+                    else if (tree == 0)   // ELEMENTAL — ranged nuker
+                    {
+                        shaDpsShared();
+                        // Water Shield (mana) behind a tank; Lightning Shield when it holds
+                        // its own aggro (Kevin: ranged shamans prefer water with a tank).
+                        add("party_has_tank",  "buff_self:Water Shield", 78);
+                        add("!party_has_tank", "buff_self:Lightning Shield", 77);
+                        add("out_of_combat", "buff_self:Flametongue Weapon", 85);
+                        add("in_combat&totem_buff_stale:air", "cast_self:Wrath of Air Totem", 48);  // spell haste
+                        add("has_target", "cast:Lava Burst", 66);
+                        add("enemies_clustered:8>2", "cast:Chain Lightning", 56);   // ranged cluster AoE
+                        add("has_target", "cast:Lightning Bolt", 38);              // ranged filler
+                    }
+                    else   // low level / no talents — basic caster shaman
+                    {
+                        shaDpsShared();
+                        add("party_has_tank",  "buff_self:Water Shield", 78);
+                        add("!party_has_tank", "buff_self:Lightning Shield", 77);
+                        add("out_of_combat", "buff_self:Flametongue Weapon", 85);
+                        add("has_target", "cast:Lightning Bolt", 38);
+                    }
                 }
                 break;
 
-            case 8: // Mage
-                add("target_casting&target_interruptible", "cast:Counterspell", 88);
-                // Out of mana mid-fight: channel Evocation to refill — high priority,
-                // since a dry mage contributes nothing anyway. Mage-only (cooldown
-                // enforced by the engine); gated <10% so it fires only when genuinely
-                // empty, never as a filler. Sits just under the interrupt.
-                add("in_combat&self_mana<10", "cast_self:Evocation", 87);
-                add("self_missing_aura:Ice Barrier", "cast_self:Ice Barrier", 80);
-                // Only when a melee is ACTUALLY swinging at the mage (root-and-run defence),
-                // not merely near it — else the mage roots the tank's body-pull mob in place
-                // far from the tank the instant it walks past (Mill). melee_attackers = mobs
-                // in the mage's attacker set, vs enemies_in_melee = mere proximity.
-                add("melee_attackers>0", "cast_self:Frost Nova", 76);
-                add("always", "buff_self:Frost Armor", 72);
-                add("target_missing_aura:Living Bomb", "cast:Living Bomb", 68);
-                add("always", "cast_party_missing:Arcane Intellect", 60);
-                // Placed AoE keys off the densest mob CLUSTER (3+ enemies within
-                // ~8y of each OTHER), not hostiles near the mage — a ranged mage
-                // stands well back, so a bot-centred count reads 0 on a pack it
-                // could nuke. Fire leads Flamestrike; everyone else leads Blizzard.
-                // The Flamestrike fallback is gated !Frost (primary_tree:2) so a
-                // Frost mage never casts it when Blizzard is briefly unavailable.
-                add("enemies_clustered:8>2&primary_tree:1", "cast:Flamestrike", 60);
-                add("enemies_clustered:8>2", "cast:Blizzard", 58);
-                add("enemies_clustered:8>2&!primary_tree:2", "cast:Flamestrike", 56);
-                // Single-target nuke LEADS with the spec's own school: Fire -> Fireball,
-                // Frost -> Frostbolt (this used to be a flat Frostbolt-first list, so a
-                // Fire mage frost-bolted and a Frost mage could drop to Fireball). The
-                // generic fallbacks EXCLUDE the opposing spec, so Frost never Fireballs
-                // and Fire never Frostbolts; Arcane / unspecced keep the Frostbolt-led order.
-                add("primary_tree:1&has_target", "cast:Fireball", 46);
-                add("primary_tree:2&has_target", "cast:Frostbolt", 46);
-                add("!primary_tree:1&has_target", "cast:Frostbolt", 44);
-                add("!primary_tree:2&has_target", "cast:Fireball", 42);
-                add("has_target", "cast:Arcane Blast", 40);
-                // Disabled by default: henchmen recover for free (eat/drink
-                // below) and don't need conjured items, and a henchman mage
-                // burning mana to conjure between pulls just slows the party.
-                // Kept in the rotation (flagged "disabled") so a player running
-                // a mage as one of their own alt-bots can tick it on in the
-                // editor to stock the shared bags.
-                add("out_of_combat&shared_drink<5", "cast_self:Conjure Water", 18, "disabled");
-                add("out_of_combat&shared_food<5", "cast_self:Conjure Food", 16, "disabled");
-                break;
+            case 8: // Mage — Arcane(0) / Fire(1) / Frost(2), baked per spec.
+            {
+                // SHARED by every mage spec (and the low-level fallback).
+                auto mageShared = [&]
+                {
+                    add("target_casting&target_interruptible", "cast:Counterspell", 88);
+                    // Out of mana mid-fight: channel Evocation to refill — high priority,
+                    // since a dry mage contributes nothing anyway. Mage-only (cooldown
+                    // enforced by the engine); gated <10% so it fires only when genuinely
+                    // empty, never as a filler. Sits just under the interrupt.
+                    add("in_combat&self_mana<10", "cast_self:Evocation", 87);
+                    // Ice Barrier is a Frost talent — falls through (unknown) for Fire/
+                    // Arcane, who have no comparable absorb in their default kit.
+                    add("self_missing_aura:Ice Barrier", "cast_self:Ice Barrier", 80);
+                    // Only when a melee is ACTUALLY swinging at the mage (root-and-run defence),
+                    // not merely near it — else the mage roots the tank's body-pull mob in place
+                    // far from the tank the instant it walks past (Mill). melee_attackers = mobs
+                    // in the mage's attacker set, vs enemies_in_melee = mere proximity.
+                    add("melee_attackers>0", "cast_self:Frost Nova", 76);
+                    add("always", "cast_party_missing:Arcane Intellect", 60);
+                    // Disabled by default: henchmen recover for free (eat/drink below) and
+                    // don't need conjured items. Kept (flagged "disabled") so a player
+                    // running a mage as an alt-bot can tick it on to stock the shared bags.
+                    add("out_of_combat&shared_drink<5", "cast_self:Conjure Water", 18, "disabled");
+                    add("out_of_combat&shared_food<5", "cast_self:Conjure Food", 16, "disabled");
+                };
 
-            case 9: // Warlock
-                // Demonology (talent tree 1) runs its signature FELGUARD, not the Imp.
-                // Higher priority than the Imp rule; if the bot doesn't actually know
-                // Summon Felguard (not deep enough in Demo), the cast fails and it falls
-                // through to the Imp below — so Affliction/Destruction still get the Imp.
-                add("pet_missing&primary_tree:1", "cast_self:Summon Felguard", 89);
-                add("pet_missing", "cast_self:Summon Imp", 88);
-                add("self_health<35", "cast:Death Coil", 82);
-                add("self_missing_aura:Demon Armor", "cast_self:Demon Armor", 76);
-                // Immolate disabled by default (kept in the list so a Destro player
-                // can tick it back on in the editor). Corruption is a SPREAD dot now —
-                // cast_spread keeps the whole pull dotted (self-gates on who's missing
-                // it) instead of stacking it on the tank's single target.
-                add("target_missing_aura:Immolate", "cast:Immolate", 72, "disabled");
-                add("has_target", "cast_spread:Corruption", 70);
-                add("target_missing_aura:Curse of Agony", "cast:Curse of Agony", 66);
-                add("target_missing_aura:Unstable Affliction", "cast:Unstable Affliction", 62);
-                // AoE on the densest mob CLUSTER, not hostiles near the warlock
-                // (who stands at range). Seed of Corruption (spreads off the
-                // current target) leads; Rain of Fire (placed ground AoE) backs
-                // it up on a fresh pack with no Seed yet.
-                add("enemies_clustered:8>2&target_missing_aura:Seed of Corruption", "cast:Seed of Corruption", 58);
-                add("enemies_clustered:8>2", "cast:Rain of Fire", 56);
-                add("target_health<25", "cast:Drain Soul", 54);
-                add("has_target", "cast:Haunt", 50);
-                add("has_target", "cast:Incinerate", 44);
-                add("has_target", "cast:Shadow Bolt", 42);
+                if (tree == 1)   // FIRE
+                {
+                    mageShared();
+                    // Molten Armor (L62, +crit/+spell-hit) is the fire/arcane armor; Frost
+                    // Armor only while Molten isn't trained yet (!spell_ready == not known,
+                    // armor has no cooldown), so it never overwrites an active Molten Armor.
+                    add("always", "buff_self:Molten Armor", 72);
+                    add("!spell_ready:Molten Armor", "buff_self:Frost Armor", 71);
+                    add("target_missing_aura:Living Bomb", "cast:Living Bomb", 68);
+                    // Ground AoE on the densest CLUSTER (a ranged mage stands back, so a
+                    // bot-centred melee count reads 0 on a pack it could nuke).
+                    add("enemies_clustered:8>2", "cast:Flamestrike", 60);
+                    add("has_target", "cast:Fireball", 46);   // primary nuke
+                    add("has_target", "cast:Scorch", 40);     // instant-ish filler / on the move
+                    add("has_target", "cast:Fire Blast", 38); // instant, off cooldown
+                }
+                else if (tree == 2)   // FROST
+                {
+                    mageShared();
+                    add("always", "buff_self:Ice Armor", 72);  // Frost's own armor (L34 upgrade of Frost Armor)
+                    add("!spell_ready:Ice Armor", "buff_self:Frost Armor", 71);
+                    add("enemies_clustered:8>2", "cast:Blizzard", 60);  // frost ground AoE
+                    add("has_target", "cast:Frostbolt", 46);   // primary nuke
+                    add("has_target", "cast:Ice Lance", 40);   // instant filler (Fingers of Frost / movement)
+                }
+                else if (tree == 0)   // ARCANE
+                {
+                    mageShared();
+                    add("always", "buff_self:Molten Armor", 72);
+                    add("!spell_ready:Molten Armor", "buff_self:Frost Armor", 71);
+                    // Arcane's only AoE is the PBAoE Arcane Explosion — gate on mobs
+                    // ACTUALLY in melee on the mage (it has no ranged AoE; we never walk
+                    // a ranged arcane mage into a pack just to AoE).
+                    add("enemies_in_melee>2", "cast:Arcane Explosion", 58);
+                    add("has_target", "cast:Arcane Blast", 46);    // primary nuke (ramps)
+                    add("has_target", "cast:Arcane Missiles", 44); // Missile Barrage proc / filler
+                    add("has_target", "cast:Arcane Barrage", 40);  // instant dump / movement (L80)
+                }
+                else   // tree < 0 — low level / no talents: basic mage.
+                {
+                    mageShared();
+                    add("always", "buff_self:Frost Armor", 72);
+                    add("has_target", "cast:Frostbolt", 46);
+                    add("has_target", "cast:Fireball", 44);
+                    add("has_target", "cast:Fire Blast", 40);
+                }
                 break;
+            }
+
+            case 9: // Warlock — Affliction(0) / Demonology(1) / Destruction(2), baked per spec.
+            {
+                // SHARED by every warlock spec (and the low-level fallback).
+                auto wlShared = [&]
+                {
+                    add("pet_missing", "cast_self:Summon Imp", 88);
+                    add("self_health<35", "cast:Death Coil", 82);
+                    // Fel Armor (L62, +spell power & healing taken) is the caster armor;
+                    // Demon Armor only while Fel Armor isn't trained yet (!spell_ready ==
+                    // not known; armor has no cooldown, so it never overwrites Fel Armor).
+                    add("always", "buff_self:Fel Armor", 76);
+                    add("!spell_ready:Fel Armor", "buff_self:Demon Armor", 75);
+                    add("target_missing_aura:Curse of Agony", "cast:Curse of Agony", 66);
+                    // AoE on the densest mob CLUSTER (a ranged warlock stands well back).
+                    add("enemies_clustered:8>2", "cast:Rain of Fire", 56);   // placed ground AoE
+                    add("has_target", "cast:Shadow Bolt", 42);               // universal filler
+                };
+
+                if (tree == 0)   // AFFLICTION — DoTs + drain
+                {
+                    wlShared();
+                    // Corruption is a SPREAD dot — cast_spread keeps the whole pull dotted
+                    // (self-gates on who's missing it) instead of stacking it on the tank.
+                    add("has_target", "cast_spread:Corruption", 70);
+                    add("target_missing_aura:Unstable Affliction", "cast:Unstable Affliction", 62);
+                    add("enemies_clustered:8>2&target_missing_aura:Seed of Corruption", "cast:Seed of Corruption", 58);
+                    add("target_health<25", "cast:Drain Soul", 54);   // execute drain
+                    add("has_target", "cast:Haunt", 50);
+                }
+                else if (tree == 1)   // DEMONOLOGY — Felguard + Immolate/Corruption + Shadow Bolt
+                {
+                    // Signature FELGUARD above the Imp; falls through to the Imp (in
+                    // wlShared) if not deep enough in Demo to know it.
+                    add("pet_missing", "cast_self:Summon Felguard", 89);
+                    wlShared();
+                    add("target_missing_aura:Immolate", "cast:Immolate", 72);
+                    add("has_target", "cast_spread:Corruption", 70);
+                }
+                else if (tree == 2)   // DESTRUCTION — direct fire
+                {
+                    wlShared();
+                    add("target_missing_aura:Immolate", "cast:Immolate", 72);   // core, keep up
+                    add("has_target", "cast:Conflagrate", 68);   // consumes Immolate (talent)
+                    add("has_target", "cast:Chaos Bolt", 60);    // talent nuke (L80)
+                    add("has_target", "cast:Incinerate", 44);    // primary filler (above Shadow Bolt)
+                }
+                else   // low level / no talents — basic warlock
+                {
+                    wlShared();
+                    add("has_target", "cast:Corruption", 70);
+                }
+                break;
+            }
 
             case 11: // Druid
                 if (isHealer)
@@ -1149,59 +1334,49 @@ namespace WowPsParty
                     add("target_missing_aura:Faerie Fire (Feral)", "cast:Faerie Fire (Feral)", 54);
                     add("has_target", "cast:Maul", 40);
                 }
-                else
-                {
+                else   // DPS — Feral cat(1) vs Balance(0). The follow layer reads live
+                {      // talents (PrimaryTalentTree) to kite/close, independent of this.
                     add("party_lowest_health<30", "cast_party_lowest:Healing Touch", 84);
-                    // Mark of the Wild can't be cast in Cat/Bear form — casting it
-                    // would drop the combat form, and with party bots perpetually
-                    // "missing" the buff an `always` rule re-broke the form every tick
-                    // (the balance/feral druid "spazzing through forms, never fighting").
-                    // Only buff it when genuinely idle (out of combat AND no target),
-                    // the same moment the cancel_form rules below drop to caster form.
+                    // Mark of the Wild can't be cast in Cat/Bear/Moonkin form — casting it
+                    // would drop the form, and with bots perpetually "missing" the buff an
+                    // `always` rule re-broke the form every tick (the druid "spazzing
+                    // through forms, never fighting"). Only when genuinely idle (out of
+                    // combat AND no target), the same moment cancel_form drops to caster.
                     add("out_of_combat&no_target", "cast_party_missing:Mark of the Wild", 60);
-                    // FERAL CAT (talent tree 1): melee combo build/spend, like a
-                    // rogue. The follow layer treats tree-1 druids as melee. Shift
-                    // to Cat Form only in combat (has_target) so it can still mount
-                    // / buff out of combat. Savage Roar gated to elites for the
-                    // same reason rogue Slice and Dice is — on trash it just eats
-                    // the combo the damage finishers need (see LESSONS).
-                    // Shift into the combat form on IN_COMBAT, not has_target: a target
-                    // isn't always set the instant a fight starts (esp. for an AoE opener
-                    // keyed off a cluster, not a single victim), which left the druid
-                    // un-shifted and unable to act. cancel_form below drops it back out of
-                    // combat. The form-up still won't fire out of combat, so it can still
-                    // mount/buff/drink between pulls.
-                    add("primary_tree:1&in_combat&self_missing_aura:Cat Form", "buff_self:Cat Form", 82);
-                    add("primary_tree:1&has_target&self_energy<35", "cast_self:Tiger's Fury", 79);
-                    add("primary_tree:1&self_missing_aura:Savage Roar&self_combo>0&target_is_elite", "cast:Savage Roar", 77);
-                    add("primary_tree:1&target_health<25&self_combo>2", "cast:Ferocious Bite", 75);
-                    add("primary_tree:1&self_combo>4&target_missing_aura:Rip&target_ttd>8", "cast:Rip", 73);
-                    add("primary_tree:1&self_combo>4", "cast:Ferocious Bite", 70);
-                    add("primary_tree:1&target_missing_aura:Rake", "cast:Rake", 66);
-                    // Cat-form Swipe IS a front cone — aim it at the most enemies (cast_cone)
-                    // when there are 3+ in melee, before single-target builders.
-                    add("primary_tree:1&enemies_in_melee>2", "cast_cone:Swipe (Cat)", 62);
-                    add("primary_tree:1&has_target", "cast:Mangle (Cat)", 58);
-                    add("primary_tree:1&has_target", "cast:Claw", 48);   // pre-Mangle fallback
-                    // Leave the form out of combat so the cat can drink/mount/buff
-                    // (above eat/drink at 12-14 so it drops form FIRST).
-                    add("primary_tree:1&out_of_combat&no_target&self_has_aura:Cat Form", "cancel_form", 16);
-                    // BALANCE — and the universal NON-feral fallback (!tree 1),
-                    // so a no-talent low-level druid OR one a user manually flips
-                    // to dps while Resto-specced still nukes instead of standing
-                    // idle. Moonkin Form falls through harmlessly if untalented.
-                    // Moonkin on IN_COMBAT, not has_target (Kevin): a balance druid opening
-                    // with an AoE keys off a cluster, not a single victim, so has_target was
-                    // often false at the pull and it fought caster-form / didn't shift at all.
-                    // cancel_form below reverts it out of combat.
-                    add("!primary_tree:1&in_combat&self_missing_aura:Moonkin Form", "buff_self:Moonkin Form", 80);
-                    add("!primary_tree:1&target_missing_aura:Moonfire", "cast:Moonfire", 72);
-                    add("!primary_tree:1&target_missing_aura:Insect Swarm", "cast:Insect Swarm", 68);
-                    // Cluster-gated ground AoE: balance casts from range.
-                    add("!primary_tree:1&enemies_clustered:8>2", "cast:Hurricane", 58);
-                    add("!primary_tree:1&has_target", "cast:Starfire", 46);
-                    add("!primary_tree:1&has_target", "cast:Wrath", 44);
-                    add("!primary_tree:1&out_of_combat&no_target&self_has_aura:Moonkin Form", "cancel_form", 16);
+                    if (tree == 1)   // FERAL CAT — melee combo build/spend, like a rogue.
+                    {
+                        // Shift into Cat on IN_COMBAT, not has_target: a target isn't always
+                        // set the instant a fight starts (esp. an AoE opener keyed off a
+                        // cluster), which left the druid un-shifted and unable to act.
+                        add("in_combat&self_missing_aura:Cat Form", "buff_self:Cat Form", 82);
+                        add("has_target&self_energy<35", "cast_self:Tiger's Fury", 79);
+                        // Savage Roar gated to elites (like rogue Slice and Dice): on trash
+                        // it just eats the combo the damage finishers need.
+                        add("self_missing_aura:Savage Roar&self_combo>0&target_is_elite", "cast:Savage Roar", 77);
+                        add("target_health<25&self_combo>2", "cast:Ferocious Bite", 75);
+                        add("self_combo>4&target_missing_aura:Rip&target_ttd>8", "cast:Rip", 73);
+                        add("self_combo>4", "cast:Ferocious Bite", 70);
+                        add("target_missing_aura:Rake", "cast:Rake", 66);
+                        // Cat-form Swipe is a front cone — aim it at the most enemies.
+                        add("enemies_in_melee>2", "cast_cone:Swipe (Cat)", 62);
+                        add("has_target", "cast:Mangle (Cat)", 58);
+                        add("has_target", "cast:Claw", 48);   // pre-Mangle fallback
+                        // Leave form out of combat so the cat can drink/mount/buff.
+                        add("out_of_combat&no_target&self_has_aura:Cat Form", "cancel_form", 16);
+                    }
+                    else   // BALANCE(0) — ranged caster; also the non-feral / low-level
+                    {      // fallback (a no-talent low druid, or a Resto flipped to dps).
+                        // Moonkin on IN_COMBAT, not has_target: a balance opener keys off a
+                        // cluster, so has_target is often false at the pull. Falls through
+                        // harmlessly if untalented. cancel_form reverts it out of combat.
+                        add("in_combat&self_missing_aura:Moonkin Form", "buff_self:Moonkin Form", 80);
+                        add("target_missing_aura:Moonfire", "cast:Moonfire", 72);
+                        add("target_missing_aura:Insect Swarm", "cast:Insect Swarm", 68);
+                        add("enemies_clustered:8>2", "cast:Hurricane", 58);   // ranged ground AoE
+                        add("has_target", "cast:Starfire", 46);
+                        add("has_target", "cast:Wrath", 44);
+                        add("out_of_combat&no_target&self_has_aura:Moonkin Form", "cancel_form", 16);
+                    }
                 }
                 break;
 
@@ -2176,7 +2351,8 @@ namespace WowPsParty
             // Always the class default rotation (identical to "Generate"); never the
             // saved one. Then wipe any persisted rotation so it can't survive the run.
             WowPsParty::RotationCacheSet(candidateGuid,
-                WowPsParty::ParseRotationString(DefaultRotationForClass(cls, useRole)));
+                WowPsParty::ParseRotationString(
+                    DefaultRotationForClass(cls, useRole, DominantTalentTabDB(candidateGuid))));
             CharacterDatabase.Execute(
                 "UPDATE `party_loadout` SET `priority_actions_json` = '' WHERE `guid` = {}", candidateGuid);
 
@@ -2280,7 +2456,8 @@ namespace WowPsParty
                     if (!hadCustomRotation)
                     {
                         WowPsParty::RotationCacheSet(guidLow,
-                            WowPsParty::ParseRotationString(DefaultRotationForClass(cls, freshRole)));
+                            WowPsParty::ParseRotationString(
+                                DefaultRotationForClass(cls, freshRole, DominantTalentTabLive(hen))));
                         WowPsParty::TargetModeCacheSet(guidLow,
                             freshRole == "tank" ? "loose" : "master");
                     }
@@ -2326,7 +2503,8 @@ namespace WowPsParty
                     hen->SaveToDB(false, false);
                     WowPsParty::SetHenchmanRole(henchGuid, useRole);
                     WowPsParty::RotationCacheSet(henchGuid.GetCounter(),
-                        WowPsParty::ParseRotationString(DefaultRotationForClass(cls, useRole)));
+                        WowPsParty::ParseRotationString(
+                            DefaultRotationForClass(cls, useRole, DominantTalentTabLive(hen))));
                     WowPsParty::TargetModeCacheSet(henchGuid.GetCounter(),
                         useRole == "tank" ? "loose" : "master");
                     LOG_INFO("module",

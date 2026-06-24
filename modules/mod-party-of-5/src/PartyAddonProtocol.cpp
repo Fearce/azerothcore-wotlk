@@ -3912,7 +3912,11 @@ public:
             // to the class default role when there's no directive.
             std::string const genRole = WowPsParty::RoleForGuid(
                 ObjectGuid::Create<HighGuid::Player>(guid));
-            std::string dsl = WowPsParty::DefaultRotationForClass(cls, genRole);
+            // Bake the member's actual spec so Generate previews the SAME per-spec
+            // rotation hire applied (a Frost mage sees the Frost list, not a cross-
+            // school one); -1 (no talents) falls back to the basic rotation.
+            std::string dsl = WowPsParty::DefaultRotationForClass(
+                cls, genRole, WowPsParty::DominantTreeForGuid(guid));
             std::replace(dsl.begin(), dsl.end(), '|', '~');
             std::ostringstream out;
             out << "GENROT\t" << token << '\t' << dsl;
@@ -4567,7 +4571,8 @@ public:
                 if (Player* h = ObjectAccessor::FindConnectedPlayer(rotOg))
                 {
                     WowPsParty::RotationCacheSet(guid, WowPsParty::ParseRotationString(
-                        WowPsParty::DefaultRotationForClass(h->getClass(), WowPsParty::RoleForGuid(rotOg))));
+                        WowPsParty::DefaultRotationForClass(h->getClass(), WowPsParty::RoleForGuid(rotOg),
+                            WowPsParty::DominantTreeForGuid(guid))));
                     ChatHandler(player->GetSession()).PSendSysMessage(
                         "|cff66ccff[WowPsParty]|r Henchman rotation cleared — restored its class default.");
                     LOG_INFO("module",
@@ -4921,7 +4926,8 @@ public:
                 if (Player* h = ObjectAccessor::FindConnectedPlayer(rotOg))
                 {
                     WowPsParty::RotationCacheSet(guid, WowPsParty::ParseRotationString(
-                        WowPsParty::DefaultRotationForClass(h->getClass(), WowPsParty::RoleForGuid(rotOg))));
+                        WowPsParty::DefaultRotationForClass(h->getClass(), WowPsParty::RoleForGuid(rotOg),
+                            WowPsParty::DominantTreeForGuid(guid))));
                     ChatHandler(player->GetSession()).PSendSysMessage(
                         "|cff66ccff[WowPsParty]|r Henchman rotation cleared — restored its class default.");
                     LOG_INFO("module",

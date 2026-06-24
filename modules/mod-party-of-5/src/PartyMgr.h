@@ -112,7 +112,19 @@ namespace WowPsParty
     // by the `.party preset` command and henchman hire so henchmen run our
     // rotation engine + combat AI (positioning, LoS approach) with sensible
     // class spells, instead of the default playerbot AI. Empty for unknown.
-    std::string DefaultRotationForClass(uint8 cls, std::string const& role = "");
+    // `tree` is the dominant talent tab (0/1/2) the rotation is BAKED for, so a
+    // multi-DPS-spec class (mage/warlock/hunter/shaman/druid/warrior/DK/rogue)
+    // gets a clean spec-specific list instead of one cross-school list gated by
+    // runtime `primary_tree:N`. -1 = unknown spec (pre-10 / no talents / the
+    // generic `.party preset`) → a simple basic rotation for the class.
+    std::string DefaultRotationForClass(uint8 cls, std::string const& role = "", int tree = -1);
+
+    // Dominant talent tree (0/1/2) for baking a per-spec default rotation, or -1
+    // when the char has no talents yet (low level). Prefers a connected bot's
+    // live talents (authoritative right after a re-spec); falls back to the
+    // character_talent table for an offline candidate. Public so the addon
+    // protocol's Generate / apply-default paths can pick the right spec.
+    int DominantTreeForGuid(uint32 guid);
 
     // Keep a managed bot's consumables topped up: hunters (and anyone with a
     // bow/gun) get level-appropriate ammo and never run dry; rogues get
