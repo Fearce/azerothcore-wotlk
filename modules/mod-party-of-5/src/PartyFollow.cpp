@@ -4441,12 +4441,14 @@ namespace WowPsParty
         {
             // Ally-peel reach. Mobs ON US (the self-defense loops below) are
             // uncapped — they're already in our melee. But peeling a mob off an
-            // ALLY makes AssistTarget MELEE-CHASE it, and that chase is uncapped:
-            // at 30y a tank sprinted across the room to a far peel and body-pulled
-            // every pack on the way ("chain-pulls until we die"). 18y still covers
-            // adds on a healer/caster positioned behind the tank; farther adds are
-            // grabbed with a ranged taunt rule (cast_loose_enemy:Growl), not a run.
-            static constexpr float PARTY_DEFEND_RANGE = 18.0f;
+            // ALLY makes AssistTarget engage it; for a MELEE bot that's a chase, and
+            // an uncapped chase chain-pulled the room (at 30y a tank sprinted to a
+            // far peel and body-pulled every pack on the way, "chain-pulls until we
+            // die") — so melee stay tight at 18y. A RANGED bot doesn't path-chase
+            // (it stands and casts up to ~36y), so it can safely help an ally being
+            // beaten on across the room — the far-body-pull case where casters used
+            // to idle behind the healer (Kevin). Doubled to 36y for ranged.
+            float const PARTY_DEFEND_RANGE = FollowerIsMelee(bot) ? 18.0f : 36.0f;
             // self-defense — anything swinging at US or OUR pet, always (it's
             // already on us / right next to us, no range cap).
             for (Unit* a : bot->getAttackers())
