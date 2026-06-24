@@ -2314,6 +2314,32 @@ namespace WowPsParty
                 return false;
             }
 
+            // my_name:Maele,Tarcus — TRUE when THIS bot's own character name
+            // matches any of the comma-separated names (case-insensitive,
+            // trimmed). Lets a shared/Common rotation assign behaviour to a
+            // SPECIFIC bot by name — e.g. in a raid, give the warrior named
+            // Maele its own interrupt/cooldown rule while everyone else shares
+            // the rest. Negate with a leading ! (handled by the AND-chain
+            // splitter) to mean "every bot EXCEPT these".
+            if (cname == "my_name")
+            {
+                std::string const have = Lower(bot->GetName());
+                size_t start = 0;
+                while (start <= arg.size())
+                {
+                    size_t const comma = arg.find(',', start);
+                    std::string token = arg.substr(
+                        start, comma == std::string::npos ? std::string::npos : comma - start);
+                    size_t const a = token.find_first_not_of(" \t");
+                    size_t const b = token.find_last_not_of(" \t");
+                    if (a != std::string::npos && Lower(token.substr(a, b - a + 1)) == have)
+                        return true;
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
+                return false;
+            }
+
             // tank_has_aura / tank_missing_aura — check the party's TANK (role from
             // the Party Roster), so a healer can keep Earth Shield / Beacon / a HoT
             // up on the tank. No live tank in world → the rule doesn't fire.
