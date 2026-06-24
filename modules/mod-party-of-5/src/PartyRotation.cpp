@@ -3665,11 +3665,12 @@ namespace WowPsParty
                 auto& e = g_approachState[gLow];   // (targetGuidLow, lastMoveMs)
                 MovementGeneratorType const mg =
                     bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
-                // Already advancing on the SAME target? POINT for a back-out,
-                // CHASE for an offensive approach, FOLLOW for a friendly one.
-                bool const moving = tooClose      ? (mg == POINT_MOTION_TYPE)
-                                  : targetIsVictim ? (mg == CHASE_MOTION_TYPE)
-                                                   : (mg == FOLLOW_MOTION_TYPE);
+                // Already advancing on the SAME target? A back-out and any non-victim
+                // approach (ground-AoE cluster anchor or a friendly buff/rez) are
+                // driven by MovePoint; an offensive chase of the victim by MoveChase.
+                bool const usePoint = tooClose || !targetIsVictim;
+                bool const moving = usePoint ? (mg == POINT_MOTION_TYPE)
+                                             : (mg == CHASE_MOTION_TYPE);
                 if (e.first == tLow && (now - e.second) < 700 && moving)
                     reissue = false;
                 else { e.first = tLow; e.second = now; }
@@ -3700,7 +3701,21 @@ namespace WowPsParty
                         : !bot->IsWithinLOSInMap(target) ? 2.0f
                                                          : maxRange - 3.0f;
                     if (!targetIsVictim)
-                        bot->GetMotionMaster()->MoveFollow(target, settleDist, 0.0f);
+                    {
+                        // Walk to the NEAREST in-range spot (settleDist toward us),
+                        // NOT MoveFollow. FollowMovementGenerator parks the follower at
+                        // a fixed bearing off the target's FACING (ToAbsoluteAngle), so
+                        // for a stationary enemy cluster anchor it aims beside/through
+                        // the pack — a ground-AoE caster then shuffled forever just out
+                        // of range without ever closing (Mynya / Hurricane). MovePoint
+                        // to GetNearPoint toward the bot is the same straight-line close
+                        // MoveChase gives the victim, minus the HasLostTarget stall a
+                        // non-victim MoveChase would hit.
+                        float nx, ny, nz;
+                        target->GetNearPoint(bot, nx, ny, nz, 0.0f,
+                            settleDist, target->GetAngle(bot));
+                        bot->GetMotionMaster()->MovePoint(0, nx, ny, nz);
+                    }
                     else if (meleeSpell)
                         bot->GetMotionMaster()->MoveChase(target);   // chase to contact
                     else
