@@ -3210,6 +3210,70 @@ namespace WowPsParty
         return firstKnown;
     }
 
+    // Is `u` already locked down by a CC, so a second CC would be wasted/overlapping?
+    // Counts the IN-PLACE loss-of-control mechanics (stun/root/sleep/poly/freeze/shackle/
+    // horror/banish/sap/knockout) — NOT snare/daze (those only slow; the mob still moves,
+    // so re-rooting it IS wanted). Backs the `cc` action's "skip if already CC'd".
+    static bool IsCrowdControlled(Unit* u)
+    {
+        if (!u) return false;
+        if (u->HasUnitState(UNIT_STATE_STUNNED | UNIT_STATE_ROOT)) return true;
+        constexpr uint64 ccMask =
+            (1ULL << MECHANIC_STUN)   | (1ULL << MECHANIC_ROOT)    | (1ULL << MECHANIC_SLEEP)
+          | (1ULL << MECHANIC_POLYMORPH) | (1ULL << MECHANIC_FREEZE) | (1ULL << MECHANIC_SHACKLE)
+          | (1ULL << MECHANIC_HORROR) | (1ULL << MECHANIC_BANISH)  | (1ULL << MECHANIC_SAPPED)
+          | (1ULL << MECHANIC_KNOCKOUT);
+        for (auto const& kv : u->GetAppliedAuras())
+        {
+            Aura const* a = kv.second ? kv.second->GetBase() : nullptr;
+            SpellInfo const* si = a ? a->GetSpellInfo() : nullptr;
+            if (si && (si->GetAllEffectsMechanicMask() & ccMask)) return true;
+        }
+        return false;
+    }
+
+    // The bot's best ready CROWD-CONTROL spell that can actually land on `target` — an
+    // ability that LOCKS A MOB IN PLACE (stun / root / incapacitate / sleep / shackle), so
+    // an add never reaches the boss (Zombie Chow on Gluth). NO fear/knockback (they scatter
+    // the mob) and NO snare-only. Creature-type-gated per spell so we don't burn a GCD on an
+    // invalid cast (Polymorph/Hex don't work on UNDEAD; Shackle is undead-ONLY; Banish is
+    // demon/elemental; Hibernate is beast/dragon). Type-agnostic stuns/roots (Hammer of
+    // Justice, Entangling Roots, Hungering Cold, …) carry mask 0 = any. Highest-priority
+    // first; returns a ready one, else the first known (so the caller can wait out a CD).
+    static uint32 ResolveCcSpell(Player* bot, Unit* target)
+    {
+        if (!bot || !target) return 0;
+        struct CcSpell { char const* name; uint32 typeMask; };   // typeMask 0 = any creature type
+        auto TM = [](uint32 t) -> uint32 { return 1u << (t - 1); };   // matches GetCreatureTypeMask()
+        uint32 const BEAST = TM(CREATURE_TYPE_BEAST),   DRAGON = TM(CREATURE_TYPE_DRAGONKIN);
+        uint32 const DEMON = TM(CREATURE_TYPE_DEMON),   ELEM   = TM(CREATURE_TYPE_ELEMENTAL);
+        uint32 const UNDEAD = TM(CREATURE_TYPE_UNDEAD), HUMANOID = TM(CREATURE_TYPE_HUMANOID);
+        std::vector<CcSpell> list;
+        switch (bot->getClass())
+        {
+            case CLASS_WARRIOR:      list = { {"Shockwave", 0}, {"Concussion Blow", 0} }; break;
+            case CLASS_PALADIN:      list = { {"Hammer of Justice", 0}, {"Repentance", HUMANOID} }; break;
+            case CLASS_HUNTER:       list = { {"Wyvern Sting", 0} }; break;  // Freezing Trap is ground-placed, not unit-cast
+            case CLASS_ROGUE:        list = { {"Kidney Shot", 0}, {"Sap", BEAST|DRAGON|DEMON|HUMANOID} }; break;
+            case CLASS_PRIEST:       list = { {"Shackle Undead", UNDEAD} }; break;
+            case CLASS_SHAMAN:       list = { {"Hex", BEAST|HUMANOID} }; break;  // WotLK Hex = humanoid/beast only (no Bind Elemental until Cata)
+            case CLASS_MAGE:         list = { {"Polymorph", BEAST|HUMANOID} }; break;  // (no undead lock; Frost Nova is PBAoE, not single-target)
+            case CLASS_WARLOCK:      list = { {"Banish", DEMON|ELEM}, {"Death Coil", 0} }; break;  // Death Coil = 3s horror, all types
+            case CLASS_DRUID:        list = { {"Entangling Roots", 0}, {"Cyclone", 0}, {"Hibernate", BEAST|DRAGON} }; break;
+            case CLASS_DEATH_KNIGHT: list = { {"Hungering Cold", 0} }; break;  // Frost-only AoE freeze; Chains of Ice is just a snare (mob still moves)
+            default: break;
+        }
+        uint32 const tMask = target->GetCreatureTypeMask();   // creature-type bit (HUMANOID for a player)
+        for (CcSpell const& c : list)
+        {
+            if (c.typeMask != 0 && !(tMask & c.typeMask)) continue;   // can't land on this type
+            uint32 const id = FindKnownSpellByName(bot, c.name);
+            if (id && !bot->HasSpellCooldown(id))
+                return id;   // known + ready + lands on this type
+        }
+        return 0;   // nothing ready to CC this mob (the cc verb then yields)
+    }
+
     // The lead tank's RANGED pull ability, or 0 if it has none. Lets a tank with
     // no thrown/gun/bow weapon (a paladin carries a libram in the ranged slot, a
     // DK/druid nothing) still OPEN from range instead of charging the pack: the
@@ -4789,6 +4853,50 @@ namespace WowPsParty
                 LOG_INFO("module",
                     "[WowPsParty Rotation] {} scan-cast {} -> {}",
                     bot->GetName(), arg, pick->GetName());
+            return fired;
+        }
+
+        // "cc" — CROWD-CONTROL a mob so it never reaches the boss (Zombie Chow on Gluth).
+        // Scans every enemy the party is fighting (like cast_scan), re-checks THIS rule's
+        // target_* clauses per enemy (so "target_name:Zombie Chow | cc" works off-target),
+        // SKIPS any mob already CC'd (no overlap — naturally spreads N bots across N adds),
+        // and casts the bot's best in-place CC that can land on that mob's creature type
+        // (ResolveCcSpell). No retarget — normal DPS resumes next tick. Put it high in Common
+        // gated by target_name so the whole party locks the adds the instant they appear.
+        if (verb == "cc")
+        {
+            std::vector<Player*> party;
+            GatherPartyPlayers(bot, party, /*includeDead=*/false);
+            // Resolve a READY, CASTABLE CC for THIS mob (0 = can't CC it right now). Folding
+            // the per-mob spell resolve + canFireSpellOn into the scan (unlike a fixed-spell
+            // cast_scan) means we pick the first mob this bot can ACTUALLY lock now, instead
+            // of latching a far/blocked one and skipping a reachable add.
+            uint32 pickSpell = 0;
+            auto resolveFor = [&](Unit* u) -> uint32
+            {
+                if (!u || !u->IsAlive() || !bot->IsValidAttackTarget(u)) return 0;
+                if (!MobEngagedByParty(bot, u, party)) return 0;   // party already fights it → no pull
+                if (IsCrowdControlled(u)) return 0;                // already locked → don't overlap
+                if (!EvalCondition(cond, bot, u)) return 0;        // rule's target_* (target_name) vs THIS mob
+                uint32 const sid = ResolveCcSpell(bot, u);
+                if (!sid || bot->HasSpellCooldown(sid) || !canFireSpellOn(sid, u)) return 0;
+                return sid;
+            };
+            Unit* pick = nullptr;
+            if (Unit* v = bot->GetVictim())
+                if (uint32 s = resolveFor(v)) { pick = v; pickSpell = s; }
+            if (!pick)
+            {
+                std::list<Unit*> hostiles;
+                GatherHostilesAround(bot, 41.0f, hostiles);
+                for (Unit* a : hostiles)
+                    if (uint32 s = resolveFor(a)) { pick = a; pickSpell = s; break; }
+            }
+            if (!pick || !channelClipOk()) return false;
+            bool const fired = faceAndCast(pick, pickSpell);
+            if (fired)
+                LOG_INFO("module", "[WowPsParty Rotation] {} CC {} -> {}",
+                         bot->GetName(), pickSpell, pick->GetName());
             return fired;
         }
 
@@ -6695,6 +6803,7 @@ namespace WowPsParty
             bool const isSpread = r.action.rfind("cast_spread", 0) == 0
                                || r.action.rfind("cast_combo_spread", 0) == 0
                                || r.action.rfind("cast_scan", 0) == 0
+                               || r.action == "cc"                              // scans + re-checks target_* per mob
                                || r.action.rfind("interrupt_caster", 0) == 0;   // covers _melee too
             // For a friendly-target action, evaluate target_* conditions against
             // the unit we'll actually heal/buff (the heal target), not the enemy
