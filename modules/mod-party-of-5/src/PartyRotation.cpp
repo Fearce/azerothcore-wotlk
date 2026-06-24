@@ -2389,6 +2389,32 @@ namespace WowPsParty
                 int const stacks = u ? int(NamedAuraStacks(u, n, auraCaster)) : 0;
                 return op == '<' ? (stacks < want) : (stacks > want);
             }
+            // party_aura_clustered:<spell><op>R — for a debuff that EXPLODES on cleanse and
+            // hits nearby allies (Grobbulus's Mutating Injection, 20y). For a party member
+            // HOLDING <spell>:
+            //   "<R"  TRUE if another party member is within R of the holder (CLUSTERED →
+            //         unsafe to cleanse);
+            //   ">R"  TRUE if NO other member is within R of the holder (ISOLATED → safe).
+            // Gate the cure, e.g. "!party_aura_clustered:Mutating Injection<21 | cure_party:…"
+            // so it only cleanses once the afflicted has run clear — pair it with the
+            // afflicted's own "self_has_aura:Mutating Injection | keep_distance_party:21".
+            // Supports the _my_ form (only the aura WE applied).
+            if (cname == "party_aura_clustered")
+            {
+                std::string n; char op; int r;
+                if (!unpackNameOpVal(n, op, r)) return false;
+                std::vector<Player*> party;
+                GatherPartyPlayers(bot, party, /*includeDead=*/false);
+                for (Player* h : party)
+                {
+                    if (!h || !TargetHasNamedAura(h, n, auraCaster)) continue;
+                    bool nearAlly = false;
+                    for (Player* o : party)
+                        if (o && o != h && h->GetDistance(o) <= float(r)) { nearAlly = true; break; }
+                    if (op == '<' ? nearAlly : !nearAlly) return true;
+                }
+                return false;
+            }
             // Tank-scoped stacks / remaining, so a healer can MAINTAIN a stacking
             // per-caster HoT on the tank — the canonical case is a druid keeping
             // Lifebloom at 3 stacks: gate the refresh on
@@ -4251,7 +4277,8 @@ namespace WowPsParty
                 || verb == "stay_in_front"    || verb == "hold_position"
                 || verb == "move_out_of_los"  || verb == "pull"
                 || verb == "interrupt_caster_melee"   // travels to a far caster
-                || verb == "reposition_random" || verb == "walk_away_from_source"))
+                || verb == "reposition_random" || verb == "walk_away_from_source"
+                || verb == "dodge_frontals"))
             return false;
 
         if (verb == "cast" || verb == "cast_self")
@@ -5279,6 +5306,51 @@ namespace WowPsParty
             return true;
         }
 
+        // "dodge_frontals" — JUST get out of the enemy's frontal cone (Slime Spray, Cleave,
+        // Breath), nothing more. Unlike move_behind (which strafes all the way to the exact
+        // REAR), this steps to the NEAREST edge of the ±90° front arc on the side the bot is
+        // already on — the smallest move that clears the cone — and recomputes every tick, so
+        // the instant the enemy turns the bot slides to the new edge instead of being caught
+        // in front even briefly. Make it the HIGHEST-priority Common rule to hard-guarantee
+        // "never in front" (it owns the tick while in front; yields the moment it's clear, so
+        // lower rules — poison-dodge etc. — run only from a safe angle). Preserves range, so
+        // ranged stay ranged. Uses the bot's victim, else the nearest engaged enemy (so a
+        // healer dodges the boss's cone too). Avoids stepping into a damaging ground cloud.
+        if (verb == "dodge_frontals")
+        {
+            Unit* enemy = bot->GetVictim();
+            if (!enemy || !enemy->IsAlive()) enemy = NearestEngagedEnemy(bot, 60.0f);
+            if (!enemy || !enemy->IsAlive()) return false;
+            if (!enemy->isInFront(bot)) return false;   // already out of the front arc → safe
+
+            float const gap    = bot->GetDistance(enemy);            // keep our current range
+            float const facing = enemy->GetOrientation();
+            float rel = enemy->GetAngle(bot) - facing;               // our bearing vs its facing
+            while (rel >  float(M_PI)) rel -= 2.0f * float(M_PI);
+            while (rel < -float(M_PI)) rel += 2.0f * float(M_PI);
+            float const side = (rel >= 0.0f) ? 1.0f : -1.0f;         // exit toward the side we're on
+            constexpr float EDGE = float(M_PI) * 0.5f + 0.30f;       // just past the 90° cone edge
+
+            WowPsParty::HoldFollower(bot->GetGUID(), 1200);
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE
+                && bot->isMoving())
+                return true;                                         // let the in-flight sidestep finish
+            std::vector<Unit*> clouds;
+            GatherDamagingClouds(bot, 45.0f, clouds);
+            for (float s : { side, -side })   // preferred side first, then the other if blocked/hazardous
+            {
+                float x, y, z;
+                enemy->GetNearPoint(bot, x, y, z, 0.0f, gap, facing + s * EDGE);
+                if (!clouds.empty() && PointInClouds(clouds, x, y)) continue;
+                if (!NavReachable(bot, x, y, z, gap)) continue;
+                bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                                                  0.0f, 0.0f, /*generatePath=*/true,
+                                                  /*forceDestination=*/false);
+                return true;
+            }
+            return true;   // boxed both sides — hold rather than walk deeper into the cone
+        }
+
         // "stay_in_front:N" — hold the target's FRONTAL arc, N yards out (the direction it
         // faces). The mirror of move_behind, for "stack in front" / frontal-soak phases.
         // Default to melee reach if no number. HoldFollower's so AssistTarget keeps its
@@ -6133,7 +6205,8 @@ namespace WowPsParty
     {
         return verb == "reposition_random"
             || verb == "walk_away_from_source"
-            || verb == "move_out_of_los";
+            || verb == "move_out_of_los"
+            || verb == "dodge_frontals";   // get out of the cone NOW, even mid-cast
     }
 
     // Verbs that deal damage to / pull an ENEMY (generate threat). Used to hold a
@@ -6624,17 +6697,20 @@ namespace WowPsParty
                 bot->InterruptNonMeleeSpells(false);
                 castingHarmfulFiller = false;
             }
-            // A survival dodge that matched mid cast/channel: break the spell so the
-            // bot actually MOVES (the movement is the whole point — it sheds Intense
-            // Cold / leaves the fire). Otherwise the launched move-spline would
-            // self-cancel the cast at ~1% anyway, a messier version of the same thing.
-            // No per-tick stutter: once the hop spline is live the verb's own
-            // "already mid-hop -> return true" guard stops re-issuing, and with the
-            // cast already killed this branch is a no-op next tick — so every verb in
-            // IsReactiveMoveVerb MUST keep that mid-move self-skip or this would thrash.
-            if ((castTimeInFlight || committed) && IsReactiveMoveVerb(verb))
-                bot->InterruptNonMeleeSpells(false);
+            bool const wasCasting = (castTimeInFlight || committed);
             bool const execOk = ExecAction(r.action, bot, r.flags, r.condition);
+            // A survival dodge that ACTUALLY MOVED mid cast/channel: break the spell so
+            // the move is clean (the launched spline self-cancels it at ~1% anyway). This
+            // MUST be checked AFTER ExecAction and only when the verb really issued a move
+            // (bot now on a POINT spline) — a reactive verb that YIELDED (dodge_frontals
+            // when already out of the cone, move_out_of_los when already hidden) must NOT
+            // kill the cast for nothing. Before, the interrupt fired whenever the rule's
+            // CONDITION matched, so an always-on dodge_frontals cancelled every behind-the-
+            // boss caster's cast each tick then yielded (Kevin). Gating on real movement
+            // fixes that and hardens the other reactive verbs against the same waste.
+            if (execOk && wasCasting && IsReactiveMoveVerb(verb)
+                && bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE)
+                bot->InterruptNonMeleeSpells(false);
             if (trace)
                 LOG_INFO("module",
                     "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> {}",
