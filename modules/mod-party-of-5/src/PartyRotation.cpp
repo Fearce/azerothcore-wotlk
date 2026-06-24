@@ -903,11 +903,21 @@ namespace WowPsParty
     // yellow spot is good enough, they don't have to go to the purple"). The wide angle
     // fan matters because cover is often to the SIDE (around a corner), not straight back
     // from the enemy. Returns false in open ground with no cover, so the caller skips.
+    static bool RecentDamageNear(uint32 guidLow, float x, float y, float margin);  // defined below (g_recentDamage)
+
     static bool PickLosBreakPoint(Player* bot, Unit* enemy,
                                   float& ox, float& oy, float& oz)
     {
         if (!bot || !enemy) return false;
         float const awayAngle = enemy->GetAngle(bot);   // enemy -> bot, i.e. away from enemy
+        // Don't duck INTO a hazard — a LoS spot inside a damaging ground cloud or on top of
+        // a thing we just took damage from (Ingvar's spinning Shadow Axe behind the pillar)
+        // makes the bot bounce LoS<->damage and die. Gather the clouds once; reject hazard
+        // candidates below. If EVERY LoS spot is hazardous we return false (no duck) — eating
+        // the cast in the open beats the deadly bounce.
+        uint32 const gLow = bot->GetGUID().GetCounter();
+        std::vector<Unit*> clouds;
+        GatherDamagingClouds(bot, 45.0f, clouds);
         static float const radii[]   = { 2.5f, 4.0f, 5.5f, 7.0f, 9.0f, 11.5f, 15.0f, 19.0f, 24.0f };
         static float const offsets[] = { 0.0f, 0.4f, -0.4f, 0.8f, -0.8f, 1.2f, -1.2f,
                                          1.6f, -1.6f, 2.0f, -2.0f, 2.5f, -2.5f,
@@ -918,6 +928,11 @@ namespace WowPsParty
             {
                 float x, y, z;
                 bot->GetNearPoint(bot, x, y, z, 0.0f, r, awayAngle + off);
+                // Skip a spot that sits in damage — a cloud, or within 6y of something we
+                // just got hit by — so the LoS duck can't drop us into the very hazard a
+                // walk_away_from_source rule is fleeing (the LoS<->damage death loop).
+                if (PointInClouds(clouds, x, y, 3.0f)) continue;
+                if (RecentDamageNear(gLow, x, y, 6.0f)) continue;
                 // Cheap VMAP ray first: must actually break the enemy's sight line.
                 // M2 so "out of LoS" here means the SAME thing the move_out_of_los gate
                 // (and Spell::CheckCast) mean — else a spot shadowed only by an M2 doodad
@@ -1883,6 +1898,27 @@ namespace WowPsParty
             sx = rit->sx; sy = rit->sy; sz = rit->sz;
             if (outAgeMs) *outAgeMs = now - rit->ms;
             return true;
+        }
+        return false;
+    }
+
+    // True if (x,y) is within `margin` of ANY source position the bot took damage from in
+    // the recent window — i.e. ducking there would put us right back in the damage that a
+    // walk_away_from_source / took_damage_from rule is fleeing. PickLosBreakPoint uses it so
+    // a LoS duck never picks a spot inside a hazard (Ingvar's spinning Shadow Axe behind the
+    // very pillar the bot wants to LoS behind), which caused the deadly LoS<->damage bounce.
+    static bool RecentDamageNear(uint32 guidLow, float x, float y, float margin)
+    {
+        uint32 const now = getMSTime();
+        std::lock_guard<std::mutex> lock(g_recentDamageMutex);
+        auto it = g_recentDamage.find(guidLow);
+        if (it == g_recentDamage.end()) return false;
+        float const m2 = margin * margin;
+        for (RecentHit const& h : it->second)
+        {
+            if (!h.hasSrc || now - h.ms > RECENT_DMG_WINDOW_MS) continue;
+            float const dx = h.sx - x, dy = h.sy - y;
+            if (dx * dx + dy * dy <= m2) return true;
         }
         return false;
     }
