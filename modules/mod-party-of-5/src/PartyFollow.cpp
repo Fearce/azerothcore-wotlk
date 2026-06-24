@@ -1423,6 +1423,31 @@ namespace WowPsParty
         g_losSeekStartMs.erase(guidLow);
     }
 
+    // When a ranged bot GIVES UP finding a clean firing spot (tiny room / tight
+    // corner — e.g. the SM Cathedral hidden-boss room, where Mynya + Egoreno stood
+    // blind in the doorway and dealt ZERO damage), it must stop trying to reach ideal
+    // range and instead fight from wherever it has LoS, even point-blank. "Stand down"
+    // means PAUSE the get-to-range / back-out routine — NOT freeze out of LoS. While
+    // suppressed the bot still closes INTO the target's LoS and fights normally; only
+    // the retreat-to-firing-range bands are held off, so it doesn't immediately walk
+    // back out of LoS. Auto-expires; re-arms on the next give-up if the room's still
+    // too tight (Kevin, 2026-06-24).
+    static constexpr uint32 RANGE_ROUTINE_SUPPRESS_MS = 15000;
+    static std::unordered_map<uint32, uint32> g_rangeSuppressUntilMs;  // guidLow -> expiry ms
+    static std::mutex g_rangeSuppressMutex;
+
+    static void SuppressRangeRoutine(uint32 guidLow, uint32 nowMs)
+    {
+        std::lock_guard<std::mutex> lock(g_rangeSuppressMutex);
+        g_rangeSuppressUntilMs[guidLow] = nowMs + RANGE_ROUTINE_SUPPRESS_MS;
+    }
+    static bool RangeRoutineSuppressed(uint32 guidLow, uint32 nowMs)
+    {
+        std::lock_guard<std::mutex> lock(g_rangeSuppressMutex);
+        auto it = g_rangeSuppressUntilMs.find(guidLow);
+        return it != g_rangeSuppressUntilMs.end() && nowMs < it->second;
+    }
+
     // Threat-cap throttle (replaces a fixed timer): even once the tank HAS the
     // mob, a DPS keeps DPSing only while its own threat stays below this fraction
     // of the tank's threat ON THAT MOB. The instant it climbs past, it drops the
@@ -5025,23 +5050,17 @@ namespace WowPsParty
 
                 if (reachable)
                 {
-                    // Tight corner / tiny room: if we've been unable to settle with LoS
-                    // for a while, STOP pacing in-and-out — stand our ground and hold,
-                    // facing the target, until LoS opens (clock cleared the moment it
-                    // does). Without this the fire-band backs us out the instant we round
-                    // the corner, LoS drops, and we oscillate forever (Kevin).
+                    // Tight corner / tiny room (the SM Cathedral boss room): if we still
+                    // can't settle WITH LoS after the give-up window, stop trying to reach
+                    // ideal firing range. Arm the range-routine suppression so the back-out
+                    // bands below won't yank us out of LoS once we round into the room, then
+                    // KEEP CLOSING into LoS and fight from there (point-blank if need be) —
+                    // instead of standing blind in the doorway dealing zero damage (Kevin).
+                    // Suppressing the retreat is what breaks the round-the-corner ->
+                    // fire-band-backs-us-out -> LoS-drops oscillation the old stand-ground
+                    // hold was working around.
                     if (LosSeekElapsed(gLow, nowMs) >= LOS_SEEK_GIVEUP_MS)
-                    {
-                        if (mg != IDLE_MOTION_TYPE)
-                        {
-                            bot->StopMoving();
-                            bot->GetMotionMaster()->Clear();
-                            bot->GetMotionMaster()->MoveIdle();
-                            AssistLog(gLow, "ranged: no quick LoS spot in tight space — standing ground, not pacing");
-                        }
-                        bot->SetFacingToObject(desired);
-                        return;
-                    }
+                        SuppressRangeRoutine(gLow, nowMs);
                     // Corner / staircase on OUR level: path to the walkable near-target
                     // spot (generatePath rounds the corner / climbs stairs;
                     // forceDestination=false so an unreachable spot just isn't taken).
@@ -5075,6 +5094,27 @@ namespace WowPsParty
 
             if (d < 8.0f)
             {
+                // Range routine paused (we just gave up finding a firing spot in a tiny
+                // room): do NOT back out — that drops LoS again and we deal zero damage.
+                // Stand in LoS and fight point-blank until the suppression lapses (then we
+                // retry the back-out, re-arming it if the room's still too tight). Hunter
+                // gets dead-zone white swings; casters/healers cast from here.
+                if (los && RangeRoutineSuppressed(gLow, nowMs))
+                {
+                    if (mg != IDLE_MOTION_TYPE)
+                    {
+                        bot->StopMoving();
+                        bot->GetMotionMaster()->Clear();
+                        bot->GetMotionMaster()->MoveIdle();
+                    }
+                    if (bot->HasUnitState(UNIT_STATE_MELEE_ATTACKING) && acls != CLASS_HUNTER)
+                        bot->Attack(desired, false);
+                    if (acls == CLASS_HUNTER)
+                        bot->Attack(desired, true);   // white melee swings in the dead zone
+                    bot->SetFacingToObject(desired);
+                    AssistLog(gLow, "ranged: range routine paused (tight room) — fighting in place, in LoS");
+                    return;
+                }
                 // Nothing on us but we're <8y (walked in, or the mob died / was
                 // taken). Back out just PAST the dead zone (13y) so we can shoot
                 // again — a ranged special shot's effective min range is ~10y for a
