@@ -2456,6 +2456,28 @@ namespace WowPsParty
                 return false;
             }
 
+            // is_immune:shadow — TRUE when the target is immune to that DAMAGE school
+            // (BRD has mobs innately immune to shadow, so a shadow priest should stop
+            // re-applying Shadow Word: Pain). Names: physical/melee, holy, fire, nature,
+            // frost, shadow, arcane. The no-arg "is_immune" (below) is immune to EVERY
+            // school at once (a Divine Shield / Ice Block bubble).
+            if (cname == "is_immune")
+            {
+                Unit* t = theTarget();
+                if (!t) return false;
+                std::string const s = Lower(arg);
+                SpellSchoolMask m = SPELL_SCHOOL_MASK_NONE;
+                if      (s == "physical" || s == "melee") m = SPELL_SCHOOL_MASK_NORMAL;
+                else if (s == "holy")   m = SPELL_SCHOOL_MASK_HOLY;
+                else if (s == "fire")   m = SPELL_SCHOOL_MASK_FIRE;
+                else if (s == "nature") m = SPELL_SCHOOL_MASK_NATURE;
+                else if (s == "frost")  m = SPELL_SCHOOL_MASK_FROST;
+                else if (s == "shadow") m = SPELL_SCHOOL_MASK_SHADOW;
+                else if (s == "arcane") m = SPELL_SCHOOL_MASK_ARCANE;
+                else return false;       // unknown school name → never matches
+                return t->IsImmunedToDamage(m);
+            }
+
             // my_name:Maele,Tarcus — TRUE when THIS bot's own character name
             // matches any of the comma-separated names (case-insensitive,
             // trimmed). Lets a shared/Common rotation assign behaviour to a
@@ -2985,6 +3007,16 @@ namespace WowPsParty
         }
         if (cond == "target_is_normal")
             return UnitCreatureRank(theTarget()) == CREATURE_ELITE_NORMAL;
+
+        // is_immune — TRUE when the target is immune to ALL damage schools at once (a
+        // Divine Shield / Ice Block "bubble"): every offence is wasted on it, so gate a
+        // focus-switch / stop_attacking rule on it. For one school use is_immune:<school>
+        // (e.g. is_immune:shadow, handled above). Negate with a leading ! as usual.
+        if (cond == "is_immune")
+        {
+            Unit* t = theTarget();
+            return t && t->IsImmunedToDamage(SPELL_SCHOOL_MASK_ALL);
+        }
 
         // target_has_stealable_magic — TRUE when the target carries a beneficial
         // MAGIC buff a mage Spellsteal could take. Gate a `cast:Spellsteal` rule
@@ -3907,6 +3939,19 @@ namespace WowPsParty
                 if (int32(bot->GetPower(powerType)) < cost)
                     return reject("not enough power");
             }
+
+            // Immunity guard (offensive spells): never spend a GCD / mana on a spell
+            // the target is fully immune to. IsImmunedToSpell catches a Divine Shield /
+            // Ice Block bubble (every school), a BRD mob with innate shadow-school
+            // immunity (so a shadow priest stops re-casting Shadow Word: Pain on it),
+            // and mechanic immunities (a stun on a stun-immune mob). HARD block (no
+            // reposition) — the rotation falls through to a different school / spell, or
+            // the bot has nothing to cast and AssistTarget can move on. Re-checked LIVE
+            // every tick, so a temporary bubble lifts on its own once the aura fades —
+            // no stale "stopped forever" memo. Positive spells (heals/buffs) are exempt.
+            if (target != bot && !info->IsPositive()
+                && target->IsImmunedToSpell(info, nullptr))
+                return reject("target immune to this spell");
 
             // Self-casts don't need range / LoS checks.
             if (target != bot)
