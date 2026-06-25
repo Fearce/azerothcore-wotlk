@@ -51,6 +51,8 @@
 #include "Item.h"
 #include "ItemTemplate.h"
 #include "LootMgr.h"   // Loot / LootItem — open lootable satchels from the shared bags
+#include "Mail.h"      // MailDraft — mail a Party Inventory item to a player
+#include "CharacterCache.h"   // sCharacterCache — resolve a recipient name -> guid/account
 #include "Log.h"
 #include "Map.h"
 #include "MotionMaster.h"
@@ -2479,6 +2481,85 @@ static void HandleProspect(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// MAIL_SEND\t<srcPartySlot>\t<srcItemGuidLow>\t<recipientName> — mail a bagged item from
+// any party member to <recipientName>. The item leaves the owner's bags and arrives in the
+// recipient's mailbox, sent server-side (the item may be on a different char than the one
+// at the mailbox, and a clientless bot owner can't drive the mail UI). Soulbound items can
+// only go to your OWN characters (same account), like the real mail rules.
+static void HandleMailSend(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto t1 = payload.find('\t');
+    if (t1 == std::string_view::npos) return;
+    auto t2 = payload.find('\t', t1 + 1);
+    if (t2 == std::string_view::npos) return;
+    uint32 const srcSlot        = std::strtoul(std::string(payload.substr(0, t1)).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(t1 + 1, t2 - t1 - 1)).c_str(), nullptr, 10);
+    std::string recipient(payload.substr(t2 + 1));
+    // Trim + normalise the recipient name (the client capitalises, but be safe).
+    size_t const a = recipient.find_first_not_of(" \t");
+    size_t const b = recipient.find_last_not_of(" \t");
+    recipient = (a == std::string::npos) ? std::string() : recipient.substr(a, b - a + 1);
+    if (!srcItemGuidLow || recipient.empty()) return;
+
+    ChatHandler ch(requester->GetSession());
+    uint32 const account   = requester->GetSession()->GetAccountId();
+    uint32 const ownerGuid = WowPsParty::GuidForAccountSlot(account, srcSlot);
+    if (!ownerGuid) return;
+    Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(ownerGuid));
+    if (!owner) return;
+    Item* item = owner->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!item) return;
+    ItemTemplate const* tmpl = item->GetTemplate();
+    if (!tmpl) return;
+
+    if (item->IsEquipped() || item->IsNotEmptyBag())
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r Unequip / empty it before mailing.");
+        return;
+    }
+
+    ObjectGuid const rcvGuid = sCharacterCache->GetCharacterGuidByName(recipient);
+    if (!rcvGuid)
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r No character named |cffffffff{}|r to mail to.", recipient);
+        return;
+    }
+    if (rcvGuid == owner->GetGUID())
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r That item is already on |cffffffff{}|r.", recipient);
+        return;
+    }
+    bool const sameAccount = (sCharacterCache->GetCharacterAccountIdByGuid(rcvGuid) == account);
+    if (!item->CanBeTraded(true) && !sameAccount)   // mailbound=true allows BoA; soulbound only to own chars
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r |cffffffff{}|r is soulbound — it can only be mailed to your own characters.", tmpl->Name1);
+        return;
+    }
+
+    std::string const itemName = tmpl->Name1;
+    Player* const rcvPlayer = ObjectAccessor::FindConnectedPlayer(rcvGuid);
+
+    // Detach the item from the owner's bags and hand it to the mail (the same sequence the
+    // core's CMSG_SEND_MAIL handler uses), then send it. No deposit charged (party QoL).
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+    owner->MoveItemFromInventory(item->GetBagSlot(), item->GetSlot(), true);
+    item->DeleteFromInventoryDB(trans);
+    item->SaveToDB(trans);
+    MailDraft(std::string("Party Inventory"), std::string("Sent from the Party Inventory."))
+        .AddItem(item)
+        .SendMailTo(trans, MailReceiver(rcvPlayer, rcvGuid.GetCounter()), MailSender(owner),
+                    MAIL_CHECK_MASK_COPIED);
+    owner->SaveInventoryAndGoldToDB(trans);
+    CharacterDatabase.CommitTransaction(trans);
+
+    ch.PSendSysMessage("|cff66ccff[WowPsParty]|r Mailed |cffffffff{}|r to |cffffffff{}|r.", itemName, recipient);
+    LOG_INFO("module", "[WowPsParty Mail] requester={} owner={} item='{}'(entry={}) -> recipient='{}'(guid={})",
+        requester->GetGUID().GetCounter(), owner->GetGUID().GetCounter(), itemName, tmpl->ItemId,
+        recipient, rcvGuid.GetCounter());
+    WowPsParty::SendInventoryTo(requester);
+}
+
 // AH_SELL\t<srcPartySlot>\t<srcItemGuidLow>\t<copperBuyout>
 //   Lists an item out of any party member's bag on the owner's faction Auction
 //   House — no auctioneer required (same auctioneer-less posting the AH bot uses).
@@ -4562,6 +4643,10 @@ public:
         else if (command == "PROSPECT")
         {
             HandleProspect(player, payload);
+        }
+        else if (command == "MAIL_SEND")
+        {
+            HandleMailSend(player, payload);
         }
         else if (command == "COME_HITHER")
         {
