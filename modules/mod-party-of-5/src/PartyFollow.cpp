@@ -4227,6 +4227,96 @@ namespace WowPsParty
         }
     }
 
+    // ---- Trial of the Champion JOUST -----------------------------------------
+    // The opening of ToC (map 650) is a mounted joust: each player boards an Argent
+    // jousting MOUNT (a free, pre-spawned vehicle creature) and fights with lance
+    // abilities. The bots used to stay on foot (the generic boarding only knew Oculus
+    // drakes), so the party couldn't clear it.
+    static constexpr uint32 TOC_ARGENT_WARHORSE   = 35644;   // Alliance player joust mount
+    static constexpr uint32 TOC_ARGENT_BATTLEWORG = 36558;   // Horde player joust mount
+    static constexpr uint32 TOC_LANCE_EQUIPPED    = 62853;   // aura the mount expects on the rider
+    static constexpr uint32 TOC_SPELL_DEFEND        = 66482;  // stacking damage reduction (keep at 3)
+    static constexpr uint32 TOC_SPELL_SHIELD_BREAKER= 62575;  // ranged: strips the enemy's Defend
+    static constexpr uint32 TOC_SPELL_CHARGE        = 68284;  // gap-closer + charge/stun
+    static constexpr uint32 TOC_SPELL_THRUST        = 68505;  // melee lance attack
+
+    static bool CastVehicleAbility(Creature* vc, uint32 spellId, Unit* target);   // defined below
+
+    static bool IsToCJoustMount(Unit* veh)
+    {
+        if (!veh) return false;
+        uint32 const e = veh->GetEntry();
+        return e == TOC_ARGENT_WARHORSE || e == TOC_ARGENT_BATTLEWORG;
+    }
+
+    // Nearest FREE joust mount the bot can board — same creature entry as the leader's
+    // mount (so same faction, and never an enemy champion's different-entry mount), alive,
+    // with seat 0 empty. The mounts are pre-spawned, so the bot just boards one.
+    static Creature* FindFreeJoustMount(Player* bot, Unit* leadVeh)
+    {
+        if (!bot || !leadVeh) return nullptr;
+        std::list<Creature*> mounts;
+        Acore::AllCreaturesOfEntryInRange check(bot, leadVeh->GetEntry(), 60.0f);
+        Acore::CreatureListSearcher<Acore::AllCreaturesOfEntryInRange> searcher(bot, mounts, check);
+        Cell::VisitObjects(bot, searcher, 60.0f);
+        Creature* best = nullptr;
+        float bestD = 1e9f;
+        for (Creature* c : mounts)
+        {
+            if (!c || !c->IsAlive() || c == leadVeh) continue;
+            Vehicle* vk = c->GetVehicleKit();
+            if (!vk || vk->GetPassenger(0)) continue;   // no kit / seat 0 already taken
+            float const d = bot->GetDistance(c);
+            if (d < bestD) { bestD = d; best = c; }
+        }
+        return best;
+    }
+
+    // One tick of the joust ability rotation while the bot rides a ToC mount. Keep Defend
+    // stacked (survival), then strip the enemy's shield at range (Shield-Breaker), close the
+    // gap (Charge), and Thrust in melee. Cast via the vehicle creature (CastVehicleAbility),
+    // the same proven path the Oculus drakes use. Returns true (it owns the vehicle tick).
+    static bool TickToCJoustAbilities(Player* bot, Creature* vc, uint32& last, uint32 now)
+    {
+        // Throttled state trace (~5s) — this can only be validated in a live ToC run, so
+        // log enough to tell whether the bot is engaging and the lance spells are firing.
+        {
+            static thread_local std::unordered_map<uint32, uint32> traceMs;
+            uint32& t = traceMs[bot->GetGUID().GetCounter()];
+            if (now - t > 5000)
+            {
+                t = now;
+                Unit* const v = vc->GetVictim();
+                LOG_INFO("module", "[WowPsParty Joust] {} on mount entry={} defendStacks={} victim={}",
+                         bot->GetName(), vc->GetEntry(), vc->GetAuraCount(TOC_SPELL_DEFEND),
+                         v ? v->GetEntry() : 0);
+            }
+        }
+
+        // Survival first: keep the Defend shield topped to 3 stacks (CD-paced).
+        if (vc->GetAuraCount(TOC_SPELL_DEFEND) < 3 && CastVehicleAbility(vc, TOC_SPELL_DEFEND, vc))
+        { last = now; return true; }
+
+        // Pick an enemy: the leader's mount's victim (an enemy champion's mount), else the
+        // nearest hostile the mount can attack.
+        Player* leader = ObjectAccessor::FindConnectedPlayer(GetLeaderFor(bot->GetGUID()));
+        Unit* target = nullptr;
+        if (leader && leader->GetVehicleBase()) target = leader->GetVehicleBase()->GetVictim();
+        if (!target || !target->IsAlive() || !vc->IsValidAttackTarget(target))
+            target = vc->SelectNearbyTarget(nullptr, 40.0f);
+        if (target && vc->IsValidAttackTarget(target))
+        {
+            float const d = vc->GetDistance(target);
+            if (d > 8.0f && d <= 30.0f && CastVehicleAbility(vc, TOC_SPELL_SHIELD_BREAKER, target))
+            { last = now; return true; }                 // strip their shield at range
+            if (d > 10.0f && CastVehicleAbility(vc, TOC_SPELL_CHARGE, target))
+            { last = now; return true; }                 // charge in to close + stun
+            if (d <= 8.0f && CastVehicleAbility(vc, TOC_SPELL_THRUST, target))
+            { last = now; return true; }                 // melee lance
+        }
+        return true;
+    }
+
     // Most-injured party member that is itself on a vehicle (so a vehicle heal/shield has
     // a sensible target) at or below pctMax. Includes the leader. Returns the VEHICLE base.
     static Unit* MostInjuredVehicleAlly(Player* bot, Player* leader, uint32 pctMax)
@@ -4296,6 +4386,27 @@ namespace WowPsParty
                 if (now - last > 3000) { last = now; bot->CastSpell(bot, ride, true); }
                 return true;
             }
+            // ToC joust: the mounts are FREE pre-spawned vehicles — board the nearest
+            // unoccupied one matching the leader's mount (Argent Warhorse / Battleworg).
+            if (IsToCJoustMount(leadVeh))
+            {
+                uint32 const now = getMSTime();
+                uint32& last = g_vehAcquireMs[bot->GetGUID().GetCounter()];
+                if (now - last > 2000)
+                {
+                    last = now;
+                    if (Creature* mount = FindFreeJoustMount(bot, leadVeh))
+                    {
+                        if (!bot->HasAura(TOC_LANCE_EQUIPPED))
+                            bot->CastSpell(bot, TOC_LANCE_EQUIPPED, true);   // the mount expects the lance
+                        bot->EnterVehicle(mount, 0);
+                        LOG_INFO("module", "[WowPsParty Vehicle] {} boarded a ToC joust mount", bot->GetName());
+                    }
+                }
+                bot->GetMotionMaster()->Clear();   // don't run on the ground while waiting for a free mount
+                bot->StopMoving();
+                return true;
+            }
             // No known way to put the bot on this vehicle type yet — at least DON'T walk
             // in the air after the flying leader. Hold position. (Generic free-vehicle
             // boarding is a follow-up.)
@@ -4319,6 +4430,12 @@ namespace WowPsParty
         uint32 const now = getMSTime();
         uint32& last = g_vehCastMs[bot->GetGUID().GetCounter()];
         if (now - last < 1300) return true;   // ~GCD throttle
+
+        // ToC joust mounts run a dedicated lance rotation (Defend/Shield-Breaker/Charge/
+        // Thrust); the generic "first castable ability" loop below would miss the self-cast
+        // Defend shield and the range-gated lance abilities.
+        if (IsToCJoustMount(vc))
+            return TickToCJoustAbilities(bot, vc, last, now);
 
         Player* leader = ObjectAccessor::FindConnectedPlayer(GetLeaderFor(bot->GetGUID()));
         Unit* enemy = nullptr;
