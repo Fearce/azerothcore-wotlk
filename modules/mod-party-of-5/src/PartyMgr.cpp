@@ -858,9 +858,10 @@ namespace WowPsParty
                 else if (tree == 1)   // COMBAT — Sinister Strike + Blade Flurry cleave
                 {
                     rogueShared();
-                    // Blade Flurry: cleave CD whenever 3+ are in melee. buff_self falls
-                    // through while active / on cooldown, so the high priority is free.
-                    add("enemies_in_melee>2", "buff_self:Blade Flurry", 84);
+                    // Blade Flurry: cleave CD whenever 3+ are in melee. Sits JUST BELOW
+                    // Stealth (80 -> 79, Kevin) so it leads the in-combat rotation; buff_self
+                    // falls through while active / on cooldown, so the high priority is free.
+                    add("enemies_in_melee>2", "buff_self:Blade Flurry", 79);
                 }
                 else if (tree == 2)   // SUBTLETY — Hemorrhage builder
                 {
@@ -1062,12 +1063,12 @@ namespace WowPsParty
                     // weapon's temp-enchant and skips once it's already imbued, so the
                     // high priority is free). Resto -> Earthliving Weapon.
                     add("out_of_combat", "buff_self:Earthliving Weapon", 85);
-                    // Buff totems — IN COMBAT only (Kevin): re-dropped at the shaman's feet
-                    // whenever the old one is gone or the party out-ran it (totem_buff_stale),
-                    // so the aura keeps reaching a party that moved up. One per element slot.
-                    add("in_combat&totem_buff_stale:water", "cast_self:Mana Spring Totem", 40);   // party mana regen
-                    add("in_combat&totem_buff_stale:earth", "cast_self:Stoneskin Totem", 39);     // armor / cast pushback
-                    add("in_combat&totem_buff_stale:air",   "cast_self:Wrath of Air Totem", 38);  // +spell power for the casters
+                    // Buff totems dropped as a SET in one off-GCD tick (Call-of-the-Elements
+                    // emulation): water/earth/air at once whenever any is gone or out-run,
+                    // incl. DURING a multi-pull (party_in_combat), so the aura keeps reaching
+                    // a party that moved up without the resto burning a GCD per totem.
+                    add("party_in_combat&totem_set_stale:Stoneskin Totem,Mana Spring Totem,Wrath of Air Totem",
+                        "cast_totem_set:Stoneskin Totem,Mana Spring Totem,Wrath of Air Totem", 40);
                     add("self_mana>88&target_missing_aura:Flame Shock", "cast:Flame Shock", 34);
                     add("self_mana>88&has_target", "cast:Lightning Bolt", 30);
                 }
@@ -1079,13 +1080,10 @@ namespace WowPsParty
                         add("party_lowest_health<30", "cast_party_lowest:Healing Wave", 86);
                         add("target_casting&target_interruptible", "cast:Wind Shear", 82);
                         add("target_missing_aura:Flame Shock", "cast:Flame Shock", 72);
-                        // Totems — IN COMBAT only (Kevin). The attack totem walks IN to
-                        // the pack and re-places on each new pack; buff totems drop at the
-                        // shaman's feet and re-drop (totem_buff_stale) once the party out-
-                        // runs them. The air totem is spec-specific (added per branch).
-                        add("in_combat&totem_attack_needed:fire", "cast_totem_attack:Searing Totem", 54); // pack fire damage
-                        add("in_combat&totem_buff_stale:earth", "cast_self:Strength of Earth Totem", 50); // party melee AP
-                        add("in_combat&totem_buff_stale:water", "cast_self:Mana Spring Totem", 49);       // party mana regen
+                        // Totems are added PER SPEC below — the buff SET differs by spec
+                        // (elemental gets Totem of Wrath in the fire slot; enh/low keep
+                        // Searing as a separate attack totem). The set drops as one off-GCD
+                        // action (Call-of-the-Elements emulation), incl. during a multi-pull.
                         add("has_target", "cast:Earth Shock", 46);   // ele instant / enh dump
                     };
 
@@ -1098,7 +1096,14 @@ namespace WowPsParty
                         // so it never overwrites a known Windfury).
                         add("out_of_combat", "buff_self:Windfury Weapon", 85);
                         add("out_of_combat&!spell_ready:Windfury Weapon", "buff_self:Rockbiter Weapon", 84);
-                        add("in_combat&totem_buff_stale:air", "cast_self:Windfury Totem", 48);  // melee haste
+                        // Buff totems dropped as a SET in one off-GCD tick (Call-of-the-
+                        // Elements emulation): earth/water/air at once, incl. DURING a
+                        // multi-pull (party_in_combat) so the shaman doesn't burn a GCD per
+                        // totem. Fire is the Searing ATTACK totem, walked to the pack (kept
+                        // separate, held during the pull since it pulls threat).
+                        add("party_in_combat&totem_set_stale:Strength of Earth Totem,Mana Spring Totem,Windfury Totem",
+                            "cast_totem_set:Strength of Earth Totem,Mana Spring Totem,Windfury Totem", 52);
+                        add("party_in_combat&totem_attack_needed:fire", "cast_totem_attack:Searing Totem", 54);
                         add("has_target", "cast:Stormstrike", 70);
                         add("has_target", "cast:Lava Lash", 64);
                         // Enh's only nukes are the INSTANT Maelstrom-Weapon procs (5 stacks)
@@ -1116,7 +1121,19 @@ namespace WowPsParty
                         add("party_has_tank",  "buff_self:Water Shield", 78);
                         add("!party_has_tank", "buff_self:Lightning Shield", 77);
                         add("out_of_combat", "buff_self:Flametongue Weapon", 85);
-                        add("in_combat&totem_buff_stale:air", "cast_self:Wrath of Air Totem", 48);  // spell haste
+                        // Buff totems dropped as a SET in one off-GCD tick (Call-of-the-
+                        // Elements emulation), incl. DURING a multi-pull (party_in_combat).
+                        // Fire = Totem of Wrath (a BUFF totem) when learned; air = Wrath of
+                        // Air, else Windfury (list order = priority, first LEARNED per element
+                        // wins). Searing is only used as the fire totem when Totem of Wrath
+                        // ISN'T learned (below).
+                        add("party_in_combat&totem_set_stale:Totem of Wrath,Strength of Earth Totem,Mana Spring Totem,Wrath of Air Totem,Windfury Totem",
+                            "cast_totem_set:Totem of Wrath,Strength of Earth Totem,Mana Spring Totem,Wrath of Air Totem,Windfury Totem", 52);
+                        // Fire FALLBACK: no Totem of Wrath learned -> the fire slot has no
+                        // buff totem, so drop Searing at the pack instead. Suppressed while
+                        // Totem of Wrath holds the fire slot (it's the better elemental totem).
+                        add("party_in_combat&totem_attack_needed:fire&!self_totem_active:Totem of Wrath",
+                            "cast_totem_attack:Searing Totem", 50);
                         add("has_target", "cast:Lava Burst", 66);
                         add("enemies_clustered:8>2", "cast:Chain Lightning", 56);   // ranged cluster AoE
                         add("has_target", "cast:Lightning Bolt", 38);              // ranged filler
@@ -1127,6 +1144,11 @@ namespace WowPsParty
                         add("party_has_tank",  "buff_self:Water Shield", 78);
                         add("!party_has_tank", "buff_self:Lightning Shield", 77);
                         add("out_of_combat", "buff_self:Flametongue Weapon", 85);
+                        // Buff totems as a SET (whichever of these are learned); Searing is
+                        // the fire attack totem. ResolveTotemSet skips any not-yet-trained.
+                        add("party_in_combat&totem_set_stale:Strength of Earth Totem,Mana Spring Totem",
+                            "cast_totem_set:Strength of Earth Totem,Mana Spring Totem", 52);
+                        add("party_in_combat&totem_attack_needed:fire", "cast_totem_attack:Searing Totem", 54);
                         add("has_target", "cast:Lightning Bolt", 38);
                     }
                 }

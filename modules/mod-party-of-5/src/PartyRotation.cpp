@@ -2225,6 +2225,77 @@ namespace WowPsParty
     static uint32 FindKnownSpellByName(Player* bot, std::string const& name);
     static uint32 ResolveUtilitySpell(Player* bot, bool wantStun);
 
+    // ---- Shaman totem SET (Call-of-the-Elements emulation) ------------------
+    // 3.3.5a's "Call of the Elements" (66842) is a CLIENT-side button that fans out
+    // into 4 separate totem casts; it has NO server effect, so a clientless bot can't
+    // use it. Instead we emulate it: a single cast_totem_set action drops the bot's
+    // chosen buff totem per element in ONE tick (off-GCD, mana still paid — like the
+    // real one-button drop) so the shaman stops burning a GCD per totem every fight.
+
+    // The element totem slot (SUMMON_SLOT_TOTEM_FIRE..AIR) a totem SPELL summons into,
+    // read from its SUMMON effect's SummonProperties (the same data the core places it
+    // by). 0 = not one of the 4 element totems (or unknown spell).
+    static uint8 TotemElementSlotForSpell(uint32 spellId)
+    {
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId);
+        if (!si) return 0;
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        {
+            if (si->Effects[i].Effect != SPELL_EFFECT_SUMMON) continue;
+            SummonPropertiesEntry const* props =
+                sSummonPropertiesStore.LookupEntry(si->Effects[i].MiscValueB);
+            if (props && props->Slot >= SUMMON_SLOT_TOTEM_FIRE && props->Slot < MAX_TOTEM_SLOT)
+                return uint8(props->Slot);
+        }
+        return 0;
+    }
+
+    // Resolve a comma-separated totem-name list to the chosen LEARNED totem per element
+    // slot — list order is priority, so the FIRST learned totem of each element wins
+    // (e.g. "Wrath of Air Totem,Windfury Totem" picks Wrath of Air when learned, else
+    // Windfury). out[slot] = spellId (0 = no learned totem for that element). Returns
+    // how many element slots got a totem.
+    static int ResolveTotemSet(Player* bot, std::string const& list, uint32 (&out)[MAX_TOTEM_SLOT])
+    {
+        for (uint8 i = 0; i < MAX_TOTEM_SLOT; ++i) out[i] = 0;
+        if (!bot) return 0;
+        int n = 0;
+        size_t start = 0;
+        while (start <= list.size())
+        {
+            size_t const comma = list.find(',', start);
+            std::string name = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+            size_t const a = name.find_first_not_of(" \t");
+            size_t const b = name.find_last_not_of(" \t");
+            if (a != std::string::npos) name = name.substr(a, b - a + 1); else name.clear();
+            if (!name.empty())
+                if (uint32 const spellId = FindKnownSpellByName(bot, name))   // 0 = not learned
+                {
+                    uint8 const slot = TotemElementSlotForSpell(spellId);
+                    if (slot >= SUMMON_SLOT_TOTEM_FIRE && slot < MAX_TOTEM_SLOT && out[slot] == 0)
+                    { out[slot] = spellId; ++n; }
+                }
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+        return n;
+    }
+
+    // True when any chosen element totem in the set is MISSING or has been left too far
+    // behind (the same staleness test as totem_buff_stale, applied per element).
+    static bool TotemSetStale(Player* bot, std::string const& list)
+    {
+        uint32 chosen[MAX_TOTEM_SLOT];
+        ResolveTotemSet(bot, list, chosen);
+        for (uint8 s = SUMMON_SLOT_TOTEM_FIRE; s < MAX_TOTEM_SLOT; ++s)
+        {
+            if (!chosen[s]) continue;
+            Creature* const t = LiveTotemInSlot(bot, s);
+            if (!t || bot->GetDistance(t) > BUFF_TOTEM_REACH) return true;
+        }
+        return false;
+    }
+
     // `tOverride` substitutes "the target" for every target_* clause (null →
     // the bot's victim, the normal case). `skipTargetClauses` drops target_*
     // clauses from this evaluation entirely — cast_spread rules use it at
@@ -2651,6 +2722,14 @@ namespace WowPsParty
                 if (!t) return true;                                 // missing -> drop it
                 return bot->GetDistance(t) > BUFF_TOTEM_REACH;       // out-run -> re-drop near the party
             }
+
+            // SET refresh gate (Call-of-the-Elements emulation). TRUE when ANY of the
+            // chosen element totems in the comma-separated list is missing/out-run, so
+            // pair it with cast_totem_set to drop the whole stale set in one tick:
+            // "party_in_combat&totem_set_stale:Totem of Wrath,Strength of Earth Totem,
+            //  Mana Spring Totem,Wrath of Air Totem | cast_totem_set:<same list>".
+            if (cname == "totem_set_stale")
+                return TotemSetStale(bot, arg);
 
             // target_casting:<spell> / target_channeling:<spell> — fire only while
             // the target is mid-cast of a SPECIFIC spell, by display name or by
@@ -4626,6 +4705,37 @@ namespace WowPsParty
             }
             if (!canFireSpellOn(spellId, bot)) return false;
             return faceAndCast(bot, spellId);   // in range — summon it at our feet, near the pack
+        }
+
+        // "cast_totem_set:<t1>,<t2>,..." — Call-of-the-Elements emulation: drop the bot's
+        // chosen LEARNED buff totem per element (list order = priority) in ONE tick. The
+        // element totems summon OFF the global cooldown (mana still paid), so the whole
+        // stale set lands at once instead of one totem per GCD across the fight — the
+        // shaman stops hand-placing totems every pull. Only the STALE ones (missing /
+        // out-run) are (re)dropped. Searing stays a separate cast_totem_attack placed at
+        // the pack, so it's never listed here.
+        if (verb == "cast_totem_set")
+        {
+            uint32 chosen[MAX_TOTEM_SLOT];
+            if (ResolveTotemSet(bot, arg, chosen) == 0) return false;   // nothing learned -> fall through
+            std::vector<uint32> toDrop;
+            for (uint8 s = SUMMON_SLOT_TOTEM_FIRE; s < MAX_TOTEM_SLOT; ++s)
+            {
+                if (!chosen[s]) continue;
+                Creature* const t = LiveTotemInSlot(bot, s);
+                if (!t || bot->GetDistance(t) > BUFF_TOTEM_REACH)
+                    toDrop.push_back(chosen[s]);
+            }
+            if (toDrop.empty()) return false;            // whole set already up + in range
+            // Totems are instant + castable while moving, so we don't StopMoving here —
+            // that would fight the pull-anchor/follow mover; they land at the bot's spot.
+            // Off-GCD (TRIGGERED_IGNORE_GCD) so all stale totems land THIS tick; power is
+            // still consumed (we do NOT set TRIGGERED_IGNORE_POWER_AND_REAGENT_COST).
+            TriggerCastFlags const flags =
+                TriggerCastFlags(TRIGGERED_IGNORE_GCD | TRIGGERED_IGNORE_CAST_IN_PROGRESS);
+            for (uint32 sid : toDrop)
+                bot->CastSpell(bot, sid, flags);
+            return true;
         }
 
         if (verb == "buff_self")
