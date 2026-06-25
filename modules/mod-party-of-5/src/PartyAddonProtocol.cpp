@@ -2336,6 +2336,149 @@ static void HandleDisenchant(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// PROSPECT\t<srcPartySlot>\t<srcItemGuidLow> — prospect a stack of ore from any party
+// member into gems. Mirrors HandleDisenchant: a party member with Jewelcrafting skill
+// (>= the ore's RequiredSkillRank) is the prospector; one prospect consumes 5 ore and
+// rolls the SAME table the Prospecting spell uses (LootTemplates_Prospecting), keyed by
+// the ore's item entry — directly, since a clientless bot can't drive the loot WINDOW.
+static void HandleProspect(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const srcSlot        = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+    if (!srcItemGuidLow) return;
+
+    uint32 const account   = requester->GetSession()->GetAccountId();
+    uint32 const ownerGuid = WowPsParty::GuidForAccountSlot(account, srcSlot);
+    if (!ownerGuid) return;
+    Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(ownerGuid));
+    if (!owner) return;
+    Item* item = owner->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!item) return;
+    ItemTemplate const* tmpl = item->GetTemplate();
+    if (!tmpl) return;
+
+    ChatHandler ch(requester->GetSession());
+    if (!tmpl->HasFlag(ITEM_FLAG_IS_PROSPECTABLE))
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r |cffffffff{}|r can't be prospected.", tmpl->Name1);
+        return;
+    }
+    if (item->GetCount() < 5)
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r Prospecting needs a stack of at least 5 |cffffffff{}|r.", tmpl->Name1);
+        return;
+    }
+
+    // A party member whose Jewelcrafting skill covers this ore's required level.
+    Player* prospector = nullptr;
+    std::ostringstream diag;
+    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
+    {
+        uint32 const g = WowPsParty::GuidForAccountSlot(account, partySlot);
+        if (!g) { diag << " [slot" << uint32(partySlot) << ":empty]"; continue; }
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g));
+        if (!p) { diag << " [slot" << uint32(partySlot) << ":guid" << g << ":NOT-CONNECTED]"; continue; }
+        bool const hasSkill = p->HasSkill(SKILL_JEWELCRAFTING);
+        uint16 const skill  = hasSkill ? p->GetSkillValue(SKILL_JEWELCRAFTING) : 0;
+        diag << " [slot" << uint32(partySlot) << ":" << p->GetName()
+             << ":jc=" << (hasSkill ? std::to_string(skill) : std::string("none")) << "]";
+        if (!prospector && hasSkill && skill >= tmpl->RequiredSkillRank)
+            prospector = p;
+    }
+    if (!prospector)
+    {
+        LOG_WARN("module",
+            "[WowPsParty Prospect] FAILED 'no jeweler skilled enough' — requester={} account={} "
+            "item='{}'(entry={}) requiredSkill={} | party:{}",
+            requester->GetName(), account, tmpl->Name1, tmpl->ItemId, tmpl->RequiredSkillRank, diag.str());
+        ch.PSendSysMessage(
+            "|cffff5555[WowPsParty]|r No party jeweler skilled enough to prospect "
+            "|cffffffff{}|r (needs Jewelcrafting {}).", tmpl->Name1, tmpl->RequiredSkillRank);
+        return;
+    }
+
+    // Roll the prospecting loot directly (same table as the spell), keyed by the ore entry.
+    Loot loot;
+    loot.FillLoot(tmpl->ItemId, LootTemplates_Prospecting, owner, true, true);
+    std::vector<std::pair<uint32, uint32>> gems;
+    for (LootItem const& li : loot.items)
+        if (li.itemid && li.count)
+            gems.emplace_back(li.itemid, uint32(li.count));
+    if (gems.empty())
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r Prospecting produced nothing — ore kept.");
+        return;
+    }
+
+    // Make sure the party can hold the gems BEFORE consuming the ore (prospecting is
+    // irreversible). Don't assume the 5-ore consume frees a slot — it only does if the
+    // stack was exactly 5 — so require the gems to fit the CURRENT free space.
+    auto freeSlots = [](Player* p) -> uint32
+    {
+        uint32 n = 0;
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            if (!p->GetItemByPos(INVENTORY_SLOT_BAG_0, i)) ++n;
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = p->GetBagByPos(b))
+                for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                    if (!p->GetItemByPos(b, uint8(j))) ++n;
+        return n;
+    };
+    uint32 partyFree = 0;
+    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
+    {
+        uint32 const g = WowPsParty::GuidForAccountSlot(account, partySlot);
+        if (!g) continue;
+        if (Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g)))
+            partyFree += freeSlots(p);
+    }
+    if (gems.size() > size_t(partyFree))
+    {
+        ch.PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Not enough free bag space for the gems — make room and try again. (Ore kept.)");
+        return;
+    }
+
+    std::string const itemName = tmpl->Name1;
+    uint32 const itemEntry = tmpl->ItemId;
+    prospector->UpdateCraftSkill(31252 /* Prospecting */);   // skill-up chance
+    owner->DestroyItemCount(itemEntry, 5, true);             // consume 5 ore
+
+    std::ostringstream gained;
+    for (auto const& m : gems)
+    {
+        for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
+        {
+            uint32 const g = WowPsParty::GuidForAccountSlot(account, partySlot);
+            if (!g) continue;
+            Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g));
+            if (!p) continue;
+            ItemPosCountVec dest;
+            if (p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, m.first, m.second) != EQUIP_ERR_OK)
+                continue;
+            p->StoreNewItem(dest, m.first, true);
+            ItemTemplate const* mt = sObjectMgr->GetItemTemplate(m.first);
+            if (!gained.str().empty()) gained << ", ";
+            gained << m.second << "x " << (mt ? mt->Name1 : "?");
+            break;
+        }
+    }
+
+    ch.PSendSysMessage("|cff66ccff[WowPsParty]|r {} prospected 5x |cffffffff{}|r -> {}.",
+        prospector->GetName(), itemName,
+        gained.str().empty() ? "nothing (party bags full)" : gained.str());
+    LOG_INFO("module",
+        "[WowPsParty Prospect] requester={} owner={} prospector={} ore='{}'(entry={}) -> {}",
+        requester->GetGUID().GetCounter(), owner->GetGUID().GetCounter(),
+        prospector->GetGUID().GetCounter(), itemName, itemEntry,
+        gained.str().empty() ? "NOTHING (bags full)" : gained.str());
+
+    WowPsParty::SendInventoryTo(requester);
+}
+
 // AH_SELL\t<srcPartySlot>\t<srcItemGuidLow>\t<copperBuyout>
 //   Lists an item out of any party member's bag on the owner's faction Auction
 //   House — no auctioneer required (same auctioneer-less posting the AH bot uses).
@@ -4415,6 +4558,10 @@ public:
         else if (command == "DISENCHANT")
         {
             HandleDisenchant(player, payload);
+        }
+        else if (command == "PROSPECT")
+        {
+            HandleProspect(player, payload);
         }
         else if (command == "COME_HITHER")
         {
