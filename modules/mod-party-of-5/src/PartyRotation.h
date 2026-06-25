@@ -25,8 +25,8 @@
  *     target_is_boss | target_is_elite | target_is_rare | target_is_normal
  *     is_immune                          target immune to ALL damage schools (a
  *                                 Divine Shield / Ice Block bubble)
- *     is_immune:<school>                 immune to one school (physical, holy, fire,
- *                                 nature, frost, shadow, arcane) — e.g. is_immune:shadow
+ *     is_immune:<school>                 immune to one school (physical/melee, holy,
+ *                                 fire, nature, frost, shadow, arcane) — e.g. is_immune:shadow
  *     target_type_{beast,dragonkin,demon,elemental,giant,undead,humanoid}
  *     target_casting | target_channeling | target_interruptible
  *     target_casting:<spell> | target_channeling:<spell>   fire only while the target
