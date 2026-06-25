@@ -5868,6 +5868,57 @@ namespace WowPsParty
                 return true;
             }
 
+            // SELF-RECOVERY via the graveyard (Kevin): a dead hero with no rez coming
+            // RELEASES its spirit to the nearest graveyard, the spirit healer resurrects
+            // it, and the follow ticker walks it back to the captain — instead of lying
+            // dead. A healer's rez is still preferred (auto-accepted above); this only
+            // fires after a grace with no rez pending and a LIVING leader to return to
+            // (so a full wipe waits for the captain to recover, then the heroes regroup).
+            static constexpr uint32 RELEASE_GRACE_MS = 12000;
+            {
+                static thread_local std::unordered_map<uint32, uint32> deadSinceMs;
+                uint32 const gl = d.followerGuid.GetCounter();
+                if (follower->IsAlive() || follower->isResurrectRequested() || !leader->IsAlive())
+                    deadSinceMs.erase(gl);   // alive / rez incoming / leader also down -> wait
+                else
+                {
+                    uint32 const now = getMSTime();
+                    uint32& since = deadSinceMs[gl];
+                    if (since == 0) since = now;
+                    if (now - since >= RELEASE_GRACE_MS)
+                    {
+                        if (follower->HasPlayerFlag(PLAYER_FLAGS_GHOST))
+                        {
+                            // Released + at the graveyard -> the spirit healer brings it
+                            // back (50% HP, NO sickness so the hero stays useful), then the
+                            // follow ticker returns it to the leader.
+                            follower->ResurrectPlayer(0.5f, false);
+                            follower->SpawnCorpseBones();
+                            ForceMovableState(follower);
+                            follower->GetMotionMaster()->Clear();
+                            follower->GetMotionMaster()->MoveIdle();
+                            follower->StopMoving();
+                            deadSinceMs.erase(gl);
+                            LOG_INFO("module",
+                                "[WowPsParty Follow] {} spirit-healer res at the graveyard -> heading back to the leader",
+                                follower->GetName());
+                            return true;
+                        }
+                        if (follower->getDeathState() == DeathState::Corpse)
+                        {
+                            // Release the spirit -> ghost at the nearest graveyard (the
+                            // spirit healer res fires next tick, once it's a ghost there).
+                            follower->BuildPlayerRepop();
+                            follower->RepopAtGraveyard();
+                            LOG_INFO("module",
+                                "[WowPsParty Follow] {} released its spirit to the nearest graveyard",
+                                follower->GetName());
+                            return true;
+                        }
+                    }
+                }
+            }
+
             // DELAYED party-wipe regroup auto-rez. A dead follower is revived at the
             // leader ONLY after the leader has been alive + OUT OF COMBAT continuously
             // for AUTO_REZ_DELAY_MS (Kevin: don't autorez immediately — delay ~1 min
