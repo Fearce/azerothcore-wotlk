@@ -774,7 +774,12 @@ public:
             ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(m.guid);
             Player* p = ObjectAccessor::FindConnectedPlayer(og);
             if (!p || !p->IsInWorld()) continue;
-            if (p->GetMapId() != killer->GetMapId()) continue;
+            // Same-Map* only (not just same map id): storing into a peer on
+            // another map/instance races that peer's save thread and can free
+            // an item still queued in it (the use-after-free seen in the shared
+            // reagent path — see WowPsParty_TakeReagent). Compare Map* because
+            // two instances of one map are distinct update contexts.
+            if (p->GetMap() != killer->GetMap()) continue;
             takers.push_back(p);
         }
         if (takers.empty()) return;
@@ -1299,6 +1304,53 @@ void WowPsParty_TakeReagent(Player* crafter, uint32 itemId, uint32 count)
     if (remaining)
         LOG_WARN("module", "[WowPsParty Reagent] {}'s craft is still {}x short of reagent {} after the shared inventory — a holder likely left the crafter's map mid-cast.",
                  crafter->GetName(), remaining, itemId);
+}
+
+// Trampoline called from the [WowPsParty PATCH] in Player::StoreLootItem (the
+// loot-window path: gathering nodes, chests, fishing, manual corpse loot). The
+// shared-inventory party is ONE pooled inventory across the human's HEROES, so
+// normal loot is spread evenly and a member with full bags overflows into a
+// hero that still has room — an individual member is never "full" until the
+// WHOLE party is. Picks the hero (the looter included) with the most free bag
+// space that can actually hold the item; returns the looter unchanged for
+// solo / shared-inventory-off / henchman looters, or when nobody can take it
+// (whole party full -> vanilla EQUIP_ERR). Henchmen are deliberately excluded
+// as recipients (GetParty/LoadedPartyPeers list heroes only) AND as looters:
+// a hired henchman's own loot is not redistributed.
+Player* WowPsParty_PickLootReceiver(Player* looter, uint32 itemid, uint32 count)
+{
+    if (!looter || !looter->GetSession()) return looter;
+    if (!WowPsParty::IsEnabled() || !WowPsParty::InventoryShared(looter))
+        return looter;                                   // solo: own bag, vanilla
+    if (WowPsParty::IsHenchman(looter->GetGUID()))
+        return looter;                                   // henchman loot stays its own
+    if (count == 0) count = 1;
+
+    // Candidates: the looter + every loaded HERO peer sharing the looter's Map*.
+    // Same-Map* only (not just same map id): mutating an off-map peer's
+    // inventory from this thread races that peer's save thread (use-after-free;
+    // see WowPsParty_TakeReagent). Two instances of one map are distinct
+    // update contexts, so compare Map* not map id.
+    std::vector<Player*> heroes;
+    heroes.push_back(looter);
+    for (Player* p : LoadedPartyPeers(looter->GetSession()->GetAccountId(), looter))
+        if (p->GetMap() == looter->GetMap())
+            heroes.push_back(p);
+
+    // Most free space first; equal bags round-robin naturally as each pickup
+    // drops that hero's free count. A hero whose bags are full sorts last and
+    // is skipped by the CanStoreNewItem check below.
+    std::stable_sort(heroes.begin(), heroes.end(),
+        [](Player const* a, Player const* b)
+        { return a->GetFreeInventorySpace() > b->GetFreeInventorySpace(); });
+
+    for (Player* h : heroes)
+    {
+        ItemPosCountVec dest;
+        if (h->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemid, count) == EQUIP_ERR_OK)
+            return h;
+    }
+    return looter;   // whole party is full -> let the vanilla path raise the error
 }
 
 // Trampoline called from the [WowPsParty PATCH] in Spell.cpp::CheckItems.

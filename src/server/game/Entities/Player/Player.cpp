@@ -13577,21 +13577,43 @@ void Player::AutoStoreLoot(uint8 bag, uint8 slot, uint32 loot_id, LootStore cons
     for (uint32 i = 0; i < max_slot; ++i)
     {
         LootItem* lootItem = loot.LootItemInSlot(i, this);
+        if (!lootItem)
+            continue;
+
+        // [WowPsParty PATCH] Shared party inventory: spread this loot (prospect /
+        // mill / disenchant / pickpocket output) evenly across the human's
+        // heroes and overflow a full member into a hero that still has room, so
+        // nothing is lost until the WHOLE party is full. Returns `this` for
+        // solo / disabled / henchman actors or when the party is full.
+        extern Player* WowPsParty_PickLootReceiver(Player*, uint32, uint32);
+        Player* receiver = WowPsParty_PickLootReceiver(this, lootItem->itemid, lootItem->count);
+        if (!receiver)
+            receiver = this;
 
         ItemPosCountVec dest;
-        InventoryResult msg = CanStoreNewItem(bag, slot, dest, lootItem->itemid, lootItem->count);
-        if (msg != EQUIP_ERR_OK && slot != NULL_SLOT)
-            msg = CanStoreNewItem(bag, NULL_SLOT, dest, lootItem->itemid, lootItem->count);
-        if (msg != EQUIP_ERR_OK && bag != NULL_BAG)
-            msg = CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, lootItem->itemid, lootItem->count);
+        InventoryResult msg;
+        if (receiver == this)
+        {
+            msg = CanStoreNewItem(bag, slot, dest, lootItem->itemid, lootItem->count);
+            if (msg != EQUIP_ERR_OK && slot != NULL_SLOT)
+                msg = CanStoreNewItem(bag, NULL_SLOT, dest, lootItem->itemid, lootItem->count);
+            if (msg != EQUIP_ERR_OK && bag != NULL_BAG)
+                msg = CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, lootItem->itemid, lootItem->count);
+        }
+        else
+        {
+            // Redirected to a hero whose bag layout differs from the requested
+            // bag/slot — just take any free slot in that hero's inventory.
+            msg = receiver->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, lootItem->itemid, lootItem->count);
+        }
         if (msg != EQUIP_ERR_OK)
         {
-            SendEquipError(msg, nullptr, nullptr, lootItem->itemid);
+            receiver->SendEquipError(msg, nullptr, nullptr, lootItem->itemid);
             continue;
         }
 
-        Item* pItem = StoreNewItem(dest, lootItem->itemid, true, lootItem->randomPropertyId);
-        SendNewItem(pItem, lootItem->count, false, false, broadcast);
+        Item* pItem = receiver->StoreNewItem(dest, lootItem->itemid, true, lootItem->randomPropertyId);
+        receiver->SendNewItem(pItem, lootItem->count, false, false, broadcast);
     }
 }
 
@@ -13642,12 +13664,26 @@ LootItem* Player::StoreLootItem(uint8 lootSlot, Loot* loot, InventoryResult& msg
         return nullptr;
     }
 
+    // [WowPsParty PATCH] A shared-inventory party is one pooled inventory across
+    // the human's heroes (hired henchmen excluded). Spread normal loot evenly
+    // and overflow a member with full bags into a hero that still has room, so
+    // no individual member is "full" until the WHOLE party is. Quest / FFA /
+    // conditioned items stay personal to the looter. Returns `this` for
+    // solo / disabled / henchman looters or when the whole party is full.
+    Player* receiver = this;
+    if (!qitem && !ffaitem && !conditem)
+    {
+        extern Player* WowPsParty_PickLootReceiver(Player*, uint32, uint32);
+        if (Player* rcv = WowPsParty_PickLootReceiver(this, item->itemid, item->count))
+            receiver = rcv;
+    }
+
     ItemPosCountVec dest;
-    msg = CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, item->itemid, item->count);
+    msg = receiver->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, item->itemid, item->count);
     if (msg == EQUIP_ERR_OK)
     {
         AllowedLooterSet looters = item->GetAllowedLooters();
-        Item* newitem = StoreNewItem(dest, item->itemid, true, item->randomPropertyId, looters);
+        Item* newitem = receiver->StoreNewItem(dest, item->itemid, true, item->randomPropertyId, looters);
 
         if (qitem)
         {
@@ -13681,7 +13717,7 @@ LootItem* Player::StoreLootItem(uint8 lootSlot, Loot* loot, InventoryResult& msg
 
         --loot->unlootedCount;
 
-        SendNewItem(newitem, uint32(item->count), false, false, true);
+        receiver->SendNewItem(newitem, uint32(item->count), false, false, true);
         UpdateLootAchievements(item, loot);
 
         // LootItem is being removed (looted) from the container, delete it from the DB.
