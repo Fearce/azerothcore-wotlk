@@ -189,10 +189,13 @@ namespace WowPsParty
     std::vector<RotationRule> GetSharedRotation(uint32 account);
     void SharedRotationRefreshFromDB(uint32 account);
 
-    // True when the rotation contains a keep_distance_* rule, i.e. the user has
-    // opted the bot into rotation-driven positioning (kiting). AssistTarget then
-    // stops chasing and lets the rotation own movement.
-    bool BotIsKiting(ObjectGuid guid);
+    // True when the bot is CURRENTLY kiting: it has an enabled keep_distance_* /
+    // close_to_enemy rule whose CONDITION holds right now (evaluated against `bot`
+    // and the `target` AssistTarget is about to engage). A rule gated behind
+    // target_name only owns the feet while THAT mob is the target — so a melee bot
+    // chases normally for every other target instead of freezing. Pass the bot +
+    // intended target; with neither it falls back to rule-presence.
+    bool BotIsKiting(ObjectGuid guid, Player* bot = nullptr, Unit* target = nullptr);
 
     // Names listed in the bot's rotation "focus:" rule(s) — adds the party must
     // kill on sight (e.g. "Chaos Rift", "Frost Tomb"). Empty when none configured.

@@ -152,6 +152,11 @@ namespace WowPsParty
     // disabled (AssistTarget yields to a rotation that never hops).
     static std::string Lower(std::string s);
     static bool CsvContains(std::string const& csv, std::string const& kw);
+    // Forward-declared (defined ~line 2319) so BotIsKiting can evaluate a kite
+    // rule's CONDITION, not just its presence. No defaults here — the definition
+    // carries them; calls before that point pass all args explicitly.
+    static bool EvalCondition(std::string const& cond, Player* bot,
+                              Unit* tOverride, bool skipTargetClauses);
 
     // The account whose COMMON (shared) rotation applies to this bot — the party LEADER's
     // account (henchmen are rndbot-pool chars on OTHER accounts; the human leader owns the
@@ -176,7 +181,7 @@ namespace WowPsParty
     // account's COMMON rotation. AssistTarget reads this to STOP installing its chase/
     // dead-zone movement, handing the feet to the rotation so the two don't fight (only
     // one mover at a time).
-    bool BotIsKiting(ObjectGuid guid)
+    bool BotIsKiting(ObjectGuid guid, Player* bot, Unit* target)
     {
         // A live tank in the party means STAND at range and let it hold — don't
         // kite (kiting hops the caster around, drags mobs and pulls them off the
@@ -185,22 +190,38 @@ namespace WowPsParty
         // feet as before. Checked first, outside g_rotationCacheMutex, so it can't
         // nest locks.
         if (WowPsParty::PartyHasLiveTank(guid)) return false;
-        auto hasKite = [](std::vector<RotationRule> const& rules) -> bool
+        // Gather the CONDITION of every enabled kite/close rule (own cache under the
+        // lock, COMMON tab after). We hand back COPIES so the conditions can be
+        // evaluated after the lock is released (EvalCondition reads live bot state).
+        std::vector<std::string> kiteConds;
+        auto collect = [&kiteConds](std::vector<RotationRule> const& rules)
         {
             for (RotationRule const& r : rules)
                 if ((r.action.rfind("keep_distance", 0) == 0
                      || r.action.rfind("close_to_enemy", 0) == 0)
                     && !CsvContains(Lower(r.flags), "disabled"))
-                    return true;
-            return false;
+                    kiteConds.push_back(r.condition);
         };
         {
             std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
             auto it = g_rotationCache.find(guid.GetCounter());
-            if (it != g_rotationCache.end() && hasKite(it->second)) return true;
+            if (it != g_rotationCache.end()) collect(it->second);
         }
         if (uint32 const acct = SharedAccountFor(guid))   // COMMON tab (lock released above)
-            if (hasKite(GetSharedRotation(acct))) return true;
+            collect(GetSharedRotation(acct));
+        if (kiteConds.empty()) return false;
+        // CONDITION-AWARE handoff: a kite rule gated behind target_name (or any
+        // condition) owns the feet ONLY while its condition actually holds right now.
+        // Keying off rule PRESENCE alone made AssistTarget permanently yield, so a
+        // MELEE bot carrying "target_name:Creeping Sludge | keep_distance_enemy:8"
+        // never closed on any OTHER target — it stood frozen / jittered as a stray
+        // mover nudged it ("spazzed out and didn't move", Kevin). Evaluate against the
+        // bot and the target AssistTarget is about to engage; with neither (defensive
+        // null) fall back to presence so a genuine kiter never loses its feet.
+        if (!bot) return true;
+        for (std::string const& c : kiteConds)
+            if (EvalCondition(c, bot, target, false))
+                return true;
         return false;
     }
 

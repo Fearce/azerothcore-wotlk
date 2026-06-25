@@ -5210,13 +5210,15 @@ namespace WowPsParty
         if (bot->getStandState() != UNIT_STAND_STATE_STAND)
             bot->SetStandState(UNIT_STAND_STATE_STAND);
 
-        // Kite mode: the rotation has a keep_distance rule, so it OWNS the feet
-        // (hops away from the enemy / toward the healer between casts). Lock the
-        // victim + facing and yield all movement — installing the chase or the
-        // dead-zone back-out here would fight the kite, and only one mover can run
-        // at a time. Don't force-face while the bot is mid-hop (let the spline
-        // steer); face the target when planted so the next cast lands.
-        if (WowPsParty::BotIsKiting(bot->GetGUID()))
+        // Kite mode: a keep_distance rule whose condition holds for `desired` OWNS
+        // the feet (hops away from the enemy / toward the healer between casts). Lock
+        // the victim + facing and yield all movement — installing the chase or the
+        // dead-zone back-out here would fight the kite, and only one mover can run at
+        // a time. Pass `desired` so a target_name-gated kite only claims the feet for
+        // the mob it names (else a melee bot would freeze on every other target).
+        // Don't force-face while the bot is mid-hop (let the spline steer); face the
+        // target when planted so the next cast lands.
+        if (WowPsParty::BotIsKiting(bot->GetGUID(), bot, desired))
         {
             if (bot->GetVictim() != desired)
             {
