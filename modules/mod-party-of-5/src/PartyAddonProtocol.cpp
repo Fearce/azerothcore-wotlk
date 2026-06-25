@@ -2540,11 +2540,18 @@ static void HandleMailSend(Player* requester, std::string_view payload)
     std::string const itemName = tmpl->Name1;
     Player* const rcvPlayer = ObjectAccessor::FindConnectedPlayer(rcvGuid);
 
-    // Detach the item from the owner's bags and hand it to the mail (the same sequence the
-    // core's CMSG_SEND_MAIL handler uses), then send it. No deposit charged (party QoL).
+    // Detach the item from the owner's bags and hand it to the mail (the EXACT sequence the
+    // core's CMSG_SEND_MAIL handler uses — SetNotRefundable, move out of inventory, force a
+    // standalone save with the NEW owner so item_instance.owner_guid is rewritten now and
+    // doesn't drift if the server restarts while the mail sits unread), then send it. No
+    // deposit charged (party QoL).
     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+    item->SetNotRefundable(owner);
     owner->MoveItemFromInventory(item->GetBagSlot(), item->GetSlot(), true);
     item->DeleteFromInventoryDB(trans);
+    if (item->GetState() == ITEM_UNCHANGED)
+        item->FSetState(ITEM_CHANGED);   // force the save below so owner_guid updates in the DB
+    item->SetOwnerGUID(rcvGuid);
     item->SaveToDB(trans);
     MailDraft(std::string("Party Inventory"), std::string("Sent from the Party Inventory."))
         .AddItem(item)

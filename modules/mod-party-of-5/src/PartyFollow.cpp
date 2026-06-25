@@ -5909,11 +5909,19 @@ namespace WowPsParty
                             // Release the spirit -> ghost at the nearest graveyard (the
                             // spirit healer res fires next tick, once it's a ghost there).
                             follower->BuildPlayerRepop();
-                            follower->RepopAtGraveyard();
-                            LOG_INFO("module",
-                                "[WowPsParty Follow] {} released its spirit to the nearest graveyard",
-                                follower->GetName());
-                            return true;
+                            // Only commit to the graveyard if the release actually took (the
+                            // GHOST flag is set). BuildPlayerRepop bails rarely (CreateCorpse
+                            // fails / a stale same-map corpse) leaving it a Corpse — if so,
+                            // DON'T re-release every tick: fall through to the 60s regroup-rez
+                            // backstop below instead of monopolising the tick forever.
+                            if (follower->HasPlayerFlag(PLAYER_FLAGS_GHOST))
+                            {
+                                follower->RepopAtGraveyard();
+                                LOG_INFO("module",
+                                    "[WowPsParty Follow] {} released its spirit to the nearest graveyard",
+                                    follower->GetName());
+                                return true;
+                            }
                         }
                     }
                 }
