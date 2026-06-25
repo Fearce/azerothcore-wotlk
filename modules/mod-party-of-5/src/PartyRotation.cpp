@@ -4823,6 +4823,44 @@ namespace WowPsParty
             return faceAndCast(bot, spellId);
         }
 
+        // "buff_mainhand:<imbue>" / "buff_offhand:<imbue>" — a weapon imbue pinned
+        // to ONE hand. buff_self always enchants the main hand (else off), so it
+        // can't hold two different imbues; enh shaman wants Windfury on the main
+        // hand and Flametongue on the off hand (+25% Lava Lash). Skip if that hand
+        // already carries this imbue, or holds nothing the imbue can enchant
+        // (e.g. a shield / empty off hand), so the rule falls through cleanly.
+        if (verb == "buff_mainhand" || verb == "buff_offhand")
+        {
+            uint8 const slot = (verb == "buff_offhand")
+                ? EQUIPMENT_SLOT_OFFHAND : EQUIPMENT_SLOT_MAINHAND;
+            uint32 const spellId = FindKnownSpellByName(bot, arg);
+            if (!spellId) return false;
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            if (!info) return false;
+            uint32 imbueEnchant = 0;
+            for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                if (info->Effects[i].Effect == SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY)
+                { imbueEnchant = info->Effects[i].MiscValue; break; }
+            if (!imbueEnchant) return false;   // not a weapon imbue
+
+            Item* weapon = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (!weapon || !weapon->IsFitToSpellRequirements(info))
+                return false;   // that hand holds nothing this imbue fits
+            if (weapon->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT) == imbueEnchant)
+                return false;   // that hand already carries this imbue
+            if (!channelClipOk()) return false;
+
+            SpellCastTargets targets;
+            targets.SetItemTarget(weapon);
+            bool const fired = bot->CastSpell(targets, info, nullptr, TRIGGERED_NONE) == SPELL_CAST_OK;
+            if (fired)
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] {} imbued {} -> {} ({} hand, temp-enchant {})",
+                    bot->GetName(), arg, weapon->GetTemplate()->Name1,
+                    slot == EQUIPMENT_SLOT_OFFHAND ? "off" : "main", imbueEnchant);
+            return fired;
+        }
+
         // "cast_pet:<spell>" — cast a spell that targets the bot's own pet
         // (Mend Pet). Call Pet / Revive Pet are self-cast and go through the
         // ordinary cast_self verb gated by pet_missing / pet_dead.

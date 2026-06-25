@@ -1085,47 +1085,61 @@ namespace WowPsParty
                 else   // DPS — Elemental(0) / Enhancement(1), baked per spec.
                 {
                     // SHARED by both DPS shaman specs (and the low-level fallback).
+                    // Flame Shock + Earth Shock are NOT shared — enh wants them low in its
+                    // damage order (Kevin), ele/low want Flame Shock high — so each branch
+                    // adds its own at the priority that spec needs (conditions identical).
                     auto shaDpsShared = [&]
                     {
                         add("party_lowest_health<30", "cast_party_lowest:Healing Wave", 86);
                         add("target_casting&target_interruptible", "cast:Wind Shear", 82);
-                        add("target_missing_aura:Flame Shock", "cast:Flame Shock", 72);
                         // Totems are added PER SPEC below — the buff SET differs by spec
                         // (elemental gets Totem of Wrath in the fire slot; enh/low keep
                         // Searing as a separate attack totem). The set drops as one off-GCD
                         // action (Call-of-the-Elements emulation), incl. during a multi-pull.
-                        add("has_target", "cast:Earth Shock", 46);   // ele instant / enh dump
                     };
 
                     if (tree == 1)   // ENHANCEMENT — melee
                     {
                         shaDpsShared();
                         add("always", "buff_self:Lightning Shield", 78);   // damage-on-hit (in melee)
-                        // Windfury Weapon imbue OOC; Rockbiter only while Windfury isn't
-                        // trained yet (!spell_ready == not known; imbues have no cooldown,
-                        // so it never overwrites a known Windfury).
-                        add("out_of_combat", "buff_self:Windfury Weapon", 85);
-                        add("out_of_combat&!spell_ready:Windfury Weapon", "buff_self:Rockbiter Weapon", 84);
+                        // Dual-imbue (Kevin): Windfury on the MAIN hand for the burst proc,
+                        // Flametongue on the OFF hand (+25% Lava Lash). buff_self always
+                        // targets the main hand, so it can't place a second imbue — the
+                        // slot-pinned verbs do. Rockbiter is the main-hand fallback only while
+                        // Windfury isn't trained (!spell_ready == not known; imbues have no
+                        // cooldown so it never overwrites a known Windfury). Each verb skips
+                        // if that hand already carries the imbue / holds nothing it fits.
+                        add("out_of_combat", "buff_mainhand:Windfury Weapon", 85);
+                        add("out_of_combat&!spell_ready:Windfury Weapon", "buff_mainhand:Rockbiter Weapon", 84);
+                        add("out_of_combat", "buff_offhand:Flametongue Weapon", 83);
                         // Buff totems dropped as a SET in one off-GCD tick (Call-of-the-
                         // Elements emulation): earth/water/air at once, incl. DURING a
                         // multi-pull (party_in_combat) so the shaman doesn't burn a GCD per
                         // totem. Fire is the Searing ATTACK totem, walked to the pack (kept
                         // separate, held during the pull since it pulls threat).
+                        add("party_in_combat&totem_attack_needed:fire", "cast_totem_attack:Searing Totem", 54);
                         add("party_in_combat&totem_set_stale:Strength of Earth Totem,Mana Spring Totem,Windfury Totem",
                             "cast_totem_set:Strength of Earth Totem,Mana Spring Totem,Windfury Totem", 52);
-                        add("party_in_combat&totem_attack_needed:fire", "cast_totem_attack:Searing Totem", 54);
-                        add("has_target", "cast:Stormstrike", 70);
-                        add("has_target", "cast:Lava Lash", 64);
-                        // Enh's only nukes are the INSTANT Maelstrom-Weapon procs (5 stacks)
-                        // — a hard cast would pull the shaman to range and keep it there
-                        // (the "enh fights at range" bug). So CL (cluster) / LB (single)
-                        // ONLY with the proc; everything else enh casts is instant.
-                        add("self_aura_stacks:Maelstrom Weapon>4&enemies_clustered:8>2", "cast:Chain Lightning", 61);
-                        add("self_aura_stacks:Maelstrom Weapon>4", "cast:Lightning Bolt", 60);
+                        // Damage order (Kevin), high->low below the totems: dump Maelstrom
+                        // procs FIRST (CL in a cluster, else LB) — they're instant and expire,
+                        // so they must beat the melee strikes — then Stormstrike, Lava Lash,
+                        // and finally the shocks. CL/LB stay gated on the 5-stack proc, so a
+                        // hard cast never pulls enh to range (the "enh fights at range" bug).
+                        add("self_aura_stacks:Maelstrom Weapon>4&enemies_clustered:8>2", "cast:Chain Lightning", 50);
+                        add("self_aura_stacks:Maelstrom Weapon>4", "cast:Lightning Bolt", 48);
+                        add("has_target", "cast:Stormstrike", 46);
+                        add("has_target", "cast:Lava Lash", 44);
+                        add("target_missing_aura:Flame Shock", "cast:Flame Shock", 42);
+                        add("has_target", "cast:Earth Shock", 40);   // instant dump
                     }
                     else if (tree == 0)   // ELEMENTAL — ranged nuker
                     {
                         shaDpsShared();
+                        add("target_missing_aura:Flame Shock", "cast:Flame Shock", 72);
+                        // Chain Lightning sits just BELOW Wind Shear and ABOVE Flame Shock
+                        // (Kevin): high-priority cluster AoE so it leads the elemental rotation
+                        // when a pack is stacked. Still AoE-gated so single-target stays on LB.
+                        add("enemies_clustered:8>2", "cast:Chain Lightning", 74);
                         // Water Shield (mana) behind a tank; Lightning Shield when it holds
                         // its own aggro (Kevin: ranged shamans prefer water with a tank).
                         add("party_has_tank",  "buff_self:Water Shield", 78);
@@ -1145,12 +1159,14 @@ namespace WowPsParty
                         add("party_in_combat&totem_attack_needed:fire&!self_totem_active:Totem of Wrath",
                             "cast_totem_attack:Searing Totem", 50);
                         add("has_target", "cast:Lava Burst", 66);
-                        add("enemies_clustered:8>2", "cast:Chain Lightning", 56);   // ranged cluster AoE
+                        add("has_target", "cast:Earth Shock", 46);                 // instant filler
                         add("has_target", "cast:Lightning Bolt", 38);              // ranged filler
                     }
                     else   // low level / no talents — basic caster shaman
                     {
                         shaDpsShared();
+                        add("target_missing_aura:Flame Shock", "cast:Flame Shock", 72);
+                        add("has_target", "cast:Earth Shock", 46);
                         add("party_has_tank",  "buff_self:Water Shield", 78);
                         add("!party_has_tank", "buff_self:Lightning Shield", 77);
                         add("out_of_combat", "buff_self:Flametongue Weapon", 85);
@@ -1176,8 +1192,9 @@ namespace WowPsParty
                     // empty, never as a filler. Sits just under the interrupt.
                     add("in_combat&self_mana<10", "cast_self:Evocation", 87);
                     // Ice Barrier is a Frost talent — falls through (unknown) for Fire/
-                    // Arcane, who have no comparable absorb in their default kit.
-                    add("self_missing_aura:Ice Barrier", "cast_self:Ice Barrier", 80);
+                    // Arcane, who have no comparable absorb in their default kit. In combat
+                    // only (Kevin): don't burn mana + a GCD shielding while idle out of combat.
+                    add("in_combat&self_missing_aura:Ice Barrier", "cast_self:Ice Barrier", 80);
                     // Only when a melee is ACTUALLY swinging at the mage (root-and-run defence),
                     // not merely near it — else the mage roots the tank's body-pull mob in place
                     // far from the tank the instant it walks past (Mill). melee_attackers = mobs
