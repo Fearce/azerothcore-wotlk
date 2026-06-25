@@ -418,8 +418,26 @@ public:
         PLAYERHOOK_ON_QUEST_ABANDON,
         PLAYERHOOK_ON_LEARN_TAXI_NODE,
         PLAYERHOOK_ON_MAP_CHANGED,
-        PLAYERHOOK_ON_REMOVE_FROM_BATTLEGROUND
+        PLAYERHOOK_ON_REMOVE_FROM_BATTLEGROUND,
+        PLAYERHOOK_CAN_PLAYER_USE_PRIVATE_CHAT
     }) { }
+
+    // Stop managed bots from whisper-spamming humans (Desouza got whispered by the Nisse
+    // heroes in Naxx). Player::Whisper drops the whisper when this returns false.
+    //  - HENCHMEN: never whisper anyone.
+    //  - HEROES (enrolled alts): only ever whisper their OWN leader (the human captain).
+    // Real players, pool/fill bots (no leader), and ADDON traffic (the WPSP protocol rides
+    // CHAT_MSG_WHISPER with LANG_ADDON) are all left untouched.
+    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 language, std::string& /*msg*/, Player* receiver) override
+    {
+        if (!player || !receiver) return true;
+        if (type != CHAT_MSG_WHISPER || language == LANG_ADDON) return true;   // only real whispers
+        if (!sPlayerbotsMgr.GetPlayerbotAI(player)) return true;               // a human whispers freely
+        if (WowPsParty::IsHenchman(player->GetGUID())) return false;           // henchman -> never whisper
+        ObjectGuid const leader = WowPsParty::GetLeaderFor(player->GetGUID());
+        if (!leader) return true;                                             // not a managed hero -> leave it
+        return receiver->GetGUID() == leader;                                // hero -> only its own leader
+    }
 
     // After a managed party leaves a BG, the dungeon finder can be wrongly disabled
     // ("Join as Party" greyed, can't queue anything "like I'm not the leader") even
