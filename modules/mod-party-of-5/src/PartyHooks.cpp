@@ -762,17 +762,22 @@ public:
         Loot* loot = &killed->loot;
         if (loot->isLooted()) return;
 
-        // Build candidate list of party members in same map who can take items.
+        // Build candidate list of party HEROES in the same map who can take
+        // items. GetParty returns only enrolled heroes (slot 0..4), never
+        // hired henchmen, so a henchman never receives shared loot even if it
+        // landed the kill. The killer is deliberately NOT pushed first: loot
+        // is spread evenly across all heroes regardless of who got the kill
+        // (the per-item ordering below does the balancing).
         std::vector<Player*> takers;
-        takers.push_back(killer);
         for (auto const& m : party)
         {
             ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(m.guid);
             Player* p = ObjectAccessor::FindConnectedPlayer(og);
-            if (!p || p == killer || !p->IsInWorld()) continue;
+            if (!p || !p->IsInWorld()) continue;
             if (p->GetMapId() != killer->GetMapId()) continue;
             takers.push_back(p);
         }
+        if (takers.empty()) return;
 
         // Gold first — to the killer, then mirrored across party by the
         // existing OnPlayerMoneyChanged hook.
@@ -804,6 +809,21 @@ public:
 
             ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(li.itemid);
             if (!tmpl) continue;
+
+            // Spread loot evenly: for each item prefer the hero with the most
+            // free bag space. When bags are equally full this naturally
+            // round-robins (each pickup drops that hero's free count by one, so
+            // the next item lands on a different hero), and a hero whose bags
+            // are full sorts last and is skipped -- the item overflows to a
+            // hero that still has room. The human's own character is just
+            // another hero in this list, so a full human inventory overflows to
+            // the heroes exactly the same way. Re-sorted per item because the
+            // previous StoreNewItem changed the free-space counts.
+            std::stable_sort(takers.begin(), takers.end(),
+                [](Player const* a, Player const* b)
+                {
+                    return a->GetFreeInventorySpace() > b->GetFreeInventorySpace();
+                });
 
             for (Player* taker : takers)
             {
