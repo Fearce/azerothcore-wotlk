@@ -198,6 +198,9 @@ namespace WowPsParty
     // kill on sight (e.g. "Chaos Rift", "Frost Tomb"). Empty when none configured.
     // AssistTarget reads this to override target selection onto a matching enemy.
     void BotFocusNames(ObjectGuid guid, std::vector<std::string>& out);
+    // Like BotFocusNames but for "focus_engaged:" rules — the override only fires on a
+    // match the PARTY is already in combat with (won't chase an un-pulled same-named mob).
+    void BotFocusEngagedNames(ObjectGuid guid, std::vector<std::string>& out);
 
     // A lead tank's configured INITIAL-pull target size. Default 3, clamped [1,8];
     // 1 = the classic single-mob pull. TankLeadEngagement reads this to body-pull a

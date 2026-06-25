@@ -213,16 +213,20 @@ namespace WowPsParty
     // accessor read ONLY the per-bot cache, so a focus rule moved from a DPS's own tab
     // into Common was silently ignored: the party kept hitting the boss and ignored the
     // Frost Tomb (Kevin's report).
-    void BotFocusNames(ObjectGuid guid, std::vector<std::string>& out)
+    // Shared collector: gather the comma-separated names from every enabled rule whose
+    // action starts with `prefix` ("focus:" or "focus_engaged:"), across the bot's OWN and
+    // the account's COMMON (shared) rotation (leader-keyed, like TickRotation).
+    static void CollectFocusList(ObjectGuid guid, std::string const& prefix, std::vector<std::string>& out)
     {
         out.clear();
-        auto scan = [&out](std::vector<RotationRule> const& rules)
+        size_t const plen = prefix.size();
+        auto scan = [&](std::vector<RotationRule> const& rules)
         {
             for (RotationRule const& r : rules)
             {
-                if (r.action.rfind("focus:", 0) != 0) continue;
+                if (r.action.rfind(prefix, 0) != 0) continue;
                 if (CsvContains(Lower(r.flags), "disabled")) continue;
-                std::string const list = r.action.substr(6);   // after "focus:"
+                std::string const list = r.action.substr(plen);   // after the prefix
                 size_t start = 0;
                 while (start <= list.size())
                 {
@@ -244,11 +248,20 @@ namespace WowPsParty
             auto it = g_rotationCache.find(guid.GetCounter());
             if (it != g_rotationCache.end()) scan(it->second);
         }
-        // The COMMON shared rotation (leader's account) — so a focus: rule in the Common
-        // tab works for heroes AND henchmen, not just one in the bot's own tab.
+        // The COMMON shared rotation (leader's account) — so a rule in the Common tab works
+        // for heroes AND henchmen, not just one in the bot's own tab.
         if (uint32 const acct = SharedAccountFor(guid))
             scan(GetSharedRotation(acct));
     }
+
+    void BotFocusNames(ObjectGuid guid, std::vector<std::string>& out)
+    { CollectFocusList(guid, "focus:", out); }
+
+    // Like focus:, but AssistTarget only switches onto a match the PARTY is ALREADY in
+    // combat with — the bot won't run off to a same-named mob that hasn't been pulled yet
+    // (Kevin: a focus that doesn't go aggro stray mobs that merely share the name).
+    void BotFocusEngagedNames(ObjectGuid guid, std::vector<std::string>& out)
+    { CollectFocusList(guid, "focus_engaged:", out); }
 
     // ---- per-tank multi-pull count (pull_count) ----------------------------
     // First-class per-bot setting (party_loadout.pull_count), set from the rotation
@@ -2848,6 +2861,12 @@ namespace WowPsParty
         if (cond == "is_moving")     return bot->isMoving();
         if (cond == "is_not_moving") return !bot->isMoving();
 
+        // Mounted gate — e.g. a paladin swaps to Crusader Aura while mounted (for the
+        // mount-speed bonus) and back to its combat aura on foot ("!is_mounted"). While
+        // mounted the combat rotation is otherwise suppressed; TickRotation runs a small
+        // pass that fires ONLY is_mounted-gated self-buffs so this still applies.
+        if (cond == "is_mounted") return bot->IsMounted();
+
         // The bot's OWN cast/channel state. `self_casting` = a generic cast bar
         // is up (Frostbolt, Pyroblast); `self_channeling` = a channel is running
         // (Blizzard, Arcane Missiles, Mind Flay, Volley). Mirror of
@@ -4525,10 +4544,10 @@ namespace WowPsParty
             return false;
         };
 
-        // "focus:<names>" is a TARGETING directive consumed by AssistTarget
-        // (BotFocusNames), not a per-tick cast — it never fires here. Recognise it
-        // so the rule loop falls through cleanly instead of logging "unknown verb".
-        if (verb == "focus") return false;
+        // "focus:<names>" / "focus_engaged:<names>" are TARGETING directives consumed by
+        // AssistTarget (BotFocusNames / BotFocusEngagedNames), not per-tick casts — they
+        // never fire here. Recognise them so the rule loop falls through cleanly.
+        if (verb == "focus" || verb == "focus_engaged") return false;
 
         // "pull_count:N" is a tank CONFIG directive read by TankLeadEngagement
         // (BotInitialPullCount), not a per-tick cast. Recognise + skip it the same way.
@@ -6604,6 +6623,45 @@ namespace WowPsParty
         return t;
     }
 
+    // Merge the account's COMMON shared rotation (runs FIRST, as a pre-rotation) with the
+    // bot's own cached rules, both priority-sorted. Keyed off the LEADER's account so a
+    // henchman on a different account still gets Common (matches TickRotation's own keying).
+    static std::vector<RotationRule> GatherMergedRules(Player* bot)
+    {
+        std::vector<RotationRule> ownRules;
+        {
+            std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
+            auto it = g_rotationCache.find(bot->GetGUID().GetCounter());
+            if (it != g_rotationCache.end()) ownRules = it->second;  // copy, drop lock
+        }
+        uint32 sharedAccount = bot->GetSession() ? bot->GetSession()->GetAccountId() : 0;
+        if (ObjectGuid const lgShared = GetLeaderFor(bot->GetGUID()))
+            if (Player* leaderShared = ObjectAccessor::FindConnectedPlayer(lgShared))
+                if (leaderShared->GetSession())
+                    sharedAccount = leaderShared->GetSession()->GetAccountId();
+        std::vector<RotationRule> rules = GetSharedRotation(sharedAccount);
+        rules.reserve(rules.size() + ownRules.size());
+        for (auto& r : ownRules) rules.push_back(std::move(r));
+        return rules;
+    }
+
+    // While mounted the combat rotation is suppressed (idle travel), but a few self-buffs
+    // SHOULD still apply on a mount — chiefly a paladin's Crusader Aura for the mount-speed
+    // bonus. Fire the first enabled buff_self rule that's explicitly gated on is_mounted and
+    // currently matches; everything else stays suppressed until the bot dismounts. Restricting
+    // to is_mounted-referencing rules keeps the rest of the rotation off during travel.
+    static void RunMountedSelfBuffs(Player* bot)
+    {
+        for (RotationRule const& r : GatherMergedRules(bot))
+        {
+            if (r.action.rfind("buff_self:", 0) != 0) continue;
+            if (r.condition.find("is_mounted") == std::string::npos) continue;
+            if (CsvContains(Lower(r.flags), "disabled")) continue;
+            if (EvalCondition(r.condition, bot, nullptr) && ExecAction(r.action, bot, r.flags, r.condition))
+                break;   // one mount-buff per tick is plenty
+        }
+    }
+
     bool TickRotation(Player* bot)
     {
         if (!bot) return false;
@@ -6653,7 +6711,10 @@ namespace WowPsParty
         if (bot->IsMounted())
         {
             if (!PartyEngagedDismounted(bot))
-                return false;   // idle travel, or a mounted fly-by — stay mounted
+            {
+                RunMountedSelfBuffs(bot);   // still apply is_mounted self-buffs (paladin Crusader Aura)
+                return false;               // otherwise idle travel / fly-by — stay mounted, no combat rotation
+            }
             bot->Dismount();    // the party is fighting on foot — get off and engage
         }
 
@@ -6700,30 +6761,10 @@ namespace WowPsParty
         EnsureHunterPet(bot);
         MaintainBotPet(bot);
 
-        std::vector<RotationRule> ownRules;
-        {
-            std::lock_guard<std::mutex> lock(g_rotationCacheMutex);
-            auto it = g_rotationCache.find(bot->GetGUID().GetCounter());
-            if (it != g_rotationCache.end()) ownRules = it->second;  // copy, drop lock
-        }
-        // Prepend the account's COMMON shared rotation: it runs FIRST (a pre-rotation),
-        // then the bot's own rules — both already priority-sorted, and the eval loop
-        // below fires the first matching rule in vector order, so shared wins ties.
-        // Applies to EVERY bot (heroes + henchmen); a bot with no own rules still runs
-        // the shared ones.
-        // Key the COMMON rotation off the LEADER's account, NOT the bot's own. Heroes are
-        // alts on the leader's account (matches), but HENCHMEN are rndbot-pool chars on
-        // DIFFERENT accounts — so keying off the bot's account gave them NO Common rotation
-        // at all (Kevin: "Common must run on heroes AND henchmen"). The leader (the human)
-        // owns the shared rotation.
-        uint32 sharedAccount = bot->GetSession() ? bot->GetSession()->GetAccountId() : 0;
-        if (ObjectGuid const lgShared = GetLeaderFor(bot->GetGUID()))
-            if (Player* leaderShared = ObjectAccessor::FindConnectedPlayer(lgShared))
-                if (leaderShared->GetSession())
-                    sharedAccount = leaderShared->GetSession()->GetAccountId();
-        std::vector<RotationRule> rules = GetSharedRotation(sharedAccount);
-        rules.reserve(rules.size() + ownRules.size());
-        for (auto& r : ownRules) rules.push_back(std::move(r));
+        // Merge COMMON (shared, leader-keyed) + the bot's own rules — see GatherMergedRules.
+        // Shared runs FIRST as a pre-rotation; the eval loop below fires the first matching
+        // rule in vector order, so shared wins ties. Applies to heroes AND henchmen.
+        std::vector<RotationRule> rules = GatherMergedRules(bot);
         if (rules.empty()) return false;
 
         // Party leash: if the controlled char has run >50y away, don't cast

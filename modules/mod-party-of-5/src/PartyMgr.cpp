@@ -687,7 +687,11 @@ namespace WowPsParty
 
                     // Mana upkeep + auras.
                     add("self_mana<30", "buff_self:Divine Plea", 46);   // +mana regen
-                    add("always", "buff_self:Devotion Aura", 44);
+                    // Crusader Aura (mount speed) while mounted; Devotion on foot. !is_mounted
+                    // keeps the two from fighting (mutually exclusive). The mounted one still
+                    // applies even though the combat rotation is otherwise suppressed mounted.
+                    add("is_mounted",  "buff_self:Crusader Aura", 45);
+                    add("!is_mounted", "buff_self:Devotion Aura", 44);
                     add("always", "buff_self:Seal of Wisdom", 42);
                     // Filler at near-full mana — conserve for healing.
                     add("self_mana>88&has_target", "cast:Judgement of Light", 30);
@@ -711,7 +715,10 @@ namespace WowPsParty
                     add("self_health<40", "buff_self:Divine Protection", 89);
                     add("party_lowest_health<35", "cast_party_lowest:Flash of Light", 86);
                     add("always", "buff_self:Righteous Fury", 82);
-                    add("always", "buff_self:Devotion Aura", 80);
+                    // Crusader Aura (mount speed) while mounted; Devotion on foot (mutually
+                    // exclusive via !is_mounted so they don't fight).
+                    add("is_mounted",  "buff_self:Crusader Aura", 81);
+                    add("!is_mounted", "buff_self:Devotion Aura", 80);
                     add("always", "buff_self:Seal of Righteousness", 78);
                     // Holy Shield: block-chance + holy-damage shield. Core prot
                     // ability that was missing — both steady mitigation AND threat.
@@ -743,7 +750,10 @@ namespace WowPsParty
                     add("target_casting&target_interruptible", "cast:Hammer of Justice", 90);
                     add("party_lowest_health<35", "cast_party_lowest:Flash of Light", 86);
                     add("target_health<20", "cast:Hammer of Wrath", 84);
-                    add("always", "buff_self:Retribution Aura", 80);
+                    // Crusader Aura (mount speed) while mounted; Retribution Aura on foot
+                    // (mutually exclusive via !is_mounted so they don't fight).
+                    add("is_mounted",  "buff_self:Crusader Aura", 81);
+                    add("!is_mounted", "buff_self:Retribution Aura", 80);
                     // +20% damage burst cooldown — popped as soon as it's off CD
                     // (high prio is free: buff_self falls through while it's active
                     // or on cooldown, so it only ever wins the tick it actually

@@ -3355,8 +3355,8 @@ namespace WowPsParty
             {
                 ItemTemplate const* t = sObjectMgr->GetItemTemplate(itemid);
                 ChatHandler(leader->GetSession()).PSendSysMessage(
-                    "|cff66ccff[WowPsParty]|r %s handed you %s — a key for you to use.",
-                    hench->GetName().c_str(), t ? t->Name1.c_str() : "an item");
+                    "|cff66ccff[WowPsParty]|r {} handed you {} — a key for you to use.",
+                    hench->GetName(), t ? t->Name1 : std::string("an item"));
             }
         }
     }
@@ -3902,18 +3902,30 @@ namespace WowPsParty
                                   float dist, float& ox, float& oy, float& oz)
     {
         if (!bot || !mob) return false;
-        // 1) straight back from the mob.
-        mob->GetNearPoint(bot, ox, oy, oz, 0.0f, dist, mob->GetAngle(bot));
-        if (!SpotProximityPulls(bot, ox, oy, oz, 10.0f)) return true;
-        // 2) toward the leader (their safe standoff) — a point `dist` from the mob on
-        //    the leader's bearing, taken only if reachable and itself clear.
-        if (leader && leader != bot)
+        // Sample a FAN of stand-spots on the ring `dist` from the mob, starting straight
+        // back (the bot's current bearing — the shortest step) and widening symmetrically
+        // out to directly-behind-the-mob. Take the FIRST that's reachable + won't proximity-
+        // pull a fresh pack. Nearest-angle-first = least travel, so a ranged bot that walked
+        // in to drop an attack totem steps back the LITTLE it needs instead of detouring all
+        // the way to the far side of the pack (Kevin: "Pamere goes to the opposite side").
+        // The old "straight back, else jump to the LEADER's bearing" was the far-side cause —
+        // when straight-back was blocked it leapt to the leader's side, often across the pack.
+        float const base = mob->GetAngle(bot);   // mob->bot bearing = directly away on the bot's side
+        static constexpr float kOffsets[] = {
+            0.0f, 0.39f, -0.39f, 0.79f, -0.79f, 1.18f, -1.18f,
+            1.57f, -1.57f, 1.96f, -1.96f, 2.36f, -2.36f, float(M_PI) };
+        for (float off : kOffsets)
         {
-            mob->GetNearPoint(bot, ox, oy, oz, 0.0f, dist, mob->GetAngle(leader));
-            if (NavReachable(bot, ox, oy, oz, bot->GetExactDist(ox, oy, oz))
-                && !SpotProximityPulls(bot, ox, oy, oz, 10.0f))
-                return true;
+            mob->GetNearPoint(bot, ox, oy, oz, 0.0f, dist, base + off);
+            if (SpotProximityPulls(bot, ox, oy, oz, 10.0f)) continue;
+            // Straight-back is always taken if clear (the bot already stood on that side);
+            // vet the fanned alternatives against the navmesh so we don't pick an off-mesh
+            // spot across a wall/ledge.
+            if (off != 0.0f && !NavReachable(bot, ox, oy, oz, bot->GetExactDist(ox, oy, oz)))
+                continue;
+            return true;
         }
+        (void)leader;   // the fan covers every bearing now, so no leader-direction fallback
         return false;   // nowhere safe -> hold in place
     }
 
@@ -4338,10 +4350,37 @@ namespace WowPsParty
 
     static constexpr float FOCUS_SCAN_RANGE = 50.0f;   // how far to look for a "focus:" add
 
-    // Nearest live, attackable enemy whose name is in `names` (the rotation
-    // "focus:" list) within `range`. Forces the whole party onto a must-kill add
-    // (Chaos Rift / Frost Tomb) the instant it appears.
-    static Unit* FindNearestFocusEnemy(Player* bot, std::vector<std::string> const& names, float range)
+    // True if any party member (or their non-totem pet) is in combat with `mob`. Mirrors
+    // the engagedWithParty check used by the loose-enemy picker — IsInCombatWith catches a
+    // RANGED attacker that getAttackers() (melee only) misses.
+    static bool PartyFightingMob(Player* bot, Unit* mob)
+    {
+        if (!bot || !mob || !mob->IsInCombat()) return false;
+        Unit* const v = mob->GetVictim();
+        auto fights = [&](Player* m) -> bool
+        {
+            if (!m) return false;
+            if (v == m || mob->IsInCombatWith(m)) return true;
+            for (Unit* ctrl : m->m_Controlled)
+                if (ctrl && !ctrl->IsTotem() && (v == ctrl || mob->IsInCombatWith(ctrl)))
+                    return true;
+            return false;
+        };
+        if (fights(bot)) return true;
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(bot->GetGUID(), party);
+        for (ObjectGuid const& g : party)
+            if (fights(ObjectAccessor::FindConnectedPlayer(g))) return true;
+        return false;
+    }
+
+    // Nearest live, attackable enemy whose name is in `names` (the rotation "focus:" /
+    // "focus_engaged:" list) within `range`. Forces the whole party onto a must-kill add
+    // (Chaos Rift / Frost Tomb) the instant it appears. When `engagedOnly`, a match is
+    // taken only if the PARTY is already fighting it — so a focus_engaged: rule never
+    // sends the bot running at an un-pulled mob that merely shares the name.
+    static Unit* FindNearestFocusEnemy(Player* bot, std::vector<std::string> const& names,
+                                       float range, bool engagedOnly)
     {
         std::vector<std::string> low;
         low.reserve(names.size());
@@ -4358,6 +4397,7 @@ namespace WowPsParty
         float bestDist = range + 1.0f;
         for (Creature* c : crs)
         {
+            if (engagedOnly && !PartyFightingMob(bot, c)) continue;   // not pulled -> ignore
             float const d = bot->GetDistance(c);
             if (d < bestDist) { bestDist = d; best = c; }
         }
@@ -4817,7 +4857,16 @@ namespace WowPsParty
             std::vector<std::string> focusNames;
             WowPsParty::BotFocusNames(bot->GetGUID(), focusNames);
             if (!focusNames.empty())
-                focusMob = FindNearestFocusEnemy(bot, focusNames, FOCUS_SCAN_RANGE);
+                focusMob = FindNearestFocusEnemy(bot, focusNames, FOCUS_SCAN_RANGE, /*engagedOnly=*/false);
+            // focus_engaged:<names> — same override but ONLY onto a match the party is
+            // already fighting (won't pull a stray same-named mob).
+            if (!focusMob)
+            {
+                std::vector<std::string> focusEngagedNames;
+                WowPsParty::BotFocusEngagedNames(bot->GetGUID(), focusEngagedNames);
+                if (!focusEngagedNames.empty())
+                    focusMob = FindNearestFocusEnemy(bot, focusEngagedNames, FOCUS_SCAN_RANGE, /*engagedOnly=*/true);
+            }
         }
         if (focusMob)
             desired = focusMob;
