@@ -1639,6 +1639,46 @@ namespace WowPsParty
         return best;
     }
 
+    // ---- unreachable-target memo -------------------------------------------
+    // When a scanning target-pick (highest/nearest/lowest health) lands on an enemy
+    // the bot then discovers it has NO LoS to AND no navmesh path to — even after
+    // climbing to the leader's own spot — the bot parks that enemy here for a few
+    // seconds. The pickers skip a memoed target so they choose a REACHABLE in-combat
+    // enemy instead. Without this the pickers are deterministic ("highest health"
+    // re-picks the SAME mob every tick): in BRD two ranged DPS on "highest health"
+    // locked onto an add sitting at 100% HP across an unwalkable gap and ran to the
+    // leader forever, never re-engaging Lord Roccor or anything they COULD reach
+    // (Kevin, 2026-06-25). Self-expiring (UNREACHABLE_MEMO_MS) so the instant the mob
+    // walks back into reach the bot resumes attacking it. The evade case is already
+    // covered upstream — the pickers gate on IsInCombat() and an evading creature is
+    // out of combat — so this is purely the in-combat-but-unwalkable case.
+    // botGuidLow -> { targetGuidLow -> expiry getMSTime() }. A small SET per bot, not a
+    // single slot: a pull can strand a bot on more than one unreachable mob, and a single
+    // slot would let two of them ping-pong the deterministic pick each tick.
+    static std::unordered_map<uint32, std::unordered_map<uint32, uint32>> g_unreachableTarget;
+    static std::mutex g_unreachableTargetMutex;
+    static constexpr uint32 UNREACHABLE_MEMO_MS = 6000;
+
+    void MarkTargetUnreachable(uint32 botLow, uint32 targetLow)
+    {
+        std::lock_guard<std::mutex> lock(g_unreachableTargetMutex);
+        g_unreachableTarget[botLow][targetLow] = getMSTime() + UNREACHABLE_MEMO_MS;
+    }
+
+    // True while botLow is parking targetLow as unreachable (and the memo hasn't
+    // expired). Lazily evicts a stale entry on lookup so the set stays bounded to the
+    // handful of enemies the pickers actually query each tick.
+    bool IsTargetUnreachable(uint32 botLow, uint32 targetLow)
+    {
+        std::lock_guard<std::mutex> lock(g_unreachableTargetMutex);
+        auto it = g_unreachableTarget.find(botLow);
+        if (it == g_unreachableTarget.end()) return false;
+        auto jt = it->second.find(targetLow);
+        if (jt == it->second.end()) return false;
+        if (getMSTime() >= jt->second) { it->second.erase(jt); return false; }
+        return true;
+    }
+
     // "lowest" target mode: the LOWEST-current-health enemy the party is already
     // engaged with, within the bot's range — focus-fire to secure the next kill
     // instead of spreading damage. Like PickLooseTarget it only considers mobs in
@@ -1656,6 +1696,7 @@ namespace WowPsParty
             if (!a || !a->IsAlive() || !a->IsInCombat()) return;
             if (!bot->IsValidAttackTarget(a)) return;
             if (bot->GetDistance(a) > MAX_RANGE) return;
+            if (IsTargetUnreachable(bot->GetGUID().GetCounter(), a->GetGUID().GetCounter())) return;
             uint32 const hp = a->GetHealth();
             if (!found || hp < bestHp) { bestHp = hp; best = a; found = true; }
         };
@@ -1697,6 +1738,7 @@ namespace WowPsParty
             if (!a || !a->IsAlive() || !a->IsInCombat()) return;
             if (!bot->IsValidAttackTarget(a)) return;
             if (bot->GetDistance(a) > MAX_RANGE) return;
+            if (IsTargetUnreachable(bot->GetGUID().GetCounter(), a->GetGUID().GetCounter())) return;
             uint32 const hp = a->GetHealth();
             if (!found || hp > bestHp) { bestHp = hp; best = a; found = true; }
         };
@@ -1741,6 +1783,7 @@ namespace WowPsParty
             if (!bot->IsValidAttackTarget(a)) return;
             float const d = bot->GetDistance(a);
             if (d > MAX_RANGE) return;
+            if (IsTargetUnreachable(bot->GetGUID().GetCounter(), a->GetGUID().GetCounter())) return;
             if (d < bestDist) { bestDist = d; best = a; }
         };
         auto considerAround = [&](Unit* u)
@@ -4712,8 +4755,17 @@ namespace WowPsParty
                 if (!desired) desired = pickPartyDefenseTarget();
             }
         }
-        // Final safety: never hand back a dead/invalid target.
-        if (desired && (!desired->IsAlive() || !bot->IsValidAttackTarget(desired)))
+        // Final safety: never hand back a dead/invalid target — or one that has
+        // EVADED. A leashed/reset creature (Lord Roccor pulled across a gap in BRD)
+        // runs home at full HP and drops the party's combat, yet stays a valid
+        // attack target and lingers as the tank's / leader's stale GetVictim(). The
+        // highest/nearest/lowest pickers screen this via IsInCombat(), but "tank"
+        // and "master" mode focus-fire that victim directly, so an evading boss
+        // stranded the "tank's target" bots: no LoS + unreachable -> they ran to the
+        // leader every tick forever and never re-engaged (Kevin, BRD 2026-06-25). An
+        // evading creature reads IsInEvadeMode() == true (UNIT_STATE_EVADE).
+        if (desired && (!desired->IsAlive() || !bot->IsValidAttackTarget(desired)
+                || (desired->IsCreature() && desired->ToCreature()->IsInEvadeMode())))
             desired = nullptr;
 
         // ---- FOCUS override -----------------------------------------------------
@@ -5318,6 +5370,31 @@ namespace WowPsParty
                                                           /*forceDestination=*/false);
                         AssistLog(gLow, "ranged: no LoS — closing to regain line of sight");
                     }
+                }
+                else if (bot->GetDistance(leader) < 10.0f)
+                {
+                    // The climb is COMPLETE — we're already at the leader's spot and the
+                    // target is STILL no-LoS + unreachable, so the leader can't see it
+                    // either and climbing more is pointless. Stand and hold instead of
+                    // re-pathing to the leader every tick: that infinite "run to the
+                    // leader forever" loop is exactly what stranded the BRD party when
+                    // Lord Roccor leashed onto unreachable ground (Kevin, 2026-06-25).
+                    // The top-of-tick LoS check resumes the firing bands the instant LoS
+                    // returns (a mob walks back into view), and AssistTarget drops this
+                    // target entirely once it evades — so this only holds while a genuine
+                    // in-combat target sits somewhere we truly can't reach.
+                    if (mg != IDLE_MOTION_TYPE)
+                    {
+                        bot->StopMoving();
+                        bot->GetMotionMaster()->Clear();
+                        bot->GetMotionMaster()->MoveIdle();
+                    }
+                    // Park this target as unreachable so the scanning pickers skip it for a
+                    // few seconds and re-select a REACHABLE in-combat enemy — otherwise a
+                    // "highest health" DPS just holds the stranded mob forever and never
+                    // re-engages anything it CAN hit (the BRD 100%-HP add, Kevin 2026-06-25).
+                    MarkTargetUnreachable(gLow, desired->GetGUID().GetCounter());
+                    AssistLog(gLow, "ranged: target unreachable even from the leader — holding (can't rejoin)");
                 }
                 else
                 {
