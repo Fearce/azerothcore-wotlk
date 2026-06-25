@@ -177,19 +177,16 @@ namespace WowPsParty
     }
 
     // True if the bot's rotation opts into rotation-driven positioning — a
-    // keep_distance_enemy (kite) or keep_distance_healer rule, in its OWN rotation OR the
-    // account's COMMON rotation. AssistTarget reads this to STOP installing its chase/
-    // dead-zone movement, handing the feet to the rotation so the two don't fight (only
-    // one mover at a time).
+    // keep_distance_enemy (kite) / keep_distance_healer / close_to_enemy rule, in its OWN
+    // rotation OR the account's COMMON rotation. AssistTarget reads this to STOP installing
+    // its chase/dead-zone movement, handing the feet to the rotation so the two don't fight
+    // (only one mover at a time). Purely CONDITION-driven (Kevin): it fires regardless of
+    // party/tank — a player who only wants DPS to kite gates the rule with am_dps / !am_tank
+    // / a role condition. There is intentionally NO live-tank veto here; the matching kite
+    // ACTIONS dropped theirs too, so the yield and the hop stay in lock-step (a one-sided
+    // guard would freeze the bot — AssistTarget yields to a rule that never moves it).
     bool BotIsKiting(ObjectGuid guid, Player* bot, Unit* target)
     {
-        // A live tank in the party means STAND at range and let it hold — don't
-        // kite (kiting hops the caster around, drags mobs and pulls them off the
-        // tank onto itself). With a tank, AssistTarget owns positioning (closes to
-        // firing range, holds there); without one, the rotation's kite drives the
-        // feet as before. Checked first, outside g_rotationCacheMutex, so it can't
-        // nest locks.
-        if (WowPsParty::PartyHasLiveTank(guid)) return false;
         // Gather the CONDITION of every enabled kite/close rule (own cache under the
         // lock, COMMON tab after). We hand back COPIES so the conditions can be
         // evaluated after the lock is released (EvalCondition reads live bot state).
@@ -5973,10 +5970,10 @@ namespace WowPsParty
         // in-flight cast. AssistTarget yields all movement while this rule exists.
         if (verb == "keep_distance_enemy")
         {
-            // With a live tank, don't kite — stand at range and let AssistTarget
-            // hold position (BotIsKiting is false then, so AssistTarget owns the
-            // feet; a hop here would fight it). Falls through to the cast rules.
-            if (WowPsParty::PartyHasLiveTank(bot->GetGUID())) return false;
+            // Condition-driven: kites whenever the rule's condition holds, with or
+            // without a tank (Kevin — gate it with am_dps / !am_tank if you only want
+            // some roles to kite). BotIsKiting drops the same tank veto, so AssistTarget
+            // yields the feet in lock-step with this hop.
             Unit* enemy = bot->GetVictim();
             if (!enemy || !enemy->IsAlive()) return false;
             if (bot->IsNonMeleeSpellCast(false, false, true)) return false;
@@ -6039,8 +6036,8 @@ namespace WowPsParty
         // a kiter doesn't backpedal out of heal range. Same between-casts timing.
         if (verb == "keep_distance_healer")
         {
-            // No kiting while a tank is up — AssistTarget owns positioning then.
-            if (WowPsParty::PartyHasLiveTank(bot->GetGUID())) return false;
+            // Condition-driven, tank or no tank — pairs with keep_distance_enemy so a
+            // kiter stays in heal range; both drop the live-tank veto together.
             Player* healer = FindPartyMemberByRole(bot, "healer");
             if (!healer || healer == bot || !healer->IsAlive()) return false;
             if (bot->IsNonMeleeSpellCast(false, false, true)) return false;
@@ -6114,9 +6111,9 @@ namespace WowPsParty
         // rules above fire the instant we're in range.
         if (verb == "close_to_enemy")
         {
-            // With a tank up, AssistTarget owns the feet (closes to firing range,
-            // holds there) — don't also drive movement from here or they fight.
-            if (WowPsParty::PartyHasLiveTank(bot->GetGUID())) return false;
+            // Condition-driven, tank or no tank: drives the feet IN to spell range
+            // whenever the rule's condition holds. BotIsKiting matches this verb (yields
+            // movement only), so the cast rules keep firing; both dropped the tank veto.
             Unit* enemy = bot->GetVictim();
             if (!enemy || !enemy->IsAlive()) return false;
             if (bot->IsNonMeleeSpellCast(false, false, true)) return false;
