@@ -1105,13 +1105,15 @@ namespace WowPsParty
                         // Dual-imbue (Kevin): Windfury on the MAIN hand for the burst proc,
                         // Flametongue on the OFF hand (+25% Lava Lash). buff_self always
                         // targets the main hand, so it can't place a second imbue — the
-                        // slot-pinned verbs do. Rockbiter is the main-hand fallback only while
-                        // Windfury isn't trained (!spell_ready == not known; imbues have no
-                        // cooldown so it never overwrites a known Windfury). Each verb skips
-                        // if that hand already carries the imbue / holds nothing it fits.
+                        // slot-pinned verbs do. Both use the normal temp-enchant path.
                         add("out_of_combat", "buff_mainhand:Windfury Weapon", 85);
-                        add("out_of_combat&!spell_ready:Windfury Weapon", "buff_mainhand:Rockbiter Weapon", 84);
                         add("out_of_combat", "buff_offhand:Flametongue Weapon", 83);
+                        // Rockbiter is the no-Windfury fallback (low level, where there's no
+                        // Flametongue to conflict). It STAYS on buff_self: its shaman-family
+                        // handler enchants both weapons itself and selects the enchant
+                        // dynamically (ignoring MiscValue), so the slot-pinned verbs — which
+                        // key off MiscValue — don't apply to it.
+                        add("out_of_combat&!spell_ready:Windfury Weapon", "buff_self:Rockbiter Weapon", 84);
                         // Buff totems dropped as a SET in one off-GCD tick (Call-of-the-
                         // Elements emulation): earth/water/air at once, incl. DURING a
                         // multi-pull (party_in_combat) so the shaman doesn't burn a GCD per
