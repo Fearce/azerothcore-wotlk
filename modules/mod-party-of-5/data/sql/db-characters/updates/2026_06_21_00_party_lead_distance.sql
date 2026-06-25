@@ -2,7 +2,7 @@
 --
 -- How far ahead (yards) a lead tank leads the party in dungeons. Per-character,
 -- stored here so it's set from the rotation editor instead of a rotation rule:
---   ''        = unset -> default 15
+--   ''        = unset -> default 10
 --   '5'..'40' = explicit lead distance
 -- The server clamps to [5,40] (WowPsParty::BotLeadDistance). Two-digit, so
 -- VARCHAR(2) holds the full range.

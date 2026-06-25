@@ -4207,19 +4207,21 @@ public:
         }
         // REQ_LEADDIST\t<token>  ->  LEADDIST\t<token>\t<5..40>
         // Reports the EFFECTIVE lead-tank dungeon lead distance (explicit column,
-        // else the default 15) so the editor slider shows the real runtime value.
+        // else the default 10) so the editor slider shows the real runtime value.
+        // MUST match WowPsParty::BotLeadDistance's default (10) — they diverged once
+        // (this replied 15 while the tank actually led at 10), so the slider lied.
         else if (command == "REQ_LEADDIST")
         {
             std::string const token(payload);
             uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
-            int n = 15;   // default
+            int n = 10;   // default — keep in sync with BotLeadDistance
             if (guid)
             {
                 QueryResult q = CharacterDatabase.Query(
                     "SELECT `lead_distance` FROM `party_loadout` WHERE `guid` = {}", guid);
                 std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
                 int const parsed = v.empty() ? 0 : std::atoi(v.c_str());
-                if (parsed >= 5 && parsed <= 40) n = parsed;   // unset/out-of-range -> default 15
+                if (parsed >= 5 && parsed <= 40) n = parsed;   // unset/out-of-range -> default 10
             }
             std::ostringstream out;
             out << "LEADDIST\t" << token << '\t' << n;
@@ -4245,6 +4247,48 @@ public:
             WowPsParty::LeadDistCacheSet(guid, n);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Lead distance: {} yds.", n);
+        }
+        // REQ_ENGAGERANGE\t<token>  ->  ENGAGERANGE\t<token>\t<10..40>
+        // Reports the EFFECTIVE lead-tank initial engage range (explicit column, else
+        // the default 22) so the editor slider shows the real runtime value. MUST match
+        // WowPsParty::BotEngageRange's default (22).
+        else if (command == "REQ_ENGAGERANGE")
+        {
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            int n = 22;   // default — keep in sync with BotEngageRange
+            if (guid)
+            {
+                QueryResult q = CharacterDatabase.Query(
+                    "SELECT `engage_range` FROM `party_loadout` WHERE `guid` = {}", guid);
+                std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+                int const parsed = v.empty() ? 0 : std::atoi(v.c_str());
+                if (parsed >= 10 && parsed <= 40) n = parsed;   // unset/out-of-range -> default 22
+            }
+            std::ostringstream out;
+            out << "ENGAGERANGE\t" << token << '\t' << n;
+            SendWPSP(player, out.str());
+        }
+        // SET_ENGAGERANGE\t<token>\t<10..40>  — the tank's auto-pull opener scan radius (yds)
+        else if (command == "SET_ENGAGERANGE")
+        {
+            std::string rest;
+            std::string const token = WowPsParty::SplitToken(std::string(payload), rest);
+            int const n = rest.empty() ? 0 : std::atoi(rest.c_str());
+            if (n < 10 || n > 40) return;   // strict: ignore an out-of-range value
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            if (!guid) return;
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
+                "`gear_lock_json`, `priority_actions_json`, `engage_range`) "
+                "VALUES ({}, '', '', '', '', '', '{}') "
+                "ON DUPLICATE KEY UPDATE `engage_range` = VALUES(`engage_range`)",
+                guid, n);
+            CharacterDatabase.CommitTransaction(tx);
+            WowPsParty::EngageRangeCacheSet(guid, n);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Engage range: {} yds.", n);
         }
         // REQ_ROLE\t<token>  ->  ROLE\t<token>\t<tank|healer|dps>
         // The bot's effective role, so the editor can gray out controls that don't

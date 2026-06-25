@@ -55,6 +55,7 @@ namespace WowPsParty
     void TargetModeRefreshFromDB(uint32 guidLow);
     void LeadDungeonRefreshFromDB(uint32 guidLow);
     void LeadDistRefreshFromDB(uint32 guidLow);
+    void EngageRangeRefreshFromDB(uint32 guidLow);
     void AnchorTankRefreshFromDB(uint32 guidLow);
     void PushControlledLoadoutTo(Player* requester, int slot);
 }
@@ -2346,17 +2347,18 @@ namespace WowPsParty
         bool const hadCustomRotation = false;   // henchmen NEVER keep a custom rotation
         {
             QueryResult lq = CharacterDatabase.Query(
-                "SELECT `strategies_csv`,`glyphs_csv`,`wait_tank_threat`,`safe_pull`,`pull_count` "
+                "SELECT `strategies_csv`,`glyphs_csv`,`wait_tank_threat`,`safe_pull`,`pull_count`,`engage_range` "
                 "FROM `party_loadout` WHERE `guid` = {}", candidateGuid);
-            std::string savedMode, savedLead, savedWait, savedSafePull, savedPullCount;
+            std::string savedMode, savedLead, savedWait, savedSafePull, savedPullCount, savedEngageRange;
             if (lq)
             {
                 Field* lf = lq->Fetch();
-                savedMode      = lf[0].Get<std::string>();
-                savedLead      = lf[1].Get<std::string>();
-                savedWait      = lf[2].Get<std::string>();
-                savedSafePull  = lf[3].Get<std::string>();
-                savedPullCount = lf[4].Get<std::string>();
+                savedMode        = lf[0].Get<std::string>();
+                savedLead        = lf[1].Get<std::string>();
+                savedWait        = lf[2].Get<std::string>();
+                savedSafePull    = lf[3].Get<std::string>();
+                savedPullCount   = lf[4].Get<std::string>();
+                savedEngageRange = lf[5].Get<std::string>();
             }
 
             // Always the class default rotation (identical to "Generate"); never the
@@ -2381,6 +2383,9 @@ namespace WowPsParty
 
             WowPsParty::PullCountCacheSet(candidateGuid,
                 savedPullCount.empty() ? 0 : std::atoi(savedPullCount.c_str()));
+
+            WowPsParty::EngageRangeCacheSet(candidateGuid,
+                savedEngageRange.empty() ? 0 : std::atoi(savedEngageRange.c_str()));
         }
 
         mgr->AddPlayerBot(henchGuid, account);
@@ -2992,6 +2997,7 @@ namespace WowPsParty
                 SafePullRefreshFromDB(guid);
                 PullCountRefreshFromDB(guid);
                 LeadDistRefreshFromDB(guid);
+                EngageRangeRefreshFromDB(guid);
                 AnchorTankRefreshFromDB(guid);
                 if (guid == activeGuid) continue;
                 if (spawned >= 4) break;

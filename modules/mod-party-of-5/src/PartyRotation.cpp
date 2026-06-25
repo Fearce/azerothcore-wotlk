@@ -311,7 +311,7 @@ namespace WowPsParty
     static std::unordered_map<uint32, int> g_leadDist;   // guidLow -> 5..40 (explicit only)
     static std::mutex g_leadDistMutex;
 
-    // val in [5,40] sets it; anything else clears it (back to default 15).
+    // val in [5,40] sets it; anything else clears it (back to default 10).
     void LeadDistCacheSet(uint32 guidLow, int val)
     {
         std::lock_guard<std::mutex> lock(g_leadDistMutex);
@@ -337,6 +337,43 @@ namespace WowPsParty
         auto it = g_leadDist.find(guid.GetCounter());
         if (it != g_leadDist.end()) return uint32(it->second);
         return DEFAULT_LEAD;
+    }
+
+    // ---- per-tank initial engage range (engage_range) ----------------------
+    // First-class per-bot setting (party_loadout.engage_range), set from the
+    // rotation editor — mirrors lead_distance. How far (yards) the lead tank's
+    // auto-pull opener scans around ITSELF for the nearest hostile to open on.
+    // Stored as '' (unset -> default 22) or '10'..'40'.
+    static std::unordered_map<uint32, int> g_engageRange;   // guidLow -> 10..40 (explicit only)
+    static std::mutex g_engageRangeMutex;
+
+    // val in [10,40] sets it; anything else clears it (back to default 22).
+    void EngageRangeCacheSet(uint32 guidLow, int val)
+    {
+        std::lock_guard<std::mutex> lock(g_engageRangeMutex);
+        if (val < 10 || val > 40) g_engageRange.erase(guidLow);
+        else                      g_engageRange[guidLow] = val;
+    }
+
+    void EngageRangeRefreshFromDB(uint32 guidLow)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `engage_range` FROM `party_loadout` WHERE `guid` = {}", guidLow);
+        std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+        EngageRangeCacheSet(guidLow, v.empty() ? 0 : std::atoi(v.c_str()));   // out-of-range -> clear
+    }
+
+    uint32 BotEngageRange(ObjectGuid guid)
+    {
+        // Default 22: the opener scans 22y around the tank for the pack to open on
+        // (tightened over time from 40 -> 28 -> 22 so it doesn't open on a still-
+        // distant mob). The editor slider sets an explicit value in [10,40];
+        // EngageRangeCacheSet already clamped it.
+        constexpr uint32 DEFAULT_ENGAGE = 22;
+        std::lock_guard<std::mutex> lock(g_engageRangeMutex);
+        auto it = g_engageRange.find(guid.GetCounter());
+        if (it != g_engageRange.end()) return uint32(it->second);
+        return DEFAULT_ENGAGE;
     }
 
     void RotationCacheRefreshFromDB(uint32 guid)

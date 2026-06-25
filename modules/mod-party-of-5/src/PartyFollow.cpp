@@ -1855,6 +1855,12 @@ namespace WowPsParty
     static constexpr uint32 GATHER_NO_ADD_GRACE_MS = 2000;  // once nothing's pullable, hold the gather this long
                                                             // (a straggler may wander in) before concluding and
                                                             // resuming combat.
+    static constexpr float  GATHER_Z_PENALTY    = 4.0f;    // each yard of vertical offset between a candidate add
+                                                            // and the gather anchor costs this many "virtual yards"
+                                                            // when ranking the next pull, so the tank clears mobs on
+                                                            // its OWN level first and only reaches up/down a ramp when
+                                                            // nothing closer on-level remains. (A VASTLY different Z is
+                                                            // still HARD-rejected by GatherEligible's PULL_Z_TOLERANCE.)
 
     // The maintain-N gather is the BODY-PULL phase: the lead tank MOVES only (no rotation,
     // no attack — TankIsBodyPulling suppresses TickRotation), grabbing up to N mobs by
@@ -2071,12 +2077,22 @@ namespace WowPsParty
         return n;
     }
 
-    // Nearest eligible un-aggroed candidate within GATHER_SCAN whose social group fits
+    // Best eligible un-aggroed candidate within GATHER_SCAN whose social group fits
     // `capacity` (= N - engaged). Returns it + its group size in grpOut, or nullptr if
     // none fit. STRICT: an add is taken only if it won't push the engaged headcount over
     // N — the cap is absolute, never overshot (Mill: "the multi-pull cap is absolute, do
     // NOT overshoot it"). A pack bigger than the remaining room is simply left alone.
-    static Unit* FindNextSafeAdd(Player* tank, uint32 capacity, uint32& grpOut)
+    //
+    // Ranking is by distance to the ANCHOR (ax,ay,az), NOT the tank: the opener passes the
+    // tank's own position (the first mob is nearest-to-tank), but each SUBSEQUENT add passes
+    // the position of the mob currently being pulled, so the tank clears OUTWARD along the
+    // pack it opened on instead of doubling back to whatever's nearest its own feet — which
+    // sent it lurching off in the opposite direction (Kevin: "pulls one mob then walks off a
+    // completely different way"). A vertical (Z) offset from the anchor is penalised (each
+    // yard costs GATHER_Z_PENALTY virtual yards) so on-level mobs are preferred; a vastly
+    // different Z is already hard-rejected by GatherEligible.
+    static Unit* FindNextSafeAdd(Player* tank, uint32 capacity, uint32& grpOut,
+                                 float ax, float ay, float az)
     {
         grpOut = 0;
         if (!tank || capacity == 0) return nullptr;
@@ -2087,12 +2103,18 @@ namespace WowPsParty
 
         std::vector<Unit*> pool;
         for (Unit* u : nearby) if (GatherEligible(tank, u)) pool.push_back(u);
+        auto anchorScore = [&](Unit* u) -> float {
+            float const dx = u->GetPositionX() - ax;
+            float const dy = u->GetPositionY() - ay;
+            float const dz = std::fabs(u->GetPositionZ() - az);
+            return std::sqrt(dx * dx + dy * dy) + dz * GATHER_Z_PENALTY;
+        };
         std::sort(pool.begin(), pool.end(),
-                  [&](Unit* a, Unit* b){ return tank->GetDistance(a) < tank->GetDistance(b); });
+                  [&](Unit* a, Unit* b){ return anchorScore(a) < anchorScore(b); });
         for (Unit* cand : pool)
         {
             uint32 const g = SocialGroupSize(cand, pool);
-            if (g <= capacity) { grpOut = g; return cand; }   // nearest that SAFELY fits
+            if (g <= capacity) { grpOut = g; return cand; }   // best-ranked that SAFELY fits
         }
         return nullptr;
     }
@@ -2174,9 +2196,18 @@ namespace WowPsParty
         //      combat / dead / in melee) or its reach-grace expires, BEFORE looking for the
         //      next one (Mill: "give it time to reach the target of every multi-pull before
         //      it re-arms the check"). ------------------------------------------------------
+        // Anchor the NEXT add search on the mob we're currently pulling (so the tank keeps
+        // clearing the pack it walked into), falling back to the tank's own position only if
+        // that mob is gone. The opener is already tank-anchored: TankLeadEngagement picks the
+        // nearest mob to the tank and commits it as curAdd before this ever runs, so the first
+        // search here is for add #2 and correctly anchors on the opener mob.
+        float anchorX = tank->GetPositionX();
+        float anchorY = tank->GetPositionY();
+        float anchorZ = tank->GetPositionZ();
         if (d.curAdd)
         {
             Unit* const cur = ObjectAccessor::GetUnit(*tank, d.curAdd);
+            if (cur) { anchorX = cur->GetPositionX(); anchorY = cur->GetPositionY(); anchorZ = cur->GetPositionZ(); }
             bool const reached = !cur || !cur->IsAlive() || cur->IsInCombat()
                               || tank->IsWithinMeleeRange(cur);
             if (!reached && now - d.curAddMs < GATHER_REACH_GRACE_MS)
@@ -2189,7 +2220,7 @@ namespace WowPsParty
 
         // ---- find the next safe add (STRICT cap: its social group must fit N - engaged) --
         uint32 grp = 0;
-        Unit* const add = FindNextSafeAdd(tank, d.targetN - engaged, grp);
+        Unit* const add = FindNextSafeAdd(tank, d.targetN - engaged, grp, anchorX, anchorY, anchorZ);
         if (add)
         {
             // Hold the DPS for the WHOLE gather: re-mark with the current pack + the incoming
@@ -2316,7 +2347,10 @@ namespace WowPsParty
         // (Kevin), so the opener radius was tightened. This is the INITIAL-pull scan only;
         // the during-multi-pull gather range (GATHER_SCAN, FindNextSafeAdd) is unchanged.
         // SelectNearbyTarget returns the nearest unit `this` considers a valid attack target.
-        Unit* nearest = bot->SelectNearbyTarget(nullptr, 22.0f);
+        // The 22y opener radius is the DEFAULT; it's a per-tank rotation-editor slider
+        // (party_loadout.engage_range, [10,40]) so the player can widen/tighten how eagerly
+        // the lead tank opens on a distant pack.
+        Unit* nearest = bot->SelectNearbyTarget(nullptr, float(WowPsParty::BotEngageRange(bot->GetGUID())));
         if (!nearest || !nearest->IsAlive()) return;
         if (!bot->IsValidAttackTarget(nearest)) return;
         if (!nearest->IsHostileTo(bot)) return;   // never auto-engage a PASSIVE/neutral (yellow) mob (Mill)
@@ -2333,7 +2367,8 @@ namespace WowPsParty
                               nearest->GetPositionZ(), std::sqrt(dx * dx + dy * dy)))
             {
                 uint32 grp = 0;
-                Unit* const reachable = FindNextSafeAdd(bot, 8, grp);   // nearest reachable eligible hostile
+                Unit* const reachable = FindNextSafeAdd(bot, 8, grp,     // OPENER: anchor on the tank itself
+                    bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ());
                 if (!reachable) return;
                 nearest = reachable;
             }
