@@ -82,6 +82,7 @@
 #include "RandomPlayerbotMgr.h" // sRandomPlayerbotMgr — server-side spawn for WG (no human anchor)
 #include "Battlefield.h"        // Wintergrasp: IsWarTime / war enrolment / participant sets
 #include "BattlefieldMgr.h"     // sBattlefieldMgr->GetBattlefieldToZoneId(WG)
+#include "BattlefieldWG.h"      // CanInteractWithRelic (final-gate breach -> defenders to core)
 #include "MotionMaster.h"       // WG bot AI movement (MovePoint / MoveChase)
 #include "GameObject.h"         // WG siege: destructible keep-wall damage (ModifyHealth)
 #include "Cell.h"               // grid search for the keep walls
@@ -1307,12 +1308,53 @@ struct WgWallCheck
     }
 };
 
-// Contest points to fan the fills across (real WG locations so pathing stays on the
-// navmesh): the keep is the central objective both sides converge on, the NE workshop a
-// secondary so they don't all stack on one spot.
+// Real WG objective coordinates (live-DB factory-banner + core tower positions) so pathing
+// stays on the navmesh. Bots are fanned ACROSS these by faction + guid-hash so the sides
+// SPREAD and contest the whole map instead of all bunching at the keep (the old behaviour:
+// everyone walked to WG_KEEP or one workshop).
 struct WgPt { float x, y, z; };
-WgPt const WG_KEEP     { 5345.0f, 2842.0f, 410.0f };
-WgPt const WG_WORKSHOP { 5104.0f, 2300.0f, 368.0f };
+WgPt const WG_KEEP     { 5345.0f, 2842.0f, 410.0f };   // keep centre
+WgPt const WG_RELIC    { 5440.0f, 2840.0f, 430.0f };   // Titan relic / core (final objective)
+// The 4 outer Siege-Workshop capture banners (NE/NW/SE/SW).
+WgPt const WG_WS_NE    { 4949.3f, 2432.6f, 320.2f };
+WgPt const WG_WS_NW    { 4948.5f, 3342.3f, 376.9f };
+WgPt const WG_WS_SE    { 4398.1f, 2356.5f, 376.2f };
+WgPt const WG_WS_SW    { 4390.8f, 3304.1f, 372.4f };
+// The two southern attack towers the user calls out for the tower-split detail.
+WgPt const WG_TOWER_SHADOWSIGHT { 4557.0f, 3624.0f, 420.0f };   // GO 190356
+WgPt const WG_TOWER_FLAMEWATCH  { 4459.0f, 1944.0f, 459.0f };   // GO 190358
+WgPt const WG_WORKSHOP = WG_WS_SE;   // back-compat alias (was a single hardcoded workshop)
+
+// Per-bot objective so the two sides spread + contest the map. DEFENDERS hold/recapture the
+// outer workshops + send a small detail to ATTACK the southern towers, and ALL converge on
+// the core/relic the instant the final inner gate is breached (CanInteractWithRelic). ATTACKERS
+// fan across the workshops to capture them + drive on the keep, with a small detail DEFENDING
+// the southern towers they hold. (Siege vehicles are spawned + driven at the gates separately;
+// foot bots fight whatever enemy they pass on the way — DriveAI engages before falling back here.)
+WgPt WgObjectiveFor(Player* bot, Battlefield* wg)
+{
+    bool const defender = (bot->GetTeamId() == wg->GetDefenderTeam());
+    uint32 const h = bot->GetGUID().GetCounter();
+
+    // Final inner gate breached -> every DEFENDER falls back to defend the core/relic.
+    if (defender)
+        if (BattlefieldWG* bfwg = static_cast<BattlefieldWG*>(wg))
+            if (bfwg->CanInteractWithRelic())
+                return WG_RELIC;
+
+    // Tower detail — ~3 of each ~30-bot side (h % 10 < 3). Defenders ATTACK the southern
+    // towers (destroying them shortens the attacker respawn); attackers DEFEND them. The two
+    // named towers alternate so the detail splits between them.
+    if (h % 10 < 3)
+        return (h & 1) ? WG_TOWER_SHADOWSIGHT : WG_TOWER_FLAMEWATCH;
+
+    // Everyone else fans across the 4 outer workshops (stand on the banner -> the core's
+    // capture system flips control). A quarter of ATTACKERS instead drive on the keep/core.
+    static WgPt const WS[4] = { WG_WS_NE, WG_WS_NW, WG_WS_SE, WG_WS_SW };
+    if (!defender && (h % 4 == 0))
+        return WG_KEEP;
+    return WS[h % 4];
+}
 
 class PartyWgFillWorldScript : public WorldScript
 {
@@ -1490,11 +1532,14 @@ private:
             }
         }
 
+        // No enemy/vehicle in range -> head to this bot's assigned OBJECTIVE so the sides
+        // spread across the map (workshops / towers / core) instead of all bunching at the
+        // keep. A small per-bot jitter keeps a shared objective from stacking pixel-perfect.
         uint32 const guidLow = bot->GetGUID().GetCounter();
-        WgPt const& obj = (guidLow % 3 == 0) ? WG_WORKSHOP : WG_KEEP;
-        float const tx = obj.x + float(int(guidLow % 7) - 3) * 10.0f;   // fan out so they don't stack
-        float const ty = obj.y + float(int(guidLow / 7 % 7) - 3) * 10.0f;
-        if (!bot->isMoving() && bot->GetExactDist2d(tx, ty) > 8.0f)
+        WgPt const obj = WgObjectiveFor(bot, wg);
+        float const tx = obj.x + float(int(guidLow % 7) - 3) * 4.0f;
+        float const ty = obj.y + float(int(guidLow / 7 % 7) - 3) * 4.0f;
+        if (!bot->isMoving() && bot->GetExactDist2d(tx, ty) > 10.0f)
             bot->GetMotionMaster()->MovePoint(0, tx, ty, obj.z);
     }
 
@@ -1587,9 +1632,15 @@ private:
     // attacker staging and, if an idle attacking fill bot is free, seat it as the driver.
     static void TopUpVehicles(Battlefield* wg, uint32 live)
     {
-        if (live >= WG_MAX_VEHICLES || !wg->IsWarTime()) return;
-
+        if (!wg->IsWarTime()) return;
         TeamId const atk = wg->GetAttackerTeam();
+        // Fill toward ~50% of the attacker's ACTUAL siege-slot capacity (granted by the
+        // workshops it controls), floor WG_MAX_VEHICLES so there's always a siege push.
+        uint32 const maxSlots = wg->GetData(atk == TEAM_ALLIANCE
+            ? BATTLEFIELD_WG_DATA_MAX_VEHICLE_A : BATTLEFIELD_WG_DATA_MAX_VEHICLE_H);
+        uint32 const target = std::max<uint32>(WG_MAX_VEHICLES, (maxSlots + 1) / 2);
+        if (live >= target) return;
+
         Position const stage = (atk == TEAM_HORDE) ? Position(5025.857f, 3674.629f, 362.737f, 4.135f)
                                                    : Position(5101.284f, 2186.564f, 365.549f, 3.812f);
         uint32 const entries[4] = { atk == TEAM_ALLIANCE ? WG_VEH_SIEGE_ALLY : WG_VEH_SIEGE_HORDE,
