@@ -1772,7 +1772,7 @@ namespace WowPsParty
     // their leash to poke a neutral monster. It just ranks the live combatants by
     // distance. Returns nullptr if nothing qualifies (assist loop then falls back
     // to party-defense).
-    static Unit* PickNearestEngagedTarget(Player* bot)
+    static Unit* PickNearestEngagedTarget(Player* bot, bool skipFullyImmune = false)
     {
         constexpr float MAX_RANGE = 40.0f;
         Unit* best = nullptr;
@@ -1781,6 +1781,10 @@ namespace WowPsParty
         {
             if (!a || !a->IsAlive() || !a->IsInCombat()) return;
             if (!bot->IsValidAttackTarget(a)) return;
+            // skipFullyImmune: pass over a mob immune to EVERY damage school (a
+            // Divine Shield / Ice Block bubble) so the immune-retarget below lands
+            // on something the party can actually hurt.
+            if (skipFullyImmune && a->IsImmunedToDamage(SPELL_SCHOOL_MASK_ALL)) return;
             float const d = bot->GetDistance(a);
             if (d > MAX_RANGE) return;
             if (IsTargetUnreachable(bot->GetGUID().GetCounter(), a->GetGUID().GetCounter())) return;
@@ -5183,6 +5187,23 @@ namespace WowPsParty
         // of combat; the engage/position bands below chase us to firing range.
         if (!desired)
             desired = PartyMainCombatTarget(bot);
+
+        // Immune-target retarget / stand-down (Kevin). A mob immune to EVERY damage
+        // school — a Divine Shield / Ice Block "bubble" — can't be hurt by anyone, so
+        // committing the bot to it just wastes it (the cast-guard already blocks the
+        // casts; this stops it standing on the bubble swinging white hits). This is the
+        // FINAL target gate — past the throttle/combo-hold/PartyMainCombatTarget, all of
+        // which can re-pick the bubbled victim — so retarget here onto the nearest OTHER
+        // engaged enemy we CAN damage; if there is none, drop to nullptr and STAND DOWN
+        // (the block below stops attacking + idles). Re-run every tick, so the bot
+        // re-engages the instant the bubble drops or another mob appears.
+        if (desired && desired->IsImmunedToDamage(SPELL_SCHOOL_MASK_ALL))
+        {
+            Unit* const alt = PickNearestEngagedTarget(bot, /*skipFullyImmune=*/true);
+            AssistLog(gLow, alt ? "immune target -> retarget to a non-immune enemy"
+                                : "immune target, no alternative -> stand down");
+            desired = alt;   // nullptr => stand-down block below
+        }
 
         if (!desired)
         {
