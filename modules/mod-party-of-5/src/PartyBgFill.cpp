@@ -123,10 +123,20 @@ namespace
     // can't pin the leader's session (g_activeLeaders) forever.
     constexpr uint32 FILL_SPAWN_GRACE_MS = 60000;
 
+    // Don't bot-fill a BG the INSTANT a managed party queues — hold off this long first so
+    // REAL players have a window to queue and we get genuine multiplayer matches instead of
+    // an immediate bot pop (Kevin: an instant pop forces grouping-up before queueing). If the
+    // BG pops on its own within the window (enough real players), we never fill (TopUpBgInPrep
+    // tops up the deficit during prep instead).
+    constexpr uint32 BG_FILL_DELAY_MS = 20000;
+
     // fillBotGuidLow -> {leaderGuidLow, bgTypeId}
     std::unordered_map<uint32, FillEntry> g_fillBots;
     // leaderGuidLow -> bgTypeId currently being filled (one fill session per leader)
     std::unordered_map<uint32, uint32>    g_activeLeaders;
+    // leaderGuidLow -> getMSTime() at queue: fill is PENDING (delayed). The world tick fires
+    // StartFill once BG_FILL_DELAY_MS has elapsed and the BG hasn't popped on its own.
+    std::unordered_map<uint32, uint32>    g_fillPendingMs;
     std::mutex                            g_mutex;
 
     BattlegroundQueueTypeId QueueTypeFor(uint32 bgTypeId)
@@ -1023,12 +1033,15 @@ public:
             std::lock_guard<std::mutex> lk(g_mutex);
             if (g_activeLeaders.count(player->GetGUID().GetCounter())) return;
             g_activeLeaders[player->GetGUID().GetCounter()] = bgTypeId;
+            // DELAY the fill: real players get BG_FILL_DELAY_MS to queue first. The world
+            // tick fires StartFill once it elapses (and the BG hasn't popped on its own).
+            if (IsFillableBg(bgTypeId))
+                g_fillPendingMs[player->GetGUID().GetCounter()] = getMSTime();
         }
-        // Spawn both-team fills for any fillable BG — Random BG included (it fills the
-        // RB queue to RB's 10v10, then TopUpBgInPrep tops the rolled instance to its real
-        // cap). The world tick always drives the heroes to accept via g_activeLeaders.
         if (IsFillableBg(bgTypeId))
-            StartFill(player, bgTypeId);
+            LOG_INFO("module",
+                "[WowPsParty BGFill] {} queued bg {} — holding the fill {}s so real players can queue first",
+                player->GetName(), bgTypeId, BG_FILL_DELAY_MS / 1000);
         else
             LOG_INFO("module",
                 "[WowPsParty BGFill] {} queued bg {} (unfillable) — driving heroes to accept the pop, no enemy fill",
@@ -1176,10 +1189,34 @@ public:
             {
                 // Leader gone and no fill bots left to retire -> drop the stale session.
                 std::lock_guard<std::mutex> lk(g_mutex);
+                g_fillPendingMs.erase(leaderLow);   // left the queue before the hold elapsed
                 bool hasFills = false;
                 for (auto const& kv : g_fillBots) if (kv.second.leaderLow == leaderLow) { hasFills = true; break; }
                 if (!hasFills) g_activeLeaders.erase(leaderLow);
                 continue;
+            }
+            // Delayed initial fill: once the hold window elapses AND the BG hasn't popped on
+            // its own (leader still queued, not yet in a BG), bot-fill both teams. If real
+            // players popped it first, skip — TopUpBgInPrep tops up any deficit during prep.
+            {
+                bool fireFill = false;
+                {
+                    std::lock_guard<std::mutex> lk(g_mutex);
+                    auto it = g_fillPendingMs.find(leaderLow);
+                    if (it != g_fillPendingMs.end())
+                    {
+                        if (leader->InBattleground())                              // popped on its own
+                            g_fillPendingMs.erase(it);
+                        else if (getMSTime() - it->second >= BG_FILL_DELAY_MS)
+                        { fireFill = true; g_fillPendingMs.erase(it); }
+                    }
+                }
+                if (fireFill)   // StartFill takes g_mutex itself — call it UNLOCKED
+                {
+                    LOG_INFO("module", "[WowPsParty BGFill] {} fill hold elapsed — filling bg {} now",
+                             leader->GetName(), bgTypeId);
+                    StartFill(leader, bgTypeId);
+                }
             }
             // Keep the match topped up to max while it's still in its pre-gate countdown
             // (no-op unless the leader is in a BG in STATUS_WAIT_JOIN with a real deficit).
