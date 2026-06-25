@@ -1038,6 +1038,11 @@ static InventoryResult CanUseItemIgnoringBind(Player* dest, Item* item)
     return EQUIP_ERR_OK;
 }
 
+// Force-persist a shared-inventory transfer for one or both members (defined
+// below). Cross-character moves must flush immediately so the destination row is
+// written now and no stale source row survives into a deferred, corruptable save.
+static void FlushPartyTransfer(Player* a, Player* b);
+
 // Move ONE loose, non-container item out of `from`'s inventory onto any OTHER
 // party member that has room. Used to free a single slot so a bigger bag can be
 // staged in a regular slot and then swapped into a bag slot on a member whose
@@ -1078,6 +1083,7 @@ static bool RelocateOneLooseItem(uint32 account, Player* from)
             item->SaveToDB(tx);
             CharacterDatabase.CommitTransaction(tx);
             peer->MoveItemToInventory(dpos, item, true);
+            FlushPartyTransfer(from, peer);
             return true;
         }
         return false;
@@ -1090,6 +1096,29 @@ static bool RelocateOneLooseItem(uint32 account, Player* from)
             for (uint32 j = 0; j < bag->GetBagSize(); ++j)
                 if (tryMove(from->GetItemByPos(b, j))) return true;
     return false;
+}
+
+// Persist a shared-inventory transfer IMMEDIATELY rather than leaving the row
+// rewrite to the destination's next deferred _SaveInventory. The cross-character
+// move/equip paths detach an item from one member and re-own + re-store it on
+// another; the SOURCE row in character_inventory is only cleared when the
+// destination's REPLACE (keyed on the item GUID) eventually runs. On a member
+// whose bags churn from rapid party-gear edits, that deferred save keeps hitting
+// the engine's defensive branches ("the player doesn't have an item at that
+// position" / "is there instead" / "queued more than once" / "dangling pointer")
+// which SKIP the position write — so the stale source row survives and the item
+// reloads onto the wrong character on relog (apparent duplicate) or orphans
+// (apparent loss). Force-draining both members' update queues here writes the
+// correct rows now (the REPLACE clears any stale source row by PK=item) and
+// stops stale/dangling pointers from accumulating into a later corrupted save.
+// This is the same immediate-persist discipline HandleMailSend / HandleAhSell
+// already use for their single owner.
+static void FlushPartyTransfer(Player* a, Player* b)
+{
+    CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+    if (a) a->SaveInventoryAndGoldToDB(tx);
+    if (b && b != a) b->SaveInventoryAndGoldToDB(tx);
+    CharacterDatabase.CommitTransaction(tx);
 }
 
 // Defined below (shared with HandleUse) — opens a lootable container on its owner.
@@ -1191,6 +1220,7 @@ static void HandleEquip(Player* requester, std::string_view payload)
             if (dest->CanStoreItem(NULL_BAG, NULL_SLOT, destPos, srcItem, false) == EQUIP_ERR_OK)
             {
                 dest->MoveItemToInventory(destPos, srcItem, true);
+                FlushPartyTransfer(srcChar, dest);
             }
             else
             {
@@ -1202,6 +1232,7 @@ static void HandleEquip(Player* requester, std::string_view payload)
                 CharacterDatabaseTransaction tx2 = CharacterDatabase.BeginTransaction();
                 srcItem->SaveToDB(tx2);
                 CharacterDatabase.CommitTransaction(tx2);
+                FlushPartyTransfer(srcChar, dest);
                 ChatHandler(requester->GetSession()).PSendSysMessage(
                     "|cffff5555[WowPsParty]|r {}'s bags are full — can't take ammo.",
                     dest->GetName());
@@ -1264,6 +1295,7 @@ static void HandleEquip(Player* requester, std::string_view payload)
             "[WowPsParty Equip] same-char swap: char={} item={} ({}) srcPos={:#x} eqDest={:#x}",
             dest->GetName(), srcItem->GetEntry(), srcItem->GetTemplate()->Name1, srcPos, eqDest);
         dest->SwapItem(srcPos, eqDest);
+        FlushPartyTransfer(dest, nullptr);
     }
     else
     {
@@ -1294,6 +1326,7 @@ static void HandleEquip(Player* requester, std::string_view payload)
             CharacterDatabaseTransaction txb = CharacterDatabase.BeginTransaction();
             srcItem->SaveToDB(txb);
             CharacterDatabase.CommitTransaction(txb);
+            FlushPartyTransfer(srcChar, dest);
         };
 
         ItemPosCountVec destPos;
@@ -1363,6 +1396,12 @@ static void HandleEquip(Player* requester, std::string_view payload)
             WowPsParty::SendInventoryTo(requester);
             return;
         }
+
+        // Equip succeeded on a DIFFERENT character than the item came from:
+        // persist both members now so the source's stale character_inventory row
+        // can't survive into a deferred save and reload the item onto the wrong
+        // character on relog (the duplicate-item / lost-gear report).
+        FlushPartyTransfer(srcChar, dest);
     }
 
     // Refresh client UI on both sides
@@ -2754,6 +2793,10 @@ static void HandlePullReagent(Player* requester, std::string_view payload)
                 CharacterDatabase.CommitTransaction(tx2);
             }
         }
+        // Persist this mate + the crafter now (don't touch `it`: a reagent stack
+        // may have merged into an existing one on the requester and been freed).
+        if (!stacks.empty())
+            FlushPartyTransfer(mate, requester);
     } while (q->NextRow());
 
     LOG_INFO("module", "[WowPsParty PullReagent] itemId={} -> moved {} stack(s) onto {}",
@@ -3156,6 +3199,7 @@ static Item* PullItemToRequester(Player* requester, Player* srcChar, Item* item)
     {
         ObjectGuid const movedGuid = item->GetGUID();   // MoveItemToInventory returns void
         requester->MoveItemToInventory(dest, item, true);
+        FlushPartyTransfer(srcChar, requester);
         return requester->GetItemByGuid(movedGuid);      // count-1 items don't merge; pointer stays valid
     }
 
@@ -3168,6 +3212,7 @@ static Item* PullItemToRequester(Player* requester, Player* srcChar, Item* item)
     CharacterDatabaseTransaction tx2 = CharacterDatabase.BeginTransaction();
     item->SaveToDB(tx2);
     CharacterDatabase.CommitTransaction(tx2);
+    FlushPartyTransfer(srcChar, requester);
     return nullptr;
 }
 
@@ -3265,6 +3310,7 @@ static void HandleGuildBankDeposit(Player* requester, std::string_view payload)
                     CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
                     cur->SaveToDB(tx);
                     CharacterDatabase.CommitTransaction(tx);
+                    FlushPartyTransfer(srcChar, requester);
                 }
             }
         ChatHandler(requester->GetSession()).PSendSysMessage(
@@ -3852,6 +3898,7 @@ static void HandleMove(Player* requester, std::string_view payload)
             return;
         srcChar->RemoveItem(item->GetBagSlot(), item->GetSlot(), true);
         srcChar->StoreItem(pos, item, true);
+        FlushPartyTransfer(srcChar, nullptr);
     }
     else
     {
@@ -3874,6 +3921,9 @@ static void HandleMove(Player* requester, std::string_view payload)
             item->SaveToDB(tx2);
             CharacterDatabase.CommitTransaction(tx2);
         }
+        // Persist both members now — a stale source row that survives a deferred
+        // save reloads the item onto the wrong character on relog.
+        FlushPartyTransfer(srcChar, dstChar);
     }
 
     WowPsParty::SendInventoryTo(requester);
