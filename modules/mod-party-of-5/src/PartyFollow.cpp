@@ -4960,6 +4960,22 @@ namespace WowPsParty
                 || (desired->IsCreature() && desired->ToCreature()->IsInEvadeMode())))
             desired = nullptr;
 
+        // FRIENDLY-FIRE GUARD: never attack a SAME-TEAM player or their pet. In Wintergrasp
+        // (a PvP zone) the heroes were seen attacking allied pets + each other ("my Nisse
+        // heroes are dueling lol") — IsValidAttackTarget misfires there, so guard the symptom
+        // by team directly (GetTeamId is the fixed character faction, reliable even when the
+        // reaction system isn't). Enemy players are a different team, so real PvP is untouched.
+        if (desired)
+            if (Player* tOwner = desired->GetCharmerOrOwnerPlayerOrPlayerItself())
+                if (tOwner != bot && tOwner->GetTeamId() == bot->GetTeamId())
+                {
+                    AssistLog(gLow, "skip: same-team player/pet (WG friendly-fire guard)");
+                    LOG_INFO("module",
+                        "[WowPsParty Assist] {} friendly-fire guard dropped same-team target {} (owner {})",
+                        bot->GetName(), desired->GetName(), tOwner->GetName());
+                    desired = nullptr;
+                }
+
         // ---- FOCUS override -----------------------------------------------------
         // A rotation "focus:<names>" rule marks must-kill adds (Chaos Rift on
         // Anomalus, Frost Tomb in Utgarde Keep). When the bot is already in combat
