@@ -152,7 +152,7 @@ namespace WowPsParty
     // disabled (AssistTarget yields to a rotation that never hops).
     static std::string Lower(std::string s);
     static bool CsvContains(std::string const& csv, std::string const& kw);
-    // Forward-declared (defined ~line 2319) so BotIsKiting can evaluate a kite
+    // Forward-declared (defined further down) so BotIsKiting can evaluate a kite
     // rule's CONDITION, not just its presence. No defaults here — the definition
     // carries them; calls before that point pass all args explicitly.
     static bool EvalCondition(std::string const& cond, Player* bot,
