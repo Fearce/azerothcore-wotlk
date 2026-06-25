@@ -2651,6 +2651,7 @@ namespace WowPsParty
     static constexpr uint32 GATHER_APPROACH_TIMEOUT_MS = 6000; // give up if stuck
     static constexpr uint32 GATHER_AVOID_MS = 30000;   // ignore an unreachable node
     static constexpr float GATHER_DUNGEON_ENEMY_CLEAR = 100.0f; // in a dungeon, don't gather a node with a live enemy this close
+    static constexpr float INSTANT_GATHER_RANGE = 10.0f; // mining/herb heroes auto-grab any node within this the instant they pass it (no walk, bypasses the avoid-list) — Kevin
 
     // Per-bot gather state. Committing to one node stops the bot oscillating
     // between two equidistant nodes; the avoid slot remembers a node we gave up
@@ -3161,6 +3162,42 @@ namespace WowPsParty
         Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
         if (!leader || !leader->IsInWorld()) { GatherLog(gLow, "skip: leader not in world"); return; }
         if (leader->GetMapId() != bot->GetMapId()) { GatherLog(gLow, "skip: leader other map"); return; }
+
+        // INSTANT pickup within 10y (Kevin): a mining/herb hero grabs ANY node it
+        // can harvest the moment it comes within 10 yards — no commit, no walk,
+        // no avoid-list. As the leader runs around, the follow formation sweeps
+        // the party past veins and herbs and they're slurped up on contact, which
+        // feels immediate AND fixes "can't reach all nodes": a vein the walk
+        // state machine can't PATH to (up a rock/ledge) and has avoid-listed is
+        // still harvested if the party simply passes within 10y of it. Nodes
+        // farther out are still actively pursued by the commit-and-walk machine
+        // below. Bag space was already ensured above; stop if a burst of nodes
+        // fills the backpack (the next tick's offload gate makes room).
+        if (canNode)
+        {
+            std::list<GameObject*> nearNodes;
+            NearbySpawnedGOCheck check(bot, INSTANT_GATHER_RANGE);
+            Acore::GameObjectListSearcher<NearbySpawnedGOCheck> searcher(bot, nearNodes, check);
+            Cell::VisitObjects(bot, searcher, INSTANT_GATHER_RANGE);
+
+            bool grabbedInstant = false;
+            for (GameObject* go : nearNodes)
+            {
+                if (bot->GetFreeInventorySpace() == 0) break;
+                if (!IsGatherableBy(bot, go)) continue;   // skill+value, GO_READY, not already mine
+                GatherLog(gLow, "instant: harvested a node within 10y on contact (no walk)");
+                GatherNode(bot, go);
+                grabbedInstant = true;
+            }
+            // Harvesting on the spot supersedes any half-finished walk target.
+            if (grabbedInstant)
+            {
+                std::lock_guard<std::mutex> lock(g_gatherMutex);
+                auto& st = g_gather[gLow];
+                st.node = ObjectGuid::Empty;
+                st.commitMs = 0;
+            }
+        }
 
         // Read this bot's committed node + avoid entry.
         ObjectGuid committed, avoid;
