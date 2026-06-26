@@ -809,17 +809,43 @@ namespace WowPsParty
         return n;
     }
 
-    // A DRUID in a shapeshift form (Bear/Cat/Moonkin/Travel) can't cast caster-form buffs
-    // like Mark of the Wild — the cast silently fails the shapeshift gate, so a bear TANK
-    // never buffs the party (Mill). When a friendly buff is blocked ONLY by the current form
-    // and it's SAFE to drop it (out of combat, nothing meleeing us, and NOT mid lead-tank
-    // body-pull/pull — a bear must stay in form to gather), cancel the form this tick and
-    // return true; the rule re-fires next tick in caster form and the buff lands. Once every
-    // member has the buff the rule stops matching and the `always: Bear Form` rule reforms.
-    // Returns false (caller casts normally) for non-druids or any unsafe / non-form-blocked case.
+    // After a bot drops a shapeshift form to apply party buffs (TryDropFormForBuff), hold
+    // its OWN "reform" rule off for a few seconds so the buff actually LANDS before the form
+    // goes back up. Needed because a rotation whose reform rule outranks the buff rule (the
+    // shadow-priest default: buff_self:Shadowform prio 76 > cast_party_missing prio 56) would
+    // re-enter the form next tick and re-block the buff forever — an endless drop/reform FLAP
+    // that also spams cast sounds. ~5s covers a couple of instant party buffs (Fortitude +
+    // Divine Spirit) before reforming. Order-independent, so it fixes custom rotations too.
+    static std::unordered_map<uint32, uint32> g_formReformUntil;   // botLow -> getMSTime() until reform held
+    static std::mutex g_formReformMutex;
+    static constexpr uint32 FORM_REFORM_SUPPRESS_MS = 5000;
+    static void SetFormReformSuppressed(uint32 low)
+    {
+        std::lock_guard<std::mutex> lk(g_formReformMutex);
+        g_formReformUntil[low] = getMSTime() + FORM_REFORM_SUPPRESS_MS;
+    }
+    static bool FormReformSuppressed(uint32 low)
+    {
+        std::lock_guard<std::mutex> lk(g_formReformMutex);
+        auto it = g_formReformUntil.find(low);
+        return it != g_formReformUntil.end() && getMSTime() < it->second;
+    }
+
+    // A DRUID in a shapeshift form (Bear/Cat/Moonkin/Travel) — or a shadow PRIEST in
+    // Shadowform — can't cast caster-form buffs like Mark of the Wild / Power Word: Fortitude
+    // / Divine Spirit: the cast silently fails the shapeshift gate, so a bear TANK or a shadow
+    // priest never buffs the party (Mill; Nissebjarke). When a friendly buff is blocked ONLY by
+    // the current form and it's SAFE to drop it (out of combat, nothing meleeing us, and NOT mid
+    // lead-tank body-pull/pull — a bear must stay in form to gather), cancel the form this tick,
+    // hold the reform briefly (so the buff lands first), and return true; the rule re-fires next
+    // tick in caster form and the buff lands. Once every member has the buff the rule stops
+    // matching and the `always: <form>` rule reforms. Returns false for other classes or any
+    // unsafe / non-form-blocked case.
     static bool TryDropFormForBuff(Player* bot, uint32 spellId)
     {
-        if (!bot || bot->getClass() != CLASS_DRUID) return false;
+        if (!bot) return false;
+        uint8 const cls = bot->getClass();
+        if (cls != CLASS_DRUID && cls != CLASS_PRIEST) return false;   // only forms that block buffs
         if (!bot->HasShapeshiftAura()) return false;
         SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
         if (!info) return false;
@@ -830,6 +856,7 @@ namespace WowPsParty
         if (WowPsParty::TankGatherActive(low) || WowPsParty::IsTankPulling(bot->GetGUID()))
             return false;                                   // a bear must stay in form to body-pull
         bot->RemoveAurasByType(SPELL_AURA_MOD_SHAPESHIFT);  // drop to caster form; cast next tick
+        SetFormReformSuppressed(low);                       // hold the reform so the buff lands first
         return true;
     }
 
@@ -4871,6 +4898,18 @@ namespace WowPsParty
             // of Righteousness every tick, never reaching Crusader Strike.
             else if (TargetHasNamedAura(bot, arg))
                 return false;
+
+            // If THIS buff is a shapeshift form (Shadowform / Bear Form / …) and we just
+            // dropped a form to apply party buffs, hold the reform out of combat until the
+            // buff lands (see TryDropFormForBuff) — otherwise a high-priority reform rule
+            // re-blocks the buff forever. Never suppress in combat: the form is wanted then.
+            if (info && !bot->IsInCombat()
+                && FormReformSuppressed(bot->GetGUID().GetCounter()))
+            {
+                for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                    if (info->Effects[i].ApplyAuraName == SPELL_AURA_MOD_SHAPESHIFT)
+                        return false;   // a form, still in the post-drop buff window — don't reform yet
+            }
 
             if (!channelClipOk()) return false;
 
