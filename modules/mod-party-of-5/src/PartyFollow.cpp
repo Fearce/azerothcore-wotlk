@@ -1599,10 +1599,11 @@ namespace WowPsParty
         // Cap the grab to adds NEAR the party. AssistTarget melee-chases the
         // picked add, and that chase is uncapped — at 30y the tank sprinted clear
         // across the room to a far add and body-pulled every pack en route (the
-        // bear-tank "chain-pulls until we die" report). 18y still grabs adds on
-        // the healer/casters positioned behind the tank; FARTHER adds are pulled
-        // with a ranged taunt rule (cast_loose_enemy:Growl) instead of a sprint.
-        constexpr float LOOSE_MAX_RANGE = 18.0f;
+        // bear-tank "chain-pulls until we die" report). 22y keeps the grab local
+        // while still reaching adds on a healer/caster who hangs a little back of
+        // the tank (Kevin: "the range is a tad low"); FARTHER adds are pulled with
+        // a ranged taunt rule (cast_loose_enemy:Growl, 30y) instead of a sprint.
+        constexpr float LOOSE_MAX_RANGE = 22.0f;
         Unit* best = nullptr;
         float bestDist = 1e9f;
         auto consider = [&](Unit* a)
@@ -1624,17 +1625,29 @@ namespace WowPsParty
         considerAttackersOf(bot);                       // mobs on me but not targeting me (taunted off, etc.)
         for (Unit* ctrl : bot->m_Controlled)            // and mobs on my own pet
             considerAttackersOf(ctrl);
-        if (Group* g = bot->GetGroup())
+        // Scan every ally for a mob loose on THEM — from our DIRECTIVE roster (leader
+        // + bots + henchmen) AND the WoW group. The directive roster is primary: a WoW
+        // group can form incompletely, and without it the tank ignored a mob beating on
+        // the leader (the same fix FindLooseEnemy carries in the rotation).
+        std::vector<Player*> members;
+        auto addMember = [&](Player* m)
         {
+            if (m && m->IsInWorld() && m != bot && m->GetMapId() == bot->GetMapId()
+                && std::find(members.begin(), members.end(), m) == members.end())
+                members.push_back(m);
+        };
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(bot->GetGUID(), party);
+        for (ObjectGuid const& gg : party)
+            addMember(ObjectAccessor::FindConnectedPlayer(gg));
+        if (Group* g = bot->GetGroup())
             for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
-            {
-                Player* m = itr->GetSource();
-                if (!m || !m->IsInWorld() || m == bot) continue;
-                if (m->GetMapId() != bot->GetMapId()) continue;
-                considerAttackersOf(m);
-                for (Unit* ctrl : m->m_Controlled)      // a mob that pulled onto a member's PET
-                    considerAttackersOf(ctrl);
-            }
+                addMember(itr->GetSource());
+        for (Player* m : members)
+        {
+            considerAttackersOf(m);
+            for (Unit* ctrl : m->m_Controlled)          // a mob that pulled onto a member's PET
+                considerAttackersOf(ctrl);
         }
         return best;
     }
@@ -2179,7 +2192,12 @@ namespace WowPsParty
         else if (tank->getClass() == CLASS_DRUID
                  && (tank->HasAura(5487) || tank->HasAura(9634)))         // Bear / Dire Bear form
         {
-            if (tank->HasSpell(16979)) return 16979;                      // Feral Charge - Bear (free, no rage)
+            // RAGE-GATED (>5%): Feral Charge costs no rage, but an empty-rage bear charging
+            // the body-pull opener kept breaking the gather (Kevin) — a fresh / just-shifted
+            // bear with no rage WALKS the opener instead. Mirrors the rotation's bear charge.
+            uint32 const maxRage = tank->GetMaxPower(POWER_RAGE);
+            bool const haveRage = maxRage && tank->GetPower(POWER_RAGE) * 100u / maxRage > 5u;
+            if (haveRage && tank->HasSpell(16979)) return 16979;          // Feral Charge - Bear
         }
         return 0;
     }
@@ -5520,6 +5538,30 @@ namespace WowPsParty
             // non-combo class, so this is a no-op for them.)
             if (bot->GetComboPoints() > 0)
                 desired = current;
+        }
+
+        // ---- TANK loose-add peel: help an ally when taunts are on cooldown -------
+        // A bot TANK in combat GRABS a mob loose on an ally (beating the healer/casters,
+        // not the tank) by ATTACKING it — even while it already holds a victim. The
+        // Growl / Challenging Roar taunt rules are the primary peel, but on their
+        // cooldown the tank used to keep wailing its current target while adds chewed
+        // the leader (Kevin: "a few mobs on me and it takes a while to react if it has
+        // no taunt"). Fires ONLY while the tank is holding a target that's on ITSELF —
+        // i.e. not already peeling — so once it grabs an add it commits (the add stays
+        // its victim until threat flips off the ally), then it rolls to the next loose
+        // add. That "holding own target" guard keeps the pick stable, so flanking adds
+        // can't spin it — no throttle needed. Skipped mid ranged-pull (that block owns
+        // the feet); body-pulls suppress AssistTarget entirely.
+        if (RoleForGuid(bot->GetGUID()) == "tank" && bot->IsInCombat()
+            && !IsTankPulling(bot->GetGUID()))
+        {
+            Unit* const cv = bot->GetVictim();
+            bool const holdingOwnTarget = cv && cv->IsAlive()
+                && (!cv->GetVictim() || cv->GetVictim() == bot)   // my victim is on me, not an ally
+                && !IsBossUnit(cv);                               // never leave a held boss to chase trash
+            if (holdingOwnTarget)
+                if (Unit* loose = PickLooseTarget(bot))
+                    desired = loose;
         }
 
         // Still nothing of our own, but the PARTY is fighting — we're idle/too far

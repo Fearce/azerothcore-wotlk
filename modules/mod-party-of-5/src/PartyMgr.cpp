@@ -1434,11 +1434,19 @@ namespace WowPsParty
                     // reforms. Gated out_of_combat + the engine's own pull/combat guard so it
                     // never drops form mid-fight or mid-body-pull (Mill: bear couldn't MotW).
                     add("out_of_combat", "cast_party_missing:Mark of the Wild", 85);
-                    add("always", "buff_self:Bear Form", 84);
-                    // Feral Charge the first mob to OPEN a pull (closes the gap fast; free, no
-                    // rage). Out of combat only + far enough to matter; needs bear form (kept by
-                    // the rule above). The MULTI-pull opener charge is driven from the pull layer.
-                    add("out_of_combat&target_dist>11", "charge", 83);
+                    // Prefer DIRE BEAR FORM when it's learned (more armor + health than plain
+                    // Bear); buff_self no-ops once it's up. The Bear Form fallback is gated
+                    // self_missing_aura:Dire Bear Form so a dire bear never flaps back down to
+                    // plain Bear, and a low druid that hasn't learned Dire Bear still shifts.
+                    add("always", "buff_self:Dire Bear Form", 84);
+                    add("self_missing_aura:Dire Bear Form", "buff_self:Bear Form", 83);
+                    // Feral Charge the first mob to OPEN a pull (closes the gap fast). Out of
+                    // combat only + far enough to matter; needs bear form (kept above). RAGE-
+                    // GATED (self_rage>5): Feral Charge costs no rage, but an empty-rage bear
+                    // — fresh, or just shifted — kept misfiring it mid body-pull and breaking
+                    // the gather (Kevin), so it only charges once it has some rage; otherwise
+                    // it walks in. The MULTI-pull opener charge (pull layer) is rage-gated too.
+                    add("out_of_combat&target_dist>11&self_rage>5", "charge", 82);
                     add("enemies_in_melee>2", "cast:Swipe (Bear)", 70);
                     add("has_target", "cast:Mangle (Bear)", 68);
                     add("target_missing_aura:Lacerate", "cast:Lacerate", 64);
