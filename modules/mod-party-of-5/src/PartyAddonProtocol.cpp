@@ -1980,6 +1980,92 @@ static void HandleEnchant(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// RUNEFORGE\t<partySlot>\t<itemGuidLow>\t<runeSpellId> — apply a Death Knight runeforging
+// rune to a weapon in the party inventory. Unlike ENCHANT (which SetEnchantment-applies the
+// rune directly and therefore can NOT credit the runeforging quest 12842), this makes the
+// weapon's OWNER actually CAST the rune, so the real runeforging path runs — applying the
+// enchant AND crediting the quest when the owner is standing at a runeforge. Runeforging is
+// self-only, so the owner must be the one who knows the rune. If the real cast can't go (not
+// at a runeforge / a clientless bot), it falls back to a direct enchant so a bot's weapon
+// still gets the rune (bots have no quest to credit anyway).
+static void HandleRuneforge(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    std::string s(payload);
+    auto t1 = s.find('\t');           if (t1 == std::string::npos) return;
+    auto t2 = s.find('\t', t1 + 1);   if (t2 == std::string::npos) return;
+    uint32 const tgtSlot     = std::strtoul(s.substr(0, t1).c_str(), nullptr, 10);
+    uint32 const itemGuidLow = std::strtoul(s.substr(t1 + 1, t2 - t1 - 1).c_str(), nullptr, 10);
+    uint32 const runeSpellId = std::strtoul(s.substr(t2 + 1).c_str(), nullptr, 10);
+    if (!itemGuidLow || !runeSpellId) return;
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    uint32 const tgtGuid = WowPsParty::GuidForAccountSlot(account, tgtSlot);
+    if (!tgtGuid) return;
+    Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(tgtGuid));
+    if (!owner) return;
+    if (WowPsParty::MemberStorageUnstable(owner)) return;
+    Item* item = owner->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(itemGuidLow));
+    if (!item) return;
+
+    ChatHandler ch(requester->GetSession());
+    SpellInfo const* rune = sSpellMgr->GetSpellInfo(runeSpellId);
+    uint32 const enchantId = PermEnchantIdOfSpell(rune);
+    if (!rune || !enchantId || !sSpellItemEnchantmentStore.LookupEntry(enchantId))
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r That isn't a runeforging rune.");
+        return;
+    }
+    if (!item->IsFitToSpellRequirements(rune))
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r That rune doesn't fit |cffffffff{}|r.",
+            item->GetTemplate() ? item->GetTemplate()->Name1 : "that weapon");
+        return;
+    }
+    // Runeforging is self-only — only the weapon's owner can rune it, and only if they've
+    // learned that rune (you still train Lockpicking/Runeforging on the hero yourself).
+    if (!owner->HasSpell(runeSpellId))
+    {
+        ch.PSendSysMessage(
+            "|cffff5555[WowPsParty]|r |cffffffff{}|r's owner hasn't learned that rune — "
+            "log in that hero and train it.", item->GetTemplate() ? item->GetTemplate()->Name1 : "that weapon");
+        return;
+    }
+
+    std::string const itemName = item->GetTemplate() ? item->GetTemplate()->Name1 : "weapon";
+
+    // Real cast first — full CheckCast (needs the owner to be AT a runeforge), which is the
+    // path that both applies the rune AND fires the runeforging quest credit.
+    SpellCastTargets targets;
+    targets.SetItemTarget(item);
+    SpellCastResult const res = owner->CastSpell(targets, rune, nullptr, TRIGGERED_NONE);
+    if (res == SPELL_CAST_OK)
+    {
+        ch.PSendSysMessage("|cff66ccff[WowPsParty]|r {} runeforged |cffffffff{}|r.",
+            owner->GetName(), itemName);
+        LOG_INFO("module", "[WowPsParty Runeforge] requester={} owner={} item='{}' rune={} -> real cast (quest-crediting)",
+            requester->GetGUID().GetCounter(), owner->GetGUID().GetCounter(), itemName, runeSpellId);
+    }
+    else
+    {
+        // Fallback: the owner can't cast it right now (not at a runeforge / a bot) — apply the
+        // rune enchant directly so a bot's weapon still gets it. No quest credit on this path.
+        owner->ApplyEnchantment(item, PERM_ENCHANTMENT_SLOT, false);
+        item->SetEnchantment(PERM_ENCHANTMENT_SLOT, enchantId, 0, 0, owner->GetGUID());
+        owner->ApplyEnchantment(item, PERM_ENCHANTMENT_SLOT, true);
+        item->SetState(ITEM_CHANGED, owner);
+        ch.PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r Runeforged |cffffffff{}|r (applied directly — stand at a "
+            "runeforge for quest credit).", itemName);
+        LOG_INFO("module", "[WowPsParty Runeforge] requester={} owner={} item='{}' rune={} -> direct apply (cast res={})",
+            requester->GetGUID().GetCounter(), owner->GetGUID().GetCounter(), itemName, runeSpellId, uint32(res));
+    }
+
+    WowPsParty::SendGearTo(requester, tgtSlot);
+    WowPsParty::SendStatsTo(requester, tgtSlot);
+    WowPsParty::SendInventoryTo(requester);
+}
+
 // Does a gem of GemColor fit a socket of SocketColor? Mirrors AC's native rules
 // (HandleSocketOpcode / Item::GemsFitSockets): a META socket takes ONLY a meta gem
 // and vice-versa; otherwise a gem fits if its color bitmask-overlaps the socket's.
@@ -4867,6 +4953,10 @@ public:
         else if (command == "ENCHANT")
         {
             HandleEnchant(player, payload);
+        }
+        else if (command == "RUNEFORGE")
+        {
+            HandleRuneforge(player, payload);
         }
         else if (command == "REQ_GEMS")
         {
