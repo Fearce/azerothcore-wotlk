@@ -2987,8 +2987,12 @@ namespace WowPsParty
         {
             Unit* t = theTarget();
             if (!t) return false;
+            // 5-man dungeon bosses are rank-1 elites with NO world-boss type_flag —
+            // isWorldBoss()/CREATURE_ELITE_WORLDBOSS only catch raid/world bosses. The
+            // engine sets CREATURE_FLAG_EXTRA_DUNGEON_BOSS dynamically on instance
+            // bosses, so IsDungeonBoss() is what makes this match Ingvar/Keristrasza/etc.
             if (Creature* c = t->ToCreature())
-                if (c->isWorldBoss()) return true;
+                if (c->isWorldBoss() || c->IsDungeonBoss()) return true;
             return UnitCreatureRank(t) == CREATURE_ELITE_WORLDBOSS;
         }
         if (cond == "target_is_elite")
@@ -3279,6 +3283,17 @@ namespace WowPsParty
             Unit* t = theTarget();
             if (!t) return false;
             return cmp(TtdSeconds(t));
+        }
+        // Yards from the bot to its current target (victim, or nearest engaged enemy for a
+        // support bot with no victim). RAW yards, edge-to-edge (matches the cast verbs' range
+        // checks). Gates gap-closers — "target_dist>9 | charge" only charges a mob far enough
+        // to be worth it; "target_dist>18 | sprint" only sprints to close a real gap. No
+        // target -> false (nothing to measure).
+        if (name == "target_dist")
+        {
+            Unit* t = theTarget();
+            if (!t) return false;
+            return cmp(int(bot->GetDistance(t)));
         }
         // Combo points are 0-5, compared RAW (not as a percent of anything).
         if (name == "self_combo")
@@ -4627,6 +4642,7 @@ namespace WowPsParty
                 || verb == "stay_in_front"    || verb == "hold_position"
                 || verb == "move_out_of_los"  || verb == "pull"
                 || verb == "interrupt_caster_melee"   // travels to a far caster
+                || verb == "charge"                   // leaps to a far enemy (away from the leader)
                 || verb == "reposition_random" || verb == "walk_away_from_source"
                 || verb == "dodge_frontals"))
             return false;
@@ -5960,6 +5976,78 @@ namespace WowPsParty
         if (verb == "shoot")
             return FireRangedWeaponShot(bot, bot->GetVictim());
 
+        // "charge" — class GAP-CLOSER onto the current victim: Warrior Charge (out of combat) /
+        // Intercept (in combat), Druid Feral Charge (bear/cat by form). Closes distance fast and,
+        // for a warrior, banks opener rage. Gate it with target_dist>N so it only fires when the
+        // mob is far enough to matter; the ability's own min/max range + LoS are enforced here.
+        // A warrior whose stance forbids the ability (and who lacks Warbringer) is switched into
+        // the required stance THIS tick — the charge lands next tick, and the bot's own stance
+        // rule (e.g. `always | buff_self:Defensive Stance`) restores the stance once this rule
+        // stops firing (the target is now in melee). NOTE: the lead tank's MULTI-pull opener
+        // charge is driven from the pull layer (PartyFollow), since the rotation is suppressed
+        // during a body-pull; this verb covers DPS warriors, ferals, and single-pull tanks.
+        if (verb == "charge")
+        {
+            Unit* v = bot->GetVictim();
+            if (!v || !v->IsAlive()) return false;
+            uint32 sid = 0;
+            if (bot->getClass() == CLASS_WARRIOR)
+                sid = FindKnownSpellByName(bot, bot->IsInCombat() ? "Intercept" : "Charge");
+            else if (bot->getClass() == CLASS_DRUID)
+            {
+                if (bot->HasAura(5487) || bot->HasAura(9634))         // Bear / Dire Bear form
+                    sid = FindKnownSpellByName(bot, "Feral Charge - Bear");
+                else if (bot->HasAura(768))                            // Cat form
+                    sid = FindKnownSpellByName(bot, "Feral Charge - Cat");
+            }
+            if (!sid || bot->HasSpellCooldown(sid)) return false;
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(sid);
+            if (!si) return false;
+            float const dist = bot->GetDistance(v);
+            if (dist > si->GetMaxRange(false, bot)) return false;     // out of charge range
+            float const minR = si->GetMinRange(false);
+            if (minR > 0.0f && dist < minR) return false;            // too close to charge
+            if (!bot->IsWithinLOSInMap(v, VMAP::ModelIgnoreFlags::M2)) return false;
+            bool const stanceOk = si->CheckShapeshift(uint32(bot->GetShapeshiftForm())) == SPELL_CAST_OK;
+            bool const warbringer = bot->getClass() == CLASS_WARRIOR && bot->HasSpell(57499);
+            if (!stanceOk && !warbringer)
+            {
+                if (bot->getClass() != CLASS_WARRIOR) return false;   // druid in a non-charge form
+                // Charge needs Battle Stance, Intercept needs Berserker Stance.
+                uint32 const wantStance =
+                    FindKnownSpellByName(bot, bot->IsInCombat() ? "Berserker Stance" : "Battle Stance");
+                if (!wantStance || bot->HasSpellCooldown(wantStance)) return false;
+                bot->CastSpell(bot, wantStance, false);
+                return true;   // stance up; the charge fires next tick once it re-evaluates
+            }
+            // Stance legal -> full-validate (range/LoS/power/cooldown). A Warbringer warrior in an
+            // "illegal" stance won't pass canFireSpellOn's shapeshift check (it doesn't model the
+            // talent), so cast directly in that one case.
+            if (stanceOk && !canFireSpellOn(sid, v)) return false;
+            if (!channelClipOk()) return false;
+            bot->CastSpell(v, sid, false);
+            return true;
+        }
+
+        // "sprint" — movement-speed self-buff to close a gap on foot: Rogue Sprint, Druid Dash.
+        // No threat, no target needed, but only worth it when the target is far (gate with
+        // target_dist). Skips while already running / on cooldown / in the wrong form (Dash needs
+        // Cat). Deliberately NO hunter aspect here (Aspect of the Cheetah dazes on hit).
+        if (verb == "sprint")
+        {
+            uint32 sid = FindKnownSpellByName(bot, "Sprint");
+            if (!sid) sid = FindKnownSpellByName(bot, "Dash");
+            if (!sid) return false;
+            if (bot->HasAura(sid) || bot->HasSpellCooldown(sid)) return false;
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(sid);
+            if (!si) return false;
+            if (si->CheckShapeshift(uint32(bot->GetShapeshiftForm())) != SPELL_CAST_OK) return false;
+            if (bot->GetGlobalCooldownMgr().HasGlobalCooldown(si)) return false;
+            if (!channelClipOk()) return false;
+            bot->CastSpell(bot, sid, false);
+            return true;
+        }
+
         // "keep_distance_enemy:N" — kite. When the target is closer than N yards,
         // hop straight away to N+4 and return true. As the LOWEST-priority rule it
         // only fires between casts: instant casts (higher rules, no is_not_moving
@@ -6455,6 +6543,21 @@ namespace WowPsParty
         }
 
         Unit* victim = bot->GetVictim();
+        // AoE with no victim: a warlock raining fire / seeding a pack (or any caster
+        // doing pure ground AoE) often has NO GetVictim() — it casts at a location,
+        // never bot->Attack()s a unit — so the pet sat idle while the owner channelled
+        // (Kevin's "imp does nothing while I Rain of Fire"). When the owner is in
+        // combat with no victim of its own, point the pet at the nearest party-engaged
+        // enemy. Only when the pet isn't already validly engaged (don't yank it off a
+        // mob beating on the owner). NearestEngagedEnemy is party-engaged-only, so this
+        // can never pull a neutral, and BotWaitsForHumanTank still heels it pre-threat.
+        if ((!victim || !victim->IsAlive() || !bot->IsValidAttackTarget(victim))
+            && bot->IsInCombat() && !WowPsParty::BotWaitsForHumanTank(bot))
+        {
+            Unit* const cur = pet->GetVictim();
+            if (!cur || !cur->IsAlive() || !bot->IsValidAttackTarget(cur))
+                victim = NearestEngagedEnemy(bot, 40.0f);
+        }
         if (victim && victim->IsAlive() && bot->IsValidAttackTarget(victim))
         {
             // Already command-attacking the right mob — leave it; re-issuing
@@ -6696,6 +6799,7 @@ namespace WowPsParty
             || verb == "cast_loose_enemy"
             || verb == "cast_cone"          // front-cone AoE
             || verb == "cast_totem_attack"  // walks into the pack + drops an attack totem
+            || verb == "charge"             // gap-closer: stuns + builds threat on the mob
             || verb == "pull"
             || verb == "shoot"
             || verb == "wand";

@@ -557,6 +557,14 @@ namespace WowPsParty
                     // In-combat rage jump-start so the tank can AoE-threat the pack right away
                     // (esp. now AoE is threat-capped): Bloodrage when rage is low. 1-min CD.
                     add("in_combat&self_rage<25", "cast_self:Bloodrage", 86);
+                    // Charge the first mob to OPEN a pull — closes the gap fast and banks rage so
+                    // the tank can threat the pull immediately. Out of combat only (Charge), and
+                    // only when the mob is far enough to matter. Above Defensive Stance (84) so a
+                    // non-Warbringer prot dances into Battle to Charge; once the mob is in melee
+                    // this stops firing and the Defensive Stance rule restores the stance. (The
+                    // MULTI-pull opener charge is driven from the pull layer — the rotation is
+                    // suppressed during a body-pull — so this covers the single-pull opener.)
+                    add("out_of_combat&target_dist>9", "charge", 85);
                     add("always", "buff_self:Defensive Stance", 84);
                     add("always", "buff_self:Commanding Shout", 80);
                     // Thunder Clap LEADS the AoE pull: with 3+ in melee it's the
@@ -597,6 +605,10 @@ namespace WowPsParty
                         // stance-dance).
                         add("target_casting&target_interruptible", "cast:Pummel", 92);
                         add("target_health<20", "cast:Execute", 90);
+                        // Charge to OPEN on a far target (closes the gap + banks rage). Out of
+                        // combat only; above the stance rules so it dances into Battle Stance to
+                        // Charge, then the Berserker/Battle rules below take the stance back.
+                        add("out_of_combat&target_dist>9", "charge", 83);
                         add("always", "buff_self:Berserker Stance", 82);
                         add("!stance_is_berserker", "buff_self:Battle Stance", 81);
                         add("always", "buff_self:Battle Shout", 80);
@@ -793,7 +805,13 @@ namespace WowPsParty
                     add("target_casting&target_interruptible", "cast:Silencing Shot", 87);
                     add("target_health<20", "cast:Kill Shot", 86);
                     add("pet_health<50", "cast_pet:Mend Pet", 78);
-                    add("always", "buff_self:Aspect of the Hawk", 74);
+                    // Aspect management: keep the damage aspect (Hawk) up, but drop to Aspect of
+                    // the Viper when nearly OOM and swap back once Viper has regen'd past 30%. The
+                    // Hawk maintenance is gated on NOT being in Viper so it can't instantly
+                    // overwrite the mana aspect; the 10%-down / 30%-up hysteresis stops flapping.
+                    add("self_mana<10&self_missing_aura:Aspect of the Viper", "cast_self:Aspect of the Viper", 75);
+                    add("self_mana>30&self_has_aura:Aspect of the Viper", "cast_self:Aspect of the Hawk", 75);
+                    add("self_missing_aura:Aspect of the Viper", "buff_self:Aspect of the Hawk", 74);
                     add("target_missing_aura:Hunter's Mark", "cast:Hunter's Mark", 70);
                     add("target_missing_aura:Serpent Sting", "cast:Serpent Sting", 66);
                     // AoE on the densest CLUSTER (a ranged hunter stands back). Volley
@@ -844,6 +862,10 @@ namespace WowPsParty
                 {
                     add("target_casting&target_interruptible", "cast:Kick", 92);
                     add("out_of_combat&self_missing_aura:Stealth", "cast_self:Stealth", 80);
+                    // Sprint to run down a distant target (no rogue charge exists). Only when the
+                    // gap is real (>18y); the melee abilities below are out of range until then, so
+                    // they fall through to this. Doesn't break Stealth.
+                    add("target_dist>18", "sprint", 60);
                     // Execute finisher: a dying target gets Eviscerated NOW with as few as
                     // 3 combo rather than waiting for 5 — above Slice and Dice so we don't
                     // refresh a buff on a corpse.
@@ -1281,21 +1303,45 @@ namespace WowPsParty
                     // above Curse of Agony so a pack gets Rain of Fire before the single-
                     // target curse (Kevin). Still below Corruption (the spread dot, 70).
                     add("enemies_clustered:8>2", "cast:Rain of Fire", 68);   // placed ground AoE
-                    add("target_missing_aura:Curse of Agony", "cast:Curse of Agony", 66);
+                    // Curse of Agony RAMPS — most of its damage lands in the back third of
+                    // its 24 s, so it's wasted on a mob that dies first. Apply only when the
+                    // target will live long enough to reach that payoff (target_ttd>20), but
+                    // ALWAYS on a boss: TTD reads 0 for the first ~5 s of any fight, so the
+                    // boss override is what gets it up at the pull instead of stalling.
+                    add("target_missing_aura:Curse of Agony&target_is_boss", "cast:Curse of Agony", 66);
+                    add("target_missing_aura:Curse of Agony&target_ttd>20", "cast:Curse of Agony", 66);
                     add("has_target", "cast:Shadow Bolt", 42);               // universal filler
                 };
 
                 if (tree == 0)   // AFFLICTION — DoTs + drain
                 {
+                    // Felhunter (Shadow Bite scales with the lock's DoTs) is the
+                    // Affliction pet; falls through to the Imp in wlShared if the lock
+                    // isn't deep enough in the tree to know it yet.
+                    add("pet_missing", "cast_self:Summon Felhunter", 89);
                     wlShared();
-                    // Corruption is a SPREAD dot — cast_spread keeps the whole pull dotted
-                    // (self-gates on who's missing it) instead of stacking it on the tank.
-                    // Gated on in_combat, NOT has_target: a spread dot needs no specific
-                    // victim, and has_target was false when the bot had no target so it
-                    // fell straight to Rain of Fire and never dotted (Kevin).
-                    add("in_combat", "cast_spread:Corruption", 70);
-                    add("target_missing_aura:Unstable Affliction", "cast:Unstable Affliction", 62);
-                    add("enemies_clustered:8>2&target_missing_aura:Seed of Corruption", "cast:Seed of Corruption", 58);
+                    // Keep Corruption rolling on the MAIN target — Affliction's Eradication
+                    // procs off Corruption TICKS, and in an AoE pull (Seed spam below) it
+                    // would otherwise fall off. Gated target_missing_aura (NOT a bare
+                    // has_target): re-casting every GCD would clip the DoT for a net loss
+                    // AND starve Seed of Corruption (has_target is always true in combat).
+                    // This is the "extra Corruption that supersedes Seed" — sits ABOVE it.
+                    add("target_missing_aura:Corruption", "cast:Corruption", 71);
+                    // AoE workhorse: Seed every mob in a big pull (>3 clustered). cast_spread
+                    // seeds each undebuffed engaged mob so the detonations chain across the
+                    // pack. Just UNDER the main-target Corruption (71) so Corruption keeps
+                    // Eradication proccing, and ABOVE the pack Corruption-spread (69).
+                    add("enemies_clustered:8>3", "cast_spread:Seed of Corruption", 70);
+                    // Spread Corruption across the REST of the pack as AoE filler — gated
+                    // in_combat (a spread dot needs no specific victim; has_target was false
+                    // with no target so it fell straight to Rain of Fire and never dotted).
+                    add("in_combat", "cast_spread:Corruption", 69);
+                    // Unstable Affliction also ramps over its duration — wasted on a dying
+                    // add. Apply only when the target lives long enough (target_ttd>8 ≈ cast
+                    // + a few ticks), but ALWAYS on a boss (TTD is 0 for the pull's first
+                    // ~5 s, so the boss override lands it immediately instead of stalling).
+                    add("target_missing_aura:Unstable Affliction&target_is_boss", "cast:Unstable Affliction", 62);
+                    add("target_missing_aura:Unstable Affliction&target_ttd>8", "cast:Unstable Affliction", 62);
                     add("target_health<25", "cast:Drain Soul", 54);   // execute drain
                     add("has_target", "cast:Haunt", 50);
                 }
@@ -1389,6 +1435,10 @@ namespace WowPsParty
                     // never drops form mid-fight or mid-body-pull (Mill: bear couldn't MotW).
                     add("out_of_combat", "cast_party_missing:Mark of the Wild", 85);
                     add("always", "buff_self:Bear Form", 84);
+                    // Feral Charge the first mob to OPEN a pull (closes the gap fast; free, no
+                    // rage). Out of combat only + far enough to matter; needs bear form (kept by
+                    // the rule above). The MULTI-pull opener charge is driven from the pull layer.
+                    add("out_of_combat&target_dist>9", "charge", 83);
                     add("enemies_in_melee>2", "cast:Swipe (Bear)", 70);
                     add("has_target", "cast:Mangle (Bear)", 68);
                     add("target_missing_aura:Lacerate", "cast:Lacerate", 64);
@@ -1411,6 +1461,10 @@ namespace WowPsParty
                         // set the instant a fight starts (esp. an AoE opener keyed off a
                         // cluster), which left the druid un-shifted and unable to act.
                         add("in_combat&self_missing_aura:Cat Form", "buff_self:Cat Form", 82);
+                        // Close the gap on a far target: Feral Charge (Cat) in the 8-25y band, or
+                        // Dash (sprint) to run down anything farther. Needs Cat form (kept above).
+                        add("target_dist>9", "charge", 81);
+                        add("target_dist>22", "sprint", 80);   // Dash — run down a distant target
                         add("has_target&self_energy<35", "cast_self:Tiger's Fury", 79);
                         // Savage Roar gated to elites (like rogue Slice and Dice): on trash
                         // it just eats the combo the damage finishers need.

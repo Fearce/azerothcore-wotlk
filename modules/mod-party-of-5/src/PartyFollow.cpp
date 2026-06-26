@@ -1865,6 +1865,12 @@ namespace WowPsParty
                                                             // its OWN level first and only reaches up/down a ramp when
                                                             // nothing closer on-level remains. (A VASTLY different Z is
                                                             // still HARD-rejected by GatherEligible's PULL_Z_TOLERANCE.)
+    static constexpr float  GATHER_DETOUR_PENALTY = 1000.0f; // a candidate the tank can only reach by routing AROUND
+                                                             // an obstacle (navmesh path detours well past the straight
+                                                             // line) is ranked below EVERY mob it can walk straight to,
+                                                             // so the gather fills from visible/near mobs first and
+                                                             // won't chain all the way around a massive wall to a pack
+                                                             // on the far side (Kevin). Only pulled if nothing else fits.
 
     // The maintain-N gather is the BODY-PULL phase: the lead tank MOVES only (no rotation,
     // no attack — TankIsBodyPulling suppresses TickRotation), grabbing up to N mobs by
@@ -1980,6 +1986,9 @@ namespace WowPsParty
 
     static bool IsBossUnit(Unit* u);   // fwd decl (defined further down); used by the gather
     static bool NavReachable(Player* bot, float x, float y, float z, float straight);  // fwd decl (defined below)
+    // As NavReachable, but reports the navmesh path length so the caller can tell a straight
+    // walk from a detour around a wall. outPathLen = straight-line dist when no path exists.
+    static bool NavReachableLen(Player* bot, float x, float y, float z, float straight, float& outPathLen);
 
     // Distinct live hostile creatures currently in combat with the tank.
     static uint32 CountEngagedHostiles(Player* tank)
@@ -2049,8 +2058,9 @@ namespace WowPsParty
     // (yellow) mobs are excluded: a body-pull works by PROXIMITY aggro, but a passive mob
     // won't aggro when the tank walks up — the tank would just stand on it. Only genuinely
     // HOSTILE (red) mobs that will react to the tank can be body-pulled (Mill).
-    static bool GatherEligible(Player* tank, Unit* u)
+    static bool GatherEligible(Player* tank, Unit* u, bool* outDetoured = nullptr)
     {
+        if (outDetoured) *outDetoured = false;
         if (!u || !u->IsAlive() || u->IsInCombat()) return false;   // un-aggroed only
         if (u->IsTotem() || !u->ToCreature()) return false;
         if (IsBossUnit(u)) return false;                            // never gather a boss
@@ -2065,8 +2075,17 @@ namespace WowPsParty
         // is the last (priciest) check so it only runs for an otherwise-eligible candidate.
         float const dx = u->GetPositionX() - tank->GetPositionX();
         float const dy = u->GetPositionY() - tank->GetPositionY();
-        return NavReachable(tank, u->GetPositionX(), u->GetPositionY(), u->GetPositionZ(),
-                            std::sqrt(dx * dx + dy * dy));
+        float const straight = std::sqrt(dx * dx + dy * dy);
+        float pathLen = straight;
+        if (!NavReachableLen(tank, u->GetPositionX(), u->GetPositionY(), u->GetPositionZ(),
+                             straight, pathLen))
+            return false;
+        // A reachable mob whose path detours well past the straight line is only gettable by
+        // routing around an obstacle (a wall/railing). Flag it so FindNextSafeAdd ranks it far
+        // below mobs the tank can walk straight to. The 1.35x+5 threshold ignores normal
+        // navmesh jitter; a wall detour roughly doubles the path.
+        if (outDetoured) *outDetoured = pathLen > straight * 1.35f + 5.0f;
+        return true;
     }
 
     // How many mobs `cand` would drag in: itself + un-aggroed neighbours within
@@ -2106,12 +2125,19 @@ namespace WowPsParty
         Cell::VisitObjects(tank, searcher, GATHER_SCAN);
 
         std::vector<Unit*> pool;
-        for (Unit* u : nearby) if (GatherEligible(tank, u)) pool.push_back(u);
+        std::unordered_set<Unit*> detoured;   // reachable only by routing around an obstacle
+        for (Unit* u : nearby)
+        {
+            bool det = false;
+            if (GatherEligible(tank, u, &det)) { pool.push_back(u); if (det) detoured.insert(u); }
+        }
         auto anchorScore = [&](Unit* u) -> float {
             float const dx = u->GetPositionX() - ax;
             float const dy = u->GetPositionY() - ay;
             float const dz = std::fabs(u->GetPositionZ() - az);
-            return std::sqrt(dx * dx + dy * dy) + dz * GATHER_Z_PENALTY;
+            float score = std::sqrt(dx * dx + dy * dy) + dz * GATHER_Z_PENALTY;
+            if (detoured.count(u)) score += GATHER_DETOUR_PENALTY;   // around-a-wall -> weigh MUCH lower
+            return score;
         };
         std::sort(pool.begin(), pool.end(),
                   [&](Unit* a, Unit* b){ return anchorScore(a) < anchorScore(b); });
@@ -2138,6 +2164,92 @@ namespace WowPsParty
         return true;
     }
 
+    // The lead tank's known CHARGE gap-closer for the body-pull opener, or 0. Warrior Charge
+    // (highest known rank) out of combat; bear-form druid Feral Charge. Resolved by spell id so
+    // we don't depend on PartyRotation's name lookup. Intercept is intentionally NOT used here:
+    // the opener fires out of combat (Charge), and we never want a rage-gated in-combat leap
+    // chained mid-gather.
+    static uint32 KnownChargeSpell(Player* tank)
+    {
+        if (tank->getClass() == CLASS_WARRIOR)
+        {
+            static uint32 const chargeRanks[] = { 11578, 6178, 100 };   // Charge r3..r1, highest known
+            for (uint32 id : chargeRanks) if (tank->HasSpell(id)) return id;
+        }
+        else if (tank->getClass() == CLASS_DRUID
+                 && (tank->HasAura(5487) || tank->HasAura(9634)))         // Bear / Dire Bear form
+        {
+            if (tank->HasSpell(16979)) return 16979;                      // Feral Charge - Bear (free, no rage)
+        }
+        return 0;
+    }
+
+    // OPENER charge for a body-pull (the user's "charge the first mob to start the multi-pull
+    // faster + bank rage"). At the very start of a body-pull the warrior/bear tank CHARGES the
+    // first mob instead of walking the whole way. It is NOT an auto-attack — Charge / Feral
+    // Charge just repositions + stuns + builds a little threat; the body-pull continues (rotation
+    // and AssistTarget stay suppressed via TankIsBodyPulling), so the tank does NOT lock onto the
+    // mob — it walks on to gather the rest. Only fires OUT OF COMBAT (so only the opener mob, not
+    // mid-gather) and only inside the ability's charge band. A protection warrior without
+    // Warbringer is danced into Battle Stance to Charge, then restored to Defensive once the
+    // charge is away (phase 2). Returns true when it OWNS this tick (charging / stance-switching)
+    // so DriveTankChase skips its walk; false to walk normally.
+    static bool TryTankOpenerCharge(Player* tank, Unit* add)
+    {
+        if (!tank || !add || !add->IsAlive()) return false;
+        static thread_local std::unordered_map<uint32, uint8> chargePhase;   // 0 idle, 1 switched-to-battle, 2 restore-pending
+        uint8& phase = chargePhase[tank->GetGUID().GetCounter()];
+
+        bool const isWarrior  = tank->getClass() == CLASS_WARRIOR;
+        bool const inDefensive = tank->HasAura(71);     // Defensive Stance
+        bool const inBattle    = tank->HasAura(2457);   // Battle Stance
+
+        // PHASE 2: the charge is away — restore Defensive Stance (only if we danced a warrior out
+        // of it), retrying until it sticks (the stance swap has a ~1s cooldown). Never block the
+        // walk while restoring (a stance switch is off-GCD and doesn't stop movement).
+        if (phase == 2)
+        {
+            if (!isWarrior || inDefensive) { phase = 0; return false; }   // nothing to restore / done
+            if (!tank->HasSpellCooldown(71)) tank->CastSpell(tank, 71, false);
+            return false;
+        }
+
+        uint32 const sid = KnownChargeSpell(tank);
+        // Charge only the OPENER: out of combat, off cooldown, in the charge band, with LoS. Once
+        // we're in combat (after the charge, or anything else) this bails so every subsequent add
+        // is body-pull WALKED, never charged.
+        if (!sid || tank->IsInCombat()) { phase = 0; return false; }
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(sid);
+        if (!si || tank->HasSpellCooldown(sid)) { phase = 0; return false; }
+        float const dist = tank->GetDistance(add);
+        float const minR = si->GetMinRange(false);
+        if (dist > si->GetMaxRange(false, tank) || (minR > 0.0f && dist < minR)) { phase = 0; return false; }
+        if (!tank->IsWithinLOSInMap(add, VMAP::ModelIgnoreFlags::M2)) { phase = 0; return false; }
+
+        bool const stanceOk   = si->CheckShapeshift(uint32(tank->GetShapeshiftForm())) == SPELL_CAST_OK;
+        bool const warbringer = isWarrior && tank->HasSpell(57499);   // Charge usable in any stance
+
+        // Dance a non-Warbringer warrior into Battle Stance first (the cast lands next tick).
+        if (isWarrior && !stanceOk && !warbringer)
+        {
+            if (!inBattle)
+            {
+                if (!tank->HasSpellCooldown(2457)) { tank->CastSpell(tank, 2457, false); phase = 1; }
+                return true;   // own the tick (skip the walk) while the stance comes up
+            }
+            // now in Battle Stance -> fall through and Charge (marking the Defensive restore)
+        }
+        else if (!stanceOk && !warbringer)
+        {
+            phase = 0; return false;   // a druid not in a chargeable form -> walk
+        }
+
+        bool const danced = isWarrior && phase == 1;   // we switched it out of Defensive for this charge
+        tank->CastSpell(add, sid, false);              // Charge / Feral Charge — NOT an auto-attack
+        phase = danced ? 2 : 0;                        // restore Defensive next ticks iff we danced
+        return true;                                   // the charge IS the movement this tick
+    }
+
     // Drive a body-pull toward `add` by MovePoint, NOT MoveChase. Diagnostics proved a
     // MoveChase(add) on an OUT-OF-COMBAT player-bot installs a CHASE generator (mg=5) that
     // emits NO spline — the tank holds at distCur=27.9, movedSelf~0, moveFlags=0x0, never
@@ -2150,6 +2262,11 @@ namespace WowPsParty
     // destination, or our point-move generator was lost (rotation/combat took over + back).
     static void DriveTankChase(Player* tank, Unit* add)
     {
+        // Opener charge: a warrior/bear tank CHARGES the first mob to close the gap fast (+ banks
+        // rage) instead of walking it. Owns the tick while charging / stance-dancing, so skip the
+        // walk; it self-limits to the out-of-combat opener mob and restores Defensive Stance after.
+        if (TryTankOpenerCharge(tank, add)) return;
+
         static thread_local std::unordered_map<uint32, uint64> lastChase;                  // tankLow -> add raw guid
         static thread_local std::unordered_map<uint32, std::array<float, 3>> lastDest;     // tankLow -> issued dest
         uint32 const low = tank->GetGUID().GetCounter();
@@ -2367,14 +2484,34 @@ namespace WowPsParty
         {
             float const dx = nearest->GetPositionX() - bot->GetPositionX();
             float const dy = nearest->GetPositionY() - bot->GetPositionY();
-            if (!NavReachable(bot, nearest->GetPositionX(), nearest->GetPositionY(),
-                              nearest->GetPositionZ(), std::sqrt(dx * dx + dy * dy)))
+            float const straight = std::sqrt(dx * dx + dy * dy);
+            float pathLen = straight;
+            bool const reachable = NavReachableLen(bot, nearest->GetPositionX(),
+                nearest->GetPositionY(), nearest->GetPositionZ(), straight, pathLen);
+            // Detoured = in straight-line LoS but only reachable by routing around a wall
+            // (same test the gather uses). Don't OPEN by walking around a wall either, when
+            // there's a mob the tank can walk straight to. Bosses are exempt — the opener
+            // may legitimately open on a boss, and you must path to it regardless.
+            bool const detoured = reachable && pathLen > straight * 1.35f + 5.0f;
+            if (!reachable || (detoured && !IsBossUnit(nearest)))
             {
                 uint32 grp = 0;
-                Unit* const reachable = FindNextSafeAdd(bot, 8, grp,     // OPENER: anchor on the tank itself
+                Unit* const alt = FindNextSafeAdd(bot, 8, grp,     // OPENER: anchor on the tank itself
                     bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ());
-                if (!reachable) return;
-                nearest = reachable;
+                if (!reachable)
+                {
+                    if (!alt) return;         // nothing reachable at all -> don't auto-pull this tick
+                    nearest = alt;
+                }
+                else if (alt && alt != nearest)
+                {
+                    // nearest is reachable but only around a wall — FindNextSafeAdd ranks
+                    // detoured mobs last, so switch ONLY if its pick is NOT itself detoured
+                    // (else every candidate is behind the wall too -> keep the nearest).
+                    bool altDetoured = false;
+                    (void)GatherEligible(bot, alt, &altDetoured);
+                    if (!altDetoured) nearest = alt;
+                }
             }
         }
 
@@ -4569,14 +4706,22 @@ namespace WowPsParty
     // line there anyway). Used by the no-LoS recovery to tell "behind a corner on my
     // level" (reachable → close in) from "on a platform a level up" (unreachable →
     // climb to the party instead of standing blind). Mirrors PartyRotation's copy.
-    static bool NavReachable(Player* bot, float x, float y, float z, float straight)
+    static bool NavReachableLen(Player* bot, float x, float y, float z, float straight, float& outPathLen)
     {
+        outPathLen = straight;
         PathGenerator gen(bot);
         if (!gen.CalculatePath(x, y, z, false)) return false;
         PathType const t = gen.GetPathType();
         if (t & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE | PATHFIND_FARFROMPOLY))
             return false;
-        return gen.getPathLength() <= straight * 2.5f + 8.0f;
+        outPathLen = gen.getPathLength();
+        return outPathLen <= straight * 2.5f + 8.0f;
+    }
+
+    static bool NavReachable(Player* bot, float x, float y, float z, float straight)
+    {
+        float len;
+        return NavReachableLen(bot, x, y, z, straight, len);
     }
 
     // Anti-flank tank positioning. A tank pulling a SPREAD pack ends up standing in the
