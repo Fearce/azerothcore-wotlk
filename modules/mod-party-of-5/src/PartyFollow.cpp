@@ -1721,16 +1721,28 @@ namespace WowPsParty
         };
         considerAround(bot);
         for (Unit* ctrl : bot->m_Controlled) considerAround(ctrl);
-        if (Group* g = bot->GetGroup())
+        // Members = our DIRECTIVE roster (leader + bots + henchmen) PLUS the WoW group.
+        // The directive roster is primary: an incompletely-formed group used to hide the
+        // party's fight from this scan, so a bot whose target died fell through to the
+        // slower fallbacks before re-engaging (Kevin: "slow to do things after a kill").
+        std::vector<Player*> members;
+        auto addMember = [&](Player* m)
         {
+            if (m && m->IsInWorld() && m != bot && m->GetMapId() == bot->GetMapId()
+                && std::find(members.begin(), members.end(), m) == members.end())
+                members.push_back(m);
+        };
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(bot->GetGUID(), party);
+        for (ObjectGuid const& gg : party)
+            addMember(ObjectAccessor::FindConnectedPlayer(gg));
+        if (Group* g = bot->GetGroup())
             for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
-            {
-                Player* m = itr->GetSource();
-                if (!m || !m->IsInWorld() || m == bot || m->GetMapId() != bot->GetMapId())
-                    continue;
-                considerAround(m);
-                for (Unit* ctrl : m->m_Controlled) considerAround(ctrl);
-            }
+                addMember(itr->GetSource());
+        for (Player* m : members)
+        {
+            considerAround(m);
+            for (Unit* ctrl : m->m_Controlled) considerAround(ctrl);
         }
         return best;
     }
@@ -1763,16 +1775,28 @@ namespace WowPsParty
         };
         considerAround(bot);
         for (Unit* ctrl : bot->m_Controlled) considerAround(ctrl);
-        if (Group* g = bot->GetGroup())
+        // Members = our DIRECTIVE roster (leader + bots + henchmen) PLUS the WoW group.
+        // The directive roster is primary: an incompletely-formed group used to hide the
+        // party's fight from this scan, so a bot whose target died fell through to the
+        // slower fallbacks before re-engaging (Kevin: "slow to do things after a kill").
+        std::vector<Player*> members;
+        auto addMember = [&](Player* m)
         {
+            if (m && m->IsInWorld() && m != bot && m->GetMapId() == bot->GetMapId()
+                && std::find(members.begin(), members.end(), m) == members.end())
+                members.push_back(m);
+        };
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(bot->GetGUID(), party);
+        for (ObjectGuid const& gg : party)
+            addMember(ObjectAccessor::FindConnectedPlayer(gg));
+        if (Group* g = bot->GetGroup())
             for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
-            {
-                Player* m = itr->GetSource();
-                if (!m || !m->IsInWorld() || m == bot || m->GetMapId() != bot->GetMapId())
-                    continue;
-                considerAround(m);
-                for (Unit* ctrl : m->m_Controlled) considerAround(ctrl);
-            }
+                addMember(itr->GetSource());
+        for (Player* m : members)
+        {
+            considerAround(m);
+            for (Unit* ctrl : m->m_Controlled) considerAround(ctrl);
         }
         return best;
     }
@@ -1811,16 +1835,28 @@ namespace WowPsParty
         };
         considerAround(bot);
         for (Unit* ctrl : bot->m_Controlled) considerAround(ctrl);
-        if (Group* g = bot->GetGroup())
+        // Members = our DIRECTIVE roster (leader + bots + henchmen) PLUS the WoW group.
+        // The directive roster is primary: an incompletely-formed group used to hide the
+        // party's fight from this scan, so a bot whose target died fell through to the
+        // slower fallbacks before re-engaging (Kevin: "slow to do things after a kill").
+        std::vector<Player*> members;
+        auto addMember = [&](Player* m)
         {
+            if (m && m->IsInWorld() && m != bot && m->GetMapId() == bot->GetMapId()
+                && std::find(members.begin(), members.end(), m) == members.end())
+                members.push_back(m);
+        };
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(bot->GetGUID(), party);
+        for (ObjectGuid const& gg : party)
+            addMember(ObjectAccessor::FindConnectedPlayer(gg));
+        if (Group* g = bot->GetGroup())
             for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
-            {
-                Player* m = itr->GetSource();
-                if (!m || !m->IsInWorld() || m == bot || m->GetMapId() != bot->GetMapId())
-                    continue;
-                considerAround(m);
-                for (Unit* ctrl : m->m_Controlled) considerAround(ctrl);
-            }
+                addMember(itr->GetSource());
+        for (Player* m : members)
+        {
+            considerAround(m);
+            for (Unit* ctrl : m->m_Controlled) considerAround(ctrl);
         }
         return best;
     }
@@ -4493,11 +4529,20 @@ namespace WowPsParty
     static Unit* PickTankEngagedTarget(Player* bot, Player* leader)
     {
         if (!bot || !leader) return nullptr;
+        // Source the pack from the TANK's combat, not the leader's. A HEALER leader is
+        // usually NOT in combat with the whole pack (it only threatens what it heals or
+        // what hits it), so keying off the leader's refs left a DPS bot idle for a few
+        // seconds after a kill — it reacquired a not-yet-led mob, found no leader-listed
+        // alternative, and waited instead of helping (Kevin). The tank is in combat with
+        // everything it holds, so its refs are the full pack. Falls back to the leader
+        // when there's no separate tank Player (a human tank-leader is itself the source).
+        Player* const tank = PartyTankPlayer(bot, leader);
+        Unit* const refSrc = tank ? tank : leader;
         Unit* best = nullptr;
         float bestDist = 1e9f;
-        for (auto const& [refGuid, ref] : leader->GetCombatManager().GetPvECombatRefs())
+        for (auto const& [refGuid, ref] : refSrc->GetCombatManager().GetPvECombatRefs())
         {
-            Unit* const m = ref->GetOther(leader);
+            Unit* const m = ref->GetOther(refSrc);
             if (!m || !m->IsAlive() || !bot->IsValidAttackTarget(m)) continue;
             if (!MobOnTank(bot, m, leader)) continue;        // tank must be its top-threat
             if (!TankHasEngageLead(m)) continue;             // ...with a real engage lead
