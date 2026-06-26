@@ -3284,11 +3284,11 @@ namespace WowPsParty
             if (!t) return false;
             return cmp(TtdSeconds(t));
         }
-        // Yards from the bot to its current target (victim, or nearest engaged enemy for a
-        // support bot with no victim). RAW yards, edge-to-edge (matches the cast verbs' range
-        // checks). Gates gap-closers — "target_dist>9 | charge" only charges a mob far enough
-        // to be worth it; "target_dist>18 | sprint" only sprints to close a real gap. No
-        // target -> false (nothing to measure).
+        // Yards from the bot to its current victim. RAW yards, edge-to-edge (matches the cast
+        // verbs' range checks). No victim -> false (nothing to measure; the gap-closers are
+        // melee bots, which always have a victim when they want to charge). Gates gap-closers —
+        // "target_dist>11 | charge" only charges a mob far enough to land; "target_dist>18 |
+        // sprint" only sprints to close a real gap.
         if (name == "target_dist")
         {
             Unit* t = theTarget();
@@ -6022,8 +6022,14 @@ namespace WowPsParty
             }
             // Stance legal -> full-validate (range/LoS/power/cooldown). A Warbringer warrior in an
             // "illegal" stance won't pass canFireSpellOn's shapeshift check (it doesn't model the
-            // talent), so cast directly in that one case.
+            // talent), so cast directly in that one case — but check power ourselves, else an
+            // under-rage Intercept silently fails while this verb claims the tick (stall).
             if (stanceOk && !canFireSpellOn(sid, v)) return false;
+            if (!stanceOk && warbringer)
+            {
+                int32 const cost = si->CalcPowerCost(bot, si->GetSchoolMask());
+                if (cost > 0 && bot->GetPower(Powers(si->PowerType)) < cost) return false;
+            }
             if (!channelClipOk()) return false;
             bot->CastSpell(v, sid, false);
             return true;

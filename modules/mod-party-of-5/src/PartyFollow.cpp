@@ -2196,35 +2196,44 @@ namespace WowPsParty
     // so DriveTankChase skips its walk; false to walk normally.
     static bool TryTankOpenerCharge(Player* tank, Unit* add)
     {
-        if (!tank || !add || !add->IsAlive()) return false;
+        if (!tank) return false;
         static thread_local std::unordered_map<uint32, uint8> chargePhase;   // 0 idle, 1 switched-to-battle, 2 restore-pending
         uint8& phase = chargePhase[tank->GetGUID().GetCounter()];
 
-        bool const isWarrior  = tank->getClass() == CLASS_WARRIOR;
+        bool const isWarrior   = tank->getClass() == CLASS_WARRIOR;
         bool const inDefensive = tank->HasAura(71);     // Defensive Stance
         bool const inBattle    = tank->HasAura(2457);   // Battle Stance
 
-        // PHASE 2: the charge is away — restore Defensive Stance (only if we danced a warrior out
-        // of it), retrying until it sticks (the stance swap has a ~1s cooldown). Never block the
-        // walk while restoring (a stance switch is off-GCD and doesn't stop movement).
-        if (phase == 2)
+        // Restore Defensive Stance after a dance — runs for PHASE 2 (charge away) AND whenever a
+        // charge we'd danced for (phase 1) is aborted below, so a warrior is NEVER left stranded
+        // in Battle Stance mid-body-pull (the rotation that would otherwise restore it is
+        // suppressed for the whole gather). Retries until it sticks (~1s stance cooldown); never
+        // blocks the walk (a stance switch is off-GCD and doesn't stop movement).
+        auto restoreThenWalk = [&]() -> bool
         {
             if (!isWarrior || inDefensive) { phase = 0; return false; }   // nothing to restore / done
             if (!tank->HasSpellCooldown(71)) tank->CastSpell(tank, 71, false);
+            phase = 2;
             return false;
-        }
+        };
+        // Abort: if we'd danced into Battle for a charge that now can't happen, restore Defensive;
+        // otherwise just hand movement back.
+        auto bail = [&]() -> bool { return (phase == 1) ? restoreThenWalk() : (phase = 0, false); };
+
+        if (phase == 2) return restoreThenWalk();
+        if (!add || !add->IsAlive()) return bail();
 
         uint32 const sid = KnownChargeSpell(tank);
         // Charge only the OPENER: out of combat, off cooldown, in the charge band, with LoS. Once
         // we're in combat (after the charge, or anything else) this bails so every subsequent add
         // is body-pull WALKED, never charged.
-        if (!sid || tank->IsInCombat()) { phase = 0; return false; }
+        if (!sid || tank->IsInCombat()) return bail();
         SpellInfo const* si = sSpellMgr->GetSpellInfo(sid);
-        if (!si || tank->HasSpellCooldown(sid)) { phase = 0; return false; }
+        if (!si || tank->HasSpellCooldown(sid)) return bail();
         float const dist = tank->GetDistance(add);
         float const minR = si->GetMinRange(false);
-        if (dist > si->GetMaxRange(false, tank) || (minR > 0.0f && dist < minR)) { phase = 0; return false; }
-        if (!tank->IsWithinLOSInMap(add, VMAP::ModelIgnoreFlags::M2)) { phase = 0; return false; }
+        if (dist > si->GetMaxRange(false, tank) || (minR > 0.0f && dist < minR)) return bail();
+        if (!tank->IsWithinLOSInMap(add, VMAP::ModelIgnoreFlags::M2)) return bail();
 
         bool const stanceOk   = si->CheckShapeshift(uint32(tank->GetShapeshiftForm())) == SPELL_CAST_OK;
         bool const warbringer = isWarrior && tank->HasSpell(57499);   // Charge usable in any stance
@@ -2241,7 +2250,7 @@ namespace WowPsParty
         }
         else if (!stanceOk && !warbringer)
         {
-            phase = 0; return false;   // a druid not in a chargeable form -> walk
+            return bail();   // a druid not in a chargeable form -> walk
         }
 
         bool const danced = isWarrior && phase == 1;   // we switched it out of Defensive for this charge

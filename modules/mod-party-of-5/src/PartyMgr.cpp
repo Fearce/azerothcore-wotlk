@@ -564,7 +564,7 @@ namespace WowPsParty
                     // this stops firing and the Defensive Stance rule restores the stance. (The
                     // MULTI-pull opener charge is driven from the pull layer — the rotation is
                     // suppressed during a body-pull — so this covers the single-pull opener.)
-                    add("out_of_combat&target_dist>9", "charge", 85);
+                    add("out_of_combat&target_dist>11", "charge", 85);
                     add("always", "buff_self:Defensive Stance", 84);
                     add("always", "buff_self:Commanding Shout", 80);
                     // Thunder Clap LEADS the AoE pull: with 3+ in melee it's the
@@ -608,7 +608,7 @@ namespace WowPsParty
                         // Charge to OPEN on a far target (closes the gap + banks rage). Out of
                         // combat only; above the stance rules so it dances into Battle Stance to
                         // Charge, then the Berserker/Battle rules below take the stance back.
-                        add("out_of_combat&target_dist>9", "charge", 83);
+                        add("out_of_combat&target_dist>11", "charge", 83);
                         add("always", "buff_self:Berserker Stance", 82);
                         add("!stance_is_berserker", "buff_self:Battle Stance", 81);
                         add("always", "buff_self:Battle Shout", 80);
@@ -1438,7 +1438,7 @@ namespace WowPsParty
                     // Feral Charge the first mob to OPEN a pull (closes the gap fast; free, no
                     // rage). Out of combat only + far enough to matter; needs bear form (kept by
                     // the rule above). The MULTI-pull opener charge is driven from the pull layer.
-                    add("out_of_combat&target_dist>9", "charge", 83);
+                    add("out_of_combat&target_dist>11", "charge", 83);
                     add("enemies_in_melee>2", "cast:Swipe (Bear)", 70);
                     add("has_target", "cast:Mangle (Bear)", 68);
                     add("target_missing_aura:Lacerate", "cast:Lacerate", 64);
@@ -1463,7 +1463,7 @@ namespace WowPsParty
                         add("in_combat&self_missing_aura:Cat Form", "buff_self:Cat Form", 82);
                         // Close the gap on a far target: Feral Charge (Cat) in the 8-25y band, or
                         // Dash (sprint) to run down anything farther. Needs Cat form (kept above).
-                        add("target_dist>9", "charge", 81);
+                        add("target_dist>11", "charge", 81);
                         add("target_dist>22", "sprint", 80);   // Dash — run down a distant target
                         add("has_target&self_energy<35", "cast_self:Tiger's Fury", 79);
                         // Savage Roar gated to elites (like rogue Slice and Dice): on trash
