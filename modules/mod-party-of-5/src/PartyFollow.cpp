@@ -1908,11 +1908,17 @@ namespace WowPsParty
     static constexpr uint32 GATHER_NO_ADD_GRACE_MS = 2000;  // once nothing's pullable, hold the gather this long
                                                             // (a straggler may wander in) before concluding and
                                                             // resuming combat.
-    static constexpr float  GATHER_Z_PENALTY    = 4.0f;    // each yard of vertical offset between a candidate add
-                                                            // and the gather anchor costs this many "virtual yards"
-                                                            // when ranking the next pull, so the tank clears mobs on
-                                                            // its OWN level first and only reaches up/down a ramp when
-                                                            // nothing closer on-level remains. (A VASTLY different Z is
+    static constexpr float  GATHER_Z_DEADZONE   = 3.0f;    // vertical offset (yards) treated as "same level" — free.
+                                                            // Uneven ground (BRD ramps/steps) puts mobs that are clearly
+                                                            // ON THE SAME walkable level 1-3y apart in Z; without this
+                                                            // dead-zone the penalty below flipped the genuinely-closest
+                                                            // mob behind a flatter-but-farther one (Kevin).
+    static constexpr float  GATHER_Z_PENALTY    = 2.0f;    // each yard of vertical offset PAST the dead-zone costs this
+                                                            // many "virtual yards" when ranking the next pull, so the
+                                                            // tank still clears mobs on its OWN level first and only
+                                                            // reaches up/down a real ramp when nothing closer on-level
+                                                            // remains — but a couple yards of terrain noise no longer
+                                                            // outweighs being clearly nearer. (A VASTLY different Z is
                                                             // still HARD-rejected by GatherEligible's PULL_Z_TOLERANCE.)
     static constexpr float  GATHER_DETOUR_PENALTY = 1000.0f; // a candidate the tank can only reach by routing AROUND
                                                              // an obstacle (navmesh path detours well past the straight
@@ -2160,9 +2166,10 @@ namespace WowPsParty
     // the position of the mob currently being pulled, so the tank clears OUTWARD along the
     // pack it opened on instead of doubling back to whatever's nearest its own feet — which
     // sent it lurching off in the opposite direction (Kevin: "pulls one mob then walks off a
-    // completely different way"). A vertical (Z) offset from the anchor is penalised (each
-    // yard costs GATHER_Z_PENALTY virtual yards) so on-level mobs are preferred; a vastly
-    // different Z is already hard-rejected by GatherEligible.
+    // completely different way"). A vertical (Z) offset from the anchor PAST GATHER_Z_DEADZONE
+    // (terrain noise on uneven ground is free) is penalised (each further yard costs
+    // GATHER_Z_PENALTY virtual yards) so on-level mobs are preferred; a vastly different Z is
+    // already hard-rejected by GatherEligible.
     static Unit* FindNextSafeAdd(Player* tank, uint32 capacity, uint32& grpOut,
                                  float ax, float ay, float az)
     {
@@ -2183,7 +2190,7 @@ namespace WowPsParty
         auto anchorScore = [&](Unit* u) -> float {
             float const dx = u->GetPositionX() - ax;
             float const dy = u->GetPositionY() - ay;
-            float const dz = std::fabs(u->GetPositionZ() - az);
+            float const dz = std::max(0.0f, std::fabs(u->GetPositionZ() - az) - GATHER_Z_DEADZONE);
             float score = std::sqrt(dx * dx + dy * dy) + dz * GATHER_Z_PENALTY;
             if (detoured.count(u)) score += GATHER_DETOUR_PENALTY;   // around-a-wall -> weigh MUCH lower
             return score;
