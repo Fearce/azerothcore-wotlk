@@ -1996,8 +1996,10 @@ static void HandleRuneforge(Player* requester, std::string_view payload)
     auto t2 = s.find('\t', t1 + 1);   if (t2 == std::string::npos) return;
     uint32 const tgtSlot     = std::strtoul(s.substr(0, t1).c_str(), nullptr, 10);
     uint32 const itemGuidLow = std::strtoul(s.substr(t1 + 1, t2 - t1 - 1).c_str(), nullptr, 10);
-    uint32 const runeSpellId = std::strtoul(s.substr(t2 + 1).c_str(), nullptr, 10);
-    if (!itemGuidLow || !runeSpellId) return;
+    std::string runeName(s.substr(t2 + 1));   // the SELECTED recipe NAME (may contain spaces)
+    { auto a = runeName.find_first_not_of(" \t"); auto b = runeName.find_last_not_of(" \t");
+      runeName = (a == std::string::npos) ? std::string() : runeName.substr(a, b - a + 1); }
+    if (!itemGuidLow || runeName.empty()) return;
 
     uint32 const account = requester->GetSession()->GetAccountId();
     uint32 const tgtGuid = WowPsParty::GuidForAccountSlot(account, tgtSlot);
@@ -2009,6 +2011,34 @@ static void HandleRuneforge(Player* requester, std::string_view payload)
     if (!item) return;
 
     ChatHandler ch(requester->GetSession());
+
+    // The runeforge UI is TradeSkill-driven and gives the client only a NAME, so resolve it
+    // to one of the OWNER's known runeforging runes — a known spell with a permanent-enchant
+    // effect whose name matches. This also enforces runeforging's self-only rule: it only
+    // works on the owner's own weapon, by a rune that owner has actually learned.
+    auto lower = [](std::string v){ std::transform(v.begin(), v.end(), v.begin(), ::tolower); return v; };
+    std::string const want = lower(runeName);
+    uint32 runeSpellId = 0;
+    for (auto const& kv : owner->GetSpellMap())
+    {
+        uint32 const sid = kv.first;
+        if (!owner->HasSpell(sid)) continue;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(sid);
+        if (!si || !PermEnchantIdOfSpell(si)) continue;     // not a rune / enchant spell
+        for (uint8 loc = 0; loc < 16; ++loc)
+            if (char const* nm = si->SpellName[loc])
+                if (*nm && lower(nm) == want) { runeSpellId = sid; break; }
+        if (runeSpellId) break;
+    }
+    if (!runeSpellId)
+    {
+        ch.PSendSysMessage(
+            "|cffff5555[WowPsParty]|r |cffffffff{}|r's owner hasn't learned the rune \"{}\" — "
+            "log in that hero and train Runeforging / that rune.",
+            item->GetTemplate() ? item->GetTemplate()->Name1 : "that weapon", runeName);
+        return;
+    }
+
     SpellInfo const* rune = sSpellMgr->GetSpellInfo(runeSpellId);
     uint32 const enchantId = PermEnchantIdOfSpell(rune);
     if (!rune || !enchantId || !sSpellItemEnchantmentStore.LookupEntry(enchantId))
@@ -2020,15 +2050,6 @@ static void HandleRuneforge(Player* requester, std::string_view payload)
     {
         ch.PSendSysMessage("|cffff5555[WowPsParty]|r That rune doesn't fit |cffffffff{}|r.",
             item->GetTemplate() ? item->GetTemplate()->Name1 : "that weapon");
-        return;
-    }
-    // Runeforging is self-only — only the weapon's owner can rune it, and only if they've
-    // learned that rune (you still train Lockpicking/Runeforging on the hero yourself).
-    if (!owner->HasSpell(runeSpellId))
-    {
-        ch.PSendSysMessage(
-            "|cffff5555[WowPsParty]|r |cffffffff{}|r's owner hasn't learned that rune — "
-            "log in that hero and train it.", item->GetTemplate() ? item->GetTemplate()->Name1 : "that weapon");
         return;
     }
 
