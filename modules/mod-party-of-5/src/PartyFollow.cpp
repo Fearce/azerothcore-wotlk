@@ -3075,6 +3075,119 @@ namespace WowPsParty
         g->BroadcastPacket(&data, true, -1, bot->GetGUID());
     }
 
+    // "I'm standing next to a node I could gather if you'd trained me higher" — the
+    // can't-gather callout. Throttled to once per 10 minutes PER SKILL per bot so a
+    // herbalist running through a herb-rich zone calls Herbalism out at most once a
+    // window (Mining/Skinning throttle independently). (guidLow<<16|skill)->getMSTime().
+    static std::unordered_map<uint64, uint32> g_cantGatherAnnounce;
+    static std::mutex g_cantGatherAnnounceMutex;
+    static constexpr uint32 CANT_GATHER_ANNOUNCE_THROTTLE_MS = 10 * 60 * 1000;
+    static constexpr float  CANT_GATHER_ANNOUNCE_RANGE       = 30.0f;
+
+    // If `go` is a mining/herb node the bot HAS the profession for but TOO LITTLE
+    // skill to gather, return its skill id + fill name/have/req; 0 otherwise. The
+    // "have" is GetSkillValue (effective, bonuses included) so it matches the exact
+    // value IsGatherableBy gates on — the message can never disagree with reality.
+    static uint32 NodeSkillGap(Player* bot, GameObject* go, std::string& nameOut, int32& haveOut, int32& reqOut)
+    {
+        if (!go || !go->isSpawned() || go->getLootState() != GO_READY) return 0;
+        uint32 skillId = 0, req = 0;
+        if (!NodeGatherSkill(go, skillId, req)) return 0;
+        if (!bot->HasSkill(skillId)) return 0;
+        int32 const have = bot->GetSkillValue(skillId);
+        if (have >= int32(req)) return 0;            // can gather — no gap
+        nameOut = go->GetName(); haveOut = have; reqOut = int32(req);
+        return skillId;
+    }
+
+    // Same idea for a skinnable corpse: the bot has the loot skill but can't skin it
+    // yet. Mirrors IsSkinnableBy's skill math (req keys off CURRENT skill, not the
+    // corpse-level bands). Callers pre-filter to real party-relevant corpses via
+    // NearbySkinnableCheck, so this only weighs the skill gap.
+    static uint32 CorpseSkinGap(Player* bot, Creature* c, std::string& nameOut, int32& haveOut, int32& reqOut)
+    {
+        if (!c || c->IsAlive()) return 0;
+        CreatureTemplate const* tmpl = c->GetCreatureTemplate();
+        if (!tmpl || tmpl->SkinLootId == 0) return 0;
+        if (c->loot.loot_type == LOOT_SKINNING) return 0;     // already skinned
+        uint32 const skill = tmpl->GetRequiredLootSkill();
+        if (!bot->HasSkill(skill)) return 0;
+        int32 const have = bot->GetSkillValue(skill);
+        int32 const req  = (have < 100) ? (c->GetLevel() - 10) * 10 : c->GetLevel() * 5;
+        if (req <= have) return 0;                            // can skin — no gap
+        nameOut = c->GetName(); haveOut = have; reqOut = req;
+        return skill;
+    }
+
+    // Scan nearby nodes + corpses for ones this hero has the profession for but lacks
+    // the skill to gather, and call out the nearest per skill in party chat (10-min
+    // per-skill throttle). Followers only — TickGathering already excludes henchmen
+    // and the possessed/controlled body before this runs.
+    static void AnnounceUngatherableNearby(Player* bot, bool canNode, bool canSkin)
+    {
+        Group* const g = bot->GetGroup();
+        if (!g) return;
+
+        struct Gap { std::string name; int32 have; int32 req; float dist; char const* verb; };
+        std::unordered_map<uint32, Gap> gaps;   // skillId -> nearest gap for that skill
+        auto consider = [&](uint32 skillId, std::string const& name, int32 have, int32 req,
+                            float dist, char const* verb)
+        {
+            if (!skillId) return;
+            auto it = gaps.find(skillId);
+            if (it == gaps.end() || dist < it->second.dist)
+                gaps[skillId] = Gap{ name, have, req, dist, verb };
+        };
+
+        if (canNode)
+        {
+            std::list<GameObject*> gos;
+            NearbySpawnedGOCheck check(bot, CANT_GATHER_ANNOUNCE_RANGE);
+            Acore::GameObjectListSearcher<NearbySpawnedGOCheck> searcher(bot, gos, check);
+            Cell::VisitObjects(bot, searcher, CANT_GATHER_ANNOUNCE_RANGE);
+            for (GameObject* go : gos)
+            {
+                std::string name; int32 have = 0, req = 0;
+                if (uint32 sk = NodeSkillGap(bot, go, name, have, req))
+                    consider(sk, name, have, req, bot->GetDistance(go), "gather");
+            }
+        }
+        if (canSkin)
+        {
+            std::list<Creature*> crs;
+            NearbySkinnableCheck check(bot, CANT_GATHER_ANNOUNCE_RANGE);
+            Acore::CreatureListSearcher<NearbySkinnableCheck> searcher(bot, crs, check);
+            Cell::VisitObjects(bot, searcher, CANT_GATHER_ANNOUNCE_RANGE);
+            for (Creature* c : crs)
+            {
+                std::string name; int32 have = 0, req = 0;
+                if (uint32 sk = CorpseSkinGap(bot, c, name, have, req))
+                    consider(sk, name, have, req, bot->GetDistance(c), "skin");
+            }
+        }
+        if (gaps.empty()) return;
+
+        uint32 const now = getMSTime();
+        for (auto const& kv : gaps)
+        {
+            uint64 const key = (uint64(bot->GetGUID().GetCounter()) << 16) | uint16(kv.first);
+            {
+                std::lock_guard<std::mutex> lock(g_cantGatherAnnounceMutex);
+                uint32& last = g_cantGatherAnnounce[key];
+                if (last != 0 && now - last < CANT_GATHER_ANNOUNCE_THROTTLE_MS) continue;
+                last = now;
+            }
+            Gap const& gp = kv.second;
+            std::string const msg = Acore::StringFormat(
+                "I cannot {} {}, I only have {}/{} required skill.",
+                gp.verb, gp.name, gp.have, gp.req);
+            WorldPacket data;
+            ChatMsg const type = g->isRaidGroup() ? CHAT_MSG_RAID : CHAT_MSG_PARTY;
+            ChatHandler::BuildChatPacket(data, type, LANG_UNIVERSAL, bot, nullptr, msg.c_str());
+            g->BroadcastPacket(&data, true, -1, bot->GetGUID());
+        }
+    }
+
     // Harvest the node directly into the bot's bags. Mirrors the essence of
     // Spell::EffectOpenLock (skill-up guarded by the per-GO skillup list, then
     // loot) but without a loot window — our party bots hard-return from
@@ -3284,6 +3397,12 @@ namespace WowPsParty
         if (bot->IsInCombat())                            { GatherLog(gLow, "skip: in combat"); return; }
         if (bot->IsNonMeleeSpellCast(false, false, true)) { GatherLog(gLow, "skip: casting"); return; }
         if (IsTankLeading(bot->GetGUID()))                { GatherLog(gLow, "skip: leading the dungeon"); return; }
+
+        // Near a node/corpse this hero could gather if trained higher? Call it out in
+        // party chat (throttled per skill) — the "I cannot gather Kingsblood, I only
+        // have 113/125 required skill" line. Done before the bags-full / leader-leash
+        // returns below, since a skill gap is independent of bag space or leash.
+        AnnounceUngatherableNearby(bot, canNode, canSkin);
 
         // Nowhere to put the mats — don't harvest (AutoStoreLoot silently drops
         // items that don't fit, which would deplete the node for nothing) and
