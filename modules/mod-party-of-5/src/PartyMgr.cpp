@@ -1447,6 +1447,13 @@ namespace WowPsParty
                     // the gather (Kevin), so it only charges once it has some rage; otherwise
                     // it walks in. The MULTI-pull opener charge (pull layer) is rage-gated too.
                     add("out_of_combat&target_dist>11&self_rage>5", "charge", 82);
+                    // Demoralizing Roar (-melee AP debuff, mitigation) HIGH PRIORITY: snap it on
+                    // for an AoE pull (3+ in melee) and on ANY dungeon/raid boss, but only when
+                    // the target lacks it (self-gates so it fires once then goes dormant, never
+                    // starving the threat rotation). Mirrors the warrior tank's Demoralizing
+                    // Shout; the cast's own range check covers "in range".
+                    add("enemies_in_melee>2&target_missing_aura:Demoralizing Roar", "cast:Demoralizing Roar", 73);
+                    add("target_is_boss&target_missing_aura:Demoralizing Roar", "cast:Demoralizing Roar", 72);
                     add("enemies_in_melee>2", "cast:Swipe (Bear)", 70);
                     add("has_target", "cast:Mangle (Bear)", 68);
                     add("target_missing_aura:Lacerate", "cast:Lacerate", 64);
