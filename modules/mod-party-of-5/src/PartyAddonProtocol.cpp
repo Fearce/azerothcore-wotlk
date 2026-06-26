@@ -2520,6 +2520,189 @@ static void HandleProspect(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// PICKLOCK\t<srcPartySlot>\t<srcItemGuidLow> — pick a locked box (junkbox / lockbox /
+// strongbox) from any party member's bags using a party ROGUE's Lockpicking skill.
+// Mirrors HandleDisenchant: any party member whose Lockpicking >= the box's required
+// skill is the picker. A clientless bot owner can't drive the loot WINDOW, so the box's
+// item-loot is rolled directly (the same LootTemplates_Item + money path the engine's
+// Player::SendLoot uses) into the party's bags, then the emptied box is consumed —
+// equivalent to picking the lock and looting it out. The point is the "tell your rogue
+// to open it" feel: you still have to log in your rogue hero and train Lockpicking.
+static void HandlePickLock(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const srcSlot        = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+    if (!srcItemGuidLow) return;
+
+    uint32 const account   = requester->GetSession()->GetAccountId();
+    uint32 const ownerGuid = WowPsParty::GuidForAccountSlot(account, srcSlot);
+    if (!ownerGuid) return;
+    Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(ownerGuid));
+    if (!owner) return;
+    Item* item = owner->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!item) return;
+    ItemTemplate const* tmpl = item->GetTemplate();
+    if (!tmpl) return;
+
+    ChatHandler ch(requester->GetSession());
+
+    // It must be a Lockpicking-locked box. Read its lock (the same LOCK_KEY_SKILL table
+    // the gather scanner + EffectOpenLock read) and pull the Lockpicking requirement. A
+    // box needing a KEY, a non-lockpicking skill, or no lock is not ours.
+    uint32 reqSkill = 0;
+    bool   pickable = false;
+    if (uint32 lockId = tmpl->LockID)
+        if (LockEntry const* lock = sLockStore.LookupEntry(lockId))
+            for (uint8 i = 0; i < 8; ++i)
+            {
+                if (lock->Type[i] != LOCK_KEY_SKILL) continue;
+                if (SkillByLockType(LockType(lock->Index[i])) == SKILL_LOCKPICKING)
+                { reqSkill = lock->Skill[i]; pickable = true; break; }
+            }
+    if (item->HasFlag(ITEM_FIELD_FLAGS, ITEM_FIELD_FLAG_UNLOCKED))
+        pickable = false;   // already opened
+    if (!pickable)
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r |cffffffff{}|r isn't a pickable lockbox.", tmpl->Name1);
+        return;
+    }
+
+    // A party member whose Lockpicking covers the box. Per-slot diagnostic like
+    // HandleDisenchant so a failure (a rogue momentarily zoning / skills not loaded)
+    // is explainable from the log.
+    Player* picker = nullptr;
+    std::ostringstream diag;
+    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
+    {
+        uint32 const g = WowPsParty::GuidForAccountSlot(account, partySlot);
+        if (!g) { diag << " [slot" << uint32(partySlot) << ":empty]"; continue; }
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g));
+        if (!p) { diag << " [slot" << uint32(partySlot) << ":NOT-CONNECTED]"; continue; }
+        bool const has = p->HasSkill(SKILL_LOCKPICKING);
+        uint16 const sk = has ? p->GetSkillValue(SKILL_LOCKPICKING) : 0;
+        diag << " [slot" << uint32(partySlot) << ":" << p->GetName()
+             << ":lockpick=" << (has ? std::to_string(sk) : std::string("none")) << "]";
+        if (!picker && has && sk >= reqSkill) picker = p;
+    }
+    if (!picker)
+    {
+        LOG_WARN("module",
+            "[WowPsParty PickLock] FAILED 'no rogue skilled enough' — requester={} account={} "
+            "item='{}'(entry={}) reqLockpick={} | party:{}",
+            requester->GetName(), account, tmpl->Name1, tmpl->ItemId, reqSkill, diag.str());
+        ch.PSendSysMessage(
+            "|cffff5555[WowPsParty]|r No party rogue skilled enough to pick |cffffffff{}|r "
+            "(needs Lockpicking {}). Train a rogue hero's Lockpicking.", tmpl->Name1, reqSkill);
+        return;
+    }
+
+    // Roll the box's contents the same way Player::SendLoot opens an item: money first,
+    // then the item table (noEmptyError keyed off whether money rolled).
+    Loot loot;
+    loot.generateMoneyLoot(tmpl->MinMoneyLoot, tmpl->MaxMoneyLoot);
+    loot.FillLoot(tmpl->ItemId, LootTemplates_Item, owner, true, loot.gold != 0);
+
+    std::vector<std::pair<uint32, uint32>> drops;
+    for (LootItem const& li : loot.items)
+        if (li.itemid && li.count) drops.emplace_back(li.itemid, uint32(li.count));
+    uint32 const money = loot.gold;
+
+    // A box that rolled absolutely nothing (rare/edge): don't destroy it for free —
+    // just unlock it so the player can open it the normal way, and bail.
+    if (drops.empty() && money == 0)
+    {
+        item->SetFlag(ITEM_FIELD_FLAGS, ITEM_FIELD_FLAG_UNLOCKED);
+        item->SetState(ITEM_CHANGED, owner);
+        if (uint32 pure = picker->GetPureSkillValue(SKILL_LOCKPICKING))
+            picker->UpdateGatherSkill(SKILL_LOCKPICKING, pure, reqSkill);
+        ch.PSendSysMessage("|cff66ccff[WowPsParty]|r {} unlocked |cffffffff{}|r (it was empty).",
+            picker->GetName(), tmpl->Name1);
+        WowPsParty::SendInventoryTo(requester);
+        return;
+    }
+
+    // Picking is IRREVERSIBLE (the box is consumed), so confirm the party can actually
+    // hold the rolled drops BEFORE destroying it — never lose item 2/3 of a multi-item
+    // box to full bags. Mirrors HandleDisenchant's precheck; the box's own slot frees on
+    // consume, so it covers one drop (the +1). Conservative (ignores partial-stack merges),
+    // which only ever errs toward "make room".
+    auto freeSlots = [](Player* p) -> uint32
+    {
+        uint32 n = 0;
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            if (!p->GetItemByPos(INVENTORY_SLOT_BAG_0, i)) ++n;
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = p->GetBagByPos(b))
+                for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                    if (!p->GetItemByPos(b, uint8(j))) ++n;
+        return n;
+    };
+    uint32 partyFree = 0;
+    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
+    {
+        uint32 const g = WowPsParty::GuidForAccountSlot(account, partySlot);
+        if (!g) continue;
+        if (Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g)))
+            partyFree += freeSlots(p);
+    }
+    if (drops.size() > size_t(partyFree) + 1)   // +1 = the box's slot that frees on consume
+    {
+        ch.PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Not enough free bag space for |cffffffff{}|r's contents "
+            "— make room and try again. (Box kept.)", tmpl->Name1);
+        return;
+    }
+
+    std::string const itemName = tmpl->Name1;
+    uint32 const itemEntry = tmpl->ItemId;
+
+    // Lockpicking skill-up for the picker (mirrors EffectOpenLock's item path), then
+    // consume the box (frees its slot for the drops) and distribute across the party
+    // (owner first), exactly like HandleDisenchant delivers mats.
+    if (uint32 pure = picker->GetPureSkillValue(SKILL_LOCKPICKING))
+        picker->UpdateGatherSkill(SKILL_LOCKPICKING, pure, reqSkill);
+    owner->DestroyItem(item->GetBagSlot(), item->GetSlot(), true);
+
+    std::ostringstream gained;
+    for (auto const& d : drops)
+    {
+        for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
+        {
+            uint32 const g = WowPsParty::GuidForAccountSlot(account, partySlot);
+            if (!g) continue;
+            Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g));
+            if (!p) continue;
+            ItemPosCountVec dest;
+            if (p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, d.first, d.second) != EQUIP_ERR_OK)
+                continue;
+            p->StoreNewItem(dest, d.first, true);
+            ItemTemplate const* dt = sObjectMgr->GetItemTemplate(d.first);
+            if (!gained.str().empty()) gained << ", ";
+            gained << d.second << "x " << (dt ? dt->Name1 : "?");
+            break;
+        }
+    }
+    if (money > 0)
+    {
+        owner->ModifyMoney(int32(money));
+        if (!gained.str().empty()) gained << ", ";
+        gained << (money / 10000) << "g " << ((money % 10000) / 100) << "s " << (money % 100) << "c";
+    }
+
+    ch.PSendSysMessage("|cff66ccff[WowPsParty]|r {} picked |cffffffff{}|r -> {}.",
+        picker->GetName(), itemName, gained.str().empty() ? "nothing (party bags full)" : gained.str());
+    LOG_INFO("module",
+        "[WowPsParty PickLock] requester={} owner={} picker={} box='{}'(entry={}) reqLockpick={} -> {}",
+        requester->GetGUID().GetCounter(), owner->GetGUID().GetCounter(),
+        picker->GetGUID().GetCounter(), itemName, itemEntry, reqSkill,
+        gained.str().empty() ? "NOTHING (bags full)" : gained.str());
+
+    WowPsParty::SendInventoryTo(requester);
+}
+
 // MAIL_SEND\t<srcPartySlot>\t<srcItemGuidLow>\t<recipientName> — mail a bagged item from
 // any party member to <recipientName>. The item leaves the owner's bags and arrives in the
 // recipient's mailbox, sent server-side (the item may be on a different char than the one
@@ -4700,6 +4883,10 @@ public:
         else if (command == "PROSPECT")
         {
             HandleProspect(player, payload);
+        }
+        else if (command == "PICKLOCK")
+        {
+            HandlePickLock(player, payload);
         }
         else if (command == "MAIL_SEND")
         {

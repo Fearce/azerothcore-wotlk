@@ -2864,7 +2864,34 @@ namespace WowPsParty
                 reqOut     = lock->Skill[i];
                 return true;
             }
+            // A rogue hero cracks open lockpicking-locked TREASURE CHESTS (footlockers,
+            // strongboxes) exactly like a miner works a vein — the party walks over, the
+            // chest is looted into the bags + skills the rogue up, all through the same
+            // gather machinery below. Gated to CHEST type: doors carry a lockpicking lock
+            // too but have no loot, so GatherNode (AutoStoreLoot + deactivate) would
+            // mishandle them — the rogue door pass in TickGathering opens those instead.
+            if (skillId == SKILL_LOCKPICKING && go->GetGoType() == GAMEOBJECT_TYPE_CHEST)
+            {
+                skillIdOut = skillId;
+                reqOut     = lock->Skill[i];
+                return true;
+            }
         }
+        return false;
+    }
+
+    // The Lockpicking requirement of `go`'s lock if it has a LOCK_KEY_SKILL lockpicking
+    // entry; false otherwise. Used by the rogue DOOR pass (treasure chests go through
+    // NodeGatherSkill above; doors are opened directly since they hold no loot).
+    static bool GoLockpickReq(GameObject* go, uint32& reqOut)
+    {
+        if (!go) return false;
+        LockEntry const* lock = sLockStore.LookupEntry(go->GetGOInfo()->GetLockId());
+        if (!lock) return false;
+        for (uint8 i = 0; i < 8; ++i)
+            if (lock->Type[i] == LOCK_KEY_SKILL
+                && SkillByLockType(LockType(lock->Index[i])) == SKILL_LOCKPICKING)
+            { reqOut = lock->Skill[i]; return true; }
         return false;
     }
 
@@ -3387,7 +3414,13 @@ namespace WowPsParty
         // Skill gate FIRST — most bots have no gather profession, exit silently.
         // Past this point the bot CAN gather, so every other skip is logged
         // (throttled per reason) — that's how we diagnose "my miner won't mine".
-        bool const canNode = bot->HasSkill(SKILL_MINING) || bot->HasSkill(SKILL_HERBALISM);
+        // canNode now covers ANY skill-locked GameObject the hero can open: mining/herb
+        // veins AND lockpicking treasure chests (a rogue), so a chest flows through the
+        // exact same instant-grab + commit-walk + loot machinery as a vein. canPick also
+        // drives the separate DOOR pass (doors hold no loot). The per-node HasSkill check
+        // in IsGatherableBy keeps a miner off chests and a rogue off veins.
+        bool const canPick = bot->HasSkill(SKILL_LOCKPICKING);
+        bool const canNode = bot->HasSkill(SKILL_MINING) || bot->HasSkill(SKILL_HERBALISM) || canPick;
         bool const canSkin = bot->HasSkill(SKILL_SKINNING);
         if (!canNode && !canSkin) return;
 
@@ -3403,6 +3436,41 @@ namespace WowPsParty
         // have 113/125 required skill" line. Done before the bags-full / leader-leash
         // returns below, since a skill gap is independent of bag space or leash.
         AnnounceUngatherableNearby(bot, canNode, canSkin);
+
+        // A rogue hero picks open lockpicking-locked DOORS it passes within 10y (BRD-style
+        // barred doors). Doors hold no loot, so they skip the node/GatherNode path AND the
+        // bags-full gate below (a full backpack must never leave a door shut) — opened
+        // directly with UseDoorOrButton, the exact primitive GameObject::Use invokes for a
+        // door, minus the gossip/script hooks. It toggles the door and does NOT re-check
+        // the lock, so the lockpicking gate here is the authority: scenery / boss / event
+        // doors carry no lockpicking lock, so GoLockpickReq skips them — the door's own
+        // lock, not the visible state, is what protects us. Only doors in their READY
+        // resting + READY loot state are touched (what UseDoorOrButton itself requires), so
+        // the commit (skill-up + skillup-list throttle) always pairs with a real open and
+        // two bots can't flap the same door.
+        if (canPick)
+        {
+            std::list<GameObject*> nearGos;
+            NearbySpawnedGOCheck check(bot, INSTANT_GATHER_RANGE);
+            Acore::GameObjectListSearcher<NearbySpawnedGOCheck> searcher(bot, nearGos, check);
+            Cell::VisitObjects(bot, searcher, INSTANT_GATHER_RANGE);
+            for (GameObject* go : nearGos)
+            {
+                if (go->GetGoType() != GAMEOBJECT_TYPE_DOOR) continue;
+                if (go->GetGoState() != GO_STATE_READY) continue;     // resting (not already toggled open)
+                if (go->getLootState() != GO_READY) continue;         // UseDoorOrButton no-ops otherwise
+                if (go->IsInSkillupList(bot->GetGUID())) continue;    // picked it already
+                uint32 reqLock = 0;
+                if (!GoLockpickReq(go, reqLock)) continue;            // not a lockpicking door
+                if (uint32(bot->GetSkillValue(SKILL_LOCKPICKING)) < reqLock) continue;
+                bot->SetFacingToObject(go);
+                go->AddToSkillupList(bot->GetGUID());
+                if (uint32 pure = bot->GetPureSkillValue(SKILL_LOCKPICKING))
+                    bot->UpdateGatherSkill(SKILL_LOCKPICKING, pure, reqLock);
+                go->UseDoorOrButton(0, false, bot);
+                GatherLog(gLow, "instant: picked a locked door within 10y on contact");
+            }
+        }
 
         // Nowhere to put the mats — don't harvest (AutoStoreLoot silently drops
         // items that don't fit, which would deplete the node for nothing) and
