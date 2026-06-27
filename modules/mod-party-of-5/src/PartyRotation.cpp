@@ -6912,6 +6912,74 @@ namespace WowPsParty
         }
     }
 
+    // Purely COSMETIC facing sync. The combat rotation aims with SetOrientation
+    // (synchronous, server-side — see faceAndCast): it updates m_orientation so
+    // every cast/swing lands, but sends NO packet, so nearby clients keep RENDERING
+    // a stale facing (Kevin: "melee bots sometimes don't face their target but still
+    // hit fine; same for a channelled Blizzard"). Periodically broadcast the correct
+    // facing toward the melee victim — or, for a ground-targeted channel, the AoE
+    // patch — via a HEARTBEAT (SendMovementFlagUpdate carries position+orientation
+    // with NO movement spline, so it does NOT clip the channel the way SetFacingTo, a
+    // MoveSpline, would). Throttled; skipped while moving (chase/move splines already
+    // carry facing) and while rooted (a heartbeat is illegal then). Never changes a
+    // combat outcome — server orientation is already correct; this only flushes it to
+    // onlookers.
+    static constexpr uint32 FACE_SYNC_THROTTLE_MS = 500;   // twice a second is plenty for cosmetics
+    static constexpr float  FACE_SYNC_MIN_DELTA   = 0.15f; // ~8.5 deg — below this a melee correction isn't worth a packet
+    static void FaceTargetCosmetic(Player* bot)
+    {
+        if (!bot->IsInCombat()) return;
+        // Truly stationary: IsStopped() alone misses the stop-spline TAIL (and charge/jump
+        // splines), where a heartbeat would carry a lagged server position and snap onlookers.
+        // movespline->Finalized() is the real "physically still moving" test (see faceAndCast).
+        if (!bot->IsStopped() || !bot->movespline->Finalized()) return;  // moving -> the spline carries facing
+        if (bot->IsRooted()) return;      // SendMovementFlagUpdate refuses a rooted unit
+
+        static thread_local std::unordered_map<uint32, uint32> lastMs;
+        uint32 const now = getMSTime();
+        uint32& t = lastMs[bot->GetGUID().GetCounter()];
+        if (t && now - t < FACE_SYNC_THROTTLE_MS) return;
+
+        // Aim point: a ground-targeted channel's patch wins (Blizzard / Rain of Fire /
+        // Volley), else the channel's unit target, else the current melee/spell victim.
+        Spell* const ch = bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
+        float aim = 0.0f;
+        bool  haveAim = false;
+        if (ch)
+        {
+            if (ch->m_targets.HasDst())
+            {
+                WorldLocation const* dst = ch->m_targets.GetDstPos();
+                aim = bot->GetAngle(dst->GetPositionX(), dst->GetPositionY());
+                haveAim = true;
+            }
+            else if (Unit* ut = ch->m_targets.GetUnitTarget())
+            {
+                aim = bot->GetAngle(ut);
+                haveAim = true;
+            }
+        }
+        if (!haveAim)
+            if (Unit* v = bot->GetVictim())
+            {
+                aim = bot->GetAngle(v);
+                haveAim = true;
+            }
+        if (!haveAim) return;
+
+        t = now;
+        // Angular distance to the desired facing, folded into [0, pi].
+        float delta = std::fabs(aim - bot->GetOrientation());
+        if (delta > float(M_PI)) delta = 2.0f * float(M_PI) - delta;
+        // Already aimed within a few degrees? For melee skip — nothing to correct. For a
+        // channel still flush once a throttle window: the cast-time SetOrientation may
+        // never have reached onlookers, so the patch could render off-facing all channel.
+        if (delta <= FACE_SYNC_MIN_DELTA && !ch) return;
+
+        bot->SetOrientation(aim);        // server-side truth (a near-no-op if already aimed)
+        bot->SendMovementFlagUpdate();   // heartbeat -> onlookers update; no spline, no channel clip
+    }
+
     bool TickRotation(Player* bot)
     {
         if (!bot) return false;
@@ -6980,6 +7048,11 @@ namespace WowPsParty
         // once it's been stationary CAST_SETTLE_MS. Must run every tick before the
         // auto-attack + rotation below.
         SampleMovement(bot);
+
+        // Cosmetic only: flush the bot's true facing to onlookers (melee victim, or a
+        // ground-AoE channel's patch). Runs every tick here — BEFORE the channel-commit
+        // gate below stands the rotation down — so it also corrects a Blizzard channel.
+        FaceTargetCosmetic(bot);
 
         // Keep ammo/poisons topped up (self-throttled). Runs before the rotation
         // so a freshly-spawned hunter has arrows on its first idle tick and a
