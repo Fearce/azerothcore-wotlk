@@ -396,11 +396,11 @@ namespace WowPsParty
 
     uint32 BotEngageRange(ObjectGuid guid)
     {
-        // Default 22: the opener scans 22y around the tank for the pack to open on
-        // (tightened over time from 40 -> 28 -> 22 so it doesn't open on a still-
+        // Default 20: the opener scans 20y around the tank for the pack to open on
+        // (tightened over time from 40 -> 28 -> 22 -> 20 so it doesn't open on a still-
         // distant mob). The editor slider sets an explicit value in [10,40];
         // EngageRangeCacheSet already clamped it.
-        constexpr uint32 DEFAULT_ENGAGE = 22;
+        constexpr uint32 DEFAULT_ENGAGE = 20;
         std::lock_guard<std::mutex> lock(g_engageRangeMutex);
         auto it = g_engageRange.find(guid.GetCounter());
         if (it != g_engageRange.end()) return uint32(it->second);

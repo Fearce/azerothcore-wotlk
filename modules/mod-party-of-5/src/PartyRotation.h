@@ -229,7 +229,7 @@ namespace WowPsParty
 
     // A lead tank's configured INITIAL ENGAGE RANGE (yards): how far the auto-pull
     // opener (TankLeadEngagement) scans around the tank for the nearest hostile to
-    // open on. Default 22, clamped [10,40]; sourced from the party_loadout.engage_range
+    // open on. Default 20, clamped [10,40]; sourced from the party_loadout.engage_range
     // column (set in the rotation editor slider).
     uint32 BotEngageRange(ObjectGuid guid);
     void EngageRangeCacheSet(uint32 guidLow, int val);

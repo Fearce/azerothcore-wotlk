@@ -953,7 +953,7 @@ namespace WowPsParty
     // Settle window after a fight before the lead tank auto-pulls the next pack —
     // gives the party time to loot, regroup, and start drinking instead of being
     // yanked straight into the next group.
-    static constexpr uint32 POST_COMBAT_PULL_DELAY_MS = 5000;
+    static constexpr uint32 POST_COMBAT_PULL_DELAY_MS = 4000;
 
     // Mana the pull-pacing gate waits for before the lead tank proactively opens the
     // next pack ("don't chain-pull on fumes"). NOT "topped off": a healer between

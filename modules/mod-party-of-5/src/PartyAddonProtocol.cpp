@@ -4821,20 +4821,20 @@ public:
         }
         // REQ_ENGAGERANGE\t<token>  ->  ENGAGERANGE\t<token>\t<10..40>
         // Reports the EFFECTIVE lead-tank initial engage range (explicit column, else
-        // the default 22) so the editor slider shows the real runtime value. MUST match
-        // WowPsParty::BotEngageRange's default (22).
+        // the default 20) so the editor slider shows the real runtime value. MUST match
+        // WowPsParty::BotEngageRange's default (20).
         else if (command == "REQ_ENGAGERANGE")
         {
             std::string const token(payload);
             uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
-            int n = 22;   // default — keep in sync with BotEngageRange
+            int n = 20;   // default — keep in sync with BotEngageRange
             if (guid)
             {
                 QueryResult q = CharacterDatabase.Query(
                     "SELECT `engage_range` FROM `party_loadout` WHERE `guid` = {}", guid);
                 std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
                 int const parsed = v.empty() ? 0 : std::atoi(v.c_str());
-                if (parsed >= 10 && parsed <= 40) n = parsed;   // unset/out-of-range -> default 22
+                if (parsed >= 10 && parsed <= 40) n = parsed;   // unset/out-of-range -> default 20
             }
             std::ostringstream out;
             out << "ENGAGERANGE\t" << token << '\t' << n;
