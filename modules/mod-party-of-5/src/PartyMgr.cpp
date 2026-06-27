@@ -18,6 +18,8 @@
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "LFGMgr.h"             // sLFGMgr->GetLFGDungeon — read a dungeon's level range for LFG scaling
+#include "LFG.h"                // lfg::LFGDungeonData
 #include "SpellMgr.h"           // henchman down-level spell sanitize
 #include "SpellInfo.h"          // SpellLevel / LEARN_SPELL effect inspection
 #include "Bag.h"                // henchman inventory clear (GetBagByPos/GetBagSize)
@@ -1668,13 +1670,14 @@ namespace WowPsParty
         }
 
         // Tank-CLASS coverage: a player should always be able to pick from at
-        // least TWO different tank classes, even when the nearby pool is thin or
+        // least THREE different tank classes, even when the nearby pool is thin or
         // the nearest char of every tank class happens to be DPS-specced (the
         // per-class coverage above only guarantees a class APPEARS, in whatever
         // role its nearest char is). Pull the nearest genuinely TANK-specced pool
         // char of each tank-capable class — any level, re-leveled to the player on
-        // hire (the hire path preserves the picked tank tree) — until two distinct
-        // tank classes are offered.
+        // hire (the hire path preserves the picked tank tree) — until three distinct
+        // tank classes are offered. (Below 55, DK is out, leaving Warr/Pal/Druid —
+        // still three.)
         std::unordered_set<uint8>  tankClassesShown;
         std::unordered_set<uint32> shownGuids;
         for (auto const& c : out)
@@ -1685,7 +1688,7 @@ namespace WowPsParty
         static uint8 const kTankClasses[] = { 1, 2, 6, 11 };  // Warrior/Paladin/DK/Druid → Prot/Prot/Blood/Bear
         for (uint8 cls : kTankClasses)
         {
-            if (tankClassesShown.size() >= 2) break;
+            if (tankClassesShown.size() >= 3) break;
             if (tankClassesShown.count(cls)) continue;   // this tank class already offered
             if (cls == 6 && L < 55) continue;            // Death Knights start at level 55
 
@@ -1742,10 +1745,10 @@ namespace WowPsParty
                 break;
             }
         }
-        if (tankClassesShown.size() < 2)
+        if (tankClassesShown.size() < 3)
             LOG_INFO("module",
                 "[WowPsParty Henchmen] tank-class coverage only found {} tank class(es) for guid={} level={} "
-                "(pool may lack tank-specced chars of a second tank class)",
+                "(pool may lack tank-specced chars of a third tank class)",
                 uint32(tankClassesShown.size()), requester->GetGUID().GetCounter(), uint32(L));
 
         // Sort for the hire screen: tanks first, then healers, then dps; within
@@ -2356,6 +2359,103 @@ namespace WowPsParty
         // arrives with no Bear Form; LearnAllClassSpells (trainer set) won't cover
         // it. HasSpell-gated, so this is a no-op once taught.
         WowPsParty::LearnClassQuestSkills(bot);
+    }
+
+    // Re-level an already-hired, in-world henchman to an EXACT target level (up or
+    // down), preserving its role. Mirrors the proven out-of-band relevel + role-force
+    // path in HireHenchman, just to an arbitrary target: Randomize re-rolls
+    // level-appropriate gear + stats (and a RANDOM talent tree), so we (1) restore
+    // the bot's captured tree, (2) force the role's tree for a tank/healer so it
+    // really tanks/heals (also the only guard for the feral cat/bear tab-1 case),
+    // (3) re-derive the role from the final talents and rebuild the role-default
+    // rotation/targetmode — otherwise a scaled pick could keep a tank rotation on a
+    // now-DPS spec — and (4) strip over/under-level spell ranks
+    // (SanitizeHenchmanSpellsIfNeeded is memoized per (guid,level), so the level
+    // change re-triggers it). Henchmen never keep a custom rotation, so the rebuild
+    // is unconditional.
+    static void ReLevelHenchmanInPlace(Player* hen, uint8 target)
+    {
+        if (!hen || !hen->IsInWorld()) return;
+        if (target < 1)  target = 1;
+        if (target > 80) target = 80;
+        uint32 const oldLvl = hen->GetLevel();
+        if (uint8(oldLvl) == target) return;
+
+        uint8 const cls = hen->getClass();
+        // Capture role + tree BEFORE the re-roll (the bot's hired/forced identity).
+        std::string const role = InferHenchmanRoleLive(hen, ClassDefaultRole(cls));
+        int const intendedTab  = DominantTalentTabLive(hen);
+
+        PlayerbotFactory factory(hen, target);
+        factory.Randomize(false);
+
+        // Restore the captured tree if the re-roll moved off it.
+        if (intendedTab >= 0 && DominantTalentTabLive(hen) != intendedTab)
+        {
+            int const specNo = int(sPlayerbotAIConfig.randomClassSpecIndex[cls][uint32(intendedTab)]);
+            PlayerbotFactory::InitTalentsBySpecNo(hen, specNo, /*reset=*/true);
+            hen->SendTalentsInfoData(false);
+        }
+        // A tank/healer must actually BE that spec — force the role's canonical tree
+        // (DPS returns -1 → no force, any DPS spec is fine).
+        if (role == "tank" || role == "healer")
+        {
+            int const wantTab = DesiredTalentTabForRole(cls, role);
+            if (wantTab >= 0 && DominantTalentTabLive(hen) != wantTab)
+            {
+                int const specNo = int(sPlayerbotAIConfig.randomClassSpecIndex[cls][uint32(wantTab)]);
+                PlayerbotFactory::InitTalentsBySpecNo(hen, specNo, /*reset=*/true);
+                hen->SendTalentsInfoData(false);
+            }
+        }
+        hen->SaveToDB(false, false);
+
+        // Re-derive the role from the final talents and rebuild the role-default
+        // rotation/targetmode so a scaled pick never keeps a stale rotation.
+        std::string const freshRole = InferHenchmanRoleLive(hen, ClassDefaultRole(cls));
+        WowPsParty::SetHenchmanRole(hen->GetGUID(), freshRole);
+        WowPsParty::RotationCacheSet(hen->GetGUID().GetCounter(),
+            WowPsParty::ParseRotationString(
+                DefaultRotationForClass(cls, freshRole, DominantTalentTabLive(hen))));
+        WowPsParty::TargetModeCacheSet(hen->GetGUID().GetCounter(),
+            freshRole == "tank" ? "loose" : "master");
+
+        SanitizeHenchmanSpellsIfNeeded(hen);
+        LOG_INFO("module",
+            "[WowPsParty LfgScale] re-leveled hench guid={} {} -> {} for dungeon range",
+            hen->GetGUID().GetCounter(), oldLvl, uint32(target));
+    }
+
+    void ScaleHenchmenForDungeons(Player* leader, std::set<uint32> const& dungeons)
+    {
+        if (!leader || dungeons.empty()) return;
+        Group* grp = leader->GetGroup();
+        if (!grp) return;
+
+        // Effective range across the selected dungeons: highest floor .. lowest
+        // ceiling (so a single scaled level satisfies EVERY selected dungeon at once).
+        uint8 effMin = 0, effMax = 80;
+        bool any = false;
+        for (uint32 d : dungeons)
+        {
+            lfg::LFGDungeonData const* dd = sLFGMgr->GetLFGDungeon(d);
+            if (!dd || dd->maxlevel == 0) continue;   // not a real dungeon entry
+            effMin = std::max<uint8>(effMin, dd->minlevel);
+            effMax = std::min<uint8>(effMax, dd->maxlevel);
+            any = true;
+        }
+        if (!any || effMin > effMax) return;   // no real range / dungeons don't overlap
+
+        for (GroupReference* itr = grp->GetFirstMember(); itr != nullptr; itr = itr->next())
+        {
+            Player* m = itr->GetSource();
+            if (!m || m == leader || !m->IsInWorld()) continue;
+            if (!WowPsParty::IsHenchman(m->GetGUID())) continue;
+            uint8 const cur    = m->GetLevel();
+            uint8 const target = cur < effMin ? effMin : (cur > effMax ? effMax : cur);
+            if (target != cur)
+                ReLevelHenchmanInPlace(m, target);
+        }
     }
 
     bool HireHenchman(Player* requester, uint32 candidateGuid,

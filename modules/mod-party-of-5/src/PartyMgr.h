@@ -20,6 +20,7 @@
 #include "ObjectGuid.h"
 
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -101,9 +102,18 @@ namespace WowPsParty
         std::string spec;       // short spec abbrev (e.g. "Holy"/"Resto"); "" if none
     };
 
-    // Up to 10 candidates (2 tank / 2 healer / 6 dps) from offline random-pool
-    // chars near the requester's level (±2, or 80 if the player is 80).
+    // Up to ~11 candidates (3 tank / 2 healer / 6 dps) from offline random-pool
+    // chars near the requester's level (±4, or 80 if the player is 80). At least
+    // THREE distinct tank classes are guaranteed when the pool can supply them.
     std::vector<HenchmanCandidate> BuildHenchmanCandidates(Player* requester);
+
+    // Scale every henchman in `leader`'s group into the level range shared by the
+    // selected LFG `dungeons` (effective range = highest minlevel .. lowest maxlevel
+    // across the set). A henchman below the range is up-leveled to the floor; above
+    // it, down-leveled to the ceiling; in range it is left alone. Lets a party of
+    // mixed-level henchmen queue any dungeon the human leader can, fighting at the
+    // dungeon's level. No-op when the dungeons share no overlapping range.
+    void ScaleHenchmenForDungeons(Player* leader, std::set<uint32> const& dungeons);
 
     // Copper cost to hire a henchman of the given level.
     uint32 HenchmanHireCost(uint8 level);

@@ -48,6 +48,10 @@
 #include <unordered_map>
 #include <vector>
 
+// Defined in PartyFollow.cpp — true ONLY for a hired henchman bot (NOT the human's
+// own enrolled hero-alts, which BotHasActiveFollowDirective would also match).
+bool WowPsParty_IsHenchman_Trampoline(ObjectGuid guid);
+
 namespace
 {
     using lfg::LfgDungeonSet;
@@ -196,9 +200,39 @@ namespace
             }
             return done;
         };
-        uint8 const ht = hireFrom(orderForVariety(tanks), "tank",   pf.needTank);
-        uint8 const hh = hireFrom(orderForVariety(heals), "healer", pf.needHeal);
-        uint8 const hd = hireFrom(orderForVariety(dps),   "dps",    pf.needDps);
+
+        // Effective dungeon level range (highest floor .. lowest ceiling across the
+        // selected dungeons). Used to PREFER henchmen already eligible (Kevin's "even
+        // better": only hire adventurers in range), with out-of-range picks kept as a
+        // fallback — those get scaled into the range at queue time (below). No real
+        // range (effMin=0/effMax=80) → every candidate counts as in range → original
+        // pick order.
+        uint8 effMin = 0, effMax = 80;
+        {
+            uint8 lo = 0, hi = 80; bool any = false;
+            for (uint32 d : pf.dungeons)
+            {
+                lfg::LFGDungeonData const* dd = sLFGMgr->GetLFGDungeon(d);
+                if (!dd || dd->maxlevel == 0) continue;
+                lo = std::max<uint8>(lo, dd->minlevel);
+                hi = std::min<uint8>(hi, dd->maxlevel);
+                any = true;
+            }
+            if (any && lo <= hi) { effMin = lo; effMax = hi; }
+        }
+        auto preferInRange = [&](std::vector<WowPsParty::HenchmanCandidate> const& bucket) -> std::vector<uint32>
+        {
+            std::vector<WowPsParty::HenchmanCandidate> inR, outR;
+            for (auto const& c : bucket)
+                ((c.level >= effMin && c.level <= effMax) ? inR : outR).push_back(c);
+            std::vector<uint32> order = orderForVariety(inR);
+            std::vector<uint32> tail  = orderForVariety(outR);
+            order.insert(order.end(), tail.begin(), tail.end());
+            return order;
+        };
+        uint8 const ht = hireFrom(preferInRange(tanks), "tank",   pf.needTank);
+        uint8 const hh = hireFrom(preferInRange(heals), "healer", pf.needHeal);
+        uint8 const hd = hireFrom(preferInRange(dps),   "dps",    pf.needDps);
 
         if (ht < pf.needTank || hh < pf.needHeal || hd < pf.needDps)
         {
@@ -238,6 +272,10 @@ namespace
                 e.committed = true;
                 e.passthrough = true;
             }
+            // Scale the freshly-hired henchmen into the selected dungeons' level
+            // range so they queue eligible AND fight at the dungeon's level (an
+            // in-band pick can sit just outside a narrow dungeon band).
+            WowPsParty::ScaleHenchmenForDungeons(p, dungeons);
             LfgDungeonSet d = dungeons;
             sLFGMgr->JoinLfg(p, roles, d, "");
         }, std::chrono::seconds(REDRIVE_DELAY_SEC));
@@ -273,9 +311,16 @@ public:
             }
         }
 
-        // Solo only (v1). A real group falls through to normal LFG.
+        // A real premade (manually-hired henchmen) queuing directly: scale any
+        // henchman into the selected dungeons' level range, then let it through
+        // unchanged. The bot-bypass GlobalScript clears the bots' progression locks
+        // so the party is never rejected for a bot's quest/level. (The auto-fill
+        // offer is solo-only; a real group falls through to normal LFG.)
         if (player->GetGroup())
+        {
+            WowPsParty::ScaleHenchmenForDungeons(player, dungeons);
             return true;
+        }
         // Must have queued as a real role.
         if (!(roles & (lfg::PLAYER_ROLE_TANK | lfg::PLAYER_ROLE_HEALER | lfg::PLAYER_ROLE_DAMAGE)))
             return true;
@@ -399,8 +444,36 @@ namespace WowPsParty
     }
 }
 
+// Henchman bots ignore LFG progression gates so a hired party is never rejected as
+// invalid because a bot hasn't completed a quest (e.g. the DK starting quest) or sits
+// outside a dungeon's level band. Real players keep every gate. Genuine HARD locks
+// (instance already bound, dungeon disabled, missing DF permission — all surfaced as
+// RAID_LOCKED) stay. Level mismatch is ALSO fixed for real by scaling the bot
+// (ScaleHenchmenForDungeons); clearing the lock here is belt-and-suspenders so a
+// timing gap in scaling can't block the queue.
+class PartyLfgBotBypassGlobalScript : public GlobalScript
+{
+public:
+    PartyLfgBotBypassGlobalScript() : GlobalScript("PartyLfgBotBypassGlobalScript", {
+        GLOBALHOOK_ON_INITIALIZE_LOCKED_DUNGEONS
+    }) { }
+
+    void OnInitializeLockedDungeons(Player* player, uint8& /*level*/, uint32& lockData,
+                                    lfg::LFGDungeonData const* /*dungeon*/) override
+    {
+        if (!player || lockData == 0)
+            return;
+        if (lockData == lfg::LFG_LOCKSTATUS_RAID_LOCKED)
+            return;   // keep instance-bound / disabled / no-permission hard locks
+        if (!WowPsParty_IsHenchman_Trampoline(player->GetGUID()))
+            return;   // real players (incl. the human's own hero-alts) keep every gate
+        lockData = 0;
+    }
+};
+
 void AddPartyLfgFillScripts()
 {
     new PartyLfgFillPlayerScript();
     new PartyLfgFillRecruiterScript();
+    new PartyLfgBotBypassGlobalScript();
 }
