@@ -2058,6 +2058,50 @@ namespace WowPsParty
         return n;
     }
 
+    // True while u is genuinely fighting something — at least one ALIVE, in-world
+    // unit on its combat refs (PvE or PvP) or a live attacker. An evading/blinked mob
+    // is still alive and still referenced, so this stays true through a normal fight.
+    static bool HasLiveHostile(Unit* u)
+    {
+        if (!u) return false;
+        for (auto const& [g, ref] : u->GetCombatManager().GetPvECombatRefs())
+            if (Unit* o = ref->GetOther(u)) { if (o->IsAlive() && o->IsInWorld()) return true; }
+        for (auto const& [g, ref] : u->GetCombatManager().GetPvPCombatRefs())
+            if (Unit* o = ref->GetOther(u)) { if (o->IsAlive() && o->IsInWorld()) return true; }
+        for (Unit* a : u->getAttackers())
+            if (a && a->IsAlive() && a->IsInWorld()) return true;
+        return false;
+    }
+
+    // Phantom-combat watchdog. AzerothCore occasionally leaves a unit flagged
+    // in-combat after the last creature it fought dies/evades without tearing the
+    // combat reference down. The party then reads party_in_combat forever and every
+    // bot idles in assist-mode with target=0 (and the human leader is stuck too).
+    // When a unit has been in combat with ZERO live hostiles for PHANTOM_COMBAT_MS,
+    // force-clear it exactly as `.combatstop` does (CombatStop + drop threat). A real
+    // fight always has a live unit on the combat refs, so this can only fire on a
+    // stale ghost reference. Idempotent: clearing an already-clear unit is a no-op,
+    // so several party bots sweeping the same leader each tick is harmless.
+    static void SweepPhantomCombat(Unit* u, uint32 logLow)
+    {
+        if (!u) return;
+        static constexpr uint32 PHANTOM_COMBAT_MS = 5000;
+        // guidLow -> getMSTime() when the unit was first seen in combat with no live
+        // hostile. thread_local is race-free: a map's units update on one thread, and
+        // bot + leader share that map (callers gate on equal GetMapId).
+        static thread_local std::unordered_map<uint32, uint32> g_phantomSince;
+        uint32 const ul = u->GetGUID().GetCounter();
+        if (!u->IsInCombat() || HasLiveHostile(u)) { g_phantomSince.erase(ul); return; }
+        uint32 const now = getMSTime();
+        auto it = g_phantomSince.find(ul);
+        if (it == g_phantomSince.end()) { g_phantomSince[ul] = now; return; }
+        if (getMSTimeDiff(it->second, now) < PHANTOM_COMBAT_MS) return;
+        u->CombatStop();
+        u->GetThreatMgr().RemoveMeFromThreatLists();
+        g_phantomSince.erase(ul);
+        AssistLog(logLow, "phantom-combat cleared (in combat, no live hostile >5s)");
+    }
+
     // Any NON-tank party member (DPS/healer/the human leader) currently in combat. During
     // a body-pull the whole party HOLDS (no casts, no auto-attack — IsPartyPullPending), and
     // the gather's own mobs aggro the TANK, not them — so a non-tank in combat means a
@@ -5135,6 +5179,12 @@ namespace WowPsParty
         Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
         if (!leader || !leader->IsInWorld()) { AssistLog(gLow, "skip: leader not in world"); return; }
         if (leader->GetMapId() != bot->GetMapId()) { AssistLog(gLow, "skip: leader on different map"); return; }
+
+        // Phantom-combat watchdog: clear a stale in-combat flag (a dead/despawned mob's
+        // lingering combat ref) on this bot AND the leader before it strands the whole
+        // party in assist-mode with no target. Runs every tick on a clean-state bot.
+        SweepPhantomCombat(bot, gLow);
+        SweepPhantomCombat(leader, leader->GetGUID().GetCounter());
 
         // BATTLEGROUND leash: keep party bots within 30y of the human so the healer can't
         // wander off (e.g. to cure random raid bots) and leave the human to die when a fight
