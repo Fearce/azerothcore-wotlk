@@ -6275,6 +6275,37 @@ namespace WowPsParty
 
         // MELEE — close to contact, fanned out by formation angle so the melee
         // companions surround the mob (orbiting is fine when you're in contact).
+
+        // No line of sight (target behind a thin wall / pillar / around a corner):
+        // MoveChase only maintains a DISTANCE band and never checks LoS, so once the
+        // target is within chase reach by STRAIGHT-LINE distance the chase parks the
+        // bot blind against the wall — it can't swing (the engine needs LoS) and its
+        // gap-closer (Charge / Feral Charge) is LoS-gated too, so it just stands in
+        // "range" doing nothing (Kevin: warrior/druid "stuck at a wall in charge
+        // range"). Mirror the ranged branch's recovery: drive a navmesh MovePoint to
+        // a point just PAST the target's edge to round the corner; the formation
+        // chase below resumes the instant LoS clears. 4y past the edge so the near-
+        // point doesn't land on the same blind side and re-strand us.
+        if (!bot->IsWithinLOSInMap(desired, VMAP::ModelIgnoreFlags::M2))
+        {
+            float lx, ly, lz;
+            desired->GetNearPoint(bot, lx, ly, lz, 0.0f, 4.0f, desired->GetAngle(bot));
+            if (NavReachable(bot, lx, ly, lz, bot->GetDistance(desired)))
+            {
+                if (mg != POINT_MOTION_TYPE)
+                {
+                    bot->GetMotionMaster()->MovePoint(0, lx, ly, lz, FORCED_MOVEMENT_NONE,
+                                                      0.0f, 0.0f, /*generatePath=*/true,
+                                                      /*forceDestination=*/false);
+                    AssistLog(gLow, "melee: no LoS — closing to round the corner");
+                }
+                bot->SetFacingToObject(desired);
+                return;
+            }
+            // No navigable way around (truly walled off): fall through to the chase,
+            // which still pathfinds toward the victim rather than freezing here.
+        }
+
         // TANK anti-flank: when SURROUNDED by 4+ on a spread AoE pull, nudge into the open
         // side so the pack funnels to the front (back hits ignore block/dodge/parry). It
         // returns true ONLY on the brief nudge tick; otherwise the tank fights normally
