@@ -3043,6 +3043,17 @@ bool PlayerbotAI::TellMasterNoFacing(std::ostringstream& stream, PlayerbotSecuri
 
 bool PlayerbotAI::TellMasterNoFacing(std::string const text, PlayerbotSecurityLevel securityLevel)
 {
+    // [WowPsParty PATCH] Hired henchmen are SILENT to their captain. The hire "Hello"
+    // (AcceptInvitationAction) and dismiss "Goodbye!" (LeaveGroupAction / PlayerbotMgr)
+    // and any other bot chatter add nothing and spam the leader. PartyHooks'
+    // OnPlayerCanUseChat already blocks henchman Player::Whisper, but TellMaster bypasses
+    // it by building the chat packet and SendDirectMessage-ing the master's session
+    // straight. Suppress here too. Heroes (enrolled alts) are NOT henchmen and may still
+    // whisper their own leader; the WPSP addon protocol doesn't ride TellMaster.
+    extern bool WowPsParty_IsHenchman_Trampoline(ObjectGuid guid);
+    if (bot && WowPsParty_IsHenchman_Trampoline(bot->GetGUID()))
+        return false;
+
     Player* master = GetMaster();
     PlayerbotAI* masterBotAI = nullptr;
     if (master)
