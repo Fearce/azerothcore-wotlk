@@ -2155,11 +2155,20 @@ namespace WowPsParty
         return n;
     }
 
-    // Best eligible un-aggroed candidate within GATHER_SCAN whose social group fits
-    // `capacity` (= N - engaged). Returns it + its group size in grpOut, or nullptr if
-    // none fit. STRICT: an add is taken only if it won't push the engaged headcount over
-    // N — the cap is absolute, never overshot (Mill: "the multi-pull cap is absolute, do
-    // NOT overshoot it"). A pack bigger than the remaining room is simply left alone.
+    // Best eligible un-aggroed candidate within GATHER_SCAN. Returns it + its group size in
+    // grpOut, or nullptr if none qualify. Two tiers:
+    //
+    //   TIER 1 (unavoidable) — a candidate within SOCIAL_AGGRO_R of a mob the party is
+    //   ALREADY fighting is part of THIS pull: social aggro drags it in the moment we finish
+    //   the current mob whether we pick it or not. It bypasses the cap entirely. The cap
+    //   exists to stop the tank WALKING OFF to a SEPARATE pack, never to make it abandon the
+    //   cluster it already opened on and march to a smaller distant one (Kevin: tank pulled
+    //   one mob inside a 6-pack, then walked through a doorway to a far pack — leaving 5
+    //   clustered mobs that social-aggro anyway, so it double-pulled and lost position).
+    //
+    //   TIER 2 (a genuinely separate pack) — STRICT cap: taken only if its social group won't
+    //   push the engaged headcount over N (Mill: "the multi-pull cap is absolute, do NOT
+    //   overshoot it"). A separate pack bigger than the remaining room is left alone.
     //
     // Ranking is by distance to the ANCHOR (ax,ay,az), NOT the tank: the opener passes the
     // tank's own position (the first mob is nearest-to-tank), but each SUBSEQUENT add passes
@@ -2197,6 +2206,25 @@ namespace WowPsParty
         };
         std::sort(pool.begin(), pool.end(),
                   [&](Unit* a, Unit* b){ return anchorScore(a) < anchorScore(b); });
+
+        // Mobs the party is ALREADY in combat with (the pool itself is un-aggroed only). A
+        // candidate within SOCIAL_AGGRO_R of one of these is socially chained to the live
+        // fight — it's coming regardless of the cap (TIER 1 above).
+        std::vector<Unit*> engaged;
+        for (auto const& [rg, ref] : tank->GetCombatManager().GetPvECombatRefs())
+            if (Unit* o = ref->GetOther(tank))
+                if (o->IsAlive() && o->ToCreature()) engaged.push_back(o);
+        auto chainedToFight = [&](Unit* cand) {
+            for (Unit* e : engaged)
+                if (e->GetDistance(cand) <= SOCIAL_AGGRO_R) return true;
+            return false;
+        };
+
+        // TIER 1: nearest-to-anchor add chained to the current fight wins — cap IGNORED.
+        for (Unit* cand : pool)
+            if (chainedToFight(cand)) { grpOut = SocialGroupSize(cand, pool); return cand; }
+
+        // TIER 2: a separate pack — strict cap so we never over-pull beyond N.
         for (Unit* cand : pool)
         {
             uint32 const g = SocialGroupSize(cand, pool);
