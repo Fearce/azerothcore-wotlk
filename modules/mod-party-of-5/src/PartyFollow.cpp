@@ -1534,6 +1534,15 @@ namespace WowPsParty
     // the actual threat, not a timer"). Auto-scales to any tank/DPS/gear.
     static constexpr float THREAT_CAP_RATIO = 0.80f;
 
+    // Ripped-aggro SOFT STAND-DOWN: when a non-tank pulls a mob off the tank and the
+    // tank holds nothing else it's under the cap on, it does NOT stand idle — it keeps
+    // fighting that mob with INSTANTS (cast-time spells decline while it moves) and runs
+    // it back to the tank. If the tank still hasn't taken it back after this long, the
+    // bot stops dragging and just KILLS what's on it (Kevin). DRAG_HANDOFF_DIST is the
+    // tank-follow distance for that run (also used by the loose-add drag-to-tank block).
+    static constexpr uint32 STANDDOWN_REENGAGE_MS = 3000;
+    static constexpr float  DRAG_HANDOFF_DIST     = 8.0f;   // run the add to here from the tank
+
     // ---- Human-tank ENGAGE LEAD (pure threat, NO timer) ----------------------
     // A mob only counts as "properly engaged" by the tank once the tank holds at
     // least this fraction of the mob's MAX HEALTH in threat on it. Below it, DPS
@@ -5258,6 +5267,14 @@ namespace WowPsParty
         // Non-tanks currently dragging a loose add back to the tank (see the
         // drag-to-tank block below). thread_local for the same race-free reason.
         static thread_local std::unordered_set<uint32> g_dragToTank;
+        // A non-tank that RIPPED a mob off the tank (over the threat cap, tank holds
+        // nothing else it's under-cap on): the ripped mob + the getMSTime it entered the
+        // soft stand-down, so we re-engage after STANDDOWN_REENGAGE_MS if the tank never
+        // takes it back. Keyed by the ripped mob's guid-low so a DIFFERENT mob ripping
+        // next re-arms a fresh window (instead of inheriting an already-expired timer).
+        // thread_local — same per-bot, single-map-thread reasoning as g_dragToTank.
+        struct StandDownState { uint32 mobLow; uint32 sinceMs; };
+        static thread_local std::unordered_map<uint32, StandDownState> g_standDown;
         if (!IsLeadTank(bot->GetGUID()) && IsPartyPullPending(bot))
         {
             bool meleeThreatOnMe = false;
@@ -5580,7 +5597,14 @@ namespace WowPsParty
         {
             std::string const myRole = RoleForGuid(bot->GetGUID());
             bool const gated = desired && myRole != "tank";   // DPS AND healer; tank engages freely
-            if (gated && TankLeadActive(bot, leader)
+            // The party's LIVE tank, or nullptr when the tank is DEAD (human tank-lead:
+            // leader not alive; bot tank: PartyLeadTank already filters dead). A dead tank
+            // skips the whole throttle so the party blasts freely to clear the pack until a
+            // tank is back up (Kevin: "when the tank is DEAD, threat throttle should
+            // disengage until the tank is back alive"). Also the run-to target for a
+            // ripped-aggro stand-down below.
+            Player* const throttleTank = PartyTankPlayer(bot, leader);
+            if (gated && throttleTank && TankLeadActive(bot, leader)
                 && WaitForHumanTank(bot->GetGUID())            // default WAIT under a tank (human OR bot); '0' opts out
                 && !IsBossUnit(desired))                       // bosses: no throttle, blast on
             {
@@ -5615,6 +5639,8 @@ namespace WowPsParty
                         tm.GetThreat(bot),
                         tankU ? tm.GetThreat(tankU) * THREAT_CAP_RATIO : 0.0f);
                 }
+                if (release)
+                    g_standDown.erase(gLow);   // back under the cap → not standing down
                 if (!release)
                 {
                     // The mob we picked isn't tank-held yet — but if the tank ALREADY
@@ -5623,28 +5649,83 @@ namespace WowPsParty
                     if (Unit* const alt = PickTankEngagedTarget(bot, leader))
                     {
                         desired = alt;   // fall through and attack the tank-held mob
+                        g_standDown.erase(gLow);   // productively fighting an under-cap mob
                     }
                     else
                     {
-                        // Tank holds nothing engageable yet → wait. Loose leash only:
-                        // catch up if we've drifted past HOLD_LEASH, otherwise stand
-                        // put — no formation spot.
-                        if (bot->GetVictim()) bot->AttackStop();
-                        MovementGeneratorType const mg2 =
-                            bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
-                        if (bot->GetDistance(leader) > HOLD_LEASH)
+                        // No tank-held mob we're under the cap on. Did we RIP a mob off the
+                        // tank — i.e. one is now on US (we're its top-threat / it's beating on
+                        // us)? If so, DON'T stand idle (the old bug Kevin reported). Keep
+                        // fighting it (the rotation fires INSTANTS — cast-time spells decline
+                        // while we move, RecentlyMoved) and RUN IT TO THE TANK so the mob is
+                        // dragged into taunt/AoE range and the tank can peel it back. If the
+                        // tank STILL hasn't taken it after STANDDOWN_REENGAGE_MS, stop dragging
+                        // and just KILL what's on us (Kevin: "if the tank doesn't come after a
+                        // few seconds, absolutely try to kill the enemies attacking it").
+                        uint32 const sdNow = getMSTime();
+                        Unit* ripped = (desired && desired->IsAlive()
+                                        && desired->GetVictim() == bot) ? desired : nullptr;
+                        if (!ripped)
+                            for (Unit* a : bot->getAttackers())
+                                if (a && a->IsAlive() && a->GetVictim() == bot
+                                    && bot->IsValidAttackTarget(a)) { ripped = a; break; }
+
+                        if (ripped && throttleTank && throttleTank != bot)
                         {
-                            if (mg2 != FOLLOW_MOTION_TYPE)
-                                bot->GetMotionMaster()->MoveFollow(leader, HOLD_LEASH - 5.0f, bot->GetFollowAngle());
+                            uint32 const rippedLow = ripped->GetGUID().GetCounter();
+                            StandDownState& sd = g_standDown[gLow];
+                            if (sd.mobLow != rippedLow)   // first tick on THIS mob → fresh window
+                            { sd.mobLow = rippedLow; sd.sinceMs = sdNow; }
+                            if (getMSTimeDiff(sd.sinceMs, sdNow) < STANDDOWN_REENGAGE_MS)
+                            {
+                                // Soft stand-down: keep it engaged (instants fire while we
+                                // move; non-instants self-decline), run it to the tank.
+                                if (bot->GetVictim() != ripped)
+                                {
+                                    MarkRetarget(gLow, sdNow);
+                                    bot->Attack(ripped, FollowerIsMelee(bot));   // melee → white swings; ranged → no melee flag
+                                }
+                                MovementGeneratorType const mg3 =
+                                    bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
+                                if (mg3 != FOLLOW_MOTION_TYPE)
+                                {
+                                    if (bot->getStandState() != UNIT_STAND_STATE_STAND)
+                                        bot->SetStandState(UNIT_STAND_STATE_STAND);
+                                    bot->GetMotionMaster()->Clear();
+                                    bot->GetMotionMaster()->MoveFollow(throttleTank, DRAG_HANDOFF_DIST, bot->GetFollowAngle());
+                                }
+                                AssistLog(gLow, "stand-down: ripped aggro — fighting with instants, running it to the tank");
+                                return;
+                            }
+                            // Window expired → stop dragging, KILL it where we are. Leave the
+                            // timer armed (stays expired) so we don't flip back to a drag next
+                            // tick; only dropping under the cap (release, above) resets it.
+                            desired = ripped;
+                            AssistLog(gLow, "stand-down: tank never took it back — re-engaging to kill");
+                            // fall through to normal engage on `ripped`
                         }
-                        else if (mg2 != IDLE_MOTION_TYPE)
+                        else
                         {
-                            bot->StopMoving();
-                            bot->GetMotionMaster()->Clear();
-                            bot->GetMotionMaster()->MoveIdle();
+                            // Genuinely nothing on us → pre-engagement wait. Loose leash only:
+                            // catch up if we've drifted past HOLD_LEASH, else stand put.
+                            g_standDown.erase(gLow);
+                            if (bot->GetVictim()) bot->AttackStop();
+                            MovementGeneratorType const mg2 =
+                                bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
+                            if (bot->GetDistance(leader) > HOLD_LEASH)
+                            {
+                                if (mg2 != FOLLOW_MOTION_TYPE)
+                                    bot->GetMotionMaster()->MoveFollow(leader, HOLD_LEASH - 5.0f, bot->GetFollowAngle());
+                            }
+                            else if (mg2 != IDLE_MOTION_TYPE)
+                            {
+                                bot->StopMoving();
+                                bot->GetMotionMaster()->Clear();
+                                bot->GetMotionMaster()->MoveIdle();
+                            }
+                            AssistLog(gLow, "human-tank: waiting — tank has no engageable threat yet (loose leash)");
+                            return;
                         }
-                        AssistLog(gLow, "human-tank: waiting — tank has no engageable threat yet (loose leash)");
-                        return;
                     }
                 }
             }
@@ -5813,7 +5894,7 @@ namespace WowPsParty
         // and the add is already on us (not a fresh pull), so the geometry — not a
         // distance cap — is what keeps it from chain-pulling. Don't clamp it to 18y.
         static constexpr float TANK_GRAB_RANGE   = 30.0f;   // beyond this the tank can't reach the add
-        static constexpr float DRAG_HANDOFF_DIST = 8.0f;    // run the add to here from the tank
+        // DRAG_HANDOFF_DIST is shared at namespace scope (see THREAT_CAP_RATIO block).
         if (!focusMob && RoleForGuid(bot->GetGUID()) != "tank")
         {
             Player* const dragTank = PartyTankPlayer(bot, leader);
