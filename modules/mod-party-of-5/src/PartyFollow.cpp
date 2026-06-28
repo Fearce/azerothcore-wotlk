@@ -1540,6 +1540,10 @@ namespace WowPsParty
     // it back to the tank. If the tank still hasn't taken it back after this long, the
     // bot stops dragging and just KILLS what's on it (Kevin). DRAG_HANDOFF_DIST is the
     // tank-follow distance for that run (also used by the loose-add drag-to-tank block).
+    // STANDDOWN_GRACE_MS is a short hold BEFORE the run-to-tank starts — the bot keeps
+    // fighting in place so the tank gets a beat to taunt/peel before the caster cancels
+    // everything to run (Kevin). Must be < STANDDOWN_REENGAGE_MS.
+    static constexpr uint32 STANDDOWN_GRACE_MS    = 1500;
     static constexpr uint32 STANDDOWN_REENGAGE_MS = 3000;
     static constexpr float  DRAG_HANDOFF_DIST     = 8.0f;   // run the add to here from the tank
 
@@ -5676,9 +5680,20 @@ namespace WowPsParty
                             StandDownState& sd = g_standDown[gLow];
                             if (sd.mobLow != rippedLow)   // first tick on THIS mob → fresh window
                             { sd.mobLow = rippedLow; sd.sinceMs = sdNow; }
-                            if (getMSTimeDiff(sd.sinceMs, sdNow) < STANDDOWN_REENGAGE_MS)
+                            uint32 const elapsed = getMSTimeDiff(sd.sinceMs, sdNow);
+                            // THREE phases keyed off how long we've held this rip:
+                            //  [0, GRACE)        — give the tank a beat to taunt/peel: keep fighting
+                            //                      it NORMALLY in place (full rotation, casts and all),
+                            //                      DON'T cancel to run (Kevin: "a 1-2s delay before the
+                            //                      run-to-tank, so the tank can do something first").
+                            //  [GRACE, REENGAGE) — tank still hasn't taken it: run it to the tank
+                            //                      (instants fire while moving; non-instants decline).
+                            //  [REENGAGE, ∞)     — tank never came: stop dragging, just KILL it.
+                            // Grace and kill are the SAME behavior (fight where we are), so only the
+                            // middle drag phase returns early with movement.
+                            if (elapsed >= STANDDOWN_GRACE_MS && elapsed < STANDDOWN_REENGAGE_MS)
                             {
-                                // Soft stand-down: keep it engaged (instants fire while we
+                                // Soft stand-down DRAG: keep it engaged (instants fire while we
                                 // move; non-instants self-decline), run it to the tank.
                                 if (bot->GetVictim() != ripped)
                                 {
@@ -5697,11 +5712,14 @@ namespace WowPsParty
                                 AssistLog(gLow, "stand-down: ripped aggro — fighting with instants, running it to the tank");
                                 return;
                             }
-                            // Window expired → stop dragging, KILL it where we are. Leave the
-                            // timer armed (stays expired) so we don't flip back to a drag next
-                            // tick; only dropping under the cap (release, above) resets it.
+                            // In the grace window, or past the re-engage cap → fight the mob
+                            // where we are (full rotation). Timer stays armed for this mob, so
+                            // it advances grace→drag→kill on its own; only dropping under the
+                            // cap (release, above) or the mob changing resets it.
                             desired = ripped;
-                            AssistLog(gLow, "stand-down: tank never took it back — re-engaging to kill");
+                            AssistLog(gLow, elapsed < STANDDOWN_GRACE_MS
+                                ? "stand-down: ripped aggro — holding in place briefly, giving the tank a chance"
+                                : "stand-down: tank never took it back — re-engaging to kill");
                             // fall through to normal engage on `ripped`
                         }
                         else
