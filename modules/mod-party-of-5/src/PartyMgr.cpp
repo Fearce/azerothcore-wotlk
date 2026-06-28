@@ -1144,6 +1144,10 @@ namespace WowPsParty
                         // totem. Fire is the Searing ATTACK totem, walked to the pack (kept
                         // separate, held during the pull since it pulls threat).
                         add("party_in_combat&totem_attack_needed:fire", "cast_totem_attack:Searing Totem", 54);
+                        // Recall Searing the moment the WHOLE party leaves combat — the attack
+                        // totem outlives the fight and keeps shooting anything that wanders near,
+                        // pulling bystanders while the party drinks.
+                        add("party_out_of_combat&self_totem_active:Searing Totem", "recall_totem:Searing Totem", 60);
                         add("party_in_combat&totem_set_stale:Strength of Earth Totem,Mana Spring Totem,Windfury Totem",
                             "cast_totem_set:Strength of Earth Totem,Mana Spring Totem,Windfury Totem", 52);
                         // Damage order (Kevin), high->low below the totems: dump Maelstrom
@@ -1184,6 +1188,9 @@ namespace WowPsParty
                         // Totem of Wrath holds the fire slot (it's the better elemental totem).
                         add("party_in_combat&totem_attack_needed:fire&!self_totem_active:Totem of Wrath",
                             "cast_totem_attack:Searing Totem", 50);
+                        // Recall the Searing fallback once combat ends (only relevant when
+                        // Totem of Wrath isn't learned, so it never touches the ToW buff totem).
+                        add("party_out_of_combat&self_totem_active:Searing Totem", "recall_totem:Searing Totem", 60);
                         add("has_target", "cast:Lava Burst", 66);
                         add("has_target", "cast:Earth Shock", 46);                 // instant filler
                         add("has_target", "cast:Lightning Bolt", 38);              // ranged filler
@@ -1201,6 +1208,9 @@ namespace WowPsParty
                         add("party_in_combat&totem_set_stale:Strength of Earth Totem,Mana Spring Totem",
                             "cast_totem_set:Strength of Earth Totem,Mana Spring Totem", 52);
                         add("party_in_combat&totem_attack_needed:fire", "cast_totem_attack:Searing Totem", 54);
+                        // Recall Searing after combat so the lingering attack totem stops
+                        // pulling bystanders while the party drinks.
+                        add("party_out_of_combat&self_totem_active:Searing Totem", "recall_totem:Searing Totem", 60);
                         add("has_target", "cast:Lightning Bolt", 38);
                     }
                 }

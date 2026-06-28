@@ -23,6 +23,7 @@
 #include "PathGenerator.h"   // reachability check for the move_out_of_los duck spot
 #include "Pet.h"
 #include "Player.h"
+#include "Totem.h"            // Totem::UnSummon — recall_totem dismisses lingering attack totems
 #include "PlayerbotMgr.h"    // sPlayerbotsMgr — tell a human leader from a managed bot
 #include "Random.h"
 #include "Spell.h"
@@ -2139,6 +2140,43 @@ namespace WowPsParty
         if (!g) return nullptr;
         Creature* t = bot->GetMap()->GetCreature(g);
         return (t && t->IsAlive()) ? t : nullptr;
+    }
+
+    // Does this live totem's creating-spell name (or, as a fallback, its creature name)
+    // match any name in the comma-separated `list`? Powers recall_totem — matching by
+    // NAME (not element slot) lets us dismiss only the attack totems (Searing/Magma)
+    // while leaving a buff totem that shares the same element slot (Totem of Wrath /
+    // Flametongue Totem in the fire slot) untouched.
+    static bool TotemNameInList(Creature* t, std::string const& list)
+    {
+        if (!t) return false;
+        std::string spellName;
+        if (uint32 const spellId = t->GetUInt32Value(UNIT_CREATED_BY_SPELL))
+            if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
+                if (si->SpellName[0]) spellName = si->SpellName[0];
+        std::string const creatureName = t->GetName();
+        auto eqCI = [](std::string const& a, std::string const& b) -> bool
+        {
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); ++i)
+                if (char(std::tolower((unsigned char)a[i])) != char(std::tolower((unsigned char)b[i])))
+                    return false;
+            return true;
+        };
+        size_t start = 0;
+        while (start <= list.size())
+        {
+            size_t const comma = list.find(',', start);
+            std::string name = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+            size_t const a = name.find_first_not_of(" \t");
+            size_t const b = name.find_last_not_of(" \t");
+            if (a != std::string::npos) name = name.substr(a, b - a + 1); else name.clear();
+            if (!name.empty() && (eqCI(name, spellName) || eqCI(name, creatureName)))
+                return true;
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+        return false;
     }
 
     // Nearest hostile within `range` that the PARTY is already fighting (never a neutral /
@@ -4861,6 +4899,28 @@ namespace WowPsParty
             for (uint32 sid : toDrop)
                 bot->CastSpell(bot, sid, flags);
             return true;
+        }
+
+        // "recall_totem:<name1>,<name2>,..." — dismiss the named totem(s) if up. An ATTACK
+        // totem (Searing ~20y, Magma PBAoE) lingers for its full duration after a fight and
+        // keeps firing at anything that wanders near, pulling bystanders while the party
+        // drinks; a default rule recalls it once the WHOLE party leaves combat. Matched by
+        // NAME so a buff totem sharing the fire slot (Totem of Wrath / Flametongue) is never
+        // dismissed. Mirrors the player's CMSG_TOTEM_DESTROYED path (SpellHandler.cpp:
+        // totem->ToTotem()->UnSummon()).
+        if (verb == "recall_totem")
+        {
+            bool any = false;
+            for (uint8 s = SUMMON_SLOT_TOTEM_FIRE; s < MAX_TOTEM_SLOT; ++s)
+            {
+                Creature* const t = LiveTotemInSlot(bot, s);
+                if (t && t->IsTotem() && TotemNameInList(t, arg))
+                {
+                    t->ToTotem()->UnSummon();
+                    any = true;
+                }
+            }
+            return any;
         }
 
         if (verb == "buff_self")
