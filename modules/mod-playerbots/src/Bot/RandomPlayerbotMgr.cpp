@@ -1340,20 +1340,28 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
     uint32 isValid = GetEventValue(bot, "add");
     if (!isValid)
     {
-        if (!player || !player->GetGroup())
-        {
-            if (player)
-                LOG_DEBUG("playerbots", "Bot #{} {}:{} <{}>: log out", bot, IsAlliance(player->getRace()) ? "A" : "H",
-                          player->GetLevel(), player->GetName().c_str());
-            else
-                LOG_DEBUG("playerbots", "Bot #{}: log out", bot);
+        // An online bot that's mid-battleground (or sitting in a BG queue about to pop)
+        // must NOT be logged out when its in-world timer lapses — yanking it offline
+        // drops it from the live match and strands the human in an N-1 vs N BG (Kevin:
+        // "2 alliance bots left mid-EotS -> 13v15"). Defer the logout exactly like the
+        // existing in-a-group case: leave the "add" event set so the next cycle retries,
+        // and the logout lands once the bot is free of the BG (our own BGFill RetireFillBot
+        // also reaps master-0 fills when the match ends). An OFFLINE bot still gets its
+        // event cleared so the account slot frees up.
+        if (player && (player->GetGroup() || player->InBattleground() || player->InBattlegroundQueue()))
+            return false;
 
-            SetEventValue(bot, "add", 0, 0);
-            currentBots.remove(bot);
+        if (player)
+            LOG_DEBUG("playerbots", "Bot #{} {}:{} <{}>: log out", bot, IsAlliance(player->getRace()) ? "A" : "H",
+                      player->GetLevel(), player->GetName().c_str());
+        else
+            LOG_DEBUG("playerbots", "Bot #{}: log out", bot);
 
-            if (player)
-                LogoutPlayerBot(botGUID);
-        }
+        SetEventValue(bot, "add", 0, 0);
+        currentBots.remove(bot);
+
+        if (player)
+            LogoutPlayerBot(botGUID);
 
         return false;
     }
