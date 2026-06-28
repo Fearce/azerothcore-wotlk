@@ -5197,8 +5197,24 @@ namespace WowPsParty
         if (bot->GetVehicleBase()) { AssistLog(gLow, "skip: in vehicle"); return; }
         // Don't interrupt a cast in progress.
         if (bot->IsNonMeleeSpellCast(false, false, true)) { AssistLog(gLow, "skip: casting"); return; }
-        // Rotation engine has parked this bot (drinking, etc).
-        if (IsFollowerHeld(bot->GetGUID())) { AssistLog(gLow, "skip: held by rotation"); return; }
+        // Rotation engine has parked this bot (drinking, cast-plant, recall, gather).
+        // STALE-HOLD RECOVERY: a hold left over from a finished cast/channel — e.g. a
+        // balance druid whose pack died mid-Hurricane — otherwise keeps re-skipping the
+        // bot here, so with no victim it can never re-acquire and sits COMPLETELY IDLE in
+        // combat (Kevin's Elenyana stall: held, target=0, not casting, not moving). If a
+        // NON-TANK is in combat with NO victim and isn't being recalled, DON'T skip — fall
+        // through and let it re-target. Safe by construction: an active cast already
+        // returned at "skip: casting" above; a bot planting a cast still HAS a victim; a
+        // DPS that genuinely must wait for the tank's pull is still held by the threat-gate
+        // below (not this). Tanks keep their gather/lead holds untouched.
+        if (IsFollowerHeld(bot->GetGUID()))
+        {
+            bool const staleHold = bot->IsInCombat() && !bot->GetVictim()
+                                && RoleForGuid(bot->GetGUID()) != "tank"
+                                && !IsBeingRecalled(bot->GetGUID());
+            if (!staleHold) { AssistLog(gLow, "skip: held by rotation"); return; }
+            AssistLog(gLow, "held + in-combat with no victim — re-acquiring (stale hold recovery)");
+        }
         // Lead tank mid BODY-PULL/gather: do NOTHING here — no target, no attack (so it
         // builds NO threat until the pack is grouped), no chase. TankLeadEngagement /
         // TankGatherStep own the feet and the rotation is suppressed (TickRotation). Resumes
