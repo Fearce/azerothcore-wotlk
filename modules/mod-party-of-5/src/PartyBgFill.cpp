@@ -1641,13 +1641,54 @@ private:
         uint32 const target = std::max<uint32>(WG_MAX_VEHICLES, (maxSlots + 1) / 2);
         if (live >= target) return;
 
-        Position const stage = (atk == TEAM_HORDE) ? Position(5025.857f, 3674.629f, 362.737f, 4.135f)
-                                                   : Position(5101.284f, 2186.564f, 365.549f, 3.812f);
+        // Spawn the siege AT the front keep wall, not the far rear staging. The old staging
+        // spawn (~600y from any wall) meant the creature died — killed by defenders / churned
+        // by the live-count cleanup — in its ~16s lifetime long before it ever pathed into
+        // batter range, so no wall was ever touched (Kevin's WG: "not a single wall touched",
+        // 110 spawns all gone). Anchor the spawn on the live destructible-wall GO nearest the
+        // attacker's approach: a ground-valid, navmesh-adjacent spot already in DriveVehicles'
+        // batter range, so the wall takes damage from the first tick. Offset a few yards to the
+        // keep EXTERIOR (away from centre = attacker side) so it spawns OUTSIDE the wall, facing
+        // it. Falls back to the rear staging if no wall/anchor resolves this tick.
+        Position spawnPos = (atk == TEAM_HORDE) ? Position(5025.857f, 3674.629f, 362.737f, 4.135f)
+                                                : Position(5101.284f, 2186.564f, 365.549f, 3.812f);
+        {
+            WorldObject* anchor = nullptr;
+            for (uint8 ti = 0; ti < 2 && !anchor; ++ti)
+                for (ObjectGuid const& g : wg->GetPlayersInWarSet(TeamId(ti)))
+                    if (Player* p = ObjectAccessor::FindConnectedPlayer(g)) { anchor = p; break; }
+            if (anchor)
+            {
+                std::list<GameObject*> walls;
+                WgWallCheck check(WG_KEEP.x, WG_KEEP.y, WG_KEEP.z, 400.0f);
+                Acore::GameObjectListSearcher<WgWallCheck> searcher(anchor, walls, check);
+                Cell::VisitObjects(anchor, searcher, 400.0f);
+                // The wall nearest the attacker's approach = the front they're breaching.
+                GameObject* wall = nullptr; float bestD = 1e9f;
+                for (GameObject* w : walls)
+                {
+                    float const d = w->GetExactDist2d(spawnPos.GetPositionX(), spawnPos.GetPositionY());
+                    if (d < bestD) { bestD = d; wall = w; }
+                }
+                if (wall)
+                {
+                    float dx = wall->GetPositionX() - WG_KEEP.x;
+                    float dy = wall->GetPositionY() - WG_KEEP.y;
+                    float len = std::sqrt(dx * dx + dy * dy);
+                    if (len < 0.1f) { dx = 1.0f; dy = 0.0f; len = 1.0f; }
+                    constexpr float WALL_OFFSET = 12.0f;   // just outside the wall, attacker side
+                    spawnPos = Position(wall->GetPositionX() + dx / len * WALL_OFFSET,
+                                        wall->GetPositionY() + dy / len * WALL_OFFSET,
+                                        wall->GetPositionZ(),
+                                        std::atan2(-dy, -dx));   // face the wall (toward the keep)
+                }
+            }
+        }
         uint32 const entries[4] = { atk == TEAM_ALLIANCE ? WG_VEH_SIEGE_ALLY : WG_VEH_SIEGE_HORDE,
                                     WG_VEH_DEMOLISHER, WG_VEH_CATAPULT, WG_VEH_DEMOLISHER };
         static uint32 vehRoll = 0;
         uint32 const pick = entries[(vehRoll++) % 4];   // vary the entry across spawns
-        Creature* veh = wg->SpawnCreature(pick, stage, atk);
+        Creature* veh = wg->SpawnCreature(pick, spawnPos, atk);
         if (!veh) return;
 
         // Seat an idle attacking fill bot as the driver (flavour — the vehicle drives itself
