@@ -1509,17 +1509,23 @@ namespace WowPsParty
                     }
                     else   // BALANCE(0) — ranged caster; also the non-feral / low-level
                     {      // fallback (a no-talent low druid, or a Resto flipped to dps).
-                        // Moonkin on IN_COMBAT, not has_target: a balance opener keys off a
-                        // cluster, so has_target is often false at the pull. Falls through
-                        // harmlessly if untalented. cancel_form reverts it out of combat.
-                        add("in_combat&self_missing_aura:Moonkin Form", "buff_self:Moonkin Form", 80);
+                        // Moonkin on PARTY combat, not the bot's own: keyed off self in_combat
+                        // it very often hadn't entered combat yet when it fired an AoE (Hurricane)
+                        // — so shift the moment the PARTY engages. has_target is also avoided (a
+                        // balance opener keys off a cluster, so has_target is often false at the
+                        // pull). Falls through harmlessly if untalented. cancel_form reverts it
+                        // out of combat.
+                        add("party_in_combat&self_missing_aura:Moonkin Form", "buff_self:Moonkin Form", 80);
                         add("target_missing_aura:Moonfire", "cast:Moonfire", 72);
                         // Hurricane (ranged ground AoE) above Insect Swarm so it LEADS in AoE.
                         add("enemies_clustered:8>2", "cast:Hurricane", 70);
                         add("target_missing_aura:Insect Swarm", "cast:Insect Swarm", 68);
                         add("has_target", "cast:Starfire", 46);
                         add("has_target", "cast:Wrath", 44);
-                        add("out_of_combat&no_target&self_has_aura:Moonkin Form", "cancel_form", 16);
+                        // Revert on PARTY out-of-combat to match the party_in_combat shift above —
+                        // keyed to the bot's own out_of_combat it would fight the shift in the
+                        // window where the party is fighting but this bot isn't in combat yet.
+                        add("party_out_of_combat&no_target&self_has_aura:Moonkin Form", "cancel_form", 16);
                     }
                 }
                 break;
