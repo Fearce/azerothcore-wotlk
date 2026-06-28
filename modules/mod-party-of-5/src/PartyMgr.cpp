@@ -1629,6 +1629,15 @@ namespace WowPsParty
             } while (tq->NextRow());
         }
 
+        // A Death Knight with ZERO spent talents (the lvl-55 starter state) has no
+        // spec and no real build — useless and not worth hiring — so it must never
+        // be offered. SPECIFIC to DKs: every other class is legitimately talentless
+        // at low level and stays hireable (Kevin: "ignore untalented death knights").
+        auto isUntalentedDk = [](uint8 cls, std::unordered_set<uint32> const& known)
+        {
+            return cls == CLASS_DEATH_KNIGHT && known.empty();
+        };
+
         // Keep ONE candidate per (class, spec) — never a duplicate spec. Proximity
         // order means the kept one is the nearest-level char for that spec.
         std::unordered_set<uint32> const noTalents;
@@ -1637,6 +1646,8 @@ namespace WowPsParty
         {
             auto const it = talents.find(r.guid);
             std::unordered_set<uint32> const& known = (it != talents.end()) ? it->second : noTalents;
+            if (isUntalentedDk(r.cls, known))
+                continue;   // untalented DK — never hireable
             HenchmanCandidate c;
             c.guid  = r.guid;
             c.name  = r.name;
@@ -1670,6 +1681,8 @@ namespace WowPsParty
             uint32 const guidLow = mf[0].Get<uint32>();
             if (WowPsParty::IsHenchman(ObjectGuid::Create<HighGuid::Player>(guidLow)))
                 continue;   // busy
+            if (cls == CLASS_DEATH_KNIGHT && DominantTalentTabDB(guidLow) < 0)
+                continue;   // untalented DK — never hireable (DominantTalentTabDB: -1 = no talents)
             HenchmanCandidate c;
             c.guid  = guidLow;
             c.name  = mf[1].Get<std::string>();
@@ -1740,6 +1753,8 @@ namespace WowPsParty
             {
                 auto const it = ttal.find(t.guid);
                 std::unordered_set<uint32> const& known = (it != ttal.end()) ? it->second : noTalents;
+                if (isUntalentedDk(cls, known))
+                    continue;   // untalented DK — never hireable (would otherwise pass via the "tank" default role)
                 if (RoleFromTalents(cls, known, ClassDefaultRole(cls)) != "tank")
                     continue;
                 HenchmanCandidate c;
