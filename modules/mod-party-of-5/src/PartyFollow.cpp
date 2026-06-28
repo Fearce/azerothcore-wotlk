@@ -7045,7 +7045,17 @@ namespace WowPsParty
                             follower->GetName(), leader->GetName());
                 }
             }
-            else if (!leaderMounted && botMounted && !follower->IsInCombat() && !botCasting)
+            // Leader on foot but the bot still mounted -> get the bot off too. This is
+            // NOT gated on the bot being out of combat: a mounted bot that's also IN
+            // combat while the leader fights on foot is the post-ToC-joust deadlock —
+            // AssistTarget skips mounted bots ("transport fly-by") so the bot can never
+            // fight, and a fighting bot never drops combat on its own to dismount. The
+            // bot would stand frozen on its lingering joust-mount aura forever ("heroes
+            // just watch the bosses after I dismount off the horses"). Dismounting any
+            // time the leader is on foot is always correct — the bot re-mounts via the
+            // branch above the instant the leader re-mounts. Only !botCasting is kept,
+            // to avoid yanking a mount aura out from under an in-progress mount cast.
+            else if (!leaderMounted && botMounted && !botCasting)
             {
                 // Remove the mount AURA, not just call Dismount(). Dismount()
                 // clears the mounted flag but leaves SPELL_AURA_MOUNTED applied,
