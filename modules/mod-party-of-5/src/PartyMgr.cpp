@@ -2909,6 +2909,10 @@ namespace WowPsParty
         if (!requester || !requester->GetSession()) return;
         ObjectGuid const g = ObjectGuid::Create<HighGuid::Player>(henchGuid);
         if (!WowPsParty::IsHenchman(g)) return;   // only dismiss henchmen
+        // Record BEFORE RemoveFollower so the TellMaster guard still silences the
+        // framework's farewell whisper fired from LogoutPlayerBot below (by then the
+        // henchman registration is gone and IsHenchman would read false).
+        WowPsParty::MarkHenchmanRecentlyDismissed(g);
         // Clear its bags (keep ammo/reagents/shards) AND its saved loadout BEFORE
         // RemoveFollower drops the directive — both guards read that directive, so
         // it must still exist or they silently no-op.
@@ -2939,6 +2943,11 @@ namespace WowPsParty
     {
         if (!WowPsParty::IsHenchman(henchGuid)) return;
         ObjectGuid const leaderGuid = WowPsParty::GetLeaderFor(henchGuid);
+        // Record BEFORE RemoveFollower so the TellMaster guard still silences the
+        // framework's farewell whisper. Here the logout (and its goodbye) is deferred
+        // 200ms, well after the henchman registration is torn down — the memo's TTL
+        // covers that window.
+        WowPsParty::MarkHenchmanRecentlyDismissed(henchGuid);
         // Clear its bags (keep ammo/reagents/shards) BEFORE RemoveFollower drops
         // the directive — the clear's IsHenchman guard needs it. The clear is pure
         // bag-item destruction; only the LOGOUT below needs the 200ms defer.

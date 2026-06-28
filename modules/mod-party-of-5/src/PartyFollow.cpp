@@ -1083,6 +1083,37 @@ namespace WowPsParty
         return g_regrouping.count(henchGuid.GetCounter()) != 0;
     }
 
+    // Henchmen dismissed in the last few seconds. The mod-playerbots LOGOUT path
+    // fires a "Goodbye!"/"See you later!" farewell AFTER DismissHenchman* has
+    // already called RemoveFollower (clearing the henchman registration) — and in
+    // DismissHenchmanByGuid the logout is even deferred 200ms — so by the time the
+    // whisper goes out IsHenchman is false and the TellMaster silence guard misses
+    // it (goodbyes spam the leader on leave-party). The dismiss records the guid
+    // here BEFORE RemoveFollower so the guard still recognises it; the short TTL
+    // covers the deferred farewell without keeping the bot "henchman" for anything else.
+    static std::unordered_map<uint32, uint32> g_recentDismissMs;
+    static constexpr uint32 RECENT_DISMISS_TTL_MS = 5000;   // >> the 200ms deferred logout farewell
+
+    void MarkHenchmanRecentlyDismissed(ObjectGuid henchGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        // Opportunistic prune of stale entries (mirrors g_tankGather) so a guid that
+        // is dismissed but never re-hired can't linger forever.
+        uint32 const now = getMSTime();
+        for (auto it = g_recentDismissMs.begin(); it != g_recentDismissMs.end();)
+            it = (getMSTimeDiff(it->second, now) > RECENT_DISMISS_TTL_MS) ? g_recentDismissMs.erase(it) : std::next(it);
+        g_recentDismissMs[henchGuid.GetCounter()] = now;
+    }
+
+    bool WasHenchmanRecentlyDismissed(ObjectGuid henchGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_recentDismissMs.find(henchGuid.GetCounter());
+        if (it == g_recentDismissMs.end()) return false;
+        if (GetMSTimeDiffToNow(it->second) > RECENT_DISMISS_TTL_MS) { g_recentDismissMs.erase(it); return false; }
+        return true;
+    }
+
     ObjectGuid GetLeaderFor(ObjectGuid followerGuid)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -7671,6 +7702,15 @@ bool WowPsParty_BotHasActiveFollowDirective_Trampoline(ObjectGuid guid)
 bool WowPsParty_IsHenchman_Trampoline(ObjectGuid guid)
 {
     return WowPsParty::IsHenchman(guid);
+}
+
+// Trampoline: was this bot a henchman dismissed in the last few seconds? The
+// TellMaster silence guard also checks this so the framework's farewell whisper
+// ("Goodbye!"/"See you later!"), fired from the logout path after the henchman
+// registration is already torn down, stays suppressed.
+bool WowPsParty_WasHenchmanRecentlyDismissed_Trampoline(ObjectGuid guid)
+{
+    return WowPsParty::WasHenchmanRecentlyDismissed(guid);
 }
 
 // Trampoline: is this player AI-controlled (a hero alt OR a henchman)? Core's

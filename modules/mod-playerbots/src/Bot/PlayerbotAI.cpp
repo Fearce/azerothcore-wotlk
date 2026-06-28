@@ -3051,7 +3051,12 @@ bool PlayerbotAI::TellMasterNoFacing(std::string const text, PlayerbotSecurityLe
     // straight. Suppress here too. Heroes (enrolled alts) are NOT henchmen and may still
     // whisper their own leader; the WPSP addon protocol doesn't ride TellMaster.
     extern bool WowPsParty_IsHenchman_Trampoline(ObjectGuid guid);
-    if (bot && WowPsParty_IsHenchman_Trampoline(bot->GetGUID()))
+    // ...and for a few seconds AFTER dismiss: the framework's "Goodbye!"/"See you
+    // later!" farewell fires from the logout path once the henchman registration is
+    // already gone (IsHenchman would read false), so check the recent-dismiss memo too.
+    extern bool WowPsParty_WasHenchmanRecentlyDismissed_Trampoline(ObjectGuid guid);
+    if (bot && (WowPsParty_IsHenchman_Trampoline(bot->GetGUID())
+             || WowPsParty_WasHenchmanRecentlyDismissed_Trampoline(bot->GetGUID())))
         return false;
 
     Player* master = GetMaster();
