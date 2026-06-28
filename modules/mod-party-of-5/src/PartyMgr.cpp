@@ -946,11 +946,11 @@ namespace WowPsParty
                     add("party_lowest_health<30", "cast_party_lowest:Guardian Spirit", 92);  // Holy
                     add("party_lowest_health<30", "cast_party_lowest:Pain Suppression", 91); // Disc
 
-                    // AoE HEALS — only when 2+ members are hurt near each other AND one
+                    // AoE HEALS — only when 3+ members are hurt near each other AND one
                     // is meaningfully low. (Editor labels the cluster condition "Enemies
                     // 30y" but it counts INJURED ALLIES — display quirk, not the gate.)
-                    add("party_injured_clustered:30>1&party_lowest_health<80", "cast_party_lowest:Prayer of Healing", 85);
-                    add("party_injured_clustered:30>1&party_lowest_health<80", "cast_party_lowest:Circle of Healing", 84); // Holy talent, instant
+                    add("party_injured_clustered:30>2&party_lowest_health<80", "cast_party_lowest:Prayer of Healing", 85);
+                    add("party_injured_clustered:30>2&party_lowest_health<80", "cast_party_lowest:Circle of Healing", 84); // Holy talent, instant
 
                     // SINGLE-TARGET HEALS — PW:Shield (absorb; harmlessly skips a Weakened
                     // Soul target and falls through) -> Penance -> Flash Heal -> Binding
