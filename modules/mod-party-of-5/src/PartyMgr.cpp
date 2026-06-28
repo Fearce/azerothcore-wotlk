@@ -667,48 +667,57 @@ namespace WowPsParty
                 add("out_of_combat", "buff_self:Blessing of Kings", 85);
                 if (isHealer)
                 {
-                    // Holy paladin: a SINGLE-TARGET healer (no AoE heal in 3.3.5a).
-                    // Holy Light = big efficient slow heal (learnable from L1, so a
-                    // low paladin always heals); Flash of Light = fast top-off (L20);
-                    // Holy Shock = instant (Holy talent). Best-first; unlearned spells
-                    // fall through, so it works at every level and any spec depth.
+                    // Holy paladin — SINGLE-TARGET healer (no group AoE heal in 3.3.5a).
+                    // Same tiered structure as the priest: buffs/rez OOC, defensive CDs,
+                    // then heals by role (strong-CD -> fast -> efficient), proactive tank
+                    // absorbs, interrupt, cleanse, filler. Best-first within a tier;
+                    // unlearned spells fall through. Eat/Drink auto-append below — every
+                    // priority here stays >14 so they sink to the bottom.
 
-                    // EMERGENCY — fast heal, or the only heal a sub-20 pala has.
-                    add("party_lowest_health<40", "cast_party_lowest:Holy Shock", 98);     // instant (talent)
-                    add("party_lowest_health<40", "cast_party_lowest:Flash of Light", 97); // fast (L20)
-                    add("party_lowest_health<40", "cast_party_lowest:Holy Light", 96);     // L1 efficient fallback
-                    add("party_lowest_health<20", "cast_party_lowest:Lay on Hands", 95);   // full-heal panic CD
+                    // BUFFS — Kings party-wide (OOC), self auras/seal (persistent; skip
+                    // if already up, so the high priority never costs a heal).
+                    add("party_out_of_combat", "cast_party_missing:Blessing of Kings", 99); // falls through if unknown
+                    add("!is_mounted", "buff_self:Devotion Aura", 98);
+                    add("is_mounted",  "buff_self:Crusader Aura", 97);  // mount-speed aura (rotation else suppressed mounted)
+                    add("always", "buff_self:Seal of Wisdom", 96);
 
-                    add("party_has_dead", "rez_party:Redemption", 90);
-                    add("party_has_magic", "cure_party:Cleanse", 88);
-                    add("party_has_poison", "cure_party:Cleanse", 87);
-                    add("party_has_disease", "cure_party:Cleanse", 86);
+                    // RESURRECTION — out of combat.
+                    add("party_has_dead&party_out_of_combat", "rez_party:Redemption", 95);
 
-                    // MULTIPLE HURT — no AoE heal, so FAST single-target on the lowest;
-                    // never the slow Holy Light on the tank while the group is low.
-                    add("party_injured_clustered:30>1", "cast_party_lowest:Holy Shock", 80);
-                    add("party_injured_clustered:30>1", "cast_party_lowest:Flash of Light", 79);
-                    add("party_injured_clustered:30>1", "cast_party_lowest:Holy Light", 78);
+                    // DEFENSIVE COOLDOWNS.
+                    add("party_lowest_health<25", "cast_party_lowest:Lay on Hands", 92);  // full-heal panic
+                    add("self_health<40", "buff_self:Divine Protection", 91);            // self damage cut
 
-                    // Proactive (Holy talents; fall through if unspecced).
-                    add("always", "cast_role_missing:tank:Beacon of Light", 72);       // mirror heals to the tank
-                    add("tank_health<90", "cast_role_missing:tank:Sacred Shield", 70); // absorb on the tank
+                    // (No group AoE heal exists for a 3.3.5a paladin.)
 
-                    // SINGLE TARGET, SAFE (one hurt) — efficient slow Holy Light to
-                    // conserve mana; gated !cluster so it never fires while several are low.
-                    add("party_lowest_health<75&!party_injured_clustered:30>1", "cast_party_lowest:Holy Light", 60);
-                    add("party_lowest_health<85&self_mana>65", "cast_party_lowest:Flash of Light", 50);
+                    // STRONG HEAL — Holy Shock, instant, on CD, for <70.
+                    add("party_lowest_health<70", "cast_party_lowest:Holy Shock", 78);   // Holy talent
+                    // FAST HEAL — short cast, for <50.
+                    add("party_lowest_health<50", "cast_party_lowest:Flash of Light", 76);
+                    // EFFICIENT SLOW HEAL — for <70.
+                    add("party_lowest_health<70", "cast_party_lowest:Holy Light", 74);
 
-                    // Mana upkeep + auras.
-                    add("self_mana<30", "buff_self:Divine Plea", 46);   // +mana regen
-                    // Crusader Aura (mount speed) while mounted; Devotion on foot. !is_mounted
-                    // keeps the two from fighting (mutually exclusive). The mounted one still
-                    // applies even though the combat rotation is otherwise suppressed mounted.
-                    add("is_mounted",  "buff_self:Crusader Aura", 45);
-                    add("!is_mounted", "buff_self:Devotion Aura", 44);
-                    add("always", "buff_self:Seal of Wisdom", 42);
-                    // Filler at near-full mana — conserve for healing.
-                    add("self_mana>88&has_target", "cast:Judgement of Light", 30);
+                    // PROACTIVE — keep Beacon mirroring + Sacred Shield absorb on the tank
+                    // (Holy talents; fall through if unspecced).
+                    add("always", "cast_role_missing:tank:Beacon of Light", 68);
+                    add("tank_health<90", "cast_role_missing:tank:Sacred Shield", 66);
+
+                    // INTERRUPT a known-dangerous cast — Hammer of Justice stun (paladins
+                    // have no kick; available_stun resolves to HoJ, no-ops if unknown).
+                    add("target_casting:known_dangerous", "cast_scan:available_stun", 60);
+
+                    // MANA upkeep.
+                    add("self_mana<30", "buff_self:Divine Plea", 56);
+
+                    // CLEANSE (one spell removes magic / poison / disease).
+                    add("party_has_magic",   "cure_party:Cleanse", 52);
+                    add("party_has_poison",  "cure_party:Cleanse", 51);
+                    add("party_has_disease", "cure_party:Cleanse", 50);
+
+                    // FILLER — only at near-full mana (conserve for healing). Judgement
+                    // of Light is the reliable ranged filler (Exorcism only lands on
+                    // Undead/Demon, so it's omitted — it would no-op on most mobs).
+                    add("self_mana>90&has_target", "cast:Judgement of Light", 40);
                 }
                 else if (isTank)
                 {
@@ -1051,54 +1060,53 @@ namespace WowPsParty
             case 7: // Shaman
                 if (isHealer)
                 {
-                    // Resto shaman: Healing Wave = big efficient slow heal (L1, so a low
-                    // shaman always heals); Lesser Healing Wave = fast top-off (L20);
-                    // Chain Heal = the AoE chain (L40); Riptide = instant HoT (Resto
-                    // talent). Best-first; unlearned spells fall through at every level.
+                    // Resto shaman — same tiered structure as the priest. Best-first
+                    // within a tier; unlearned spells fall through at every level.
+                    // Eat/Drink auto-append below — every priority here stays >14.
 
-                    // EMERGENCY — instant/fast, or the only heal a sub-20 shaman has.
-                    add("party_lowest_health<40", "cast_party_lowest:Riptide", 98);             // instant HoT (talent)
-                    add("party_lowest_health<40", "cast_party_lowest:Lesser Healing Wave", 97); // fast (L20)
-                    add("party_lowest_health<40", "cast_party_lowest:Healing Wave", 96);        // L1 efficient fallback
+                    // BUFFS — weapon imbue + mana/dmg shield (OOC), buff totem SET anytime.
+                    add("out_of_combat", "buff_self:Earthliving Weapon", 99);   // skip-if-imbued, so high prio is free
+                    add("party_has_tank",  "buff_self:Water Shield", 98);       // mana sustain behind a tank
+                    add("!party_has_tank", "buff_self:Lightning Shield", 97);   // dmg shield with no tank
+                    // Buff totem SET in one off-GCD tick (Call-of-the-Elements emulation):
+                    // earth/water/air at once whenever any is gone or out-run, incl. during
+                    // a multi-pull so the aura follows a party that moved up.
+                    add("totem_set_stale:Stoneskin Totem,Mana Spring Totem,Wrath of Air Totem",
+                        "cast_totem_set:Stoneskin Totem,Mana Spring Totem,Wrath of Air Totem", 96);
 
-                    add("party_has_dead", "rez_party:Ancestral Spirit", 90);
-                    add("party_has_poison", "cure_party:Cure Toxins", 88);
-                    add("party_has_disease", "cure_party:Cure Toxins", 87);
-                    add("party_has_curse", "cure_party:Cleanse Spirit", 86);
+                    // RESURRECTION — out of combat.
+                    add("party_has_dead&party_out_of_combat", "rez_party:Ancestral Spirit", 95);
 
-                    // MULTIPLE HURT — Chain Heal (L40) jumps between them; below 40 / when
-                    // it can't help, fast single-target on the lowest (never the slow
-                    // Healing Wave on the tank while several are low).
-                    add("party_injured_clustered:30>1", "cast_party_lowest:Chain Heal", 80);          // AoE chain (L40)
-                    add("party_injured_clustered:30>1", "cast_party_lowest:Riptide", 79);
-                    add("party_injured_clustered:30>1", "cast_party_lowest:Lesser Healing Wave", 78);
-                    add("party_injured_clustered:30>1", "cast_party_lowest:Healing Wave", 77);
+                    // DEFENSIVE / EMERGENCY COOLDOWN — Nature's Swiftness makes the next
+                    // heal instant (talent); the big Healing Wave below then lands instantly.
+                    add("party_lowest_health<30", "buff_self:Nature's Swiftness", 92);
 
-                    // Proactive.
-                    add("always", "cast_role_missing:tank:Earth Shield", 72);            // absorb-on-hit on the tank (talent)
-                    add("party_lowest_health<85", "cast_party_lowest_hot:Riptide", 68);  // instant HoT top-up
+                    // AoE HEAL — Chain Heal when 3+ are hurt near each other (above singles).
+                    add("party_injured_clustered:30>2&party_lowest_health<80", "cast_party_lowest:Chain Heal", 85); // jumps between them (L40)
 
-                    // SINGLE TARGET, SAFE (one hurt) — efficient slow Healing Wave to
-                    // conserve mana; gated !cluster so it never fires while several are low.
-                    add("party_lowest_health<75&!party_injured_clustered:30>1", "cast_party_lowest:Healing Wave", 60);
-                    add("party_lowest_health<85&self_mana>65", "cast_party_lowest:Lesser Healing Wave", 50);
+                    // STRONG HEAL — Riptide, instant HoT+heal, on CD, for <70.
+                    add("party_lowest_health<70", "cast_party_lowest:Riptide", 78);
+                    // FAST HEAL — short cast, for <50.
+                    add("party_lowest_health<50", "cast_party_lowest:Lesser Healing Wave", 76);
+                    // EFFICIENT SLOW HEAL — for <70.
+                    add("party_lowest_health<70", "cast_party_lowest:Healing Wave", 74);
 
-                    // Shield: Water (mana sustain) behind a tank; Lightning Shield only when
-                    // there's no tank holding aggro (Kevin: ranged shamans prefer water with a tank).
-                    add("party_has_tank",  "buff_self:Water Shield", 44);
-                    add("!party_has_tank", "buff_self:Lightning Shield", 43);
-                    // Weapon imbue — OUT OF COMBAT, high prio (buff_self detects the
-                    // weapon's temp-enchant and skips once it's already imbued, so the
-                    // high priority is free). Resto -> Earthliving Weapon.
-                    add("out_of_combat", "buff_self:Earthliving Weapon", 85);
-                    // Buff totems dropped as a SET in one off-GCD tick (Call-of-the-Elements
-                    // emulation): water/earth/air at once whenever any is gone or out-run,
-                    // incl. DURING a multi-pull (party_in_combat), so the aura keeps reaching
-                    // a party that moved up without the resto burning a GCD per totem.
-                    add("party_in_combat&totem_set_stale:Stoneskin Totem,Mana Spring Totem,Wrath of Air Totem",
-                        "cast_totem_set:Stoneskin Totem,Mana Spring Totem,Wrath of Air Totem", 40);
-                    add("self_mana>88&target_missing_aura:Flame Shock", "cast:Flame Shock", 34);
-                    add("self_mana>88&has_target", "cast:Lightning Bolt", 30);
+                    // HoT — keep Riptide rolling on the lowest <90 missing it.
+                    add("party_lowest_health<90", "cast_party_lowest_hot:Riptide", 66);
+                    // PROACTIVE — Earth Shield absorb-on-hit on the tank (talent).
+                    add("always", "cast_role_missing:tank:Earth Shield", 64);
+
+                    // INTERRUPT a known-dangerous cast — Wind Shear.
+                    add("target_casting:known_dangerous", "cast_scan:available_interrupt", 60);
+
+                    // CLEANSE.
+                    add("party_has_poison",  "cure_party:Cure Toxins", 52);
+                    add("party_has_disease", "cure_party:Cure Toxins", 51);
+                    add("party_has_curse",   "cure_party:Cleanse Spirit", 50);
+
+                    // FILLER — only at near-full mana (conserve for healing).
+                    add("self_mana>90&target_missing_aura:Flame Shock", "cast:Flame Shock", 40);
+                    add("self_mana>90&has_target", "cast:Lightning Bolt", 38);
                 }
                 else   // DPS — Elemental(0) / Enhancement(1), baked per spec.
                 {
@@ -1379,44 +1387,47 @@ namespace WowPsParty
             case 11: // Druid
                 if (isHealer)
                 {
-                    // Resto druid: Healing Touch = big slow heal (L1, low druids always
-                    // heal); Nourish = fast efficient filler (L80); Regrowth = fast
-                    // direct+HoT (L12); Rejuvenation = HoT (L4); Wild Growth = AoE HoT
-                    // (Resto talent); Swiftmend = instant (talent, consumes a HoT).
-                    // Best-first; unlearned spells fall through at every level.
+                    // Resto druid — HoT-centric, same tiered structure as the priest.
+                    // Best-first within a tier; unlearned spells fall through at every
+                    // level. Eat/Drink auto-append below — every priority here stays >14.
 
-                    // EMERGENCY — instant/fast, or the only big heal a low druid has.
-                    add("party_lowest_health<40", "cast_party_lowest:Swiftmend", 98);     // instant (talent)
-                    add("party_lowest_health<40", "cast_party_lowest:Regrowth", 97);      // fast direct+HoT (L12)
-                    add("party_lowest_health<40", "cast_party_lowest:Nourish", 96);       // fast efficient (L80)
-                    add("party_lowest_health<40", "cast_party_lowest:Healing Touch", 95); // L1 big-heal fallback
+                    // BUFFS — out of combat.
+                    add("party_out_of_combat", "cast_party_missing:Mark of the Wild", 99);
 
-                    add("party_has_dead", "rez_party:Revive", 90);
-                    add("party_has_curse", "cure_party:Remove Curse", 88);
-                    add("party_has_poison", "cure_party:Abolish Poison", 87);
+                    // RESURRECTION — out of combat.
+                    add("party_has_dead&party_out_of_combat", "rez_party:Revive", 95);
 
-                    // MULTIPLE HURT — Wild Growth (AoE HoT talent) / Tranquility (L30
-                    // channel) / blanket Rejuvenation; else fast single-target. Never
-                    // the slow Healing Touch on the tank while several are low.
-                    add("party_injured_clustered:30>1", "cast_party_lowest:Wild Growth", 80);      // AoE HoT (talent)
-                    add("party_injured_clustered:30>1", "cast_party_lowest_hot:Rejuvenation", 79); // blanket HoT
-                    add("party_injured_clustered:30>1", "cast_self:Tranquility", 78);              // AoE channel (L30)
-                    add("party_injured_clustered:30>1", "cast_party_lowest:Regrowth", 77);         // fast single fallback
-                    add("party_injured_clustered:30>1", "cast_party_lowest:Healing Touch", 76);    // pre-12 fallback
+                    // DEFENSIVE COOLDOWNS.
+                    add("party_lowest_health<30", "buff_self:Nature's Swiftness", 92);  // next heal instant (talent)
+                    add("self_health<40", "buff_self:Barkskin", 91);                    // self damage cut
 
-                    // Proactive HoTs (cheap, efficient — keep them rolling).
-                    add("party_lowest_health<90", "cast_party_lowest_hot:Rejuvenation", 70);  // HoT (L4)
-                    add("party_lowest_health<80", "cast_party_lowest_hot:Regrowth", 66);      // HoT+heal (L12)
+                    // AoE HEALS — when 3+ are hurt near each other (above single heals).
+                    add("party_injured_clustered:30>2&party_lowest_health<80", "cast_party_lowest:Wild Growth", 85); // instant AoE HoT (talent)
+                    add("party_injured_clustered:30>2&party_lowest_health<80", "cast_self:Tranquility", 84);         // AoE channel (L30, big CD)
 
-                    // SINGLE TARGET, SAFE (one hurt) — efficient heal to conserve mana:
-                    // Nourish at 80, the slow Healing Touch below it. Gated !cluster.
-                    add("party_lowest_health<75&!party_injured_clustered:30>1", "cast_party_lowest:Nourish", 61);       // fast efficient (L80)
-                    add("party_lowest_health<75&!party_injured_clustered:30>1", "cast_party_lowest:Healing Touch", 60); // big slow (L1)
+                    // STRONG HEAL — Swiftmend, instant (consumes a HoT), on CD, for <70.
+                    add("party_lowest_health<70", "cast_party_lowest:Swiftmend", 78);  // talent
+                    // FAST HEAL — short cast, for <50: Nourish (L80) -> Regrowth (L12).
+                    add("party_lowest_health<50", "cast_party_lowest:Nourish", 76);
+                    add("party_lowest_health<50", "cast_party_lowest:Regrowth", 75);
+                    // EFFICIENT SLOW HEAL — for <70.
+                    add("party_lowest_health<70", "cast_party_lowest:Healing Touch", 74);
 
-                    // Buff + filler.
-                    add("always", "cast_party_missing:Mark of the Wild", 44);
-                    add("self_mana>88&target_missing_aura:Moonfire", "cast:Moonfire", 32);
-                    add("self_mana>88&has_target", "cast:Wrath", 28);
+                    // HoTs — low priority, kept rolling: Rejuv <90, Regrowth-HoT <80,
+                    // Lifebloom maintained on the tank.
+                    add("party_lowest_health<90", "cast_party_lowest_hot:Rejuvenation", 66);
+                    add("party_lowest_health<80", "cast_party_lowest_hot:Regrowth", 64);
+                    add("always", "cast_role_missing:tank:Lifebloom", 62);  // stacking HoT on the tank
+
+                    // (No caster-form interrupt for a resto druid.)
+
+                    // CLEANSE.
+                    add("party_has_curse",  "cure_party:Remove Curse", 52);
+                    add("party_has_poison", "cure_party:Abolish Poison", 51);
+
+                    // FILLER — only at near-full mana (conserve for healing).
+                    add("self_mana>90&target_missing_aura:Moonfire", "cast:Moonfire", 40);
+                    add("self_mana>90&has_target", "cast:Wrath", 38);
                 }
                 else if (isTank)
                 {
