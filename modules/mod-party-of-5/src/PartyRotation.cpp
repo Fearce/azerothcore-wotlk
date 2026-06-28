@@ -4709,7 +4709,7 @@ namespace WowPsParty
                 || verb == "interrupt_caster_melee"   // travels to a far caster
                 || verb == "charge"                   // leaps to a far enemy (away from the leader)
                 || verb == "reposition_random" || verb == "walk_away_from_source"
-                || verb == "dodge_frontals"))
+                || verb == "dodge_frontals"   || verb == "face_away"))
             return false;
 
         if (verb == "cast" || verb == "cast_self")
@@ -6047,6 +6047,63 @@ namespace WowPsParty
             return true;
         }
 
+        // "face_away[:<name>]" — turn the bot's BACK to its target (or a NAMED enemy)
+        // WITHOUT moving. For gaze / frontal-blind mechanics you avoid by NOT looking at
+        // the caster: Eadric the Pure's Radiance (Trial of the Champion) blinds everyone
+        // facing him, so script "target_name:Eadric the Pure&target_casting:Radiance |
+        // face_away" to turn around the instant Radiance goes off. Bare form faces away
+        // from the bot's victim (nearest engaged enemy for a victimless healer);
+        // "face_away:Eadric the Pure" faces away from THAT named enemy even while the bot
+        // is nuking an add. Pure orientation — no spell, no step. Holds the turn (and
+        // AssistTarget off the feet) while the rule matches; the moment the cast ends the
+        // rule stops matching, the hold lapses, and the bot re-engages normally. Returns
+        // true so lower rules and our own casts (which re-face the target) don't run and
+        // spin us back around mid-Radiance. It IS a reactive-move verb (see below) so it
+        // also fires mid-cast — turning in place never breaks a cast.
+        if (verb == "face_away")
+        {
+            Unit* src = nullptr;
+            if (!arg.empty())
+            {
+                // Named source: find the boss by name among nearby hostiles (any unfriendly
+                // unit in range, not just party-engaged ones), so we turn from Eadric even
+                // when our victim is an add. Closest match wins.
+                std::string const want = Lower(arg);
+                std::list<Unit*> hostiles;
+                GatherHostilesAround(bot, 60.0f, hostiles);
+                float best = 0.0f;
+                for (Unit* u : hostiles)
+                    if (u && u->IsAlive() && Lower(u->GetName()) == want)
+                    {
+                        float const d = bot->GetDistance(u);
+                        if (!src || d < best) { src = u; best = d; }
+                    }
+            }
+            else
+            {
+                src = bot->GetVictim();
+                if (!src || !src->IsAlive()) src = NearestEngagedEnemy(bot, 60.0f);
+            }
+            if (!src || !src->IsAlive()) return false;   // nobody to turn from — let a lower rule act
+
+            // Stop an active chase/follow so it can't drag us around the source (and
+            // re-face it) while we hold our back to it — the same guard move_out_of_los
+            // uses. Leave an idle/point generator be so the hold doesn't churn per tick.
+            MovementGeneratorType const mg =
+                bot->GetMotionMaster()->GetCurrentMovementGeneratorType();
+            if (mg != IDLE_MOTION_TYPE && mg != POINT_MOTION_TYPE)
+            {
+                bot->StopMoving();
+                bot->GetMotionMaster()->Clear();
+            }
+            WowPsParty::HoldFollower(bot->GetGUID(), 1500);
+            // src->GetAngle(bot) is the bearing FROM the source TO us — adopting it as our
+            // orientation puts our back squarely to the source. Re-assert every tick so a
+            // stray melee swing / movement can't creep us back to facing before the hit.
+            bot->SetFacingTo(src->GetAngle(bot));
+            return true;
+        }
+
         // "wand" — the actual wand shooting (spell 5019 "Shoot", an auto-repeat) is
         // maintained as a BACKGROUND auto-attack in EnsureRangedAutoAttack so it's
         // never toggled and never counts as casting. This rule just reports whether
@@ -6882,7 +6939,8 @@ namespace WowPsParty
         return verb == "reposition_random"
             || verb == "walk_away_from_source"
             || verb == "move_out_of_los"
-            || verb == "dodge_frontals";   // get out of the cone NOW, even mid-cast
+            || verb == "dodge_frontals"   // get out of the cone NOW, even mid-cast
+            || verb == "face_away";       // turn from the gaze NOW, even mid-cast (turning never breaks a cast)
     }
 
     // Verbs that deal damage to / pull an ENEMY (generate threat). Used to hold a
