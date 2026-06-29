@@ -7566,19 +7566,6 @@ namespace WowPsParty
                             && tank->IsAlive() && tank->GetMapId() == follower->GetMapId())
                             anchor = tank;
 
-                // Restore natural run speed (drop any catch-up boost) — used on every
-                // path where the bot is NOT actively chasing its formation slot, and on
-                // the combat/held bail below so a boost never bleeds into combat. Recomputes
-                // from auras rather than forcing 1.0 so a (rare) speed aura is respected.
-                auto clearCatchup = [&]()
-                {
-                    if (h.catchupApplied != 0.0f)
-                    {
-                        follower->UpdateSpeed(MOVE_RUN, true);
-                        h.catchupApplied = 0.0f;
-                    }
-                };
-
                 // Live guard re-check — bail (yield to whoever owns it) the instant
                 // this bot is anything but a calm open-follower.
                 if (!follower->IsAlive()
@@ -7590,40 +7577,11 @@ namespace WowPsParty
                     || IsTankLeading(d.followerGuid)
                     || BotIsApproachingGatherNode(gLow)   // mining/herbing — don't yank it off the node
                     || AnyPartyMemberEngaged(d.followerGuid, follower))
-                { clearCatchup(); h.wandering = false; continue; }
+                { h.wandering = false; continue; }
 
                 MovementGeneratorType const mg =
                     follower->GetMotionMaster()->GetCurrentMovementGeneratorType();
                 bool const leaderMoving = anchor->isMoving();
-
-                // Catch-up speed: only a henchman TANK at natural run speed (unmounted,
-                // no speed-altering aura of its own so the base rate is a clean 1.0) and
-                // only while the anchor is actually moving. Scale by how far the bot has
-                // dropped BEHIND its slot (distance-to-anchor minus the slot distance),
-                // 0 at the slot up to +CATCHUP_MAX_BOOST at CATCHUP_FULL_DIST yards past it.
-                bool const catchupEligible =
-                    IsHenchman(d.followerGuid)
-                    && RoleForGuid(d.followerGuid) == "tank"
-                    && !follower->IsMounted()
-                    && !follower->HasAuraType(SPELL_AURA_MOD_INCREASE_SPEED)
-                    && !follower->HasAuraType(SPELL_AURA_MOD_DECREASE_SPEED)
-                    && !follower->HasAuraType(SPELL_AURA_MOD_SPEED_ALWAYS)
-                    && !follower->HasAuraType(SPELL_AURA_MOD_SPEED_NOT_STACK);
-                float desiredBoost = 0.0f;
-                if (catchupEligible && leaderMoving)
-                {
-                    float const behind = follower->GetExactDist2d(
-                        anchor->GetPositionX(), anchor->GetPositionY()) - h.slotDist;
-                    if (behind > 0.0f)
-                        desiredBoost = std::min(behind / CATCHUP_FULL_DIST, 1.0f) * CATCHUP_MAX_BOOST;
-                }
-                if (desiredBoost <= 0.001f)
-                    clearCatchup();
-                else if (std::fabs(desiredBoost - h.catchupApplied) > 0.02f)   // quantize: no speed-packet churn
-                {
-                    follower->SetSpeed(MOVE_RUN, 1.0f + desiredBoost, true);
-                    h.catchupApplied = desiredBoost;
-                }
 
                 // Re-assert the formation slot ONLY when it isn't already in
                 // effect (gen isn't FOLLOW, or the jittered slot drifted) — so
@@ -7751,6 +7709,87 @@ namespace WowPsParty
             }
         }
 
+        // Out-of-combat catch-up speed for henchman TANKS, across EVERY movement mode
+        // they use — the rear-formation MoveFollow (open world), the lead-ahead MoveFollow
+        // (dungeon), and the recorded-path MovePoint replay (TankFollowPath). All three move
+        // the bot at its natural run speed, so a single SetSpeed boost covers them; doing it
+        // here (not in HumanizeTick) is deliberate: a dungeon lead tank is explicitly made
+        // humanize-INELIGIBLE, so the formation tick never sees it. A tank glued to the
+        // leader falls behind on turns and can't keep pace with a sped-up leader (e.g. a Ret
+        // paladin's +15%). Scale run speed by how far the bot trails its intended distance
+        // from the leader — the lead distance for a dungeon lead tank, else its formation
+        // slot — 0 at that distance up to +CATCHUP_MAX_BOOST at CATCHUP_FULL_DIST yards past
+        // it. Touches only speed, never the movement generator, so it can't fight whoever
+        // owns the bot's feet. Runs at the 250ms humanize cadence.
+        void TickTankCatchupSpeed()
+        {
+            std::vector<Directive> snapshot;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                snapshot = g_directives;
+            }
+
+            for (Directive const& d : snapshot)
+            {
+                uint32 const gLow = d.followerGuid.GetCounter();
+                Player* follower = ObjectAccessor::FindConnectedPlayer(d.followerGuid);
+                Player* leader   = ObjectAccessor::FindConnectedPlayer(d.leaderGuid);
+                if (!follower || !leader || follower == leader
+                    || !follower->IsInWorld() || !leader->IsInWorld())
+                    continue;
+
+                FollowHumanize& h = g_humanize[gLow];
+                auto clearCatchup = [&]()
+                {
+                    if (h.catchupApplied != 0.0f)
+                    {
+                        follower->UpdateSpeed(MOVE_RUN, true);   // recompute natural speed from auras
+                        h.catchupApplied = 0.0f;
+                    }
+                };
+
+                // Henchman tank only (alt tanks can follow by relaxing IsHenchman), party
+                // and bot both out of combat, at a clean natural run speed (unmounted, no
+                // speed-altering aura of its own so the base rate is a true 1.0).
+                bool const eligible =
+                    IsHenchman(d.followerGuid)
+                    && RoleForGuid(d.followerGuid) == "tank"
+                    && follower->IsAlive()
+                    && follower->GetMapId() == leader->GetMapId()
+                    && !follower->IsInCombat() && !follower->GetVictim()
+                    && !leader->IsInCombat()
+                    && !follower->IsMounted()
+                    && !follower->IsBeingTeleported()
+                    && !AnyPartyMemberEngaged(d.followerGuid, follower)
+                    && !follower->HasAuraType(SPELL_AURA_MOD_INCREASE_SPEED)
+                    && !follower->HasAuraType(SPELL_AURA_MOD_DECREASE_SPEED)
+                    && !follower->HasAuraType(SPELL_AURA_MOD_SPEED_ALWAYS)
+                    && !follower->HasAuraType(SPELL_AURA_MOD_SPEED_NOT_STACK);
+                if (!eligible || !leader->isMoving()) { clearCatchup(); continue; }
+
+                // Intended distance from the leader: the lead distance for a dungeon lead
+                // tank (it sits AHEAD), else its formation slot distance. Boost on how far
+                // PAST that the bot has fallen.
+                bool const inDungeon = leader->GetMap() && leader->GetMap()->IsDungeon();
+                float const refDist  = (inDungeon && IsLeadTank(d.followerGuid))
+                                     ? float(WowPsParty::BotLeadDistance(d.followerGuid))
+                                     : h.slotDist;
+                float const behind = follower->GetExactDist2d(
+                    leader->GetPositionX(), leader->GetPositionY()) - refDist;
+                float const desiredBoost = behind > 0.0f
+                    ? std::min(behind / CATCHUP_FULL_DIST, 1.0f) * CATCHUP_MAX_BOOST
+                    : 0.0f;
+
+                if (desiredBoost <= 0.001f)
+                    clearCatchup();
+                else if (std::fabs(desiredBoost - h.catchupApplied) > 0.02f)   // quantize: no speed-packet churn
+                {
+                    follower->SetSpeed(MOVE_RUN, 1.0f + desiredBoost, true);
+                    h.catchupApplied = desiredBoost;
+                }
+            }
+        }
+
     } // anonymous namespace
 
     // WorldScript OnUpdate hook -- ticks ~every 1s, applies all directives.
@@ -7777,6 +7816,7 @@ namespace WowPsParty
             {
                 _humanizeAccum = 0;
                 HumanizeTick();
+                TickTankCatchupSpeed();   // catch-up speed for tanks across all movement modes
             }
 
             _accum += diff;
