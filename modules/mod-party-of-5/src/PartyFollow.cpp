@@ -6572,6 +6572,7 @@ namespace WowPsParty
             bool   wandering      = false;
             uint32 wanderUntilMs  = 0;
             uint32 nextFidgetMs   = 0;
+            float  catchupApplied = 0.0f;    // current out-of-combat catch-up speed boost (0 = none)
         };
         // World-thread only (the follow WorldScript OnUpdate drives both the
         // 1 Hz pass and the fast tick), so no mutex is needed.
@@ -6579,6 +6580,16 @@ namespace WowPsParty
 
         static constexpr uint32 HUMANIZE_INTERVAL_MS = 250;
         static constexpr uint32 WANDER_POINT_ID       = 0x7A9D;  // distinct MovePoint id
+
+        // Out-of-combat "catch-up" speed for a formation-following bot tank: a tank
+        // glued to the leader's facing falls behind on turns and can't keep pace with
+        // a sped-up leader (e.g. a Ret paladin's +15% Pursuit of Justice). Scale its
+        // run speed linearly with how far it has dropped BEHIND its formation slot,
+        // up to a hard +20% cap reached at CATCHUP_FULL_DIST yards past the slot.
+        // Henchmen only for now (alt tanks may follow later); removed the instant
+        // combat starts (live-guard clear + the OnPlayerEnterCombat hook).
+        static constexpr float CATCHUP_MAX_BOOST = 0.20f;   // +20% ceiling
+        static constexpr float CATCHUP_FULL_DIST = 16.0f;   // yards past the slot for full boost
 
         // Stable per-bot offset in [-amp, amp], constant across ticks (a bot's
         // "personality" — so two of the same class don't sit on one bearing).
@@ -7555,6 +7566,19 @@ namespace WowPsParty
                             && tank->IsAlive() && tank->GetMapId() == follower->GetMapId())
                             anchor = tank;
 
+                // Restore natural run speed (drop any catch-up boost) — used on every
+                // path where the bot is NOT actively chasing its formation slot, and on
+                // the combat/held bail below so a boost never bleeds into combat. Recomputes
+                // from auras rather than forcing 1.0 so a (rare) speed aura is respected.
+                auto clearCatchup = [&]()
+                {
+                    if (h.catchupApplied != 0.0f)
+                    {
+                        follower->UpdateSpeed(MOVE_RUN, true);
+                        h.catchupApplied = 0.0f;
+                    }
+                };
+
                 // Live guard re-check — bail (yield to whoever owns it) the instant
                 // this bot is anything but a calm open-follower.
                 if (!follower->IsAlive()
@@ -7566,11 +7590,40 @@ namespace WowPsParty
                     || IsTankLeading(d.followerGuid)
                     || BotIsApproachingGatherNode(gLow)   // mining/herbing — don't yank it off the node
                     || AnyPartyMemberEngaged(d.followerGuid, follower))
-                { h.wandering = false; continue; }
+                { clearCatchup(); h.wandering = false; continue; }
 
                 MovementGeneratorType const mg =
                     follower->GetMotionMaster()->GetCurrentMovementGeneratorType();
                 bool const leaderMoving = anchor->isMoving();
+
+                // Catch-up speed: only a henchman TANK at natural run speed (unmounted,
+                // no speed-altering aura of its own so the base rate is a clean 1.0) and
+                // only while the anchor is actually moving. Scale by how far the bot has
+                // dropped BEHIND its slot (distance-to-anchor minus the slot distance),
+                // 0 at the slot up to +CATCHUP_MAX_BOOST at CATCHUP_FULL_DIST yards past it.
+                bool const catchupEligible =
+                    IsHenchman(d.followerGuid)
+                    && RoleForGuid(d.followerGuid) == "tank"
+                    && !follower->IsMounted()
+                    && !follower->HasAuraType(SPELL_AURA_MOD_INCREASE_SPEED)
+                    && !follower->HasAuraType(SPELL_AURA_MOD_DECREASE_SPEED)
+                    && !follower->HasAuraType(SPELL_AURA_MOD_SPEED_ALWAYS)
+                    && !follower->HasAuraType(SPELL_AURA_MOD_SPEED_NOT_STACK);
+                float desiredBoost = 0.0f;
+                if (catchupEligible && leaderMoving)
+                {
+                    float const behind = follower->GetExactDist2d(
+                        anchor->GetPositionX(), anchor->GetPositionY()) - h.slotDist;
+                    if (behind > 0.0f)
+                        desiredBoost = std::min(behind / CATCHUP_FULL_DIST, 1.0f) * CATCHUP_MAX_BOOST;
+                }
+                if (desiredBoost <= 0.001f)
+                    clearCatchup();
+                else if (std::fabs(desiredBoost - h.catchupApplied) > 0.02f)   // quantize: no speed-packet churn
+                {
+                    follower->SetSpeed(MOVE_RUN, 1.0f + desiredBoost, true);
+                    h.catchupApplied = desiredBoost;
+                }
 
                 // Re-assert the formation slot ONLY when it isn't already in
                 // effect (gen isn't FOLLOW, or the jittered slot drifted) — so
@@ -7806,12 +7859,34 @@ namespace WowPsParty
         // the module loader at server startup (proper AC script-init point).
         // Kept as a stable public no-op so callers don't need to be removed.
     }
+
+    // Instantly drop the out-of-combat catch-up speed boost the moment a henchman
+    // enters combat — the 250 ms humanize tick also clears it (and zeroes the
+    // bookkeeping flag) on its next pass, but this makes the removal frame-instant
+    // as the user requires. Resets the player's own MOVE_RUN speed directly rather
+    // than touching g_humanize, since this hook can fire on a map-worker thread
+    // (MapUpdate.Threads > 1) and g_humanize is world-thread-only; UpdateSpeed is a
+    // no-op when the speed is already natural, so a non-boosted bot pays nothing.
+    class PartyFollowCombatScript : public PlayerScript
+    {
+    public:
+        PartyFollowCombatScript() : PlayerScript("PartyFollowCombatScript", {
+            PLAYERHOOK_ON_PLAYER_ENTER_COMBAT
+        }) { }
+
+        void OnPlayerEnterCombat(Player* player, Unit* /*enemy*/) override
+        {
+            if (player && WowPsParty::IsHenchman(player->GetGUID()))
+                player->UpdateSpeed(MOVE_RUN, true);
+        }
+    };
 }
 
 // Module-loader entry point; called from party_of_5_loader.cpp at startup.
 void AddPartyFollowScripts()
 {
     new WowPsParty::PartyFollowWorldScript();
+    new WowPsParty::PartyFollowCombatScript();
     LOG_INFO("module", "[WowPsParty Follow] ticker registered (interval=1000ms)");
 }
 
