@@ -2427,12 +2427,14 @@ namespace WowPsParty
         PlayerbotFactory factory(hen, target);
         factory.Randomize(false);
 
+        bool talentsChanged = false;
         // Restore the captured tree if the re-roll moved off it.
         if (intendedTab >= 0 && DominantTalentTabLive(hen) != intendedTab)
         {
             int const specNo = int(sPlayerbotAIConfig.randomClassSpecIndex[cls][uint32(intendedTab)]);
             PlayerbotFactory::InitTalentsBySpecNo(hen, specNo, /*reset=*/true);
             hen->SendTalentsInfoData(false);
+            talentsChanged = true;
         }
         // A tank/healer must actually BE that spec — force the role's canonical tree
         // (DPS returns -1 → no force, any DPS spec is fine).
@@ -2444,8 +2446,16 @@ namespace WowPsParty
                 int const specNo = int(sPlayerbotAIConfig.randomClassSpecIndex[cls][uint32(wantTab)]);
                 PlayerbotFactory::InitTalentsBySpecNo(hen, specNo, /*reset=*/true);
                 hen->SendTalentsInfoData(false);
+                talentsChanged = true;
             }
         }
+        // Randomize itemized gear for the RANDOM tree it rolled; once we move the
+        // talents off that tree (restore/force above) the gear no longer matches the
+        // spec — the factory weighs a Ret 2H ×0.05 for Protection but ×1 for Ret, so a
+        // prot tank re-specced after a Ret re-roll is left in a Ret 2H + Ret plate.
+        // Re-roll equipment against the FINAL talents so the loadout matches the spec.
+        if (talentsChanged)
+            PlayerbotFactory(hen, target).InitEquipment(false, false);
         hen->SaveToDB(false, false);
 
         // Re-derive the role from the final talents and rebuild the role-default
@@ -2708,6 +2718,10 @@ namespace WowPsParty
                         int const specNo = int(sPlayerbotAIConfig.randomClassSpecIndex[hen->getClass()][uint32(intendedTab)]);
                         PlayerbotFactory::InitTalentsBySpecNo(hen, specNo, /*reset=*/true);
                         hen->SendTalentsInfoData(false);
+                        // Randomize itemized gear for the tree it rolled, not the one we
+                        // just restored — re-roll equipment so the gear matches the spec
+                        // (else a Ret re-roll leaves a restored Prot tank in a Ret 2H).
+                        PlayerbotFactory(hen, target).InitEquipment(false, false);
                         LOG_INFO("module",
                             "[WowPsParty Henchmen] re-leveled hench guid={} restored picked spec (tree {})",
                             henchGuid.GetCounter(), intendedTab);
