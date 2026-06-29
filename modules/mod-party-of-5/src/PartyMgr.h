@@ -87,6 +87,7 @@ namespace WowPsParty
     void SetAccountXpRate(uint32 account, bool quest, uint32 rate);
     void AccountSettingsRefreshFromDB(uint32 account);
     void EnsureSettingsTable();   // CREATE TABLE IF NOT EXISTS — call on startup
+    void EnsureRosterOrderColumn();  // ADD characters.roster_order if missing — call on startup
 
     // ----- Henchmen --------------------------------------------------------
     // GW1-style hireable bot companions, drawn from the random-bot pool. They

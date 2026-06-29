@@ -120,7 +120,12 @@ namespace
             "LEFT JOIN `account_party` ap ON ap.guid = c.guid AND ap.account = c.account "
             "LEFT JOIN `party_loadout` pl ON pl.guid = c.guid "
             "WHERE c.account = {} AND (c.deleteInfos_Account IS NULL OR c.deleteInfos_Account = 0) "
-            "ORDER BY COALESCE(ap.slot, 255), c.name",
+            // The player's hand-sorted roster order wins; characters not yet placed
+            // (roster_order NULL) fall to the bottom in the legacy enrolled-first /
+            // name order, which also seeds the very first sort before any move.
+            // KEEP THIS SORT IDENTICAL to the MGMT_MOVE read, or arrows swap the wrong row.
+            "ORDER BY (c.roster_order IS NULL) ASC, c.roster_order ASC, "
+            "         COALESCE(ap.slot, 255) ASC, c.name ASC",
             accountId);
 
         std::ostringstream out;
@@ -5372,66 +5377,62 @@ public:
         }
         else if (command == "MGMT_MOVE")
         {
-            // MGMT_MOVE\t<slot>\t<up|down> — reorder the enrolled party. Swaps the
-            // member at <slot> with its nearest occupied neighbour in that direction
-            // ("up" = toward slot 0 / letter A). Persists immediately, so every move
-            // is auto-saved. Slots can be sparse (a kick leaves a gap), so we walk to
-            // the next occupied slot rather than assuming slot±1.
+            // MGMT_MOVE\t<guid>\t<up|down> — hand-sort a character within the FULL
+            // account roster (all characters, enrolled or not), so the whole list
+            // can be organised. The order persists in characters.roster_order and
+            // is rewritten densely on every move, so it auto-saves. This is purely a
+            // display order — independent of the party slot (A–E), which still drives
+            // formation/login via account_party.
             auto tab = payload.find('\t');
             if (tab == std::string_view::npos) return;
-            uint32 const slot = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+            uint32 const moveGuid = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
             std::string_view const dir = payload.substr(tab + 1);
             if (dir != "up" && dir != "down") return;
-            if (slot >= WowPsParty::PARTY_SIZE) return;
+            if (!moveGuid) return;
             uint32 const accountId = player->GetSession()->GetAccountId();
 
-            QueryResult cur = CharacterDatabase.Query(
-                "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}",
-                accountId, slot);
-            if (!cur) return;
-            uint32 const curGuid = cur->Fetch()[0].Get<uint32>();
+            // Read the current full ordering. This ORDER BY MUST sort identically to
+            // SendMgmtList's, or a swap would target a different neighbour than the
+            // panel shows. The first move materialises the legacy enrolled-first /
+            // name order into concrete indices.
+            QueryResult q = CharacterDatabase.Query(
+                "SELECT c.`guid` FROM `characters` c "
+                "LEFT JOIN `account_party` ap ON ap.guid = c.guid AND ap.account = c.account "
+                "WHERE c.`account` = {} "
+                "AND (c.`deleteInfos_Account` IS NULL OR c.`deleteInfos_Account` = 0) "
+                "ORDER BY (c.`roster_order` IS NULL) ASC, c.`roster_order` ASC, "
+                "         COALESCE(ap.`slot`, 255) ASC, c.`name` ASC",
+                accountId);
+            if (!q) return;
 
-            QueryResult nb = (dir == "up")
-                ? CharacterDatabase.Query(
-                    "SELECT `slot`, `guid` FROM `account_party` "
-                    "WHERE `account` = {} AND `slot` < {} ORDER BY `slot` DESC LIMIT 1",
-                    accountId, slot)
-                : CharacterDatabase.Query(
-                    "SELECT `slot`, `guid` FROM `account_party` "
-                    "WHERE `account` = {} AND `slot` > {} ORDER BY `slot` ASC LIMIT 1",
-                    accountId, slot);
-            if (!nb) return;   // already at the top/bottom — nothing to swap
-            Field* nbf = nb->Fetch();
-            uint8 const  nbSlot = nbf[0].Get<uint8>();
-            uint32 const nbGuid = nbf[1].Get<uint32>();
+            std::vector<uint32> order;
+            do { order.push_back(q->Fetch()[0].Get<uint32>()); } while (q->NextRow());
 
-            // Swap only the two `slot` values (keyed by guid, so is_active_on_login
-            // and role stay attached to each character). A temp slot dodges the
-            // (account, slot) primary-key collision mid-swap; 250 is well past the
-            // 0..4 party range and never used by a real member.
-            uint32 const TEMP_SLOT = 250;
+            int idx = -1;
+            for (size_t i = 0; i < order.size(); ++i)
+                if (order[i] == moveGuid) { idx = int(i); break; }
+            if (idx < 0) return;   // not this account's character
+
+            int const swapWith = (dir == "up") ? idx - 1 : idx + 1;
+            if (swapWith < 0 || swapWith >= int(order.size()))
+                return;            // already at the top/bottom of the list
+            std::swap(order[idx], order[swapWith]);
+
+            // Persist a dense 0..N-1 order for the whole list (N is tiny — one
+            // account's characters), so there are never gaps or NULLs to break ties.
             CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
-            tx->Append("UPDATE `account_party` SET `slot` = {} WHERE `account` = {} AND `guid` = {}",
-                       TEMP_SLOT, accountId, curGuid);
-            tx->Append("UPDATE `account_party` SET `slot` = {} WHERE `account` = {} AND `guid` = {}",
-                       slot, accountId, nbGuid);
-            tx->Append("UPDATE `account_party` SET `slot` = {} WHERE `account` = {} AND `guid` = {}",
-                       nbSlot, accountId, curGuid);
-            // Keep the denormalised characters.party_slot in sync (login slot lookup).
-            tx->Append("UPDATE `characters` SET `party_slot` = {} WHERE `guid` = {}", nbSlot, curGuid);
-            tx->Append("UPDATE `characters` SET `party_slot` = {} WHERE `guid` = {}", slot, nbGuid);
-            // SYNCHRONOUS: SetActiveFollowers below re-reads account_party.slot to
-            // rebuild the follow-formation order; an async commit wouldn't be visible.
+            for (size_t i = 0; i < order.size(); ++i)
+                tx->Append("UPDATE `characters` SET `roster_order` = {} WHERE `guid` = {}",
+                           uint16(i), order[i]);
+            // SYNCHRONOUS commit: SendMgmtList below re-reads roster_order to render
+            // the new order. An async CommitTransaction may not have landed yet, so
+            // the panel would render the stale order (arrow click looks like a no-op).
             CharacterDatabase.DirectCommitTransaction(tx);
-
-            // Rebuild follow directives so the new formation order takes effect now.
-            WowPsParty::ClearFollowersForAccount(accountId);
-            WowPsParty::SetActiveFollowers(accountId, player->GetGUID());
 
             // Push the reordered roster straight back so the panel updates instantly.
             SendMgmtList(player);
-            LOG_INFO("module", "[WowPsParty] MGMT_MOVE account={} slot={} dir={} swap_guid={}<->{}",
-                     accountId, slot, std::string(dir), curGuid, nbGuid);
+            LOG_INFO("module", "[WowPsParty] MGMT_MOVE account={} guid={} dir={} new_index={}",
+                     accountId, moveGuid, std::string(dir), swapWith);
         }
         else if (command == "MGMT_ROLE")
         {

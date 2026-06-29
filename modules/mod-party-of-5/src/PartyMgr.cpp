@@ -128,6 +128,23 @@ namespace WowPsParty
                 "ALTER `quest_xp_rate` SET DEFAULT 200, ALTER `kill_xp_rate` SET DEFAULT 200");
     }
 
+    void EnsureRosterOrderColumn()
+    {
+        // The roster panel lets the player hand-sort ALL their characters; the
+        // chosen order persists in characters.roster_order (per-account display
+        // rank, NULL = not yet placed). MySQL has no ADD COLUMN IF NOT EXISTS, so
+        // probe information_schema first — a bare ADD on an existing column errors
+        // 1064 and AC aborts the worldserver on startup.
+        bool const missing = !CharacterDatabase.Query(
+            "SELECT 1 FROM `information_schema`.`COLUMNS` "
+            "WHERE `TABLE_SCHEMA` = DATABASE() "
+            "AND `TABLE_NAME` = 'characters' "
+            "AND `COLUMN_NAME` = 'roster_order'");
+        if (missing)
+            CharacterDatabase.DirectExecute(
+                "ALTER TABLE `characters` ADD COLUMN `roster_order` SMALLINT UNSIGNED DEFAULT NULL");
+    }
+
     void AccountSettingsRefreshFromDB(uint32 account)
     {
         PartySettings s;  // all-ON default

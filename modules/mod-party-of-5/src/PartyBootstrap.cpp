@@ -90,6 +90,7 @@ public:
         // Per-account feature toggles (solo / Po5). Create the table on the
         // live DB if a migration hasn't run yet.
         WowPsParty::EnsureSettingsTable();
+        WowPsParty::EnsureRosterOrderColumn();
     }
 };
 
