@@ -5048,6 +5048,12 @@ namespace WowPsParty
             if (!spellId) return false;
             Pet* pet = bot->GetPet();
             if (!pet || !pet->IsAlive()) return false;
+            // Skip if the pet already carries this spell's buff — Mend Pet is a 15s
+            // HoT, so without this the rule re-casts every tick while pet_health is
+            // still climbing back over its threshold (spamming the cast for no gain).
+            // Matches by name (catches any rank); a no-op for a pet spell that leaves
+            // no same-named aura.
+            if (HasAuraFromSpell(pet, spellId)) return false;
             if (!canFireSpellOn(spellId, pet)) return false;
             if (!channelClipOk()) return false;
             return faceAndCast(pet, spellId);
