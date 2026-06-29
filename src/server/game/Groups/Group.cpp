@@ -1632,13 +1632,41 @@ void Group::CountTheRoll(Rolls::iterator rollI, Map* allowedMap)
             item->is_blocked = false;
     }
 
-    if (Loot* loot = roll->getLoot(); loot && loot->isLooted() && loot->sourceGameObject)
+    if (Loot* loot = roll->getLoot(); loot && loot->isLooted())
     {
-        const GameObjectTemplate* goInfo = loot->sourceGameObject->GetGOInfo();
-        if (goInfo && goInfo->type == GAMEOBJECT_TYPE_CHEST)
+        if (loot->sourceGameObject)
         {
-            // Deactivate chest if the last item was rolled in group
-            loot->sourceGameObject->SetLootState(GO_JUST_DEACTIVATED);
+            const GameObjectTemplate* goInfo = loot->sourceGameObject->GetGOInfo();
+            if (goInfo && goInfo->type == GAMEOBJECT_TYPE_CHEST)
+            {
+                // Deactivate chest if the last item was rolled in group
+                loot->sourceGameObject->SetLootState(GO_JUST_DEACTIVATED);
+            }
+        }
+        else if (loot->sourceWorldObjectGUID.IsCreature())
+        {
+            // Mirror the chest case for a creature corpse. Once the last
+            // group-rolled item leaves the body the loot is empty, but vanilla
+            // only dropped UNIT_DYNFLAG_LOOTABLE on a player's own loot release —
+            // never here — so a corpse emptied entirely by rolls kept glittering
+            // and players re-opened an empty body just to clear the sparkle. Run
+            // the same teardown HandleLootReleaseOpcode does on an emptied corpse.
+            Map* map = allowedMap;
+            if (!map)
+                for (auto const& vote : roll->playerVote)
+                    if (Player* voter = ObjectAccessor::FindConnectedPlayer(vote.first))
+                    {
+                        map = voter->FindMap();
+                        break;
+                    }
+            if (map)
+                if (Creature* corpse = map->GetCreature(loot->sourceWorldObjectGUID))
+                {
+                    if (!corpse->IsAlive())
+                        corpse->AllLootRemovedFromCorpse();
+                    corpse->RemoveDynamicFlag(UNIT_DYNFLAG_LOOTABLE);
+                    loot->clear();
+                }
         }
     }
 
