@@ -656,14 +656,16 @@ namespace WowPsParty
                 break;
 
             case 2: // Paladin
-                // Blessings — maintained by EVERY paladin spec. Out of combat only
-                // (don't burn a GCD re-buffing mid-fight) and high priority so a
-                // fresh/expired party gets blessed before the pull. buff-fall-through
-                // means each rule no-ops once its targets already have the blessing,
-                // so the high priority is free. Might on the physical classes (attack
-                // power), Kings on the casters (stats), Kings on the paladin itself.
-                add("out_of_combat", "cast_class_missing:warrior,rogue,deathknight,hunter:Blessing of Might", 85);
-                add("out_of_combat", "cast_class_missing:priest,mage,warlock,druid:Blessing of Kings", 85);
+                // Blessings — maintained by EVERY paladin spec. ONE buff for the
+                // whole party: Blessing of Kings on everyone (and on the paladin
+                // itself). Out of combat only (don't burn a GCD re-buffing mid-fight)
+                // and high priority so a fresh/expired party gets blessed before the
+                // pull; cast_party_missing/buff_self fall through once Kings is up, so
+                // the priority is free. We deliberately do NOT split Might onto the
+                // physical classes: a single paladin's blessings are mutually
+                // exclusive on a target, so mixing Might + Kings made the pala
+                // re-shuffle the tank between the two every tick.
+                add("party_out_of_combat", "cast_party_missing:Blessing of Kings", 85);
                 add("out_of_combat", "buff_self:Blessing of Kings", 85);
                 if (isHealer)
                 {
@@ -674,9 +676,9 @@ namespace WowPsParty
                     // unlearned spells fall through. Eat/Drink auto-append below — every
                     // priority here stays >14 so they sink to the bottom.
 
-                    // BUFFS — Kings party-wide (OOC), self auras/seal (persistent; skip
-                    // if already up, so the high priority never costs a heal).
-                    add("party_out_of_combat", "cast_party_missing:Blessing of Kings", 99); // falls through if unknown
+                    // BUFFS — self auras/seal (persistent; skip if already up, so the
+                    // high priority never costs a heal). Party-wide Blessing of Kings
+                    // is handled by the shared paladin blessing block above.
                     add("!is_mounted", "buff_self:Devotion Aura", 98);
                     add("is_mounted",  "buff_self:Crusader Aura", 97);  // mount-speed aura (rotation else suppressed mounted)
                     add("always", "buff_self:Seal of Wisdom", 96);
