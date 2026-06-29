@@ -3123,12 +3123,24 @@ namespace WowPsParty
             if (!taken) { nextSlot = candidate; break; }
         }
 
+        // Restore a previously-assigned role: party_loadout.role outlives a kick
+        // (which only deletes the account_party row), so a char set to Tank, kicked,
+        // and re-invited comes back as Tank instead of resetting to dps.
+        std::string savedRole = "dps";
+        if (QueryResult roleQ = CharacterDatabase.Query(
+                "SELECT `role` FROM `party_loadout` WHERE `guid` = {}", targetGuid))
+        {
+            std::string const r = roleQ->Fetch()[0].Get<std::string>();
+            if (r == "tank" || r == "healer" || r == "dps")
+                savedRole = r;
+        }
+
         // Transactional insert: account_party row + characters.party_slot column.
         CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
         tx->Append(
-            "INSERT INTO `account_party` (`account`, `slot`, `guid`, `is_active_on_login`) "
-            "VALUES ({}, {}, {}, {})",
-            requestorAccount, nextSlot, targetGuid,
+            "INSERT INTO `account_party` (`account`, `slot`, `guid`, `role`, `is_active_on_login`) "
+            "VALUES ({}, {}, {}, '{}', {})",
+            requestorAccount, nextSlot, targetGuid, savedRole,
             (nextSlot == 0 ? 1u : 0u));
         tx->Append(
             "UPDATE `characters` SET `party_slot` = {} WHERE `guid` = {}",

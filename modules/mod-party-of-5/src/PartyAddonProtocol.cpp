@@ -104,6 +104,51 @@ namespace
         target->GetSession()->SendPacket(&data);
     }
 
+    // Build + send the roster the party-management panel renders: one record per
+    // character on the account, "<guid>:<name>:<race>:<class>:<level>:<slot|-1>:<role>".
+    // Role precedence: account_party.role (enrolled) → party_loadout.role (solo) → dps.
+    static void SendMgmtList(Player* player)
+    {
+        if (!player || !player->GetSession())
+            return;
+        uint32 const accountId = player->GetSession()->GetAccountId();
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT c.guid, c.name, c.race, c.class, c.level, "
+            "       COALESCE(ap.slot, 255) AS slot, "
+            "       COALESCE(ap.role, NULLIF(pl.role, ''), 'dps') AS role "
+            "FROM `characters` c "
+            "LEFT JOIN `account_party` ap ON ap.guid = c.guid AND ap.account = c.account "
+            "LEFT JOIN `party_loadout` pl ON pl.guid = c.guid "
+            "WHERE c.account = {} AND (c.deleteInfos_Account IS NULL OR c.deleteInfos_Account = 0) "
+            "ORDER BY COALESCE(ap.slot, 255), c.name",
+            accountId);
+
+        std::ostringstream out;
+        out << "MGMT_LIST\t";
+        bool first = true;
+        if (q)
+        {
+            do
+            {
+                Field* f = q->Fetch();
+                uint32 const g = f[0].Get<uint32>();
+                std::string nm = f[1].Get<std::string>();
+                uint32 const race = f[2].Get<uint8>();
+                uint32 const cls  = f[3].Get<uint8>();
+                uint32 const lvl  = f[4].Get<uint8>();
+                uint8 const slot  = f[5].Get<uint8>();
+                std::string role  = f[6].Get<std::string>();
+                int const slotOut = (slot == 255) ? -1 : int(slot);
+
+                if (!first) out << ';';
+                first = false;
+                out << g << ':' << nm << ':' << race << ':' << cls << ':'
+                    << lvl << ':' << slotOut << ':' << role;
+            } while (q->NextRow());
+        }
+        SendWPSP(player, out.str());
+    }
+
     static std::string BuildRosterPayload(uint32 accountId)
     {
         auto const party = sPartyMgr.GetParty(accountId);
@@ -5323,47 +5368,70 @@ public:
         }
         else if (command == "MGMT_LIST")
         {
-            // Reply with one record per character on the account:
-            //   <guid>:<name>:<race>:<class>:<level>:<slot|-1>:<role>;...
+            SendMgmtList(player);
+        }
+        else if (command == "MGMT_MOVE")
+        {
+            // MGMT_MOVE\t<slot>\t<up|down> — reorder the enrolled party. Swaps the
+            // member at <slot> with its nearest occupied neighbour in that direction
+            // ("up" = toward slot 0 / letter A). Persists immediately, so every move
+            // is auto-saved. Slots can be sparse (a kick leaves a gap), so we walk to
+            // the next occupied slot rather than assuming slot±1.
+            auto tab = payload.find('\t');
+            if (tab == std::string_view::npos) return;
+            uint32 const slot = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+            std::string_view const dir = payload.substr(tab + 1);
+            if (dir != "up" && dir != "down") return;
+            if (slot >= WowPsParty::PARTY_SIZE) return;
             uint32 const accountId = player->GetSession()->GetAccountId();
-            // Role: account_party.role when enrolled, else the per-character
-            // party_loadout.role (solo / un-enrolled), else 'dps'. NULLIF turns the
-            // '' default into NULL so COALESCE falls through.
-            QueryResult q = CharacterDatabase.Query(
-                "SELECT c.guid, c.name, c.race, c.class, c.level, "
-                "       COALESCE(ap.slot, 255) AS slot, "
-                "       COALESCE(ap.role, NULLIF(pl.role, ''), 'dps') AS role "
-                "FROM `characters` c "
-                "LEFT JOIN `account_party` ap ON ap.guid = c.guid AND ap.account = c.account "
-                "LEFT JOIN `party_loadout` pl ON pl.guid = c.guid "
-                "WHERE c.account = {} AND (c.deleteInfos_Account IS NULL OR c.deleteInfos_Account = 0) "
-                "ORDER BY COALESCE(ap.slot, 255), c.name",
-                accountId);
 
-            std::ostringstream out;
-            out << "MGMT_LIST\t";
-            bool first = true;
-            if (q)
-            {
-                do
-                {
-                    Field* f = q->Fetch();
-                    uint32 const g = f[0].Get<uint32>();
-                    std::string nm = f[1].Get<std::string>();
-                    uint32 const race = f[2].Get<uint8>();
-                    uint32 const cls  = f[3].Get<uint8>();
-                    uint32 const lvl  = f[4].Get<uint8>();
-                    uint8 const slot  = f[5].Get<uint8>();
-                    std::string role  = f[6].Get<std::string>();
-                    int const slotOut = (slot == 255) ? -1 : int(slot);
+            QueryResult cur = CharacterDatabase.Query(
+                "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}",
+                accountId, slot);
+            if (!cur) return;
+            uint32 const curGuid = cur->Fetch()[0].Get<uint32>();
 
-                    if (!first) out << ';';
-                    first = false;
-                    out << g << ':' << nm << ':' << race << ':' << cls << ':'
-                        << lvl << ':' << slotOut << ':' << role;
-                } while (q->NextRow());
-            }
-            SendWPSP(player, out.str());
+            QueryResult nb = (dir == "up")
+                ? CharacterDatabase.Query(
+                    "SELECT `slot`, `guid` FROM `account_party` "
+                    "WHERE `account` = {} AND `slot` < {} ORDER BY `slot` DESC LIMIT 1",
+                    accountId, slot)
+                : CharacterDatabase.Query(
+                    "SELECT `slot`, `guid` FROM `account_party` "
+                    "WHERE `account` = {} AND `slot` > {} ORDER BY `slot` ASC LIMIT 1",
+                    accountId, slot);
+            if (!nb) return;   // already at the top/bottom — nothing to swap
+            Field* nbf = nb->Fetch();
+            uint8 const  nbSlot = nbf[0].Get<uint8>();
+            uint32 const nbGuid = nbf[1].Get<uint32>();
+
+            // Swap only the two `slot` values (keyed by guid, so is_active_on_login
+            // and role stay attached to each character). A temp slot dodges the
+            // (account, slot) primary-key collision mid-swap; 250 is well past the
+            // 0..4 party range and never used by a real member.
+            uint32 const TEMP_SLOT = 250;
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append("UPDATE `account_party` SET `slot` = {} WHERE `account` = {} AND `guid` = {}",
+                       TEMP_SLOT, accountId, curGuid);
+            tx->Append("UPDATE `account_party` SET `slot` = {} WHERE `account` = {} AND `guid` = {}",
+                       slot, accountId, nbGuid);
+            tx->Append("UPDATE `account_party` SET `slot` = {} WHERE `account` = {} AND `guid` = {}",
+                       nbSlot, accountId, curGuid);
+            // Keep the denormalised characters.party_slot in sync (login slot lookup).
+            tx->Append("UPDATE `characters` SET `party_slot` = {} WHERE `guid` = {}", nbSlot, curGuid);
+            tx->Append("UPDATE `characters` SET `party_slot` = {} WHERE `guid` = {}", slot, nbGuid);
+            // SYNCHRONOUS: SetActiveFollowers below re-reads account_party.slot to
+            // rebuild the follow-formation order; an async commit wouldn't be visible.
+            CharacterDatabase.DirectCommitTransaction(tx);
+
+            // Rebuild follow directives so the new formation order takes effect now.
+            WowPsParty::ClearFollowersForAccount(accountId);
+            WowPsParty::SetActiveFollowers(accountId, player->GetGUID());
+
+            // Push the reordered roster straight back so the panel updates instantly.
+            SendMgmtList(player);
+            LOG_INFO("module", "[WowPsParty] MGMT_MOVE account={} slot={} dir={} swap_guid={}<->{}",
+                     accountId, slot, std::string(dir), curGuid, nbGuid);
         }
         else if (command == "MGMT_ROLE")
         {
@@ -5376,10 +5444,25 @@ public:
             if (slot >= WowPsParty::PARTY_SIZE) return;
 
             uint32 const accountId = player->GetSession()->GetAccountId();
+            // Resolve the guid at this slot so the role can also be mirrored into
+            // party_loadout.role — that per-character copy survives a kick (which
+            // deletes the account_party row), so a re-invited char keeps its role.
+            QueryResult slotChar = CharacterDatabase.Query(
+                "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}",
+                accountId, slot);
+            if (!slotChar) return;
+            uint32 const slotGuid = slotChar->Fetch()[0].Get<uint32>();
+
             CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
             tx->Append(
                 "UPDATE `account_party` SET `role` = '{}' WHERE `account` = {} AND `slot` = {}",
                 role, accountId, slot);
+            tx->Append(
+                "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
+                "`gear_lock_json`, `priority_actions_json`, `role`) "
+                "VALUES ({}, '', '', '', '', '', '{}') "
+                "ON DUPLICATE KEY UPDATE `role` = VALUES(`role`)",
+                slotGuid, role);
             // SYNCHRONOUS commit: SetActiveFollowers below re-queries
             // account_party.role to rebuild the directives. An async commit isn't
             // visible to that synchronous read yet, so the directive (and thus
