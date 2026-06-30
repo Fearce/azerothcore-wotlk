@@ -3980,10 +3980,10 @@ Arena.PreviousOpponentsDiscardTimer = 120000
 #
 #    Arena.AutoDistributePoints
 #        Description: Automatically distribute arena points.
-#        Default:     0 - (Disabled)
-#                     1 - (Enabled)
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
 
-Arena.AutoDistributePoints = 0
+Arena.AutoDistributePoints = 1
 
 #
 #    Arena.AutoDistributeInterval

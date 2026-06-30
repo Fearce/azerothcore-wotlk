@@ -443,7 +443,7 @@ void WorldConfig::BuildConfigCache()
     SetConfigValue<uint32>(CONFIG_ARENA_MAX_RATING_DIFFERENCE, "Arena.MaxRatingDifference", 150);
     SetConfigValue<uint32>(CONFIG_ARENA_RATING_DISCARD_TIMER, "Arena.RatingDiscardTimer", 600000);
     SetConfigValue<uint32>(CONFIG_ARENA_PREV_OPPONENTS_DISCARD_TIMER, "Arena.PreviousOpponentsDiscardTimer", 120000);
-    SetConfigValue<bool>(CONFIG_ARENA_AUTO_DISTRIBUTE_POINTS, "Arena.AutoDistributePoints", false);
+    SetConfigValue<bool>(CONFIG_ARENA_AUTO_DISTRIBUTE_POINTS, "Arena.AutoDistributePoints", true);
     SetConfigValue<uint32>(CONFIG_ARENA_AUTO_DISTRIBUTE_INTERVAL_DAYS, "Arena.AutoDistributeInterval", 7);
     SetConfigValue<uint32>(CONFIG_ARENA_GAMES_REQUIRED, "Arena.GamesRequired", 10);
     SetConfigValue<uint32>(CONFIG_ARENA_START_RATING, "Arena.ArenaStartRating", 0);
