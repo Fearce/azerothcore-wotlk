@@ -103,7 +103,29 @@ namespace
                                      full, /*chatTag=*/0);
         target->GetSession()->SendPacket(&data);
     }
+}
 
+namespace WowPsParty
+{
+    void NotifyPartyInventoryChanged(Player* changed)
+    {
+        if (!changed)
+            return;
+
+        Player* recipient = changed;
+        if (ObjectGuid const leaderGuid = WowPsParty::GetLeaderFor(changed->GetGUID()))
+            if (Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid))
+                recipient = leader;
+
+        if (!recipient || !recipient->GetSession())
+            return;
+
+        SendWPSP(recipient, "INV_DIRTY");
+    }
+}
+
+namespace
+{
     // Build + send the roster the party-management panel renders: one record per
     // character on the account, "<guid>:<name>:<race>:<class>:<level>:<slot|-1>:<role>".
     // Role precedence: account_party.role (enrolled) → party_loadout.role (solo) → dps.

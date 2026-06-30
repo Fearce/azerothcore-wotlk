@@ -675,7 +675,9 @@ public:
     {
         using namespace WowPsParty;
         if (!IsEnabled() || g_propagatingLoot) return;
-        if (!player || !player->GetSession() || !item) return;
+        if (!player || !item) return;
+        NotifyPartyInventoryChanged(player);
+        if (!player->GetSession()) return;
 
         // Cap soul shards on a bot warlock (hero or henchman) at one. The
         // playerbot AI casts Drain Soul on every kill and never spends the

@@ -59,6 +59,11 @@ namespace WowPsParty
     // can drive it without a live player session.
     uint32 BootstrapPartyForAccount(uint32 account, std::vector<std::string>& messages);
 
+    // Tell the real client watching `changed`'s party that the shared bag view is
+    // stale. The addon decides whether its inventory frame is open before asking
+    // for the full inventory stream.
+    void NotifyPartyInventoryChanged(Player* changed);
+
     // Per-account feature toggles. The same install can run full Party-of-5
     // (all ON, the default) or normal solo play (companions off, normal bags,
     // no shared progression). Persisted in `party_account_settings`.
