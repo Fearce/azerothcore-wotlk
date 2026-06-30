@@ -1972,13 +1972,34 @@ static void HandleEnchant(Player* requester, std::string_view payload)
     }
 
     // Find a loaded party member who actually knows the enchant — the caster.
+    auto canSkillUpFromEnchant = [&](Player* p) -> bool
+    {
+        if (!p) return false;
+        SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(enchantSpellId);
+        for (SkillLineAbilityMap::const_iterator it = bounds.first; it != bounds.second; ++it)
+        {
+            SkillLineAbilityEntry const* ability = it->second;
+            if (!ability || ability->SkillLine != SKILL_ENCHANTING)
+                continue;
+            return p->GetPureSkillValue(SKILL_ENCHANTING) < ability->TrivialSkillLineRankHigh;
+        }
+        return false;
+    };
+
     Player* enchanter = nullptr;
-    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE && !enchanter; ++partySlot)
+    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
     {
         uint32 const guid = WowPsParty::GuidForAccountSlot(account, partySlot);
         if (!guid) continue;
         Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid));
-        if (p && p->HasSpell(enchantSpellId)) enchanter = p;
+        if (!p || !p->HasSpell(enchantSpellId)) continue;
+        bool const pCanGain = canSkillUpFromEnchant(p);
+        bool const currentCanGain = canSkillUpFromEnchant(enchanter);
+        if (!enchanter || (pCanGain && !currentCanGain)
+            || (pCanGain && currentCanGain
+                && p->GetPureSkillValue(SKILL_ENCHANTING)
+                    < enchanter->GetPureSkillValue(SKILL_ENCHANTING)))
+            enchanter = p;
     }
     // If nobody KNOWS the enchant, an enchant SCROLL in the party's bags can supply
     // it — the scroll IS the cost (no reagents) and is consumed on a successful apply.
@@ -2043,9 +2064,12 @@ static void HandleEnchant(Player* requester, std::string_view payload)
             itemName, owner->GetName());
     }
     else
+    {
+        enchanter->UpdateCraftSkill(enchantSpellId);
         ChatHandler(requester->GetSession()).PSendSysMessage(
             "|cff66ccff[WowPsParty]|r {} enchanted |cffffffff{}|r ({}'s).",
             enchanter->GetName(), itemName, owner->GetName());
+    }
 
     WowPsParty::SendGearTo(requester, tgtSlot);
     WowPsParty::SendStatsTo(requester, tgtSlot);
