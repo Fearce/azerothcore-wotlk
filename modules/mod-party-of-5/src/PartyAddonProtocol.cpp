@@ -4161,6 +4161,152 @@ static void HandleSortBags(Player* requester)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// REDISTRIBUTE_ITEMS — emergency balance pass for the shared party inventory.
+// Moves loose bag items away from cramped same-map heroes until free slots are
+// roughly even. This is intentionally slot-pressure driven, not item sorting:
+// Sort organizes each character's bags; Redistribute frees individual bags when
+// one member is full while the party still has room.
+static void HandleRedistributeItems(Player* requester)
+{
+    if (!requester || !requester->GetSession()) return;
+    uint32 const account = requester->GetSession()->GetAccountId();
+
+    std::vector<Player*> heroes;
+    for (uint8 slot = 0; slot < WowPsParty::PARTY_SIZE; ++slot)
+    {
+        uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+        if (!guid) continue;
+        Player* p = ObjectAccessor::FindConnectedPlayer(
+            ObjectGuid::Create<HighGuid::Player>(guid));
+        if (!p || !p->IsInWorld() || p->GetMap() != requester->GetMap())
+            continue;
+        heroes.push_back(p);
+    }
+
+    if (heroes.size() < 2)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Redistribute needs at least two loaded "
+            "party members on this map.");
+        WowPsParty::SendInventoryTo(requester);
+        return;
+    }
+
+    auto canMove = [](Item* item) -> bool
+    {
+        if (!item) return false;
+        if (item->IsEquipped() || item->IsInTrade() || item->IsNotEmptyBag())
+            return false;
+        ItemTemplate const* tmpl = item->GetTemplate();
+        if (!tmpl) return false;
+        if (tmpl->Class == ITEM_CLASS_CONTAINER)
+            return false;
+        return true;
+    };
+
+    auto firstMovableFor = [&](Player* owner, Player* target, ItemPosCountVec& destPos) -> Item*
+    {
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            if (Item* item = owner->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                if (canMove(item))
+                {
+                    destPos.clear();
+                    if (target->CanStoreItem(
+                            NULL_BAG, NULL_SLOT, destPos, item, false) == EQUIP_ERR_OK)
+                        return item;
+                }
+
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = owner->GetBagByPos(b))
+                for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                    if (Item* item = owner->GetItemByPos(b, uint8(j)))
+                        if (canMove(item))
+                        {
+                            destPos.clear();
+                            if (target->CanStoreItem(
+                                    NULL_BAG, NULL_SLOT, destPos, item, false) == EQUIP_ERR_OK)
+                                return item;
+                        }
+        return nullptr;
+    };
+
+    auto byFreeSlots = [](Player const* a, Player const* b)
+    {
+        return a->GetFreeInventorySpace() < b->GetFreeInventorySpace();
+    };
+
+    uint32 moved = 0;
+    constexpr uint32 MAX_MOVES = 250;
+    while (moved < MAX_MOVES)
+    {
+        std::stable_sort(heroes.begin(), heroes.end(), byFreeSlots);
+        Player* src = nullptr;
+        Player* dst = nullptr;
+        Item* item = nullptr;
+        ItemPosCountVec destPos;
+
+        for (size_t si = 0; si < heroes.size() && !item; ++si)
+        {
+            Player* candidateSrc = heroes[si];
+            uint32 const srcFree = candidateSrc->GetFreeInventorySpace();
+            for (size_t di = heroes.size(); di > 0; --di)
+            {
+                Player* candidateDst = heroes[di - 1];
+                if (candidateDst == candidateSrc)
+                    continue;
+                uint32 const dstFree = candidateDst->GetFreeInventorySpace();
+                if (dstFree <= srcFree + 1)
+                    break;
+                item = firstMovableFor(candidateSrc, candidateDst, destPos);
+                if (item)
+                {
+                    src = candidateSrc;
+                    dst = candidateDst;
+                    break;
+                }
+            }
+        }
+
+        if (!item || !src || !dst)
+            break;
+
+        ObjectGuid const srcGuid = src->GetGUID();
+        src->MoveItemFromInventory(item->GetBagSlot(), item->GetSlot(), true);
+        item->SetOwnerGUID(dst->GetGUID());
+        CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+        item->SaveToDB(tx);
+        CharacterDatabase.CommitTransaction(tx);
+
+        ItemPosCountVec verifyPos;
+        if (dst->CanStoreItem(NULL_BAG, NULL_SLOT, verifyPos, item, false) == EQUIP_ERR_OK)
+        {
+            dst->MoveItemToInventory(verifyPos, item, true);
+            FlushPartyTransfer(src, dst);
+            ++moved;
+            continue;
+        }
+
+        item->SetOwnerGUID(srcGuid);
+        ItemPosCountVec backPos;
+        if (src->CanStoreItem(NULL_BAG, NULL_SLOT, backPos, item, false) == EQUIP_ERR_OK)
+            src->MoveItemToInventory(backPos, item, true);
+        CharacterDatabaseTransaction tx2 = CharacterDatabase.BeginTransaction();
+        item->SaveToDB(tx2);
+        CharacterDatabase.CommitTransaction(tx2);
+        FlushPartyTransfer(src, dst);
+        break;
+    }
+
+    if (moved)
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r Redistributed |cffffffff{}|r item(s) across party bags.",
+            moved);
+    else
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r No movable items needed redistributing.");
+    WowPsParty::SendInventoryTo(requester);
+}
+
 // SELL_TRASH — vendor-sell every grey (poor quality) item across the whole
 // party's bags in one click. Mirrors HandleSell's credit-to-requester (the
 // shared-gold hook then mirrors the gain across the party), but loops over all
@@ -5026,6 +5172,10 @@ public:
         else if (command == "SORT_BAGS")
         {
             HandleSortBags(player);
+        }
+        else if (command == "REDISTRIBUTE_ITEMS")
+        {
+            HandleRedistributeItems(player);
         }
         else if (command == "SELL_TRASH")
         {
