@@ -1738,10 +1738,18 @@ void Spell::DoCreateItem(uint8 /*effIndex*/, uint32 itemId)
 
     /* == profession specialization handling over == */
 
-    // can the player store the new item?
+    // [WowPsParty PATCH] Crafted output belongs to the shared party inventory
+    // too. If the crafter's own bags are full, spill the created item to a
+    // same-map hero with room instead of failing while party space remains.
+    extern Player* WowPsParty_PickLootReceiver(Player*, uint32, uint32);
+    Player* receiver = WowPsParty_PickLootReceiver(player, newitemid, addNumber);
+    if (!receiver)
+        receiver = player;
+
+    // can the receiver store the new item?
     ItemPosCountVec dest;
     uint32 no_space = 0;
-    InventoryResult msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, newitemid, addNumber, &no_space);
+    InventoryResult msg = receiver->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, newitemid, addNumber, &no_space);
     if (msg != EQUIP_ERR_OK)
     {
         // convert to possible store amount
@@ -1758,7 +1766,7 @@ void Spell::DoCreateItem(uint8 /*effIndex*/, uint32 itemId)
     if (addNumber)
     {
         // create the new item and store it
-        Item* pItem = player->StoreNewItem(dest, newitemid, true);
+        Item* pItem = receiver->StoreNewItem(dest, newitemid, true);
 
         // was it successful? return error if not
         if (!pItem)
@@ -1772,7 +1780,7 @@ void Spell::DoCreateItem(uint8 /*effIndex*/, uint32 itemId)
             pItem->SetGuidValue(ITEM_FIELD_CREATOR, player->GetGUID());
 
         // send info to the client
-        player->SendNewItem(pItem, addNumber, true, SelfCast);
+        receiver->SendNewItem(pItem, addNumber, true, SelfCast);
 
         sScriptMgr->OnPlayerCreateItem(player, pItem, addNumber);
 

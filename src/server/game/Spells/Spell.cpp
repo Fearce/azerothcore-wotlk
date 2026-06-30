@@ -7433,8 +7433,17 @@ SpellCastResult Spell::CheckItems(uint32* param1, uint32* param2)
                             return SPELL_FAILED_ITEM_NOT_FOUND;
 
                         uint32 createCount = std::clamp<uint32>(m_spellInfo->Effects[i].CalcValue(), 1u, itemTemplate->GetMaxStackSize());
+                        // [WowPsParty PATCH] The shared inventory is one pooled
+                        // bag set for crafted output too. Check the same
+                        // same-map hero receiver DoCreateItem will use, so a
+                        // full crafter does not fail while party bags have room.
+                        extern Player* WowPsParty_PickLootReceiver(Player*, uint32, uint32);
+                        Player* receiver = WowPsParty_PickLootReceiver(target->ToPlayer(), m_spellInfo->Effects[i].ItemType, createCount);
+                        if (!receiver)
+                            receiver = target->ToPlayer();
+
                         ItemPosCountVec dest;
-                        InventoryResult msg = target->ToPlayer()->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, m_spellInfo->Effects[i].ItemType, createCount);
+                        InventoryResult msg = receiver->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, m_spellInfo->Effects[i].ItemType, createCount);
                         if (msg != EQUIP_ERR_OK)
                         {
                             /// @todo Needs review
@@ -7483,7 +7492,13 @@ SpellCastResult Spell::CheckItems(uint32* param1, uint32* param2)
                     if (m_CastItem && m_CastItem->GetTemplate()->HasFlag(ITEM_FLAG_NO_REAGENT_COST))
                         return SPELL_FAILED_TOTEM_CATEGORY;
                     ItemPosCountVec dest;
-                    InventoryResult msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, m_spellInfo->Effects[i].ItemType, 1);
+                    // [WowPsParty PATCH] Enchanting vellums creates an item, so
+                    // allow the scroll to spill into a same-map hero bag too.
+                    extern Player* WowPsParty_PickLootReceiver(Player*, uint32, uint32);
+                    Player* receiver = WowPsParty_PickLootReceiver(player, m_spellInfo->Effects[i].ItemType, 1);
+                    if (!receiver)
+                        receiver = player;
+                    InventoryResult msg = receiver->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, m_spellInfo->Effects[i].ItemType, 1);
                     if (msg != EQUIP_ERR_OK)
                     {
                         player->SendEquipError(msg, nullptr, nullptr, m_spellInfo->Effects[i].ItemType);
