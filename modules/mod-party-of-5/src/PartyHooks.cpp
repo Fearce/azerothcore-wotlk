@@ -679,6 +679,12 @@ public:
         NotifyPartyInventoryChanged(player);
         if (!player->GetSession()) return;
 
+        // A HIRED ALT is the player's real character, parked exactly as they left
+        // it — nothing may mutate its bags. Skip BOTH the soul-shard trim and the
+        // shared quest-item mirror below; its loot stays its own, hidden until the
+        // player logs into it.
+        if (WowPsParty::IsHiredAlt(player->GetGUID())) return;
+
         // Cap soul shards on a bot warlock (hero or henchman) at one. The
         // playerbot AI casts Drain Soul on every kill and never spends the
         // shards, and Soul Shard is non-stacking (one item per bag slot), so
@@ -1059,6 +1065,14 @@ public:
             WowPsParty::DismissHenchmanByGuid(guid);
             return;
         }
+        if (WowPsParty::IsHiredAlt(guid))
+        {
+            // Same "pretend it hearthstoned" behaviour for a hired alt leaving the
+            // party by any means — but it's logged out SAVED AS-IS (no bag clear).
+            if (WowPsParty::IsHenchmanRegrouping(guid)) return;   // mid-(re)hire regroup
+            WowPsParty::DismissHiredAltByGuid(guid);
+            return;
+        }
         // The henchman OWNER (the player who hired them) left / was removed from
         // the group — e.g. leaving an LFG dungeon. Dismiss their henchmen rather
         // than let them teleport out and keep orphan-following the ex-leader.
@@ -1078,15 +1092,20 @@ public:
         // around the human (Kevin: "never leave your roster" — the regression this gate
         // exists for). The deliberate-leave click is LEAVE, the transient churn is
         // DEFAULT, so RemoveMethod cleanly separates them.
-        if (WowPsParty::CountHenchmenFor(guid) > 0 && group
+        if ((WowPsParty::CountHenchmenFor(guid) > 0 || WowPsParty::CountHiredAltsFor(guid) > 0)
+            && group
             && (group->isLFGGroup() || group->isBGGroup()
                 || method == GROUP_REMOVEMETHOD_LEAVE))
         {
             std::vector<ObjectGuid> members;
             WowPsParty::GetPartyGuidsFor(guid, members);
             for (ObjectGuid const& m : members)
+            {
                 if (WowPsParty::IsHenchman(m))
                     WowPsParty::DismissHenchmanByGuid(m);
+                else if (WowPsParty::IsHiredAlt(m))
+                    WowPsParty::DismissHiredAltByGuid(m);
+            }
         }
     }
 };

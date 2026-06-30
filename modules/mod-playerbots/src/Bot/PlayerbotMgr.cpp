@@ -103,18 +103,19 @@ void PlayerbotHolder::AddPlayerBot(ObjectGuid playerGuid, uint32 masterAccountId
     bool sameGuild = sPlayerbotAIConfig.allowGuildBots && guild && guild->GetMember(playerGuid);
     bool addClassBot = sRandomPlayerbotMgr.IsAddclassBot(playerGuid.GetCounter());
     bool linkedAccount = sPlayerbotAIConfig.allowTrustedAccountBots && IsAccountLinked(accountId, masterAccountId);
-    // [WowPsParty PATCH] Hired henchmen are random-pool chars on another
-    // account, deliberately invited by the player as temporary companions.
-    // Our module flags them (follow directive henchman=true) before calling
-    // AddPlayerBot, so allow them past the normal cross-account guard.
-    extern bool WowPsParty_IsHenchman_Trampoline(ObjectGuid guid);
-    bool wowpsHenchman = WowPsParty_IsHenchman_Trampoline(playerGuid);
+    // [WowPsParty PATCH] Temporary companions the player deliberately invited:
+    // hired henchmen (random-pool chars on another account) AND hired alts (the
+    // player's OWN account chars). Our module flags both (follow directive) before
+    // calling AddPlayerBot, so allow them past the normal cross-account guard —
+    // independently of the allowAccountBots config the sameAccount check needs.
+    extern bool WowPsParty_IsManagedBotSpawn_Trampoline(ObjectGuid guid);
+    bool wowpsManaged = WowPsParty_IsManagedBotSpawn_Trampoline(playerGuid);
 
     bool allowed = true;
     std::ostringstream out;
     std::string botName;
     sCharacterCache->GetCharacterNameByGuid(playerGuid, botName);
-    if (!isRndbot && !sameAccount && !sameGuild && !addClassBot && !linkedAccount && !wowpsHenchman)
+    if (!isRndbot && !sameAccount && !sameGuild && !addClassBot && !linkedAccount && !wowpsManaged)
     {
         allowed = false;
         out << "Failure: You are not allowed to control bot " << botName.c_str();

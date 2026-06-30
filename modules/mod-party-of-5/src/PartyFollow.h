@@ -49,6 +49,18 @@ namespace WowPsParty
     void   RemoveFollower(ObjectGuid followerGuid);   // dismiss / logout
     bool   IsHenchman(ObjectGuid guid);
     uint32 CountHenchmenFor(ObjectGuid leaderGuid);
+
+    // Hired ALTS: the player's OWN account characters (not enrolled in account_party)
+    // spawned as follower bots. They behave like henchmen for AI / follow / corpse-loot
+    // and survive SetActiveFollowers like henchmen (they live OUTSIDE account_party), but
+    // unlike henchmen they keep their own gear / talents / bags / saved rotation — NOTHING
+    // mutates their loadout (no ammo, poison, shard-trim, re-level, sanitize, bag-clear).
+    // They're hidden from the party talent / gear / inventory panels (those key off
+    // account_party enrollment) and loot to their OWN bags, never the shared party grid.
+    void   AddHiredAltDirective(uint32 account, ObjectGuid altGuid,
+                                ObjectGuid leaderGuid, std::string const& role);
+    bool   IsHiredAlt(ObjectGuid guid);
+    uint32 CountHiredAltsFor(ObjectGuid leaderGuid);
     uint32 CountFollowersFor(ObjectGuid leaderGuid);   // alts + henchmen
     int    FormationIndexFor(ObjectGuid follower, ObjectGuid leaderGuid);
     bool   IsLeadTank(ObjectGuid botGuid);   // role-based; works for henchmen

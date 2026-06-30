@@ -260,6 +260,31 @@ namespace WowPsParty
         SendWPSP(player, body);
     }
 
+    // ALTS\t<rec>;<rec>;...   rec = guid:name:cls:level:role:spec:hired
+    // The player's own non-enrolled characters for the Hire-Alts window: an offline
+    // row (hired=0) gets a Hire button, a currently-hired row (hired=1) a Dismiss.
+    void SendAltsTo(Player* player)
+    {
+        if (!player) return;
+        auto const cands = BuildAltCandidates(player);
+        std::ostringstream out;
+        out << "ALTS\t";
+        bool first = true;
+        for (auto const& c : cands)
+        {
+            if (!first) out << ';';
+            first = false;
+            out << c.guid << ':' << c.name << ':' << uint32(c.cls) << ':'
+                << uint32(c.level) << ':' << c.role << ':' << c.spec << ':'
+                << (c.hired ? 1 : 0);
+        }
+        std::string const body = out.str();
+        LOG_INFO("module",
+            "[WowPsParty Alts] SendAltsTo guid={} candidates={} payload_bytes={}",
+            player->GetGUID().GetCounter(), uint32(cands.size()), uint32(body.size()));
+        SendWPSP(player, body);
+    }
+
 
     // Resolve the slot's character guid for the account.
     static uint32 GuidForAccountSlot(uint32 account, uint32 slot)
@@ -3751,6 +3776,9 @@ static void HandleCharterSign(Player* owner, Item* charter, Petition const* peti
     for (ObjectGuid const& g : party)
     {
         if (g == owner->GetGUID()) continue;
+        // A hired alt is parked as-is — it must NOT pick up persistent guild/arena
+        // membership (an arena-team row survives the dismiss). Leave it off charters.
+        if (WowPsParty::IsHiredAlt(g)) continue;
 
         Signatures const* cur = sPetitionMgr->GetSignature(charterGuid);
         uint32 const haveNow = cur ? uint32(cur->signatureMap.size()) : 0;
@@ -4681,6 +4709,31 @@ public:
         {
             WowPsParty::DismissAllHenchmen(player);
             WowPsParty::SendHenchmenTo(player);
+        }
+        else if (command == "REQ_ALTS")
+        {
+            WowPsParty::SendAltsTo(player);
+        }
+        else if (command == "HIRE_ALT")
+        {
+            // HIRE_ALT\t<guid>
+            uint32 const guid = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            std::string msg;
+            bool const ok = WowPsParty::HireAlt(player, guid, msg);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r {}", msg);
+            if (ok) WowPsParty::SendAltsTo(player);   // refresh (the hired one is now busy)
+        }
+        else if (command == "DISMISS_ALT")
+        {
+            uint32 const guid = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            WowPsParty::DismissHiredAlt(player, guid);
+            WowPsParty::SendAltsTo(player);
+        }
+        else if (command == "DISMISS_ALL_ALTS")
+        {
+            WowPsParty::DismissAllHiredAlts(player);
+            WowPsParty::SendAltsTo(player);
         }
         else if (command == "REQ_SPELLBOOK")
         {

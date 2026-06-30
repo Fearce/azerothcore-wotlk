@@ -171,6 +171,39 @@ namespace WowPsParty
     void DismissAllHenchmen(Player* requester);
     // Dismiss by guid (group-removal hook → uninvite = despawn).
     void DismissHenchmanByGuid(ObjectGuid henchGuid);
+
+    // ----- Hired alts ------------------------------------------------------
+    // The player's OWN account characters, NOT enrolled in account_party, hired
+    // as temporary follower bots. Free; they keep their already-equipped gear,
+    // talents, bags and previously-saved rotation — nothing mutates their loadout
+    // — and loot to their own bags. Hidden from the party gear / talent / inventory
+    // panels (those key off enrollment). Released (saved as-is) on dismiss / logout.
+    struct AltCandidate
+    {
+        uint32      guid  = 0;
+        std::string name;
+        uint8       cls   = 0;
+        uint8       level = 0;
+        std::string role;   // tank / healer / dps (from its own talents)
+        std::string spec;   // short spec abbrev; "" if none
+        bool        hired = false;   // currently spawned as a hired-alt follower
+    };
+
+    // Every non-enrolled own-account character (excluding the active session char),
+    // each flagged whether it is currently hired. Drives the Hire-Alts window: an
+    // un-hired offline row gets a Hire button, a hired row gets a Dismiss button.
+    std::vector<AltCandidate> BuildAltCandidates(Player* requester);
+
+    // Hire `altGuid` (one of `requester`'s own offline, non-enrolled characters)
+    // as a follower bot. Validates ownership + party space; spawns it AS-IS (no
+    // gear / level / inventory change) and loads its persisted rotation + loadout.
+    bool HireAlt(Player* requester, uint32 altGuid, std::string& outMsg);
+
+    // Release a hired alt (one, all, or by guid). Saves the character exactly as it
+    // is (keeping any loot); does NOT clear its bags or its saved loadout.
+    void DismissHiredAlt(Player* requester, uint32 altGuid);
+    void DismissAllHiredAlts(Player* requester);
+    void DismissHiredAltByGuid(ObjectGuid altGuid);
     // Destroy a HENCHMAN's loose bag items (keeps ammo/reagents/shards + equipped
     // gear). Henchman-guarded; no-op on the player or an enrolled alt-bot. Called
     // on hire (start clean) and dismiss (leave clean) so henchman bags never fill.

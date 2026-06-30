@@ -231,7 +231,8 @@ namespace WowPsParty
             ObjectGuid  leaderGuid;
             uint8       slot   = 0;    // 0..4 within the owning account's party
             std::string role   = "dps"; // tank / healer / dps
-            bool        henchman = false; // hired bot (default combat AI), not an enrolled alt
+            bool        henchman = false; // hired random-pool bot, not an enrolled alt
+            bool        hiredAlt = false; // the player's OWN account char, hired as a temp follower
         };
 
         // Which slot in the directive list belongs to the "leading tank" for
@@ -318,19 +319,19 @@ namespace WowPsParty
     void SetActiveFollowers(uint32 account, ObjectGuid leaderGuid)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        // Erase only enrolled-alt directives — KEEP hired henchmen. They live
-        // outside account_party, so a full wipe would drop them from our
+        // Erase only enrolled-alt directives — KEEP hired henchmen AND hired alts.
+        // Both live outside account_party, so a full wipe would drop them from our
         // management (UpdateAI stops treating them as party bots → they revert
         // to default-AI "glued to master" without follow/leash). Kicking or
-        // re-enrolling an alt re-runs this, so henchmen must survive it.
+        // re-enrolling an alt re-runs this, so the temp hires must survive it.
         g_directives.erase(
             std::remove_if(g_directives.begin(), g_directives.end(),
                 [account](Directive const& d)
-                { return d.account == account && !d.henchman; }),
+                { return d.account == account && !d.henchman && !d.hiredAlt; }),
             g_directives.end());
-        // Re-point surviving henchmen at the current leader.
+        // Re-point surviving henchmen + hired alts at the current leader.
         for (auto& d : g_directives)
-            if (d.account == account && d.henchman) d.leaderGuid = leaderGuid;
+            if (d.account == account && (d.henchman || d.hiredAlt)) d.leaderGuid = leaderGuid;
         g_formations.erase(account);
 
         // JOIN characters so a deleted-char orphan row never gets a follow
@@ -419,6 +420,31 @@ namespace WowPsParty
             leaderGuid.GetCounter(), role);
     }
 
+    // Append a follow directive for a HIRED ALT (the player's own account char).
+    // Like AddHenchmanDirective it does NOT clear the account's other directives,
+    // and the bot gets our follow ticker / leash / rotation engine. Distinct from a
+    // henchman: hiredAlt=true keeps the IsHenchman-gated mutations (ammo, bag-clear,
+    // re-level, sanitize, loadout-wipe) from ever touching this real character.
+    void AddHiredAltDirective(uint32 account, ObjectGuid altGuid,
+                              ObjectGuid leaderGuid, std::string const& role)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (auto const& d : g_directives)
+            if (d.followerGuid == altGuid) return;   // already tracked
+        Directive d;
+        d.account      = account;
+        d.followerGuid = altGuid;
+        d.leaderGuid   = leaderGuid;
+        d.slot         = 255;          // not an account_party slot
+        d.role         = role.empty() ? "dps" : role;
+        d.hiredAlt     = true;
+        g_directives.push_back(std::move(d));
+        LOG_INFO("module",
+            "[WowPsParty Follow] AddHiredAltDirective account={} alt_guid={} "
+            "leader_guid={} role={}", account, altGuid.GetCounter(),
+            leaderGuid.GetCounter(), role);
+    }
+
     // Update a tracked follower's role in place (e.g. a henchman whose spec was
     // re-rolled by the level-match factory after spawn — its directive role
     // drives targeting mode and lead-tank selection, so it must follow the new
@@ -452,6 +478,14 @@ namespace WowPsParty
         return false;
     }
 
+    bool IsHiredAlt(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (auto const& d : g_directives)
+            if (d.followerGuid == guid) return d.hiredAlt;
+        return false;
+    }
+
     // Every tracked follower (henchmen + enrolled alts), across all leaders.
     void GetAllFollowers(std::vector<ObjectGuid>& out)
     {
@@ -468,6 +502,16 @@ namespace WowPsParty
         uint32 n = 0;
         for (auto const& d : g_directives)
             if (d.henchman && d.leaderGuid == leaderGuid) ++n;
+        return n;
+    }
+
+    // Number of hired alts currently following the given leader.
+    uint32 CountHiredAltsFor(ObjectGuid leaderGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        uint32 n = 0;
+        for (auto const& d : g_directives)
+            if (d.hiredAlt && d.leaderGuid == leaderGuid) ++n;
         return n;
     }
 
@@ -3973,10 +4017,11 @@ namespace WowPsParty
         if (!bot || !bot->IsAlive() || !bot->IsInWorld() || !bot->GetSession()) return;
         if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) return;   // the controlled body
 
-        // HENCHMEN ONLY — the whole point of this feature. Enrolled alts and the
-        // human keep their normal loot path. IsHenchman takes g_mutex, so call it
-        // once and bail early for everyone else.
-        if (!IsHenchman(bot->GetGUID())) return;
+        // SELF-LOOTERS ONLY — hired henchmen AND hired alts walk to corpses and
+        // loot their own round-robin share to their OWN bags. Enrolled alts (who
+        // get the party-of-5 shared auto-distribute) and the human keep their normal
+        // loot path. Both predicates take g_mutex, so test once and bail early.
+        if (!IsHenchman(bot->GetGUID()) && !IsHiredAlt(bot->GetGUID())) return;
 
         // Must be in a WoW group to loot its kills (the native loot permission
         // and money split both key off the group).
@@ -7942,6 +7987,15 @@ bool WowPsParty_BotHasActiveFollowDirective_Trampoline(ObjectGuid guid)
 bool WowPsParty_IsHenchman_Trampoline(ObjectGuid guid)
 {
     return WowPsParty::IsHenchman(guid);
+}
+
+// Trampoline: is this bot a temporary companion the player deliberately invited
+// (a hired henchman OR a hired alt)? The patched mod-playerbots AddPlayerBot
+// permission check uses this to let both past the cross-account ownership guard,
+// independently of the allowAccountBots config.
+bool WowPsParty_IsManagedBotSpawn_Trampoline(ObjectGuid guid)
+{
+    return WowPsParty::IsHenchman(guid) || WowPsParty::IsHiredAlt(guid);
 }
 
 // Trampoline: was this bot a henchman dismissed in the last few seconds? The

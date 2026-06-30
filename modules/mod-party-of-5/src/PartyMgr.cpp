@@ -1824,18 +1824,21 @@ namespace WowPsParty
         return out;
     }
 
-    // Set the group's loot rule based on whether any henchman is present:
-    // henchman in party → GROUP_LOOT (rolls), else FREE_FOR_ALL (premade).
+    // Set the group's loot rule based on whether any SELF-LOOTING companion is
+    // present (a hired henchman or a hired alt): if so → GROUP_LOOT (rolls /
+    // round-robin) so each can claim its own share by looting the corpse; else →
+    // FREE_FOR_ALL (the all-enrolled premade, which auto-distributes on kill).
     static void UpdateGroupLootForHenchmen(Player* leader)
     {
         if (!leader) return;
         Group* g = leader->GetGroup();
         if (!g) return;
-        bool const hasHench = WowPsParty::CountHenchmenFor(leader->GetGUID()) > 0;
-        g->SetLootMethod(hasHench ? GROUP_LOOT : FREE_FOR_ALL);
+        bool const hasSelfLooter = WowPsParty::CountHenchmenFor(leader->GetGUID()) > 0
+                                || WowPsParty::CountHiredAltsFor(leader->GetGUID()) > 0;
+        g->SetLootMethod(hasSelfLooter ? GROUP_LOOT : FREE_FOR_ALL);
         g->SendUpdate();
-        LOG_INFO("module", "[WowPsParty Henchmen] loot method -> {} (henchmen present={})",
-                 hasHench ? "GROUP_LOOT" : "FREE_FOR_ALL", hasHench);
+        LOG_INFO("module", "[WowPsParty Henchmen] loot method -> {} (self-looters present={})",
+                 hasSelfLooter ? "GROUP_LOOT" : "FREE_FOR_ALL", hasSelfLooter);
     }
 
     // ===== Consumable upkeep (ammo + poisons) ===============================
@@ -2379,6 +2382,12 @@ namespace WowPsParty
     void MaintainBotConsumables(Player* bot)
     {
         if (!bot || !bot->IsInWorld() || !bot->IsAlive() || !bot->GetSession()) return;
+
+        // HIRED ALTS are left EXACTLY as the player parked them — no ammo refill,
+        // no poison imbue, no shard trim, no thrown/shield/offhand swap, no spell
+        // sanitize. Everything below mutates the character's items or spellbook, so
+        // a real alt the player will log into later must skip all of it.
+        if (WowPsParty::IsHiredAlt(bot->GetGUID())) return;
 
         // Throttle hard — this touches inventory and queues packets. Once every
         // ~12s per bot is plenty for "never run dry / stay poisoned".
@@ -3052,6 +3061,254 @@ namespace WowPsParty
         }
         for (ObjectGuid const& gg : hench)
             DismissHenchman(requester, gg.GetCounter());
+    }
+
+    // ===== Hired alts =======================================================
+    // The player's OWN account characters, hired as temporary follower bots. They
+    // run our follow + rotation engine like any party bot, but — unlike henchmen —
+    // their character is NEVER mutated: no gear/level/inventory change on hire, no
+    // bag-clear or loadout-wipe on dismiss. They keep whatever they had equipped,
+    // their saved rotation, and any loot they pick up. Free to hire.
+
+    // Despawn a hired alt identified only by guid — used by the group-removal hook
+    // so leaving the party (addon Dismiss or the stock WoW UI) stops it following
+    // and logs it out, SAVED AS-IS. Mirrors DismissHenchmanByGuid but performs NO
+    // bag/loadout clearing. Drops the directive now, defers the logout one tick.
+    void DismissHiredAltByGuid(ObjectGuid altGuid)
+    {
+        if (!WowPsParty::IsHiredAlt(altGuid)) return;
+        ObjectGuid const leaderGuid = WowPsParty::GetLeaderFor(altGuid);
+        WowPsParty::MarkHenchmanRecentlyDismissed(altGuid);  // silence the framework farewell whisper
+        WowPsParty::RemoveFollower(altGuid);
+        WowPsParty::RotationCacheClear(altGuid.GetCounter());   // in-memory only; DB loadout kept
+        LOG_INFO("module",
+            "[WowPsParty Alts] hired alt left party — dismissing alt_guid={}",
+            altGuid.GetCounter());
+        Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
+        if (!leader) return;
+        leader->m_Events.AddEventAtOffset([leaderGuid, altGuid]()
+        {
+            Player* l = ObjectAccessor::FindConnectedPlayer(leaderGuid);
+            if (!l) return;
+            if (Player* alt = ObjectAccessor::FindConnectedPlayer(altGuid))
+            {
+                if (alt->GetGroup()) alt->RemoveFromGroup();
+                alt->SaveToDB(false, false);   // persist any loot before the bot logs out
+            }
+            if (PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(l))
+                mgr->LogoutPlayerBot(altGuid);
+            UpdateGroupLootForHenchmen(l);
+        }, std::chrono::milliseconds(200));
+    }
+
+    void DismissHiredAlt(Player* requester, uint32 altGuid)
+    {
+        if (!requester || !requester->GetSession()) return;
+        ObjectGuid const g = ObjectGuid::Create<HighGuid::Player>(altGuid);
+        if (!WowPsParty::IsHiredAlt(g)) return;   // only dismiss hired alts
+        WowPsParty::MarkHenchmanRecentlyDismissed(g);
+        WowPsParty::RemoveFollower(g);
+        WowPsParty::RotationCacheClear(altGuid);   // in-memory only; the saved loadout in the DB stays
+        if (Player* alt = ObjectAccessor::FindConnectedPlayer(g))
+        {
+            if (alt->GetGroup()) alt->RemoveFromGroup();
+            alt->SaveToDB(false, false);   // persist any loot before logout
+        }
+        if (PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester))
+            mgr->LogoutPlayerBot(g);   // returns the char to offline, keeping its bags/gear
+        UpdateGroupLootForHenchmen(requester);
+        LOG_INFO("module", "[WowPsParty Alts] DISMISS alt_guid={}", altGuid);
+    }
+
+    void DismissAllHiredAlts(Player* requester)
+    {
+        if (!requester) return;
+        std::vector<ObjectGuid> alts;
+        {
+            std::vector<ObjectGuid> guids;
+            WowPsParty::GetPartyGuidsFor(requester->GetGUID(), guids);
+            for (ObjectGuid const& gg : guids)
+                if (WowPsParty::IsHiredAlt(gg)) alts.push_back(gg);
+        }
+        for (ObjectGuid const& gg : alts)
+            DismissHiredAlt(requester, gg.GetCounter());
+    }
+
+    // Every non-enrolled own-account character (minus the active session char),
+    // flagged whether it's currently hired. Offline un-hired rows are hireable;
+    // a hired row (online as a bot) is shown so it can be dismissed.
+    std::vector<AltCandidate> BuildAltCandidates(Player* requester)
+    {
+        std::vector<AltCandidate> out;
+        if (!requester || !requester->GetSession()) return out;
+        uint32 const account    = requester->GetSession()->GetAccountId();
+        uint32 const activeGuid = requester->GetGUID().GetCounter();
+
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT c.`guid`, c.`name`, c.`class`, c.`level`, c.`online` "
+            "FROM `characters` c "
+            "LEFT JOIN `account_party` ap ON ap.`guid` = c.`guid` "
+            "WHERE c.`account` = {} AND ap.`guid` IS NULL "
+            "ORDER BY (c.`roster_order` IS NULL) ASC, c.`roster_order` ASC, c.`name` ASC",
+            account);
+        if (!q) return out;
+        do
+        {
+            Field* f = q->Fetch();
+            uint32 const guid = f[0].Get<uint32>();
+            if (guid == activeGuid) continue;   // can't hire the character you're playing
+            uint8 const cls    = f[2].Get<uint8>();
+            bool  const online = f[4].Get<uint8>() != 0;
+            ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
+            bool const hired   = WowPsParty::IsHiredAlt(og);
+            // Hireable rows are offline; a currently-hired alt is online (as a bot)
+            // and listed so it can be dismissed. Skip an online char that isn't our
+            // hired alt (shouldn't happen on a single-session account — defensive).
+            if (online && !hired) continue;
+
+            AltCandidate c;
+            c.guid  = guid;
+            c.name  = f[1].Get<std::string>();
+            c.cls   = cls;
+            c.level = f[3].Get<uint8>();
+            c.hired = hired;
+            InferHenchmanRoleAndSpec(guid, cls, ClassDefaultRole(cls), c.role, c.spec);
+            out.push_back(std::move(c));
+        } while (q->NextRow());
+        return out;
+    }
+
+    bool HireAlt(Player* requester, uint32 altGuid, std::string& outMsg)
+    {
+        if (!requester || !requester->GetSession())
+        { outMsg = "No session."; return false; }
+        uint32 const account = requester->GetSession()->GetAccountId();
+
+        if (altGuid == requester->GetGUID().GetCounter())
+        { outMsg = "You can't hire the character you're playing."; return false; }
+
+        // Validate: own-account char, exists, offline, not enrolled.
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT c.`level`, c.`online`, c.`account`, c.`class`, "
+            "EXISTS(SELECT 1 FROM `account_party` ap WHERE ap.`guid` = c.`guid`) "
+            "FROM `characters` c WHERE c.`guid` = {}", altGuid);
+        if (!q) { outMsg = "Character not found."; return false; }
+        Field* f = q->Fetch();
+        uint8 const level        = f[0].Get<uint8>();
+        bool  const online       = f[1].Get<uint8>() != 0;
+        uint32 const charAccount = f[2].Get<uint32>();
+        uint8 const cls          = f[3].Get<uint8>();
+        bool  const enrolled     = f[4].Get<uint32>() != 0;
+        if (charAccount != account) { outMsg = "That isn't one of your characters."; return false; }
+        if (enrolled) { outMsg = "That character is already in your party."; return false; }
+        if (online)   { outMsg = "That character is busy — log it out first."; return false; }
+
+        // Party-space cap. Hired alts, henchmen and enrolled heroes all count as
+        // followers toward the leader+4 / raid-of-40 cap (same gate as HireHenchman).
+        Group* const reqGroup  = requester->GetGroup();
+        bool   const inRaid    = reqGroup && reqGroup->isRaidGroup();
+        uint32 const companionCap = inRaid ? 39u : 4u;
+        uint32 const followers    = WowPsParty::CountFollowersFor(requester->GetGUID());
+        if (followers >= companionCap
+            || (reqGroup && reqGroup->GetMembersCount() >= (inRaid ? 40u : 5u)))
+        {
+            outMsg = inRaid
+                ? "Your raid is full."
+                : "Your party is full (4 companions). Convert your group to a raid to add more.";
+            return false;
+        }
+
+        PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+        if (!mgr) { outMsg = "Bot manager not ready — try again in a moment."; return false; }
+
+        // Role from the alt's OWN talents — drives targeting mode + lead-tank pick.
+        std::string const role = InferHenchmanRole(altGuid, cls, ClassDefaultRole(cls));
+
+        ObjectGuid const altObjGuid = ObjectGuid::Create<HighGuid::Player>(altGuid);
+        // Register BEFORE spawning so the patched AddPlayerBot permission check
+        // (WowPsParty_IsManagedBotSpawn_Trampoline) lets the bot in.
+        WowPsParty::AddHiredAltDirective(account, altObjGuid, requester->GetGUID(), role);
+
+        // Load the alt's PERSISTED rotation + loadout into the runtime caches — the
+        // SAME set OnActiveLogin loads for an enrolled alt. Crucially, nothing is
+        // reset to a class default (the henchman hire path does): the alt runs the
+        // exact rotation/toggles the player saved for it before. The COMMON shared
+        // rotation is account-wide (already loaded at login) and applies on top.
+        RotationCacheRefreshFromDB(altGuid);
+        TargetModeRefreshFromDB(altGuid);
+        LeadDungeonRefreshFromDB(altGuid);
+        WaitTankThreatRefreshFromDB(altGuid);
+        SafePullRefreshFromDB(altGuid);
+        PullCountRefreshFromDB(altGuid);
+        LeadDistRefreshFromDB(altGuid);
+        EngageRangeRefreshFromDB(altGuid);
+        AnchorTankRefreshFromDB(altGuid);
+
+        mgr->AddPlayerBot(altObjGuid, account);
+
+        // Spawn is async (login query holder). After a short delay: if it arrived,
+        // make sure it's grouped + set the loot mode; if it never arrived, drop the
+        // directive so we never leak one. Free hire — nothing to refund.
+        ObjectGuid const leaderGuid = requester->GetGUID();
+        requester->m_Events.AddEventAtOffset([leaderGuid, altObjGuid]()
+        {
+            Player* lead = ObjectAccessor::FindConnectedPlayer(leaderGuid);
+            Player* alt  = ObjectAccessor::FindConnectedPlayer(altObjGuid);
+            if (!alt || !alt->IsInWorld())
+            {
+                WowPsParty::RemoveFollower(altObjGuid);
+                if (lead && lead->GetSession())
+                    ChatHandler(lead->GetSession()).PSendSysMessage(
+                        "|cffff5555[WowPsParty]|r Your alt didn't arrive — try again.");
+                LOG_WARN("module",
+                    "[WowPsParty Alts] spawn no-show alt_guid={} (bot not in world after delay)",
+                    altObjGuid.GetCounter());
+                return;
+            }
+            if (!lead) return;
+
+            // mod-playerbots auto-groups an own-account bot with its master, so this
+            // is usually a no-op; it's the safety net for the case it didn't.
+            Group* g = lead->GetGroup();
+            if (!g)
+            {
+                g = new Group();
+                if (!g->Create(lead)) { delete g; return; }
+                sGroupMgr->AddGroup(g);
+            }
+            if (!g->IsMember(altObjGuid))
+            {
+                if (alt->GetGroup())
+                {
+                    struct RegroupGuard {
+                        ObjectGuid gg;
+                        ~RegroupGuard() { WowPsParty::SetHenchmanRegrouping(gg, false); }
+                    } guard{altObjGuid};
+                    WowPsParty::SetHenchmanRegrouping(altObjGuid, true);
+                    alt->RemoveFromGroup();
+                }
+                if (!g->AddMember(alt))
+                {
+                    WowPsParty::DismissHiredAltByGuid(altObjGuid);
+                    if (lead->GetSession())
+                        ChatHandler(lead->GetSession()).PSendSysMessage(
+                            "|cffff5555[WowPsParty]|r Group is full — couldn't add the alt.");
+                    return;
+                }
+            }
+            UpdateGroupLootForHenchmen(lead);
+            if (PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(alt))
+            {
+                ai->ChangeStrategy("+loot",   BOT_STATE_NON_COMBAT);
+                ai->ChangeStrategy("+gather", BOT_STATE_NON_COMBAT);
+            }
+        }, std::chrono::seconds(8));
+
+        LOG_INFO("module",
+            "[WowPsParty Alts] HIRE account={} alt_guid={} role={} level={}",
+            account, altGuid, role, uint32(level));
+        outMsg = "Hired!";
+        return true;
     }
 
     static uint32 FetchAccountForGuid(uint32 guid)

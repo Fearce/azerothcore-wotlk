@@ -152,6 +152,10 @@ public:
         // + drop their follow directives) when the leader logs out.
         WowPsParty::DismissAllHenchmen(player);
 
+        // Hired alts are session-scoped too — release them (saved as-is, keeping any
+        // loot) and drop their directives so none linger across the leader's logout.
+        WowPsParty::DismissAllHiredAlts(player);
+
         // Drop any pending LFG party-fill offer + despawn its recruiter NPC so a
         // disconnect mid-popup leaks no state.
         WowPsParty::LfgFill_OnLogout(player->GetGUID());
