@@ -1263,6 +1263,27 @@ static bool RelocateOneLooseItem(uint32 account, Player* from)
     return false;
 }
 
+// GetItemByGuid walks every bag slot and reads each item's value array
+// (Item::GetGUID -> Object::GetGuidValue). A party member's bag can transiently
+// hold a dangling / half-initialised Item* -- the recurring use-after-free this
+// module already SEH-guards on every panel READ (SafeReadItemFields /
+// SafeItemTemplate). The raw core lookup had no such guard: 2026-07-01 a GBANK
+// deposit ran GetItemByGuid over a hero bag still holding a freed Item* (left by
+// Item::SaveToDB's ITEM_REMOVED delete guard, which frees the object but can't
+// clear the owning slot) and AV'd the world thread in Object::GetGuidValue. Route
+// every member item lookup through this so a poisoned slot yields nullptr instead
+// of taking the server down; all callers already null-check the result.
+static Item* SafeGetItemByGuid(Player* p, ObjectGuid guid)
+{
+    if (!p) return nullptr;
+#ifdef _WIN32
+    __try { return p->GetItemByGuid(guid); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+#else
+    return p->GetItemByGuid(guid);
+#endif
+}
+
 // Persist a shared-inventory transfer IMMEDIATELY rather than leaving the row
 // rewrite to the destination's next deferred _SaveInventory. The cross-character
 // move/equip paths detach an item from one member and re-own + re-store it on
@@ -1335,7 +1356,7 @@ static void HandleEquip(Player* requester, std::string_view payload)
     Player* srcChar = ObjectAccessor::FindConnectedPlayer(srcCharObj);
     if (!srcChar) return;
 
-    Item* srcItem = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    Item* srcItem = SafeGetItemByGuid(srcChar, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
     if (!srcItem) return;
 
     // A lootable container (Satchel of Helpful Goods / reward pouch) that reached
@@ -1634,7 +1655,7 @@ static void HandleSell(Player* requester, std::string_view payload)
         ObjectGuid::Create<HighGuid::Player>(srcCharGuid));
     if (!srcChar) return;
 
-    Item* srcItem = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    Item* srcItem = SafeGetItemByGuid(srcChar, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
     if (!srcItem) return;
 
     ItemTemplate const* tmpl = srcItem->GetTemplate();
@@ -1868,7 +1889,7 @@ static void HandleWithdraw(Player* requester, std::string_view payload)
     uint32 const itemGuidLow = std::strtoul(std::string(payload).c_str(), nullptr, 10);
     if (!itemGuidLow) return;
 
-    Item* item = requester->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(itemGuidLow));
+    Item* item = SafeGetItemByGuid(requester, ObjectGuid::Create<HighGuid::Item>(itemGuidLow));
     if (!item || !Player::IsBankPos(item->GetPos()))
     {
         ChatHandler(requester->GetSession()).PSendSysMessage(
@@ -1972,7 +1993,7 @@ static void HandleReqEnchants(Player* requester, std::string_view payload)
     Player* tgtChar = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(tgtGuid));
     if (!tgtChar) return;
     if (WowPsParty::MemberStorageUnstable(tgtChar)) return;
-    Item* tgtItem = tgtChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(tgtItemGuidLow));
+    Item* tgtItem = SafeGetItemByGuid(tgtChar, ObjectGuid::Create<HighGuid::Item>(tgtItemGuidLow));
     if (!tgtItem) return;
 
     std::vector<uint32> spellIds;
@@ -2045,7 +2066,7 @@ static void HandleEnchant(Player* requester, std::string_view payload)
     Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(tgtGuid));
     if (!owner) return;
     if (WowPsParty::MemberStorageUnstable(owner)) return;  // mid-logout: don't mutate a tearing-down inventory
-    Item* item = owner->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(tgtItemGuidLow));
+    Item* item = SafeGetItemByGuid(owner, ObjectGuid::Create<HighGuid::Item>(tgtItemGuidLow));
     if (!item) return;
 
     SpellInfo const* spell = sSpellMgr->GetSpellInfo(enchantSpellId);
@@ -2196,7 +2217,7 @@ static void HandleRuneforge(Player* requester, std::string_view payload)
     Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(tgtGuid));
     if (!owner) return;
     if (WowPsParty::MemberStorageUnstable(owner)) return;
-    Item* item = owner->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(itemGuidLow));
+    Item* item = SafeGetItemByGuid(owner, ObjectGuid::Create<HighGuid::Item>(itemGuidLow));
     if (!item) return;
 
     ChatHandler ch(requester->GetSession());
@@ -2346,7 +2367,7 @@ static void HandleReqGems(Player* requester, std::string_view payload)
     Player* tgtChar = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(tgtGuid));
     if (!tgtChar) return;
     if (WowPsParty::MemberStorageUnstable(tgtChar)) return;
-    Item* tgtItem = tgtChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(tgtItemGuidLow));
+    Item* tgtItem = SafeGetItemByGuid(tgtChar, ObjectGuid::Create<HighGuid::Item>(tgtItemGuidLow));
     if (!tgtItem) return;
     ItemTemplate const* tgtProto = WowPsParty::SafeItemTemplate(tgtItem);
     if (!tgtProto) return;
@@ -2438,7 +2459,7 @@ static void HandleGem(Player* requester, std::string_view payload)
     Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(tgtGuid));
     if (!owner) return;
     if (WowPsParty::MemberStorageUnstable(owner)) return;  // mid-logout: don't mutate a tearing-down inventory
-    Item* item = owner->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(tgtItemGuidLow));
+    Item* item = SafeGetItemByGuid(owner, ObjectGuid::Create<HighGuid::Item>(tgtItemGuidLow));
     if (!item) return;
     ItemTemplate const* proto = WowPsParty::SafeItemTemplate(item);
     if (!proto) return;
@@ -2533,7 +2554,7 @@ static void HandleDisenchant(Player* requester, std::string_view payload)
     if (!ownerGuid) return;
     Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(ownerGuid));
     if (!owner) return;
-    Item* item = owner->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    Item* item = SafeGetItemByGuid(owner, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
     if (!item) return;
     ItemTemplate const* tmpl = item->GetTemplate();
     if (!tmpl) return;
@@ -2692,7 +2713,7 @@ static void HandleProspect(Player* requester, std::string_view payload)
     if (!ownerGuid) return;
     Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(ownerGuid));
     if (!owner) return;
-    Item* item = owner->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    Item* item = SafeGetItemByGuid(owner, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
     if (!item) return;
     ItemTemplate const* tmpl = item->GetTemplate();
     if (!tmpl) return;
@@ -2838,7 +2859,7 @@ static void HandlePickLock(Player* requester, std::string_view payload)
     if (!ownerGuid) return;
     Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(ownerGuid));
     if (!owner) return;
-    Item* item = owner->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    Item* item = SafeGetItemByGuid(owner, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
     if (!item) return;
     ItemTemplate const* tmpl = item->GetTemplate();
     if (!tmpl) return;
@@ -3026,7 +3047,7 @@ static void HandleMailSend(Player* requester, std::string_view payload)
     if (!ownerGuid) return;
     Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(ownerGuid));
     if (!owner) return;
-    Item* item = owner->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    Item* item = SafeGetItemByGuid(owner, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
     if (!item) return;
     ItemTemplate const* tmpl = item->GetTemplate();
     if (!tmpl) return;
@@ -3127,7 +3148,7 @@ static void HandleAhSell(Player* requester, std::string_view payload)
         ObjectGuid::Create<HighGuid::Player>(srcCharGuid));
     if (!srcChar) return;
 
-    Item* srcItem = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    Item* srcItem = SafeGetItemByGuid(srcChar, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
     if (!srcItem) return;
     ItemTemplate const* tmpl = srcItem->GetTemplate();
     if (!tmpl) return;
@@ -3305,7 +3326,7 @@ static void HandleDestroy(Player* requester, std::string_view payload)
         ObjectGuid::Create<HighGuid::Player>(srcCharGuid));
     if (!srcChar) return;
 
-    Item* srcItem = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    Item* srcItem = SafeGetItemByGuid(srcChar, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
     if (!srcItem) return;
     if (srcItem->IsEquipped()) return;
     if (srcItem->IsNotEmptyBag())
@@ -3493,7 +3514,7 @@ static void HandleBankDeposit(Player* requester, std::string_view payload)
     Player* srcChar = ObjectAccessor::FindConnectedPlayer(
         ObjectGuid::Create<HighGuid::Player>(q->Fetch()[0].Get<uint32>()));
     if (!srcChar) return;
-    Item* item = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    Item* item = SafeGetItemByGuid(srcChar, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
     if (!item) return;
     ItemTemplate const* t = item->GetTemplate();
     std::string const itemName = t ? t->Name1 : "item";
@@ -3598,7 +3619,7 @@ static void HandleBankBag(Player* requester, std::string_view payload)
     Player* srcChar = ObjectAccessor::FindConnectedPlayer(
         ObjectGuid::Create<HighGuid::Player>(q->Fetch()[0].Get<uint32>()));
     if (!srcChar) return;
-    Item* item = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    Item* item = SafeGetItemByGuid(srcChar, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
     if (!item) return;
     ItemTemplate const* t = item->GetTemplate();
     std::string const itemName = t ? t->Name1 : "item";
@@ -3679,7 +3700,7 @@ static Item* PullItemToRequester(Player* requester, Player* srcChar, Item* item)
         ObjectGuid const movedGuid = item->GetGUID();   // MoveItemToInventory returns void
         requester->MoveItemToInventory(dest, item, true);
         FlushPartyTransfer(srcChar, requester);
-        return requester->GetItemByGuid(movedGuid);      // count-1 items don't merge; pointer stays valid
+        return SafeGetItemByGuid(requester, movedGuid);      // count-1 items don't merge; pointer stays valid
     }
 
     // Requester's bags are full — hand it straight back so it never strands.
@@ -3725,7 +3746,7 @@ static void HandleGuildBankDeposit(Player* requester, std::string_view payload)
     Player* srcChar = ObjectAccessor::FindConnectedPlayer(
         ObjectGuid::Create<HighGuid::Player>(q->Fetch()[0].Get<uint32>()));
     if (!srcChar) return;
-    Item* item = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    Item* item = SafeGetItemByGuid(srcChar, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
     if (!item) return;
     ItemTemplate const* t = item->GetTemplate();
     std::string const itemName = t ? t->Name1 : "item";
@@ -3755,12 +3776,12 @@ static void HandleGuildBankDeposit(Player* requester, std::string_view payload)
     {
         if (!guild->MemberHasTabRights(requester->GetGUID(), tabId, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
             continue;
-        Item* cur = requester->GetItemByGuid(movedGuid);
+        Item* cur = SafeGetItemByGuid(requester, movedGuid);
         if (!cur) { deposited = true; break; }
         // NULL_SLOT → auto-place in the first free/stackable slot of this tab.
         guild->SwapItemsWithInventory(requester, /*toChar*/ false, tabId, NULL_SLOT,
                                       cur->GetBagSlot(), cur->GetSlot(), 0);
-        if (!requester->GetItemByGuid(movedGuid))
+        if (!SafeGetItemByGuid(requester, movedGuid))
             deposited = true;   // it left our bags -> stored in the guild bank
     }
 
@@ -3776,7 +3797,7 @@ static void HandleGuildBankDeposit(Player* requester, std::string_view payload)
         // requester's bags (still safe + visible) rather than detaching it into a
         // slotless DB limbo. (CanStoreItem is a capacity check; the item's current
         // owner doesn't matter, so it's valid to test before detaching.)
-        if (Item* cur = requester->GetItemByGuid(movedGuid))
+        if (Item* cur = SafeGetItemByGuid(requester, movedGuid))
             if (srcChar != requester)
             {
                 ItemPosCountVec back;
@@ -3957,7 +3978,7 @@ static void HandleUse(Player* requester, std::string_view payload)
         ObjectGuid::Create<HighGuid::Player>(srcCharGuid));
     if (!srcChar) return;
 
-    Item* srcItem = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    Item* srcItem = SafeGetItemByGuid(srcChar, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
     if (!srcItem) return;
     ItemTemplate const* t = srcItem->GetTemplate();
     if (!t) return;
@@ -4132,7 +4153,7 @@ static void HandleSplit(Player* requester, std::string_view payload)
         ObjectGuid::Create<HighGuid::Player>(srcCharGuid));
     if (!srcChar) return;
 
-    Item* srcItem = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    Item* srcItem = SafeGetItemByGuid(srcChar, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
     if (!srcItem) return;
     if (count >= srcItem->GetCount()) return;   // nothing to split / would empty
 
@@ -4515,7 +4536,7 @@ static void HandleMove(Player* requester, std::string_view payload)
     Player* dstChar = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(qd->Fetch()[0].Get<uint32>()));
     if (!srcChar || !dstChar) return;
 
-    Item* item = srcChar->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    Item* item = SafeGetItemByGuid(srcChar, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
     if (!item) return;
 
     if (srcChar == dstChar)
