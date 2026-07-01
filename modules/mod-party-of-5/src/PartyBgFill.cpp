@@ -365,10 +365,10 @@ namespace
     // Prep-phase deficit TOP-UP. The spawn-at-queue fill (StartFill) can lose the
     // login/relevel/queue race, so a match locks in under-filled (Mill: "joined a 6v6
     // that should've been a 10v10"). This is the safety net: while a tracked leader is in
-    // a BG that is STILL in its pre-gate countdown (STATUS_WAIT_JOIN — the ~90s before the
-    // doors open, where joins are guaranteed accepted, exactly the real-server "join an
-    // in-progress BG with room" behaviour Mill described), keep BOTH teams topped up to
-    // MaxPlayersPerTeam by spawning fills for the REAL deficit read off the LIVE instance.
+    // a BG that is either counting down (STATUS_WAIT_JOIN) OR already live
+    // (STATUS_IN_PROGRESS — WotLK allows joining a BG in progress with room, the real-server
+    // backfill behaviour), keep BOTH teams topped up to MaxPlayersPerTeam by spawning fills
+    // for the REAL deficit read off the LIVE instance.
     // Deficit-based and self-throttling — newly-spawned fills are counted as in-flight, so
     // it converges to a full match and stops spawning. Runs every world tick; the cheap
     // both-teams-full check below short-circuits the steady state (a correctly-filled match
@@ -379,7 +379,15 @@ namespace
         if (!leader || !leader->IsInWorld() || !leader->InBattleground()) return;
         Battleground* bg = leader->GetBattleground();
         if (!bg || bg->isArena()) return;
-        if (bg->GetStatus() != STATUS_WAIT_JOIN) return;   // only before the gates open
+        // Backfill both during the pre-gate countdown (STATUS_WAIT_JOIN) AND once the match
+        // is LIVE (STATUS_IN_PROGRESS). A fill that lost the login/relevel/queue/port race
+        // during prep leaves the match locked in short with no recovery — the 15v10 Arathi
+        // Kevin saw (a Random-BG pop where +6 Horde top-ups were spawned at present=9 but
+        // only ~1 entered before the gates opened). WotLK allows joining a BG in progress
+        // with room, so keep topping the real deficit up mid-match too; the both-teams-full
+        // short-circuit below stops it the instant the match is balanced, and it also keeps
+        // a match full as real players leave. Only WAIT_LEAVE (match over) is excluded.
+        if (bg->GetStatus() != STATUS_WAIT_JOIN && bg->GetStatus() != STATUS_IN_PROGRESS) return;
         uint32 const maxPerTeam = bg->GetMaxPlayersPerTeam();
         if (maxPerTeam == 0) return;
         // Both teams already full -> nothing to do; skip the DB queries below. This is the
@@ -585,6 +593,51 @@ namespace
     {
         Battleground* tpl = sBattlegroundMgr->GetBattlegroundTemplate(BattlegroundTypeId(bgTypeId));
         return tpl && !tpl->isArena() && tpl->GetMaxPlayersPerTeam() > 0;
+    }
+
+    // ===== Strand of the Ancients on-foot combat driver ====================
+    // mod-playerbots' BattleGroundTactics has cases for AB/AV/WS/EY/IC but NONE for SA — so
+    // our master-0 fill bots get the "+bg" strategy yet it no-ops in Strand and they stand
+    // COMPLETELY AFK (Kevin), handing the human a free win since the entire enemy team is
+    // fills. A full objective SA AI (attacker/defender roles + gate-breaking demolishers) is
+    // a Wintergrasp-scale follow-up: it needs a core-state exposure (BattlegroundSA::Attackers
+    // is private) and a live SA match to validate. Until then, drive a self-contained
+    // advance-and-engage so nobody is AFK: seek the nearest enemy player, march to intercept,
+    // and fight it. Symmetric — needs no knowledge of which side attacks — so both teams
+    // converge and brawl (attackers pressing the gates, defenders holding them). Modeled on
+    // the WG DriveAI foot loop below.
+    constexpr uint32 SOTA_ENGAGE_RANGE = 40;
+
+    void DriveSotaFill(Player* bot, Battleground* bg)
+    {
+        if (!bot->IsAlive()) return;                          // dead -> the BG's spirit-res handles it
+        if (bot->IsInCombat() && bot->GetVictim()) return;    // fighting -> the class combat AI owns it
+        if (bot->IsNonMeleeSpellCast(false, false, true)) return;
+        if (bot->GetVehicle()) return;                        // seated in a demolisher/cannon -> leave it
+
+        Unit* enemy = nullptr; float bestD = 1e9f;
+        for (auto const& itr : bg->GetPlayers())
+        {
+            Player* e = ObjectAccessor::FindConnectedPlayer(itr.first);
+            if (!e || e == bot || !e->IsAlive() || e->GetMapId() != bot->GetMapId()) continue;
+            if (!bot->IsValidAttackTarget(e)) continue;       // false during warmup / for same team
+            float const d = bot->GetDistance(e);
+            if (d < bestD) { bestD = d; enemy = e; }
+        }
+        if (!enemy) return;                                   // no live enemy yet (warmup) -> stand put
+
+        if (bestD <= float(SOTA_ENGAGE_RANGE))
+        {
+            if (bot->GetVictim() != enemy)
+            { bot->Attack(enemy, true); bot->GetMotionMaster()->MoveChase(enemy); }
+            else if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
+                bot->GetMotionMaster()->MoveChase(enemy);
+            return;
+        }
+        // Too far to engage -> march to intercept. Re-issue only when stopped; the 1s tick
+        // keeps it walking toward a moving front without spamming MovePoint every tick.
+        if (!bot->isMoving())
+            bot->GetMotionMaster()->MovePoint(0, enemy->GetPositionX(), enemy->GetPositionY(), enemy->GetPositionZ());
     }
 
     // The (non-arena) battleground the human just queued — INCLUDING Random BG. We
@@ -1126,6 +1179,11 @@ public:
                     if (PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot))
                         if (!ai->HasStrategy("bg", BOT_STATE_NON_COMBAT))
                             ai->ChangeStrategy("+bg", BOT_STATE_NON_COMBAT);
+                // Strand of the Ancients has no mod-playerbots tactics, so the "+bg" strategy
+                // above no-ops and the fill stands AFK — drive it on foot ourselves instead.
+                if (Battleground* fbg = bot->GetBattleground())
+                    if (fbg->GetBgTypeID() == BATTLEGROUND_SA)
+                        DriveSotaFill(bot, fbg);
                 // Remember it made it in, so when the match ENDS (below) we retire it from
                 // HERE — never from the BG-removal hook, where a synchronous LogoutPlayer
                 // mid-teardown (×10-40 bots on a BG end) is a crash risk.
@@ -1219,8 +1277,9 @@ public:
                     StartFill(leader, bgTypeId);
                 }
             }
-            // Keep the match topped up to max while it's still in its pre-gate countdown
-            // (no-op unless the leader is in a BG in STATUS_WAIT_JOIN with a real deficit).
+            // Keep the match topped up to max during the pre-gate countdown AND while it's
+            // live (no-op unless the leader is in a BG in STATUS_WAIT_JOIN or STATUS_IN_PROGRESS
+            // with a real deficit — the mid-match backfill that fixes a locked-in 15v10).
             TopUpBgInPrep(leader);
             std::vector<ObjectGuid> party;
             WowPsParty::GetPartyGuidsFor(leader->GetGUID(), party);
