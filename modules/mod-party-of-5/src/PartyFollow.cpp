@@ -3986,6 +3986,48 @@ namespace WowPsParty
     static constexpr float HENCH_LOOT_REACH = 4.5f;   // inside INTERACTION_DISTANCE (5.5)
     static constexpr float HENCH_LOOT_STANDOFF = 2.0f; // walk to ~2y off the corpse, not on top of it
     static constexpr float HENCH_LOOT_STEPOFF  = 3.0f; // after the last corpse, nudge this far clear of it
+    // Cap how FAR a henchman will travel for loot. It used to scan/commit out to the 75y
+    // GATHER_SCAN_RANGE and run all the way back to a corpse (Kevin: "extremely far back").
+    // A corpse beyond this of the bot is simply left — the human can grab it, or the bot
+    // loots it when the party next passes closer. Well under the leader leash so the walk
+    // is short.
+    static constexpr float HENCH_LOOT_SCAN_RANGE = 30.0f;
+    // Don't even START a loot-walk while this far behind the leader — catch up first, so a
+    // henchman never strays deep behind the party chasing loot (tighter than the 75y gather
+    // leash, which is fine for standing on a vein but too loose for corpse detours).
+    static constexpr float HENCH_LOOT_LEADER_LEASH = 40.0f;
+    // Proximity-aggro guard: never START toward a corpse with an UN-aggroed live hostile
+    // this close — walking up to it would proximity-pull that pack (Kevin: "they pull packs
+    // while looting, be more careful"). ~a mob's aggro radius plus a margin. Lifted once the
+    // bot is already within loot reach (it clearly didn't aggro anything on the way in).
+    static constexpr float HENCH_LOOT_AGGRO_CLEAR = 20.0f;
+
+    // True while an UN-aggroed, out-of-combat live hostile sits within HENCH_LOOT_AGGRO_CLEAR
+    // of `corpse` — reaching it would pull that pack. Skipped once the bot is within loot reach
+    // (already there → safe to grab). Mirrors NodeBlockedByDungeonEnemies but tighter (a corpse
+    // sits in already-cleared space, so a nearby mob is a genuine fresh pull) and applies on
+    // every map, since a careless loot-pull is bad anywhere.
+    static bool CorpseLootBlockedByAggro(Player* bot, Creature* corpse)
+    {
+        if (!bot || !corpse) return false;
+        if (bot->IsWithinDist(corpse, HENCH_LOOT_REACH)) return false;   // already there -> just loot
+        struct HostileNearCheck
+        {
+            HostileNearCheck(WorldObject const* c, Player const* v, float r) : center(c), viewer(v), range(r) {}
+            bool operator()(Creature* u) const
+            {
+                return u && u->IsAlive() && !u->IsInCombat()          // un-aggroed only (a fresh pack)
+                    && !u->IsCritter() && !u->IsTotem()
+                    && center->IsWithinDist(u, range) && viewer->IsValidAttackTarget(u);
+            }
+            WorldObject const* center; Player const* viewer; float range;
+        };
+        std::list<Creature*> crs;
+        HostileNearCheck check(corpse, bot, HENCH_LOOT_AGGRO_CLEAR);
+        Acore::CreatureListSearcher<HostileNearCheck> searcher(corpse, crs, check);
+        Cell::VisitObjects(corpse, searcher, HENCH_LOOT_AGGRO_CLEAR);
+        return !crs.empty();
+    }
 
     static Creature* FindNearestLootableCorpse(Player* bot, float range,
                                                ObjectGuid avoid, Group* grp)
@@ -4000,6 +4042,7 @@ namespace WowPsParty
         for (Creature* c : crs)
         {
             if (avoid && c->GetGUID() == avoid) continue;
+            if (CorpseLootBlockedByAggro(bot, c)) continue;   // reaching it would pull a fresh pack — skip
             float const d = bot->GetDistance(c);
             if (d < bestDist) { bestDist = d; best = c; }
         }
@@ -4195,7 +4238,7 @@ namespace WowPsParty
         // of the leader, so the henchman never strays off to a far body. A corpse
         // it has ALREADY committed to is finished regardless of leash (the >100y
         // follow teleport, which clears the slot, is the only interrupt).
-        if (!committed && bot->GetDistance(leader) > GATHER_LEADER_LEASH)
+        if (!committed && bot->GetDistance(leader) > HENCH_LOOT_LEADER_LEASH)
         { HenchLootLog(gLow, "skip: lagging leader, not starting — catching up"); return; }
 
         Creature* target = committed ? ObjectAccessor::GetCreature(*bot, committed) : nullptr;
@@ -4203,13 +4246,14 @@ namespace WowPsParty
             && target->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE)
             && target->loot.loot_type != LOOT_SKINNING
             && target->GetLootRecipientGroup() == grp
+            && !CorpseLootBlockedByAggro(bot, target)        // a patrol wandered onto it -> drop it, be careful
             && HenchClaimable(target, bot->GetGUID(), grp);  // still something here FOR US?
 
         if (!valid)
         {
-            // Lost / emptied committed corpse — pick the nearest valid one,
+            // Lost / emptied / now-guarded committed corpse — pick the nearest valid one,
             // skipping any we recently gave up reaching / just looted.
-            target = FindNearestLootableCorpse(bot, GATHER_SCAN_RANGE,
+            target = FindNearestLootableCorpse(bot, HENCH_LOOT_SCAN_RANGE,
                 (now < avoidUntil) ? avoid : ObjectGuid::Empty, grp);
             std::lock_guard<std::mutex> lock(g_gatherMutex);
             auto& st = g_gather[gLow];
@@ -4253,7 +4297,7 @@ namespace WowPsParty
             // angle so the henchman doesn't sit and drink ON the corpse and block the
             // player from looting it (Kevin). Party isn't in combat here (checked above),
             // so a brief reposition is safe; the follow ticker brings it back after.
-            if (!FindNearestLootableCorpse(bot, GATHER_SCAN_RANGE, tg, grp))
+            if (!FindNearestLootableCorpse(bot, HENCH_LOOT_SCAN_RANGE, tg, grp))
             {
                 float const ang = float((gLow * 2654435761u + now) % 6283u) / 1000.0f;  // ~0..2pi, varies per bot/time
                 float ex = cx + std::cos(ang) * HENCH_LOOT_STEPOFF;
