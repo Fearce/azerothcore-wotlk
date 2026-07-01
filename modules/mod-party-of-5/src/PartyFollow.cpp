@@ -2047,7 +2047,7 @@ namespace WowPsParty
     // their leash to poke a neutral monster. It just ranks the live combatants by
     // distance. Returns nullptr if nothing qualifies (assist loop then falls back
     // to party-defense).
-    static Unit* PickNearestEngagedTarget(Player* bot, bool skipFullyImmune = false)
+    static Unit* PickNearestEngagedTarget(Player* bot, bool skipFullyImmune = false, bool fleeingOnly = false)
     {
         constexpr float MAX_RANGE = 40.0f;
         Unit* best = nullptr;
@@ -2060,6 +2060,9 @@ namespace WowPsParty
             // Divine Shield / Ice Block bubble) so the immune-retarget below lands
             // on something the party can actually hurt.
             if (skipFullyImmune && a->IsImmunedToDamage(SPELL_SCHOOL_MASK_ALL)) return;
+            // fleeingOnly: the DPS "focus them down" flee behaviour — consider ONLY a mob
+            // that's RUNNING AWAY (fear / flee-for-assistance), so the party bursts the runner.
+            if (fleeingOnly && !IsUnitFleeing(a)) return;
             float const d = bot->GetDistance(a);
             if (d > MAX_RANGE) return;
             if (IsTargetUnreachable(bot->GetGUID().GetCounter(), a->GetGUID().GetCounter())) return;
@@ -5920,6 +5923,20 @@ namespace WowPsParty
                     focusMob = FindNearestFocusEnemy(bot, focusEngagedNames, FOCUS_SCAN_RANGE, /*engagedOnly=*/true);
             }
         }
+
+        // ---- FLEEING-FOCUS: the DPS "focus them down" half of the flee behaviour --------
+        // A mob RUNNING AWAY (spell-fear / low-HP panic / flee-for-assistance) should be
+        // burst down before it sprints into the next pack and social-aggros it. The bot TANK
+        // deliberately won't chase a fleer off its pull-spot (chain-pull), so the DPS finish
+        // it: a non-tank DPS drops onto the nearest fleeing mob the party is ALREADY fighting
+        // and focuses it. Same flee-handling tier as the slow_fleeing peel — it's the kill
+        // half to that CC half. Routed through focusMob so it bypasses the threat gate/retarget
+        // throttle (immediate switch), but ranked BELOW an explicit focus: must-kill add and
+        // scoped to a party-engaged mob (PickNearestEngagedTarget never a fresh pull), so it
+        // can't drop a rift/tomb add or start a pull. Healers/tanks excluded.
+        if (!focusMob && bot->IsInCombat() && RoleForGuid(bot->GetGUID()) == "dps")
+            focusMob = PickNearestEngagedTarget(bot, /*skipFullyImmune=*/false, /*fleeingOnly=*/true);
+
         if (focusMob)
             desired = focusMob;
 
