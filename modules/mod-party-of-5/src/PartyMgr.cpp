@@ -835,13 +835,17 @@ namespace WowPsParty
                     add("target_casting&target_interruptible", "cast:Silencing Shot", 87);
                     add("target_health<20", "cast:Kill Shot", 86);
                     add("pet_health<50", "cast_pet:Mend Pet", 78);
-                    // Aspect management: keep the damage aspect (Hawk) up, but drop to Aspect of
-                    // the Viper when nearly OOM and swap back once Viper has regen'd past 30%. The
-                    // Hawk maintenance is gated on NOT being in Viper so it can't instantly
-                    // overwrite the mana aspect; the 10%-down / 30%-up hysteresis stops flapping.
+                    // Aspect management. IN COMBAT keep the damage aspect (Hawk) up; OUT OF COMBAT
+                    // run Aspect of the Pack for party travel speed (deliberately NOT Cheetah — same
+                    // daze-on-hit, but Pack buffs the whole group). Both use buff_self, which only
+                    // casts when the aspect is actually missing. Low-mana handling still drops to
+                    // Aspect of the Viper and swaps back once Viper regen's past 30%; the Hawk rule
+                    // stays gated on NOT being in Viper so it can't instantly overwrite the mana
+                    // aspect (during Viper, Hawk IS missing) — the 10%-down / 30%-up hysteresis holds.
                     add("self_mana<10&self_missing_aura:Aspect of the Viper", "cast_self:Aspect of the Viper", 75);
                     add("self_mana>30&self_has_aura:Aspect of the Viper", "cast_self:Aspect of the Hawk", 75);
-                    add("self_missing_aura:Aspect of the Viper", "buff_self:Aspect of the Hawk", 74);
+                    add("party_in_combat&self_missing_aura:Aspect of the Viper", "buff_self:Aspect of the Hawk", 74);
+                    add("party_out_of_combat&self_missing_aura:Aspect of the Pack", "buff_self:Aspect of the Pack", 74);
                     add("target_missing_aura:Hunter's Mark", "cast:Hunter's Mark", 70);
                     add("target_missing_aura:Serpent Sting", "cast:Serpent Sting", 66);
                     // AoE on the densest CLUSTER (a ranged hunter stands back). Volley

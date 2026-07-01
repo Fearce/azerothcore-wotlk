@@ -8127,19 +8127,37 @@ namespace WowPsParty
                     && !follower->HasAuraType(SPELL_AURA_MOD_DECREASE_SPEED)
                     && !follower->HasAuraType(SPELL_AURA_MOD_SPEED_ALWAYS)
                     && !follower->HasAuraType(SPELL_AURA_MOD_SPEED_NOT_STACK);
-                if (!eligible || !leader->isMoving()) { clearCatchup(); continue; }
-
-                // Intended distance from the leader: the lead distance for a dungeon lead
-                // tank (it sits AHEAD), else its formation slot distance. Boost on how far
-                // PAST that the bot has fallen.
                 bool const inDungeon = leader->GetMap() && leader->GetMap()->IsDungeon();
-                float const refDist  = (inDungeon && IsLeadTank(d.followerGuid))
-                                     ? float(WowPsParty::BotLeadDistance(d.followerGuid))
-                                     : h.slotDist;
-                float const behind = follower->GetExactDist2d(
-                    leader->GetPositionX(), leader->GetPositionY()) - refDist;
-                float const desiredBoost = behind > 0.0f
-                    ? std::min(behind / CATCHUP_FULL_DIST, 1.0f) * CATCHUP_MAX_BOOST
+                bool const leadTank  = inDungeon && IsLeadTank(d.followerGuid);
+                // A rear follower only needs catch-up while the leader walks away. A dungeon lead
+                // tank ALSO has to close the gap to its FRONT slot when the leader pauses (it must
+                // move UP to lead), so it isn't gated on leader movement — except while it's mid
+                // pull/gather, where the pull drive owns its feet and a boost would rush the body-pull.
+                bool const pulling = IsTankPulling(d.followerGuid) || TankGatherActive(gLow);
+                bool const wantCatchup = leader->isMoving() || (leadTank && !pulling);
+                if (!eligible || !wantCatchup) { clearCatchup(); continue; }
+
+                // Distance to the ACTUAL formation point, not |dist to leader| - refDist. The old
+                // signed-distance metric went NEGATIVE exactly when a lead tank lagged BEHIND its
+                // front slot (dist to leader < lead distance) — so the tank that most needed to
+                // speed up got no boost and ambled at normal speed (Kevin's report). For the lead
+                // tank the target is leadDist AHEAD of the leader (its facing, angle 0 = the same
+                // slot MoveFollow pins it to); for a rear follower keep the slot-distance proxy.
+                float gap;
+                if (leadTank)
+                {
+                    float const leadDist = float(WowPsParty::BotLeadDistance(d.followerGuid));
+                    float const ang = leader->GetOrientation();
+                    float const tx  = leader->GetPositionX() + leadDist * std::cos(ang);
+                    float const ty  = leader->GetPositionY() + leadDist * std::sin(ang);
+                    gap = follower->GetExactDist2d(tx, ty);
+                }
+                else
+                    gap = follower->GetExactDist2d(leader->GetPositionX(), leader->GetPositionY())
+                        - h.slotDist;
+
+                float const desiredBoost = gap > 0.0f
+                    ? std::min(gap / CATCHUP_FULL_DIST, 1.0f) * CATCHUP_MAX_BOOST
                     : 0.0f;
 
                 if (desiredBoost <= 0.001f)
