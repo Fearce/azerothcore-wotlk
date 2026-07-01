@@ -1710,6 +1710,37 @@ namespace WowPsParty
         return best;
     }
 
+    // Is the tank's pull-spot still OCCUPIED — a live, non-fleeing enemy sitting within
+    // PULLSPOT_LEASH of it? While something is parked at the spot the tank must keep holding
+    // it (Kevin: a mob in the pull-spot outranks running off to a loose caster). Only once
+    // everything at the spot is dead does the leash drop so the tank can close to melee a
+    // caster that won't come to it. Scans the tank's own attackers/victim AND every party
+    // member's attackers, so a mob stuck on the healer at the spot still counts as "held".
+    // Fleeing mobs don't hold the spot — they're leaving it (the flee safety-valve governs
+    // them separately), so they're excluded here.
+    static bool TankHasLiveEnemyAtPullSpot(Player* tank, PullSpot const& ps)
+    {
+        bool found = false;
+        auto consider = [&](Unit* a)
+        {
+            if (found || !a || !a->IsAlive() || !tank->IsValidAttackTarget(a)) return;
+            if (IsUnitFleeing(a)) return;
+            if (a->GetExactDist2d(ps.x, ps.y) <= PULLSPOT_LEASH) found = true;
+        };
+        for (Unit* a : tank->getAttackers()) consider(a);
+        if (Unit* v = tank->GetVictim()) consider(v);
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(tank->GetGUID(), party);
+        for (ObjectGuid g : party)
+        {
+            if (found) break;
+            Player* m = ObjectAccessor::FindPlayer(g);
+            if (!m || !m->IsAlive() || m->FindMap() != tank->FindMap()) continue;
+            for (Unit* a : m->getAttackers()) consider(a);
+        }
+        return found;
+    }
+
     // ---- Human-tank ENGAGE LEAD (pure threat, NO timer) ----------------------
     // A mob only counts as "properly engaged" by the tank once the tank holds at
     // least this fraction of the mob's MAX HEALTH in threat on it. Below it, DPS
@@ -6786,8 +6817,14 @@ namespace WowPsParty
             Unit* const dv = desired->GetVictim();
             bool const peelingAlly = dv && dv != bot && bot->IsFriendlyTo(dv);   // add loose on an ally -> go grab it
             PullSpot ps;
+            // Leash/hold ONLY while the spot is still worth holding: either the target is a
+            // fleeing runner (keep the don't-chase-a-runner behavior + safety valve below), or
+            // a live enemy is still parked at the spot (a held mob outranks chasing a caster).
+            // A non-fleeing loose caster beyond the leash with the spot CLEARED falls through to
+            // the normal chase/melee so the tank goes and engages it instead of freezing (Kevin).
             if (!peelingAlly && GetPullSpot(gLow, ps)
-                && desired->GetExactDist2d(ps.x, ps.y) > PULLSPOT_LEASH)
+                && desired->GetExactDist2d(ps.x, ps.y) > PULLSPOT_LEASH
+                && (IsUnitFleeing(desired) || TankHasLiveEnemyAtPullSpot(bot, ps)))
             {
                 // Safety valve for a FLEEING victim only: if it never dies / comes back / evades
                 // and no add arrives, don't freeze on it forever — memo it unreachable FOR THIS
