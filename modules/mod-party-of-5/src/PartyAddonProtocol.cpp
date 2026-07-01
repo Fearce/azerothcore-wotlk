@@ -407,6 +407,7 @@ namespace WowPsParty
     // forward decls — definitions follow below
     void SendGearTo(Player* requester, uint32 slot);
     void SendStatsTo(Player* requester, uint32 slot);
+    void SendCurrencyTo(Player* requester, std::string const& token);
     void SendInventoryTo(Player* requester);
     void SendQuestProgressTo(Player* requester);
 
@@ -714,6 +715,73 @@ namespace WowPsParty
             << ";par:"  << p->GetFloatValue(PLAYER_PARRY_PERCENTAGE)
             << ";blk:"  << p->GetFloatValue(PLAYER_BLOCK_PERCENTAGE)
             << ";res:"  << p->GetRatingBonusValue(CR_CRIT_TAKEN_MELEE);
+        SendWPSP(requester, out.str());
+    }
+
+    static uint32 DbCurrencyItemCount(uint32 guid, uint32 itemId)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT COALESCE(SUM(ii.`count`), 0) "
+            "FROM `character_inventory` ci "
+            "INNER JOIN `item_instance` ii ON ii.`guid` = ci.`item` "
+            "WHERE ci.`guid` = {} AND ii.`itemEntry` = {}",
+            guid, itemId);
+        return q ? uint32(q->Fetch()[0].Get<uint64>()) : 0;
+    }
+
+    static uint32 DbHonorPoints(uint32 guid)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `totalHonorPoints` FROM `characters` WHERE `guid` = {}", guid);
+        return q ? q->Fetch()[0].Get<uint32>() : 0;
+    }
+
+    static uint32 DbArenaPoints(uint32 guid)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `arenaPoints` FROM `characters` WHERE `guid` = {}", guid);
+        return q ? q->Fetch()[0].Get<uint32>() : 0;
+    }
+
+    static uint32 CurrencyCountFor(Player* p, uint32 guid, std::string const& token)
+    {
+        if (token == "honor")
+            return p ? p->GetHonorPoints() : DbHonorPoints(guid);
+        if (token == "arena")
+            return p ? p->GetArenaPoints() : DbArenaPoints(guid);
+
+        uint32 const itemId = std::strtoul(token.c_str(), nullptr, 10);
+        if (!itemId)
+            return 0;
+        return p ? p->GetItemCount(itemId, true) : DbCurrencyItemCount(guid, itemId);
+    }
+
+    // CURRENCY_COUNTS\t<token>\t<slot>:<name>:<count>;...
+    // Sent after the player clicks a row in the native Currency tab. Counts are
+    // per enrolled hero and use DB fallback for offline members.
+    void SendCurrencyTo(Player* requester, std::string const& token)
+    {
+        if (!requester || !requester->GetSession() || token.empty()) return;
+
+        uint32 const account = requester->GetSession()->GetAccountId();
+        auto const party = sPartyMgr.GetParty(account);
+
+        std::ostringstream out;
+        out << "CURRENCY_COUNTS\t" << token << '\t';
+        bool first = true;
+        for (auto const& m : party)
+        {
+            ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(m.guid);
+            Player* p = ObjectAccessor::FindConnectedPlayer(og);
+            if (!p) p = ObjectAccessor::FindPlayer(og);
+            if (p && MemberStorageUnstable(p))
+                p = nullptr;
+
+            if (!first) out << ';';
+            first = false;
+            out << uint32(m.slot) << ':' << m.name << ':'
+                << CurrencyCountFor(p, m.guid, token);
+        }
         SendWPSP(requester, out.str());
     }
 
@@ -4752,12 +4820,12 @@ public:
             uint32 slot = std::strtoul(std::string(payload).c_str(), nullptr, 10);
             WowPsParty::SendStatsTo(player, slot);
         }
+        else if (command == "REQ_CURRENCY")
+        {
+            WowPsParty::SendCurrencyTo(player, std::string(payload));
+        }
         // REQ_GENROT\t<token>  →  GENROT\t<token>\t<dsl>
-        // "Generate rotation" button: hand back the class-default rotation for
-        // the member so the editor can populate an empty rotation the user can
-        // then tweak + Save & Apply. Reuses DefaultRotationForClass (the same
-        // default the bot already runs on hire). Converts the '|' field sep to
-        // '~' for the editor's import parser (which avoids '|', a WoW escape).
+        // REQ_GENROT replies with a generated rotation DSL for the editor.
         else if (command == "REQ_GENROT")
         {
             std::string const token(payload);
