@@ -3385,8 +3385,9 @@ namespace WowPsParty
     }
 
     // Call right after a SUCCESSFUL UpdateGatherSkill (the skill actually went
-    // up). Announces only the three gathering professions, only within the last
-    // 5 points before the cap, and only once per value reached.
+    // up). Announces EVERY gathering skill-up to party chat (Kevin: every point,
+    // not just the final band before the cap), once per value reached — with a
+    // "train me" nudge in the last 5 / at the cap so he remembers the next rank.
     static void AnnounceGatherSkillProgress(Player* bot, uint32 skill)
     {
         if (skill != SKILL_MINING && skill != SKILL_HERBALISM && skill != SKILL_SKINNING)
@@ -3394,12 +3395,12 @@ namespace WowPsParty
 
         int32 const value = bot->GetPureSkillValue(skill);
         int32 const cap   = bot->GetPureMaxSkillValue(skill);
-        if (cap <= 0 || value < cap - 5) return;   // not yet in the final-5 band
+        if (cap <= 0) return;
 
         // One announcement per value: skip anything we've already reported for
-        // this bot+skill. Skill is monotonic, so the cap fires exactly once.
-        // Assumes SkillGain.Gathering = 1 (the realm default) — at a higher step
-        // intermediate values are skipped, never duplicated, by this same guard.
+        // this bot+skill. Skill is monotonic, so each reached value fires exactly
+        // once — at a higher SkillGain step, skipped-over values simply never
+        // announce (this same guard prevents any duplicate).
         uint64 const key = (uint64(bot->GetGUID().GetCounter()) << 16) | uint16(skill);
         {
             std::lock_guard<std::mutex> lock(g_skillAnnounceMutex);
@@ -3411,11 +3412,15 @@ namespace WowPsParty
         Group* g = bot->GetGroup();
         if (!g) return;
 
-        std::string const msg = (value >= cap)
-            ? Acore::StringFormat("{} {}/{} — capped! Train my next rank so I can keep gathering.",
-                                  GatherSkillName(skill), value, cap)
-            : Acore::StringFormat("{} {}/{} — almost capped, train me soon!",
-                                  GatherSkillName(skill), value, cap);
+        std::string const msg =
+            (value >= cap)
+                ? Acore::StringFormat("{} {}/{} — capped! Train my next rank so I can keep gathering.",
+                                      GatherSkillName(skill), value, cap)
+          : (value >= cap - 5)
+                ? Acore::StringFormat("{} {}/{} — almost capped, train me soon!",
+                                      GatherSkillName(skill), value, cap)
+                : Acore::StringFormat("{} skill up! Now {}/{}.",
+                                      GatherSkillName(skill), value, cap);
 
         WorldPacket data;
         ChatMsg const type = g->isRaidGroup() ? CHAT_MSG_RAID : CHAT_MSG_PARTY;
