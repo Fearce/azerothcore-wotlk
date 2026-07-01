@@ -3565,6 +3565,39 @@ namespace WowPsParty
         return 0;   // nothing ready to CC this mob (the cc verb then yields)
     }
 
+    // A ready, KNOWN slow / snare / short stun this bot can throw on a mob RUNNING AWAY, to
+    // stop it chain-pulling — parallel to ResolveCcSpell but for movement-impairing effects
+    // (which, unlike hard CC, leave the mob attackable). Best-first per class, RANGED/instant
+    // snares first so a ranged DPS peels the runner without chasing; the melee entries only
+    // ever fire when the mob is still adjacent (canFireSpellOn's range gate — no chase). 0 if
+    // nothing's known + off cooldown. Cast-time nukes with a built-in slow (Frostbolt) count.
+    static uint32 ResolveSlowSnare(Player* bot, Unit* target)
+    {
+        if (!bot || !target) return 0;
+        std::vector<char const*> list;
+        switch (bot->getClass())
+        {
+            case CLASS_MAGE:         list = { "Cone of Cold", "Frostbolt", "Frost Nova" }; break;
+            case CLASS_HUNTER:       list = { "Concussive Shot", "Wing Clip" }; break;
+            case CLASS_SHAMAN:       list = { "Frost Shock" }; break;
+            case CLASS_WARLOCK:      list = { "Curse of Exhaustion" }; break;
+            case CLASS_DRUID:        list = { "Entangling Roots" }; break;   // ranged root
+            case CLASS_DEATH_KNIGHT: list = { "Chains of Ice" }; break;      // 30y ranged snare
+            case CLASS_WARRIOR:      list = { "Hamstring", "Concussion Blow", "Shockwave" }; break;  // melee (range-gated)
+            case CLASS_PALADIN:      list = { "Hammer of Justice" }; break;  // 10y stun (range-gated)
+            case CLASS_ROGUE:        break;   // no reliable instant ranged snare without setup (combo/stealth)
+            case CLASS_PRIEST:       break;   // Mind Flay is a shadow-only channel snare — skip
+            default: break;
+        }
+        for (char const* name : list)
+        {
+            uint32 const id = FindKnownSpellByName(bot, name);
+            if (id && !bot->HasSpellCooldown(id))
+                return id;
+        }
+        return 0;
+    }
+
     // The lead tank's RANGED pull ability, or 0 if it has none. Lets a tank with
     // no thrown/gun/bow weapon (a paladin carries a libram in the ranged slot, a
     // DK/druid nothing) still OPEN from range instead of charging the pack: the
@@ -5335,6 +5368,46 @@ namespace WowPsParty
             return fired;
         }
 
+        // "slow_fleeing" — peel a HUMANOID running away in fear/for-assistance (it
+        // social-aggros the next pack) with an available slow / snare / short stun. Guards
+        // (Kevin): only a mob at FULL run speed with NO slow/stun already on it — never STACK
+        // a second impair, and never a mob already being caught — and only if the bot can hit
+        // it WITHOUT chasing (canFireSpellOn's range gate). Nearest such runner first. Tanks
+        // are excluded (they hold threat, they don't peel); the pre-pass caller gates on role,
+        // self-guarded here too. This is the DPS half of the tank pull-spot behavior.
+        if (verb == "slow_fleeing")
+        {
+            if (WowPsParty::RoleForGuid(bot->GetGUID()) == "tank") return false;
+            std::vector<Player*> party;
+            GatherPartyPlayers(bot, party, /*includeDead=*/false);
+            std::list<Unit*> hostiles;
+            GatherHostilesAround(bot, 40.0f, hostiles);
+            Unit*  pick = nullptr;
+            uint32 pickSpell = 0;
+            float  bestD = 1e9f;
+            for (Unit* m : hostiles)
+            {
+                if (!m || !m->IsAlive() || !bot->IsValidAttackTarget(m)) continue;
+                if (!MobEngagedByParty(bot, m, party)) continue;              // party's fight only — never a pull
+                Creature* const c = m->ToCreature();
+                if (!c || c->GetCreatureType() != CREATURE_TYPE_HUMANOID) continue;   // humanoids only
+                if (!WowPsParty::IsUnitFleeing(m)) continue;                  // running away only
+                if (IsCrowdControlled(m)) continue;                          // already stunned/rooted/CC'd
+                if (m->HasAuraType(SPELL_AURA_MOD_DECREASE_SPEED)) continue;  // already slowed — don't stack
+                if (m->GetSpeedRate(MOVE_RUN) < 0.95f) continue;             // not at full speed -> already impaired
+                uint32 const sid = ResolveSlowSnare(bot, m);   // already off-cooldown (ResolveSlowSnare + canFireSpellOn re-check)
+                if (!sid || !canFireSpellOn(sid, m)) continue;
+                float const d = bot->GetDistance(m);
+                if (d < bestD) { bestD = d; pick = m; pickSpell = sid; }
+            }
+            if (!pick || !channelClipOk()) return false;
+            bool const fired = faceAndCast(pick, pickSpell);
+            if (fired)
+                LOG_INFO("module", "[WowPsParty Rotation] {} SLOW-FLEEING {} -> {}",
+                         bot->GetName(), pickSpell, pick->GetName());
+            return fired;
+        }
+
         // "interrupt_caster:<spell>" — RANGED off-target interrupt. Scan every enemy
         // the party is fighting and, WITHOUT retargeting or moving, cast <spell> on the
         // first one mid an INTERRUPTIBLE cast that the bot can reach right now — so a
@@ -7005,6 +7078,7 @@ namespace WowPsParty
             || verb == "charge"             // gap-closer: stuns + builds threat on the mob
             || verb == "pull"
             || verb == "shoot"
+            || verb == "slow_fleeing"       // snares deal damage -> must honor a stop_attacking / Mirrored Soul hold
             || verb == "wand";
     }
 
@@ -7258,6 +7332,16 @@ namespace WowPsParty
                 if (leader->IsInWorld() && leader->GetMapId() == bot->GetMapId()
                     && bot->GetDistance(leader) > 50.0f)
                     return false;
+
+        // PRIORITY peel (runs BEFORE the normal rotation): a non-tank DPS slows/stuns a
+        // HUMANOID fleeing in fear so it can't sprint into the next pack and social-aggro it
+        // (Kevin) — the DPS half of the tank pull-spot behavior. slow_fleeing self-gates on a
+        // valid full-speed, not-already-impaired runner it can hit without chasing, so it's a
+        // no-op (falls through to the rotation) whenever there's nothing to peel; when it does
+        // fire, peeling the runner IS the priority this tick.
+        if (WowPsParty::RoleForGuid(bot->GetGUID()) != "tank" && bot->IsInCombat()
+            && ExecAction("slow_fleeing", bot, "", ""))
+            return true;
 
         // Rate-limited per-tick trace. The user has reported several
         // "rule X isn't firing" symptoms (taunt looping, thunder clap

@@ -191,6 +191,12 @@ namespace WowPsParty
     // holding/throttled/ground-AoEing under a tank lead. nullptr if none (pet heels).
     Unit* PickPetThrottleTarget(Player* bot);
 
+    // True when a mob is RUNNING AWAY: spell-fear / low-health family panic flee
+    // (UNIT_STATE_FLEEING) OR flee-to-get-assistance (it runs to a nearby friendly pack for
+    // help — the classic "social-aggro the next pack" case). Covers every flee movement
+    // generator. Used by the tank pull-spot anchor and the DPS slow-the-runner peel.
+    bool IsUnitFleeing(Unit* u);
+
     // True while THIS bot's lead tank is still body-pulling / locking a pull — the rotation
     // engine holds the bot's offense for the whole window (mirrors the movement pull-hold).
     bool PartyPullHoldActive(Player* bot);

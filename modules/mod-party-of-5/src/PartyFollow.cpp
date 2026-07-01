@@ -1594,6 +1594,103 @@ namespace WowPsParty
     static constexpr uint32 STANDDOWN_REENGAGE_MS = 4500;   // GRACE + 3s run-to-tank
     static constexpr float  DRAG_HANDOFF_DIST     = 8.0f;   // run the add to here from the tank
 
+    // ---- Fleeing detection + tank PULL-SPOT anchor ---------------------------
+    // A humanoid that runs in fear / for assistance at low HP chain-pulls: it sprints into
+    // the next pack and social-aggros it, so the party ends up fighting group after group.
+    // The bot tank marks WHERE it started fighting (its "pull-spot") and holds the pack
+    // there — it won't chase a fleeing humanoid off the spot; ranged DPS + slows bring the
+    // runner down instead (see PickNonFleeingEngagedTarget + the pull-spot movement leash in
+    // AssistTarget, and the slow_fleeing rotation verb).
+    bool IsUnitFleeing(Unit* u)
+    {
+        if (!u) return false;
+        if (u->HasUnitState(UNIT_STATE_FLEEING)) return true;   // spell-fear + no-assist panic flee
+        switch (u->GetMotionMaster()->GetCurrentMovementGeneratorType())
+        {
+            case FLEEING_MOTION_TYPE:
+            case TIMED_FLEEING_MOTION_TYPE:
+            case ASSISTANCE_MOTION_TYPE:           // running to a friendly pack for help (social-aggro)
+            case ASSISTANCE_DISTRACT_MOTION_TYPE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    static bool IsFleeingHumanoid(Unit* u)
+    {
+        if (!IsUnitFleeing(u)) return false;
+        Creature* const c = u->ToCreature();
+        return c && c->GetCreatureType() == CREATURE_TYPE_HUMANOID;
+    }
+
+    // Per-tank pull-spot: the position the tank was at when it started fighting a pack (a
+    // multi-pull gather concluded, or it was just engaged with no gather). Per-bot,
+    // single-map-thread — thread_local, exactly like g_standDown / g_dragToTank below.
+    struct PullSpot { float x = 0.0f, y = 0.0f, z = 0.0f; bool set = false; };
+    static thread_local std::unordered_map<uint32, PullSpot> g_pullSpot;
+    // How far a FLEEING mob may drag the tank from its spot before it stops chasing and
+    // holds/returns. Generous ("the general location"), only ever gates a fleeing target.
+    static constexpr float PULLSPOT_LEASH = 12.0f;
+    // Safety valve: if the tank holds at the spot for a fleer this long with nothing else to
+    // fight (the runner never dies / returns / evades and no add arrives), give up on it —
+    // memo it unreachable so the tank re-acquires / drops combat instead of freezing forever.
+    static constexpr uint32 PULLSPOT_HOLD_MAX_MS = 6000;
+
+    static bool GetPullSpot(uint32 low, PullSpot& out)
+    {
+        auto it = g_pullSpot.find(low);
+        if (it == g_pullSpot.end() || !it->second.set) return false;
+        out = it->second;
+        return true;
+    }
+
+    // Maintain the tank's pull-spot: clear it out of combat; stamp it once the tank is
+    // actually FIGHTING at a location — NOT while still walking a body-pull in (stamp when
+    // the gather/pull concludes, so the spot is where the pack ends up, not where the walk
+    // began). Called early in AssistTarget for tank-role bots only.
+    static void UpdateTankPullSpot(Player* tank)
+    {
+        uint32 const low = tank->GetGUID().GetCounter();
+        if (!tank->IsInCombat()) { g_pullSpot.erase(low); return; }
+        if (TankGatherActive(low) || IsTankPulling(tank->GetGUID())) return;   // still gathering/pulling
+        PullSpot p;
+        bool const have = GetPullSpot(low, p);
+        // (Re)stamp when there's no spot yet, OR the FIGHT has legitimately moved far from the
+        // stored spot — the tank is in melee of a NON-fleeing mob 2x the leash away (a real
+        // reposition: the tank dragged the pack somewhere new, or a fresh pack pulled it over).
+        // A fleeing mob can NEVER move the anchor: the movement leash stops the tank well before
+        // it gets 2x-leash toward a runner, and the non-fleeing-victim guard rejects it anyway.
+        // So the anchor tracks the current pack instead of pinning the first pull's spot forever.
+        bool relocate = false;
+        if (have && tank->GetExactDist2d(p.x, p.y) > PULLSPOT_LEASH * 2.0f)
+        {
+            Unit* const v = tank->GetVictim();
+            relocate = v && v->IsAlive() && !IsUnitFleeing(v) && tank->IsWithinMeleeRange(v);
+        }
+        if (!have || relocate)
+            g_pullSpot[low] = { tank->GetPositionX(), tank->GetPositionY(), tank->GetPositionZ(), true };
+    }
+
+    // The nearest enemy ON the tank (attacking it) that is NOT fleeing — the mob it should
+    // hold instead of chasing a runner. nullptr when every mob on the tank is fleeing/gone
+    // (then the caller keeps the runner, but the pull-spot leash still won't chase it far).
+    static Unit* PickNonFleeingEngagedTarget(Player* bot)
+    {
+        Unit* best = nullptr;
+        float bestD = 1e9f;
+        auto consider = [&](Unit* a)
+        {
+            if (!a || !a->IsAlive() || !bot->IsValidAttackTarget(a)) return;
+            if (IsUnitFleeing(a)) return;                       // ignore the runners
+            float const d = bot->GetDistance(a);
+            if (d < bestD) { bestD = d; best = a; }
+        };
+        for (Unit* a : bot->getAttackers()) consider(a);        // mobs beating on the tank
+        if (Unit* v = bot->GetVictim()) consider(v);            // and its current victim
+        return best;
+    }
+
     // ---- Human-tank ENGAGE LEAD (pure threat, NO timer) ----------------------
     // A mob only counts as "properly engaged" by the tank once the tank holds at
     // least this fraction of the mob's MAX HEALTH in threat on it. Below it, DPS
@@ -5327,6 +5424,12 @@ namespace WowPsParty
         SweepPhantomCombat(bot, gLow);
         SweepPhantomCombat(leader, leader->GetGUID().GetCounter());
 
+        // Pull-spot lifecycle: a bot tank stamps where it's fighting so it holds the pack
+        // there instead of chain-pulling after a fleeing mob (used below). Out of combat it
+        // clears, so the next pull re-stamps a fresh spot.
+        if (RoleForGuid(bot->GetGUID()) == "tank")
+            UpdateTankPullSpot(bot);
+
         // BATTLEGROUND leash: keep party bots within 30y of the human so the healer can't
         // wander off (e.g. to cure random raid bots) and leave the human to die when a fight
         // breaks out (Kevin's rule: "in BGs party members should NEVER go more than 30 yards
@@ -5920,6 +6023,16 @@ namespace WowPsParty
                 if (Unit* loose = PickLooseTarget(bot))
                     desired = loose;
         }
+
+        // Pull-spot: a bot TANK does NOT chase a HUMANOID fleeing in fear (it runs into the
+        // next pack and social-aggros it — Kevin's chain-pull). If our pick is a fleeing
+        // humanoid, prefer a non-fleeing mob still on us — hold the pack at the pull-spot and
+        // let ranged DPS + their slows bring the runner down. Only when NOTHING else is on the
+        // tank does it keep the runner (and even then the pull-spot movement leash below won't
+        // let it chase far). Any tank-role bot, mirroring the loose-add peel gate above.
+        if (RoleForGuid(bot->GetGUID()) == "tank" && desired && IsFleeingHumanoid(desired))
+            if (Unit* stayer = PickNonFleeingEngagedTarget(bot))
+                desired = stayer;
 
         // Still nothing of our own, but the PARTY is fighting — we're idle/too far
         // for party-defense to reach and the leader isn't attacking. GAP-CLOSE to
@@ -6552,6 +6665,52 @@ namespace WowPsParty
 
         // MELEE — close to contact, fanned out by formation angle so the melee
         // companions surround the mob (orbiting is fine when you're in contact).
+
+        // Pull-spot leash: don't let a FLEEING mob drag the tank off its spot into the next
+        // pack. If the tank's victim is running away and has fled beyond the leash from the
+        // pull-spot, STOP chasing — walk back to the spot (mobs still on the tank follow it
+        // back = the "drag them back" the user wants) or hold there; ranged DPS + slows finish
+        // the runner. Non-fleeing victims chase normally (they don't chain-pull), so ordinary
+        // tanking is untouched. Only a tank-role bot with a stamped pull-spot enters this.
+        if (role == "tank" && IsUnitFleeing(desired))
+        {
+            PullSpot ps;
+            if (GetPullSpot(gLow, ps) && desired->GetExactDist2d(ps.x, ps.y) > PULLSPOT_LEASH)
+            {
+                // Safety valve: give up on a runner we've held at the spot too long (it never
+                // died / came back / evaded and no add arrived) — memo it unreachable FOR THIS
+                // tank so its pickers skip it and it re-acquires or drops combat, instead of
+                // freezing forever facing a runner. Per-tank (DPS still target/kill it). The
+                // memo lapses in a few seconds, so it re-engages if the mob wanders back in.
+                static thread_local std::unordered_map<uint32, std::pair<uint32, uint32>> g_pullHold;  // tankLow -> {mobLow, sinceMs}
+                uint32 const mobLow = desired->GetGUID().GetCounter();
+                auto& hold = g_pullHold[gLow];
+                if (hold.first != mobLow) hold = { mobLow, nowMs };   // new runner -> fresh clock
+                if (getMSTimeDiff(hold.second, nowMs) >= PULLSPOT_HOLD_MAX_MS)
+                {
+                    MarkTargetUnreachable(gLow, mobLow);
+                    g_pullHold.erase(gLow);
+                    if (bot->GetVictim()) bot->AttackStop();
+                    AssistLog(gLow, "pull-spot: held too long on a runner — giving up, re-acquiring");
+                    return;
+                }
+                if (bot->GetExactDist2d(ps.x, ps.y) > 4.0f)
+                {
+                    if (mg != POINT_MOTION_TYPE)
+                        bot->GetMotionMaster()->MovePoint(0, ps.x, ps.y, ps.z);
+                    AssistLog(gLow, "pull-spot: victim fleeing beyond leash — returning to the pull-spot, not chasing");
+                }
+                else if (mg != IDLE_MOTION_TYPE)
+                {
+                    bot->StopMoving();
+                    bot->GetMotionMaster()->Clear();
+                    bot->GetMotionMaster()->MoveIdle();
+                    AssistLog(gLow, "pull-spot: holding at the spot — not chasing the runner");
+                }
+                bot->SetFacingToObject(desired);
+                return;
+            }
+        }
 
         // No line of sight (target behind a thin wall / pillar / around a corner):
         // MoveChase only maintains a DISTANCE band and never checks LoS, so once the
