@@ -1665,6 +1665,32 @@ namespace WowPsParty
             g_pullSpot[low] = { tank->GetPositionX(), tank->GetPositionY(), tank->GetPositionZ(), true };
     }
 
+    // Per-bot "pull-start anchor": where the bot stood the instant its party entered combat —
+    // before it drifted toward the pack. Almost always the safe rear (the direction the party
+    // came from), so the ranged back-out (SafeRangedBackout) biases its retreat toward it
+    // (Kevin: "mark the spot they were in when a pull started ... it's usually the safer
+    // direction"). Stamped once per fight, cleared out of combat. Separate from the tank's
+    // g_pullSpot, which stamps where the PACK ends up after a gather, not the safe rear.
+    static thread_local std::unordered_map<uint32, PullSpot> g_rangedAnchor;
+
+    static bool GetRangedAnchor(uint32 low, PullSpot& out)
+    {
+        auto it = g_rangedAnchor.find(low);
+        if (it == g_rangedAnchor.end() || !it->second.set) return false;
+        out = it->second;
+        return true;
+    }
+
+    // Stamp the anchor on the FIRST in-combat tick (pre-drift) and hold it until combat ends.
+    static void UpdateRangedPullAnchor(Player* bot)
+    {
+        uint32 const low = bot->GetGUID().GetCounter();
+        if (!bot->IsInCombat()) { g_rangedAnchor.erase(low); return; }
+        PullSpot p;
+        if (!GetRangedAnchor(low, p))
+            g_rangedAnchor[low] = { bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), true };
+    }
+
     // The nearest enemy ON the tank (attacking it) that is NOT fleeing — the mob it should
     // hold instead of chasing a runner. nullptr when every mob on the tank is fleeing/gone
     // (then the caller keeps the runner, but the pull-spot leash still won't chase it far).
@@ -4601,19 +4627,36 @@ namespace WowPsParty
                         : float(M_PI) * (1.10f + fan);
     }
 
+    // Effective proximity-aggro bubble of `mob` against a player at `moverLevel`, growing from
+    // baseR. A mob is spotted from ~1y further for each level it OUT-levels the mover — so an
+    // underleveled bot trips a fresh pull from much further out (Kevin: "especially if the bot is
+    // underleveled compared to the enemy"); an over-level bot shrinks it, but it's floored so we
+    // never treat a mob as harmless right up close, and capped so tight dungeons stay navigable.
+    static constexpr float AGGRO_RADIUS_LEVEL_CAP = 10.0f;   // max extra yards from level deficit
+    static float EffectiveAggroRadius(Unit* mob, uint32 moverLevel, float baseR)
+    {
+        int const levelDiff = int(mob->GetLevel()) - int(moverLevel);   // >0 = mob out-levels the bot
+        float const r = baseR + float(levelDiff);                        // ~1y per level
+        return std::clamp(r, baseR - 4.0f, baseR + AGGRO_RADIUS_LEVEL_CAP);
+    }
+
     // True if standing at (x,y,z) would proximity-pull a FRESH pack — an un-aggroed,
-    // out-of-combat hostile sits within `aggroR` of the spot. Anything already IN
-    // combat is excluded (that's the pull we're part of, not a new pull). `center` is
-    // the grid-visit anchor (the tank or the bot itself); the filter is by distance to
-    // the candidate point. Only called when a ranged bot is (re)choosing a standoff
-    // spot — pull anchor, in-combat back-out, spread step — never every tick, so the
-    // grid search stays cheap.
-    static bool SpotProximityPulls(Player* center, float x, float y, float z, float aggroR)
+    // out-of-combat hostile sits within its (level-adjusted) aggro bubble of the spot. Anything
+    // already IN combat is excluded (that's the pull we're part of, not a new pull). `center` is
+    // the grid-visit anchor; `mover` (defaults to center) is the player who'd actually STAND there,
+    // whose level sizes the bubble — pass it explicitly when the grid anchor differs from the mover
+    // (e.g. visiting from the tank while a ranged bot takes the spot). The filter is by distance to
+    // the candidate point. Only called when a ranged bot is (re)choosing a standoff spot — pull
+    // anchor, in-combat back-out, spread step — never every tick, so the grid search stays cheap.
+    static bool SpotProximityPulls(Player* center, float x, float y, float z, float aggroR, Player* mover = nullptr)
     {
         if (!center) return false;
+        uint32 const moverLevel = (mover ? mover : center)->GetLevel();
         float const ddx = x - center->GetPositionX();
         float const ddy = y - center->GetPositionY();
-        float const scanR = std::sqrt(ddx * ddx + ddy * ddy) + aggroR + 2.0f;
+        // Scan out to the widest possible bubble (base + level cap) so a high mob's enlarged
+        // aggro range against an underleveled bot isn't missed by the grid visit.
+        float const scanR = std::sqrt(ddx * ddx + ddy * ddy) + aggroR + AGGRO_RADIUS_LEVEL_CAP + 2.0f;
         std::list<Unit*> nearby;
         Acore::AnyUnfriendlyUnitInObjectRangeCheck check(center, center, scanR);
         Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck> searcher(center, nearby, check);
@@ -4622,10 +4665,11 @@ namespace WowPsParty
         {
             if (!u || !u->IsAlive() || u->IsInCombat()) continue;   // fresh packs only
             if (u->IsTotem() || !u->ToCreature()) continue;
+            float const effR = EffectiveAggroRadius(u, moverLevel, aggroR);
             float const dx = u->GetPositionX() - x;
             float const dy = u->GetPositionY() - y;
             float const dz = u->GetPositionZ() - z;
-            if (dx * dx + dy * dy + dz * dz <= aggroR * aggroR) return true;
+            if (dx * dx + dy * dy + dz * dz <= effR * effR) return true;
         }
         return false;
     }
@@ -4648,18 +4692,32 @@ namespace WowPsParty
         // the way to the far side of the pack (Kevin: "Pamere goes to the opposite side").
         // The old "straight back, else jump to the LEADER's bearing" was the far-side cause —
         // when straight-back was blocked it leapt to the leader's side, often across the pack.
-        float const base = mob->GetAngle(bot);   // mob->bot bearing = directly away on the bot's side
+        float base = mob->GetAngle(bot);   // mob->bot bearing = directly away on the bot's side
+        // Bias the retreat fan toward where the bot STOOD when the pull started (the safe rear the
+        // party came from) rather than wherever it has since drifted to — Kevin: "mark the spot
+        // they were in when a pull started, bias toward that; it's usually the safer direction."
+        // Only when that anchor is a real standoff distance from the mob (not right on top of it);
+        // the fan still widens to every bearing, so this only reorders which safe spot is picked.
+        PullSpot anchor;
+        bool biased = false;
+        if (GetRangedAnchor(bot->GetGUID().GetCounter(), anchor)
+            && mob->GetExactDist2d(anchor.x, anchor.y) > 8.0f)
+        {
+            base = mob->GetAngle(anchor.x, anchor.y);
+            biased = true;
+        }
         static constexpr float kOffsets[] = {
             0.0f, 0.39f, -0.39f, 0.79f, -0.79f, 1.18f, -1.18f,
             1.57f, -1.57f, 1.96f, -1.96f, 2.36f, -2.36f, float(M_PI) };
         for (float off : kOffsets)
         {
             mob->GetNearPoint(bot, ox, oy, oz, 0.0f, dist, base + off);
-            if (SpotProximityPulls(bot, ox, oy, oz, 10.0f)) continue;
-            // Straight-back is always taken if clear (the bot already stood on that side);
-            // vet the fanned alternatives against the navmesh so we don't pick an off-mesh
-            // spot across a wall/ledge.
-            if (off != 0.0f && !NavReachable(bot, ox, oy, oz, bot->GetExactDist(ox, oy, oz)))
+            if (SpotProximityPulls(bot, ox, oy, oz, 13.0f)) continue;
+            // Un-biased straight-back (off==0) is trivially reachable (the bot already stood on that
+            // side), so skip its navmesh check; but a BIASED zero-offset aims toward the anchor — a
+            // direction the bot has since drifted off — so vet it like the fanned alternatives, or we
+            // could pick an off-mesh spot across a wall/ledge toward the old rear.
+            if ((off != 0.0f || biased) && !NavReachable(bot, ox, oy, oz, bot->GetExactDist(ox, oy, oz)))
                 continue;
             return true;
         }
@@ -5471,6 +5529,9 @@ namespace WowPsParty
         // clears, so the next pull re-stamps a fresh spot.
         if (RoleForGuid(bot->GetGUID()) == "tank")
             UpdateTankPullSpot(bot);
+        // Every bot stamps where it stood when this fight began; the ranged back-out biases its
+        // retreat toward that safe rear rather than wherever it has since drifted (SafeRangedBackout).
+        UpdateRangedPullAnchor(bot);
 
         // BATTLEGROUND leash: keep party bots within 30y of the human so the healer can't
         // wander off (e.g. to cure random raid bots) and leave the human to die when a fight
@@ -5601,7 +5662,10 @@ namespace WowPsParty
                                     float px, py, pz;
                                     tank->GetNearPoint(bot, px, py, pz, 0.0f, followDist,
                                                        tank->ToAbsoluteAngle(angle));
-                                    if (!SpotProximityPulls(tank, px, py, pz, 11.0f)) { clear = true; break; }
+                                    // Grid-visit from the tank (points are near it), but size the
+                                    // aggro bubble by the ranged BOT's level — it's the one standing
+                                    // here, and it may be underleveled while the tank isn't.
+                                    if (!SpotProximityPulls(tank, px, py, pz, 13.0f, bot)) { clear = true; break; }
                                     followDist -= 4.0f;
                                     if (followDist < 10.0f) break;
                                 }
@@ -6663,7 +6727,7 @@ namespace WowPsParty
                 {
                     float sx, sy, sz;
                     if (ComputeRangedSpreadSpot(bot, desired, hold, sx, sy, sz)
-                        && !SpotProximityPulls(bot, sx, sy, sz, 10.0f))   // don't spread INTO a fresh pack
+                        && !SpotProximityPulls(bot, sx, sy, sz, 13.0f))   // don't spread INTO a fresh pack
                     {
                         MarkSpreadStep(gLow, nowMs);
                         bot->GetMotionMaster()->MovePoint(0, sx, sy, sz);
