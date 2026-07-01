@@ -28,6 +28,7 @@
 #include <vector>
 
 class Player;
+class Unit;
 
 namespace WowPsParty
 {
@@ -178,6 +179,17 @@ namespace WowPsParty
     // MaintainBotPet uses it to heel a hunter/warlock pet during the hold instead of
     // letting it charge the pull before the tank has aggro.
     bool BotWaitsForHumanTank(Player* bot);
+
+    // Like BotWaitsForHumanTank but for ANY party tank — a bot/henchman lead tank OR a
+    // human tank-leader. True when this non-tank bot is under the same threat throttle
+    // AssistTarget applies (a tank leads and this bot hasn't opted out of waiting).
+    // MaintainBotPet reads it to leash the pet so it respects the throttle.
+    bool BotUnderTankThreatRegime(Player* bot);
+
+    // The nearest mob the party TANK already holds a real engage lead on that `bot` is
+    // still under the threat cap on — the only mob its pet may attack while the owner is
+    // holding/throttled/ground-AoEing under a tank lead. nullptr if none (pet heels).
+    Unit* PickPetThrottleTarget(Player* bot);
 
     // True while THIS bot's lead tank is still body-pulling / locking a pull — the rotation
     // engine holds the bot's offense for the whole window (mirrors the movement pull-hold).

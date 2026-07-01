@@ -6675,7 +6675,25 @@ namespace WowPsParty
         // there swinging but never using Growl/Claw/Bite. Re-running self-heals
         // that (and avoids a cross-thread static-map write for bots on
         // different maps).
-        if (pet->GetReactState() == REACT_PASSIVE)
+        // Pet posture. Under a party TANK's threat throttle (a bot/henchman OR human tank
+        // leads and this bot waits) put the pet on a SHORT LEASH — REACT_PASSIVE, so it
+        // NEVER free-lances onto a fresh or out-of-combat mob and rips it off the tank. It
+        // then only fights what we explicitly command it onto below (a tank-held, under-cap
+        // mob), exactly mirroring the owner's own throttle (Kevin: "pets aren't affected by
+        // the threat throttle, they pull nearby out-of-combat mobs"). Off the throttle (no
+        // tank, or opted to blast) keep it DEFENSIVE so a soloing pet holds its own aggro.
+        // A command-attack overrides PASSIVE, so a leashed pet still assists the moment the
+        // owner is cleared onto a mob.
+        bool const underTankThrottle = WowPsParty::BotUnderTankThreatRegime(bot);
+        if (underTankThrottle)
+        {
+            if (pet->GetReactState() != REACT_PASSIVE)
+            {
+                pet->SetReactState(REACT_PASSIVE);
+                charm->SetPlayerReactState(REACT_PASSIVE);
+            }
+        }
+        else if (pet->GetReactState() != REACT_DEFENSIVE)
         {
             pet->SetReactState(REACT_DEFENSIVE);
             charm->SetPlayerReactState(REACT_DEFENSIVE);
@@ -6691,17 +6709,20 @@ namespace WowPsParty
             27276, 27277, 48011,         // Devour Magic 5-7
             58867                         // Spirit Wolf Leap
         };
-        // In DUNGEONS, keep pet TAUNTS off autocast — Growl and the voidwalker's
-        // Torment / Suffering rip mobs off the human tank (Kevin). In the open
-        // world they stay on so a soloing pet can hold its own aggro.
-        bool const inDungeon = bot->GetMap() && bot->GetMap()->IsDungeon();
+        // Keep pet TAUNTS off autocast whenever the party has a real tank to hold aggro —
+        // any dungeon, OR a live tank-role member (bot/henchman/human tank-leader) in the
+        // open world too (Kevin: "all pet taunts off when the party has a tank, bot or
+        // human"). Growl and the voidwalker's Torment / Suffering would rip mobs off the
+        // tank. Only a genuinely tankless party keeps them on so a soloing pet holds aggro.
+        bool const suppressPetTaunts = (bot->GetMap() && bot->GetMap()->IsDungeon())
+                                    || WowPsParty::PartyHasLiveTank(bot->GetGUID());
         for (auto const& s : pet->m_spells)
         {
             if (s.second.state == PETSPELL_REMOVED) continue;
             SpellInfo const* si = sSpellMgr->GetSpellInfo(s.first);
             if (!si || !si->IsAutocastable()) continue;
             bool wanted = !noAutocast.count(s.first);
-            if (wanted && inDungeon && IsPetTauntSpell(si)) wanted = false;
+            if (wanted && suppressPetTaunts && IsPetTauntSpell(si)) wanted = false;
             bool isAuto = false;
             for (uint32 a : pet->m_autospells) if (a == s.first) { isAuto = true; break; }
             // Toggle only on a mismatch — enables the abilities we want and
@@ -6711,20 +6732,33 @@ namespace WowPsParty
         }
 
         Unit* victim = bot->GetVictim();
-        // AoE with no victim: a warlock raining fire / seeding a pack (or any caster
-        // doing pure ground AoE) often has NO GetVictim() — it casts at a location,
-        // never bot->Attack()s a unit — so the pet sat idle while the owner channelled
-        // (Kevin's "imp does nothing while I Rain of Fire"). When the owner is in
-        // combat with no victim of its own, point the pet at the nearest party-engaged
-        // enemy. Only when the pet isn't already validly engaged (don't yank it off a
-        // mob beating on the owner). NearestEngagedEnemy is party-engaged-only, so this
-        // can never pull a neutral, and BotWaitsForHumanTank still heels it pre-threat.
+        // Owner in combat with no unit victim of its own (pure ground AoE — a warlock
+        // raining fire, a mage Blizzarding — or throttled/holding under a tank). Pick a
+        // target for the pet so it doesn't sit idle, but WHICH target depends on the
+        // regime:
         if ((!victim || !victim->IsAlive() || !bot->IsValidAttackTarget(victim))
-            && bot->IsInCombat() && !WowPsParty::BotWaitsForHumanTank(bot))
+            && bot->IsInCombat())
         {
-            Unit* const cur = pet->GetVictim();
-            if (!cur || !cur->IsAlive() || !bot->IsValidAttackTarget(cur))
-                victim = NearestEngagedEnemy(bot, 40.0f);
+            if (underTankThrottle)
+            {
+                // Under the tank throttle the owner has no approved victim because it's
+                // holding / dropped it over the cap / is ground-AoEing. The pet may ONLY
+                // hit a mob the tank already holds a lead on that we're under the cap on —
+                // the same picker the owner uses. If there is none, victim stays null and
+                // the pet HEELS below, so it can't rip the mob the owner just backed off.
+                victim = WowPsParty::PickPetThrottleTarget(bot);
+            }
+            else
+            {
+                // No tank throttle (solo / no-tank / opted to blast): point the pet at the
+                // nearest party-engaged enemy so it isn't idle while the owner channels
+                // (Kevin's "imp does nothing while I Rain of Fire"). Only when the pet isn't
+                // already validly engaged (don't yank it off a mob beating on the owner).
+                // NearestEngagedEnemy is party-engaged-only, so it can never pull a neutral.
+                Unit* const cur = pet->GetVictim();
+                if (!cur || !cur->IsAlive() || !bot->IsValidAttackTarget(cur))
+                    victim = NearestEngagedEnemy(bot, 40.0f);
+            }
         }
         if (victim && victim->IsAlive() && bot->IsValidAttackTarget(victim))
         {
@@ -6745,18 +6779,18 @@ namespace WowPsParty
             if (pet->AI())
                 pet->AI()->AttackStart(victim);
         }
-        else if ((!bot->IsInCombat() || WowPsParty::BotWaitsForHumanTank(bot))
+        else if ((!bot->IsInCombat() || underTankThrottle)
                  && (pet->GetVictim() || charm->IsCommandAttack()))
         {
             // Heel the pet (call it off, follow the owner) when EITHER:
             //  - the owner is genuinely out of combat (don't chase the last mob into
             //    the next pack), OR
-            //  - the owner is WAITING for a human tank to take threat and hasn't been
-            //    handed a victim yet (BotWaitsForHumanTank + no victim above). Without
-            //    this a hunter/warlock pet charged the pull immediately and ripped
-            //    aggro while the owner itself correctly held (Kevin). Once the tank
-            //    has the engage lead the owner gets a victim and the branch above
-            //    re-commands the pet onto it.
+            //  - the owner is under a tank's threat throttle (bot OR human tank) and
+            //    PickPetThrottleTarget found no tank-held under-cap mob above, so it has
+            //    no approved victim. Without this a hunter/warlock pet charged the pull
+            //    immediately and ripped aggro while the owner itself correctly held
+            //    (Kevin). Once the tank has the engage lead the owner gets a victim and
+            //    the branch above re-commands the pet onto it.
             // (Outside the tank-lead regime, an in-combat owner with no victim still
             // leaves the pet on whatever it's defensively engaging — don't yank it
             // off a mob beating on it or the owner.)
@@ -7183,20 +7217,22 @@ namespace WowPsParty
         // rogue stays poisoned — playerbots' own upkeep is gated out for us.
         WowPsParty::MaintainBotConsumables(bot);
 
-        // No-offense-until-released: under a human tank-lead, a NON-TANK of ANY class
-        // produces no offense until AssistTarget hands it a victim — which it only
+        // No-offense-until-released: under a tank-lead (bot OR human), a NON-TANK of ANY
+        // class produces no offense until AssistTarget hands it a victim — which it only
         // does once the tank has the engage lead on the target. bot->GetVictim() is
         // that release signal. This catch-all closes every offensive bypass the
         // per-victim gate misses: the hunter's Auto Shot / a wand repeat (here), and
         // spread/scan/pull/shoot/wand rotation verbs (the rule loop below). Once
         // released the rotation runs normally (AoE spilling onto the pack is accepted
         // — a player can't gate that perfectly either).
-        // Holds under a human tank-lead (above) AND while THIS bot's BOT-tank is still
-        // body-pulling/locking a pull (PartyPullHoldActive) — so a DPS bot doesn't Blizzard /
-        // Frostbolt the pack the bot-tank is still gathering (Mill: "mage cast Blizzard during
-        // a body pull, before the tank was done pulling"). GetVictim()==nullptr is the release:
-        // genuine self-defence (a mob already meleeing us) hands us a victim and frees offense.
-        bool const offenseHold = (WowPsParty::BotWaitsForHumanTank(bot)
+        // BotUnderTankThreatRegime mirrors AssistTarget's own gate (TankLeadActive +
+        // wait toggle), so a hunter's Auto Shot no longer bypasses the throttle under a
+        // BOT/henchman tank the way it used to (only the human-tank case + the bot-tank
+        // pull window were covered). PartyPullHoldActive still holds an opted-to-BLAST bot
+        // through a bot-tank's body-pull so it doesn't Blizzard/Frostbolt the pack the
+        // tank is still gathering (Mill). GetVictim()==nullptr is the release: genuine
+        // self-defence (a mob already meleeing us) hands us a victim and frees offense.
+        bool const offenseHold = (WowPsParty::BotUnderTankThreatRegime(bot)
                                || WowPsParty::PartyPullHoldActive(bot))
                               && bot->GetVictim() == nullptr;
 

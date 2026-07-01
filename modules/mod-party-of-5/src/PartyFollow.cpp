@@ -1586,9 +1586,12 @@ namespace WowPsParty
     // tank-follow distance for that run (also used by the loose-add drag-to-tank block).
     // STANDDOWN_GRACE_MS is a short hold BEFORE the run-to-tank starts — the bot keeps
     // fighting in place so the tank gets a beat to taunt/peel before the caster cancels
-    // everything to run (Kevin). Must be < STANDDOWN_REENGAGE_MS.
+    // everything to run (Kevin). The [GRACE, REENGAGE) span is the "run it to the tank"
+    // window; widened to 3s (Kevin) so a bot that ripped aggro spends longer dragging the
+    // mob back for the tank to reclaim before giving up and killing it in place. Must be
+    // < STANDDOWN_REENGAGE_MS.
     static constexpr uint32 STANDDOWN_GRACE_MS    = 1500;
-    static constexpr uint32 STANDDOWN_REENGAGE_MS = 3000;
+    static constexpr uint32 STANDDOWN_REENGAGE_MS = 4500;   // GRACE + 3s run-to-tank
     static constexpr float  DRAG_HANDOFF_DIST     = 8.0f;   // run the add to here from the tank
 
     // ---- Human-tank ENGAGE LEAD (pure threat, NO timer) ----------------------
@@ -4798,6 +4801,39 @@ namespace WowPsParty
         Player* leader = ObjectAccessor::FindConnectedPlayer(lg);
         if (!leader || !HumanTankLeadActive(bot, leader)) return false;
         return WaitForHumanTank(bot->GetGUID());
+    }
+
+    // Generalises BotWaitsForHumanTank to ANY party tank (a bot/henchman lead tank OR a
+    // human tank-leader): true when this non-tank bot is under the same threat throttle
+    // AssistTarget applies — a tank leads (TankLeadActive) and this bot hasn't opted out
+    // of waiting. MaintainBotPet reads it to leash the pet (PASSIVE + command-only) so a
+    // hunter/warlock/other pet respects the throttle instead of free-lancing onto fresh
+    // or out-of-combat mobs and ripping them off the tank.
+    bool BotUnderTankThreatRegime(Player* bot)
+    {
+        if (!bot) return false;
+        if (RoleForGuid(bot->GetGUID()) == "tank") return false;
+        ObjectGuid const lg = GetLeaderFor(bot->GetGUID());
+        if (!lg) return false;
+        Player* leader = ObjectAccessor::FindConnectedPlayer(lg);
+        if (!leader || !TankLeadActive(bot, leader)) return false;
+        return WaitForHumanTank(bot->GetGUID());
+    }
+
+    // The nearest mob the party TANK already holds a real lead on that `bot` is under the
+    // threat cap on — the ONLY mob the bot's pet may attack while the owner is holding /
+    // throttled / doing ground AoE (no unit victim of its own) under a tank lead. nullptr
+    // when there's none (the pet should heel). Mirrors the owner's throttle exactly (same
+    // PickTankEngagedTarget picker), so the pet never builds threat on a mob the owner
+    // just backed off the cap on.
+    Unit* PickPetThrottleTarget(Player* bot)
+    {
+        if (!bot) return nullptr;
+        ObjectGuid const lg = GetLeaderFor(bot->GetGUID());
+        if (!lg) return nullptr;
+        Player* leader = ObjectAccessor::FindConnectedPlayer(lg);
+        if (!leader) return nullptr;
+        return PickTankEngagedTarget(bot, leader);
     }
 
     // Public wrapper over the (file-local) IsPartyPullPending so the rotation engine can
