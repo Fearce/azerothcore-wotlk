@@ -3083,7 +3083,8 @@ static void HandlePickLock(Player* requester, std::string_view payload)
         item->SetFlag(ITEM_FIELD_FLAGS, ITEM_FIELD_FLAG_UNLOCKED);
         item->SetState(ITEM_CHANGED, owner);
         if (uint32 pure = picker->GetPureSkillValue(SKILL_LOCKPICKING))
-            picker->UpdateGatherSkill(SKILL_LOCKPICKING, pure, reqSkill);
+            if (picker->UpdateGatherSkill(SKILL_LOCKPICKING, pure, reqSkill))
+                WowPsParty::AnnounceGatherSkillUp(picker, SKILL_LOCKPICKING);
         ch.PSendSysMessage("|cff66ccff[WowPsParty]|r {} unlocked |cffffffff{}|r (it was empty).",
             picker->GetName(), tmpl->Name1);
         WowPsParty::SendInventoryTo(requester);
@@ -3129,7 +3130,8 @@ static void HandlePickLock(Player* requester, std::string_view payload)
     // consume the box (frees its slot for the drops) and distribute across the party
     // (owner first), exactly like HandleDisenchant delivers mats.
     if (uint32 pure = picker->GetPureSkillValue(SKILL_LOCKPICKING))
-        picker->UpdateGatherSkill(SKILL_LOCKPICKING, pure, reqSkill);
+        if (picker->UpdateGatherSkill(SKILL_LOCKPICKING, pure, reqSkill))
+            WowPsParty::AnnounceGatherSkillUp(picker, SKILL_LOCKPICKING);
     owner->DestroyItem(item->GetBagSlot(), item->GetSlot(), true);
 
     std::ostringstream gained;

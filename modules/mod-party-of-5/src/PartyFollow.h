@@ -301,6 +301,15 @@ namespace WowPsParty
     bool TickBotVehicleMovement(Player* bot, Player* leader);
     bool TickBotVehicleAbilities(Player* bot);
 
+    // Post the party-chat "Lockpicking skill up! Now X/Y." line (the same
+    // announcement the in-world Mining/Herbalism/Skinning gather paths use)
+    // after a rogue hero's Lockpicking actually rises. Call right after a
+    // successful UpdateGatherSkill from the lockbox/chest/door pick paths.
+    // No-op for any skill the announcer doesn't handle; self-throttles to
+    // once per reached value so it never re-spams. Lives here so the addon
+    // protocol's lockbox handler (a separate TU) can reuse it.
+    void AnnounceGatherSkillUp(Player* bot, uint32 skill);
+
     // Out-of-combat gathering. If `bot` is one of the player's alts (not a
     // henchman) and was trained in Mining or Herbalism, harvest a nearby node
     // (within 30y, within the bot's skill) while travelling with the party,

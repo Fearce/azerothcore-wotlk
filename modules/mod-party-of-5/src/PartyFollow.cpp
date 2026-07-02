@@ -3807,10 +3807,11 @@ namespace WowPsParty
     {
         switch (skill)
         {
-            case SKILL_MINING:    return "Mining";
-            case SKILL_HERBALISM: return "Herbalism";
-            case SKILL_SKINNING:  return "Skinning";
-            default:              return "Gathering";
+            case SKILL_MINING:      return "Mining";
+            case SKILL_HERBALISM:   return "Herbalism";
+            case SKILL_SKINNING:    return "Skinning";
+            case SKILL_LOCKPICKING: return "Lockpicking";
+            default:                return "Gathering";
         }
     }
 
@@ -3820,7 +3821,8 @@ namespace WowPsParty
     // "train me" nudge in the last 5 / at the cap so he remembers the next rank.
     static void AnnounceGatherSkillProgress(Player* bot, uint32 skill)
     {
-        if (skill != SKILL_MINING && skill != SKILL_HERBALISM && skill != SKILL_SKINNING)
+        if (skill != SKILL_MINING && skill != SKILL_HERBALISM &&
+            skill != SKILL_SKINNING && skill != SKILL_LOCKPICKING)
             return;
 
         int32 const value = bot->GetPureSkillValue(skill);
@@ -3842,8 +3844,15 @@ namespace WowPsParty
         Group* g = bot->GetGroup();
         if (!g) return;
 
+        // Lockpicking caps with the rogue's LEVEL (level*5), not with trained
+        // ranks — so it gets a plain skill-up line with no "train my next rank"
+        // nudge (there's nothing to train; the cap lifts when the rogue levels).
         std::string const msg =
-            (value >= cap)
+            (skill == SKILL_LOCKPICKING)
+                ? ((value >= cap)
+                    ? Acore::StringFormat("Lockpicking {}/{} — maxed for my level.", value, cap)
+                    : Acore::StringFormat("Lockpicking skill up! Now {}/{}.", value, cap))
+          : (value >= cap)
                 ? Acore::StringFormat("{} {}/{} — capped! Train my next rank so I can keep gathering.",
                                       GatherSkillName(skill), value, cap)
           : (value >= cap - 5)
@@ -4222,7 +4231,8 @@ namespace WowPsParty
                 bot->SetFacingToObject(go);
                 go->AddToSkillupList(bot->GetGUID());
                 if (uint32 pure = bot->GetPureSkillValue(SKILL_LOCKPICKING))
-                    bot->UpdateGatherSkill(SKILL_LOCKPICKING, pure, reqLock);
+                    if (bot->UpdateGatherSkill(SKILL_LOCKPICKING, pure, reqLock))
+                        AnnounceGatherSkillProgress(bot, SKILL_LOCKPICKING);
                 go->UseDoorOrButton(0, false, bot);
                 GatherLog(gLow, "instant: picked a locked door within 10y on contact");
             }
@@ -8649,6 +8659,14 @@ namespace WowPsParty
         }
 
     } // anonymous namespace
+
+    // Public wrapper (declared in PartyFollow.h) so the addon-protocol lockbox
+    // handler in another TU can post the same party-chat skill-up line the
+    // in-world gather/chest/door pick paths use.
+    void AnnounceGatherSkillUp(Player* bot, uint32 skill)
+    {
+        AnnounceGatherSkillProgress(bot, skill);
+    }
 
     // WorldScript OnUpdate hook -- ticks ~every 1s, applies all directives.
     // File-scope class (not in anon ns) so AddPartyFollowScripts can `new` it.
