@@ -423,7 +423,7 @@ namespace WowPsParty
     }
 
     // Display fields read off an Item for the inventory/gear panels.
-    struct PartyItemFields { uint32 entry; uint32 count; uint32 guidLow; int32 randProp; uint32 suffix; uint32 enchant; };
+    struct PartyItemFields { uint32 entry; uint32 count; uint32 guidLow; int32 randProp; uint32 suffix; uint32 enchant; bool soulbound; };
 
     // Defensive read of an item's display fields. A bag/equip slot can transiently
     // hold an Item whose value-array is invalid — a partially-initialised / dangling
@@ -446,6 +446,7 @@ namespace WowPsParty
             out.randProp = item->GetItemRandomPropertyId();
             out.suffix   = item->GetItemSuffixFactor();
             out.enchant  = item->GetEnchantmentId(PERM_ENCHANTMENT_SLOT);   // perm enchant, for the tooltip
+            out.soulbound = item->IsSoulBound();                            // instance bind state (value-array read → inside the SEH guard)
             return true;
 #ifdef _WIN32
         }
@@ -833,7 +834,11 @@ namespace WowPsParty
               // that only reads the first 6 fields still parses fine.
               << ':' << f.randProp
               << ':' << f.suffix
-              << ':' << f.enchant;
+              << ':' << f.enchant
+              // Instance bind state, so the tooltip can show "Soulbound" instead of
+              // the item template's static "Binds when equipped". Appended last, so an
+              // older addon that only reads the first 9 fields still parses fine.
+              << ':' << (f.soulbound ? 1 : 0);
             records.push_back(r.str());
         };
 
@@ -1851,7 +1856,8 @@ static void SendBankTo(Player* requester)
         }
         std::ostringstream r;
         r << f.entry << ':' << f.count << ':' << f.guidLow << ':'
-          << f.randProp << ':' << f.suffix << ':' << f.enchant;
+          << f.randProp << ':' << f.suffix << ':' << f.enchant
+          << ':' << (f.soulbound ? 1 : 0);   // instance bind state (see SendInventoryTo)
         records.push_back(r.str());
     };
 
