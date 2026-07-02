@@ -1747,26 +1747,33 @@ namespace WowPsParty
         return nullptr;
     }
 
-    // Find a connected party member on the bot's account with the given role.
+    // Find a connected party member with the given role, from the AUTHORITATIVE
+    // follow-directive roster (leader + followers) — RoleForGuid resolves a
+    // follower's own directive role OR the human LEADER's role (g_leaderRole).
     // role ∈ {"tank","healer","dps"}. Returns nullptr if no such member is
-    // currently in world on the same map. Walks account_party directly so it
-    // works regardless of group composition.
+    // currently in world on the same map.
+    //
+    // The old implementation queried `account_party` scoped to the BOT's account.
+    // That only works for a SAME-ACCOUNT party (party-of-5 alts): a hired HENCHMAN
+    // is a rndbot on a DIFFERENT account, so the query ran against the rndbot's
+    // account and never saw the human leader — and the solo leader's role lives in
+    // party_loadout / g_leaderRole, not account_party anyway. So "wait for the
+    // healer's mana" (healer_mana) and cast_tank silently no-op'd in solo+henchman
+    // mode. GetPartyGuidsFor + RoleForGuid is cross-account and leader-aware.
     static Player* FindPartyMemberByRole(Player* bot, char const* role)
     {
-        if (!bot || !bot->GetSession()) return nullptr;
-        uint32 const account = bot->GetSession()->GetAccountId();
-        QueryResult q = CharacterDatabase.Query(
-            "SELECT `guid` FROM `account_party` "
-            "WHERE `account` = {} AND `role` = '{}'", account, role);
-        if (!q) return nullptr;
-        do
+        if (!bot) return nullptr;
+        std::vector<ObjectGuid> guids;
+        WowPsParty::GetPartyGuidsFor(bot->GetGUID(), guids);
+        for (ObjectGuid const& g : guids)
         {
-            uint32 const g = q->Fetch()[0].Get<uint32>();
-            Player* p = ObjectAccessor::FindConnectedPlayer(
-                ObjectGuid::Create<HighGuid::Player>(g));
+            std::string r = WowPsParty::RoleForGuid(g);
+            if (r.empty()) r = "dps";
+            if (r != role) continue;
+            Player* p = ObjectAccessor::FindConnectedPlayer(g);
             if (p && p->IsAlive() && p->IsInWorld() && p->GetMapId() == bot->GetMapId())
                 return p;
-        } while (q->NextRow());
+        }
         return nullptr;
     }
 
@@ -3836,6 +3843,10 @@ namespace WowPsParty
         // Each member's role comes from whatever account OWNS them — so a second
         // human's role is read from THEIR account_party row, not ours (which is
         // why role-targeted buffs like Beacon used to skip the other player).
+        // COALESCE to party_loadout so a SOLO leader (Mill), whose role lives in
+        // party_loadout and NOT account_party, is classified correctly — without
+        // this a solo healer defaulted to 'dps' and cast_role_missing:healer (e.g.
+        // Innervate) never found them. Mirrors the ROLE addon-protocol resolution.
         // One batched query keyed by guid; default 'dps' if unrostered.
         std::string ids;
         for (Player* m : party)
@@ -3845,7 +3856,11 @@ namespace WowPsParty
         }
         std::vector<std::pair<uint32, std::string>> roles;
         if (QueryResult q = CharacterDatabase.Query(
-                "SELECT `guid`, COALESCE(`role`, 'dps') FROM `account_party` WHERE `guid` IN ({})", ids))
+                "SELECT c.`guid`, COALESCE(ap.`role`, NULLIF(pl.`role`, ''), 'dps') "
+                "FROM `characters` c "
+                "LEFT JOIN `account_party` ap ON ap.`guid` = c.`guid` AND ap.`account` = c.`account` "
+                "LEFT JOIN `party_loadout` pl ON pl.`guid` = c.`guid` "
+                "WHERE c.`guid` IN ({})", ids))
         {
             do
             {
