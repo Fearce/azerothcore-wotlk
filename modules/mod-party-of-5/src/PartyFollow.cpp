@@ -2759,12 +2759,13 @@ namespace WowPsParty
     // first mob and walk it back towards the party." So instead of charging in, the tank
     // walks in just far enough to aggro the opener (NOT a Charge), then drags the pack back
     // to a safe spot near the party and fights THERE. Only trips on a genuinely dangerous
-    // cluster — a handful of extra mobs is fine (Kevin: "3 nearby is OK; beyond that each
-    // one raises wipe odds"). Rare by design; tunable via the constants below.
+    // cluster — a handful of extra mobs beyond the intended pull is fine (Kevin: "up to 3
+    // extra is OK; 4+ raises wipe odds"). Rare by design; tunable via the constants below.
     static constexpr float  DANGER_SCAN         = 60.0f;   // radius around the fight we scan for joinable mobs
     static constexpr float  DANGER_PROXIMITY_R  = 22.0f;   // party standing at the pull spot aggros un-aggroed
                                                            // mobs within this of it (party spread + aggro radius)
-    static constexpr uint32 DANGER_EXTRA_MAX    = 3;       // > this many EXTRA mobs dragged in = dangerous
+    static constexpr uint32 DANGER_EXTRA_MAX    = 4;       // >= this many EXTRA mobs (beyond the intended
+                                                           // multi-pull + its social aggro) dragged in = dangerous
     static constexpr float  DANGER_Z_TOLERANCE  = 10.0f;   // ignore mobs on a clearly different vertical level
     static constexpr float  DANGER_PULLBACK_YDS = 22.0f;   // how far back toward the party we drag the pack
     static constexpr float  DANGER_MIN_PULLBACK = 14.0f;   // ...but never less than this (must clear the pack)
@@ -2785,18 +2786,20 @@ namespace WowPsParty
         return true;
     }
 
-    // Simulate what fighting the opener AT ITS LOCATION drags in, and return how many EXTRA
-    // mobs that is beyond the opener's own social pack (the deliberate pull). Model:
-    //   pack    = the opener's connected social component (mobs transitively within
-    //             SOCIAL_AGGRO_R of each other) — these come the moment you engage the opener,
-    //             so they're the intended pull, not "extra".
-    //   dragged = pack, then repeatedly add any pool mob that (a) is within DANGER_PROXIMITY_R
-    //             of the fight (the party stands there and proximity-aggros it) or (b) is within
-    //             SOCIAL_AGGRO_R of an already-dragged mob (its own pack chains in). Fixpoint.
-    //   extra   = |dragged| - |pack|.
-    // A separate neighbouring pack only enters via proximity (it's > SOCIAL_AGGRO_R from the
-    // opener's pack by definition), then its members chain in — exactly the "will it proximity
-    // pull, and how many come with it" question Kevin described.
+    // Simulate what fighting AT THE PULL LOCATION drags in, and return how many EXTRA mobs that
+    // is BEYOND the deliberate pull. Model:
+    //   intended = the mobs the tank MEANS to pull and their unavoidable social aggro:
+    //              the opener's social component PLUS — for a multi-pull (pull_count N >= 2) —
+    //              the nearest additional mobs the tank would walk to top its headcount up to N,
+    //              each expanded by its own social closure. None of these are "extra": they're
+    //              the intended pull + the packs that social-aggro in with it no matter what.
+    //   dragged  = intended, then repeatedly add any pool mob that (a) is within DANGER_PROXIMITY_R
+    //              of the fight (the party stands there and PROXIMITY-aggros it) or (b) is within
+    //              SOCIAL_AGGRO_R of an already-dragged mob (its own pack chains in). Fixpoint.
+    //   extra    = |dragged| - |intended|.
+    // So a NEIGHBOURING pack the tank never targeted only counts if the party standing at the
+    // fight would proximity-pull it (or it chains off something that does) — exactly the "packs
+    // beyond the multi-pull I didn't mean to grab" question Kevin described.
     static uint32 CountExtraDraggedMobs(Player* tank, Unit* opener)
     {
         if (!tank || !opener) return 0;
@@ -2826,21 +2829,40 @@ namespace WowPsParty
             pool.resize(DANGER_POOL_MAX);
         }
 
-        // pack = opener's connected social component (BFS over SOCIAL_AGGRO_R links).
-        std::unordered_set<Unit*> pack;
-        pack.insert(opener);
-        std::vector<Unit*> frontier = { opener };
-        while (!frontier.empty())
+        // Grow `set` by the social closure of `seed` over the pool (BFS over SOCIAL_AGGRO_R links).
+        auto socialClosure = [&](Unit* seed, std::unordered_set<Unit*>& set)
         {
-            Unit* const cur = frontier.back();
-            frontier.pop_back();
+            if (!set.insert(seed).second) return;
+            std::vector<Unit*> frontier = { seed };
+            while (!frontier.empty())
+            {
+                Unit* const cur = frontier.back();
+                frontier.pop_back();
+                for (Unit* u : pool)
+                    if (!set.count(u) && cur->GetDistance(u) <= SOCIAL_AGGRO_R)
+                    { set.insert(u); frontier.push_back(u); }
+            }
+        };
+
+        // intended = opener's pack, then — for a multi-pull — greedily fold in the nearest
+        // not-yet-intended mob (and its social pack) until the intended headcount reaches N.
+        // Mirrors the maintain-N gather's "walk to the nearest add"; for the danger count we
+        // only need the SET the tank would pull, not the exact walk order or navmesh cost.
+        std::unordered_set<Unit*> intended;
+        socialClosure(opener, intended);
+        uint32 const pullN = std::max<uint32>(1u, BotInitialPullCount(tank->GetGUID()));
+        while (intended.size() < pullN)
+        {
+            Unit* best = nullptr; float bestD = 0.0f;
             for (Unit* u : pool)
-                if (!pack.count(u) && cur->GetDistance(u) <= SOCIAL_AGGRO_R)
-                { pack.insert(u); frontier.push_back(u); }
+                if (!intended.count(u))
+                { float const d = opener->GetDistance(u); if (!best || d < bestD) { best = u; bestD = d; } }
+            if (!best) break;
+            socialClosure(best, intended);
         }
 
-        // dragged = pack + proximity seeds + their social closure (to a fixpoint).
-        std::unordered_set<Unit*> dragged = pack;
+        // dragged = intended + proximity seeds + their social closure (to a fixpoint).
+        std::unordered_set<Unit*> dragged = intended;
         bool changed = true;
         while (changed)
         {
@@ -2855,15 +2877,15 @@ namespace WowPsParty
                 if (join)
                 {
                     dragged.insert(u); changed = true;
-                    // The decision is binary (extra > DANGER_EXTRA_MAX); once we're past the
+                    // The decision is binary (extra >= DANGER_EXTRA_MAX); once we've reached the
                     // threshold the exact surplus doesn't matter, so stop the closure early —
                     // this is the case that would otherwise iterate a dense field to a fixpoint.
-                    if (dragged.size() - pack.size() > DANGER_EXTRA_MAX)
-                        return uint32(dragged.size() - pack.size());
+                    if (dragged.size() - intended.size() >= DANGER_EXTRA_MAX)
+                        return uint32(dragged.size() - intended.size());
                 }
             }
         }
-        return uint32(dragged.size() - pack.size());
+        return uint32(dragged.size() - intended.size());
     }
 
     // Active careful-pull state, mirroring the gather-drive pattern (map + mutex + step). One
@@ -3208,11 +3230,11 @@ namespace WowPsParty
         // (proximity + social aggro)? If so, don't charge in — aggro the opener and drag the
         // pack back to a safe spot near the party, fighting there instead. Replaces BOTH the
         // multi-pull and the single-pull barge for this pull. Trips only on a genuinely
-        // dangerous cluster (> DANGER_EXTRA_MAX extra mobs); the ordinary pull is untouched.
+        // dangerous cluster (>= DANGER_EXTRA_MAX extra mobs); the ordinary pull is untouched.
         if (!IsBossUnit(nearest))
         {
             uint32 const extra = CountExtraDraggedMobs(bot, nearest);
-            if (extra > DANGER_EXTRA_MAX)
+            if (extra >= DANGER_EXTRA_MAX)
             {
                 // Safe spot: back toward the leader (the party rear — the direction the party
                 // came from). Clamp so we don't overshoot past the leader, but never less than
@@ -3236,7 +3258,7 @@ namespace WowPsParty
                 AnnounceCarefulPull(bot);
                 LOG_INFO("module",
                     "[WowPsParty CarefulPull] guid={} ARM: entry={} would drag {} extra mob(s) "
-                    "(> {}) — pulling back {:.0f}y to a safe spot",
+                    "(>= {}, beyond the intended pull) — pulling back {:.0f}y to a safe spot",
                     bot->GetGUID().GetCounter(), nearest->GetEntry(), extra, DANGER_EXTRA_MAX, back);
                 TankCarefulPullStep(bot);   // start moving THIS tick
                 return;
