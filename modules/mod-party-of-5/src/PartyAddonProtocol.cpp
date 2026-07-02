@@ -2843,6 +2843,149 @@ static void HandleProspect(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// MILL\t<srcPartySlot>\t<srcItemGuidLow> — mill a stack of herbs from any party member
+// into pigments. Mirrors HandleProspect: a party member with Inscription skill
+// (>= the herb's RequiredSkillRank) is the scribe; one mill consumes 5 herbs and rolls
+// the SAME table the Milling spell uses (LootTemplates_Milling), keyed by the herb's
+// item entry — directly, since a clientless bot can't drive the loot WINDOW.
+static void HandleMill(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const srcSlot        = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+    if (!srcItemGuidLow) return;
+
+    uint32 const account   = requester->GetSession()->GetAccountId();
+    uint32 const ownerGuid = WowPsParty::GuidForAccountSlot(account, srcSlot);
+    if (!ownerGuid) return;
+    Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(ownerGuid));
+    if (!owner) return;
+    Item* item = SafeGetItemByGuid(owner, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!item) return;
+    ItemTemplate const* tmpl = item->GetTemplate();
+    if (!tmpl) return;
+
+    ChatHandler ch(requester->GetSession());
+    if (!tmpl->HasFlag(ITEM_FLAG_IS_MILLABLE))
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r |cffffffff{}|r can't be milled.", tmpl->Name1);
+        return;
+    }
+    if (item->GetCount() < 5)
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r Milling needs a stack of at least 5 |cffffffff{}|r.", tmpl->Name1);
+        return;
+    }
+
+    // A party member whose Inscription skill covers this herb's required level.
+    Player* scribe = nullptr;
+    std::ostringstream diag;
+    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
+    {
+        uint32 const g = WowPsParty::GuidForAccountSlot(account, partySlot);
+        if (!g) { diag << " [slot" << uint32(partySlot) << ":empty]"; continue; }
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g));
+        if (!p) { diag << " [slot" << uint32(partySlot) << ":guid" << g << ":NOT-CONNECTED]"; continue; }
+        bool const hasSkill = p->HasSkill(SKILL_INSCRIPTION);
+        uint16 const skill  = hasSkill ? p->GetSkillValue(SKILL_INSCRIPTION) : 0;
+        diag << " [slot" << uint32(partySlot) << ":" << p->GetName()
+             << ":insc=" << (hasSkill ? std::to_string(skill) : std::string("none")) << "]";
+        if (!scribe && hasSkill && skill >= tmpl->RequiredSkillRank)
+            scribe = p;
+    }
+    if (!scribe)
+    {
+        LOG_WARN("module",
+            "[WowPsParty Mill] FAILED 'no scribe skilled enough' — requester={} account={} "
+            "item='{}'(entry={}) requiredSkill={} | party:{}",
+            requester->GetName(), account, tmpl->Name1, tmpl->ItemId, tmpl->RequiredSkillRank, diag.str());
+        ch.PSendSysMessage(
+            "|cffff5555[WowPsParty]|r No party scribe skilled enough to mill "
+            "|cffffffff{}|r (needs Inscription {}).", tmpl->Name1, tmpl->RequiredSkillRank);
+        return;
+    }
+
+    // Roll the milling loot directly (same table as the spell), keyed by the herb entry.
+    Loot loot;
+    loot.FillLoot(tmpl->ItemId, LootTemplates_Milling, owner, true, true);
+    std::vector<std::pair<uint32, uint32>> pigments;
+    for (LootItem const& li : loot.items)
+        if (li.itemid && li.count)
+            pigments.emplace_back(li.itemid, uint32(li.count));
+    if (pigments.empty())
+    {
+        ch.PSendSysMessage("|cffff5555[WowPsParty]|r Milling produced nothing — herbs kept.");
+        return;
+    }
+
+    // Make sure the party can hold the pigments BEFORE consuming the herbs (milling is
+    // irreversible). Don't assume the 5-herb consume frees a slot — it only does if the
+    // stack was exactly 5 — so require the pigments to fit the CURRENT free space.
+    auto freeSlots = [](Player* p) -> uint32
+    {
+        uint32 n = 0;
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            if (!p->GetItemByPos(INVENTORY_SLOT_BAG_0, i)) ++n;
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = p->GetBagByPos(b))
+                for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                    if (!p->GetItemByPos(b, uint8(j))) ++n;
+        return n;
+    };
+    uint32 partyFree = 0;
+    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
+    {
+        uint32 const g = WowPsParty::GuidForAccountSlot(account, partySlot);
+        if (!g) continue;
+        if (Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g)))
+            partyFree += freeSlots(p);
+    }
+    if (pigments.size() > size_t(partyFree))
+    {
+        ch.PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Not enough free bag space for the pigments — make room and try again. (Herbs kept.)");
+        return;
+    }
+
+    std::string const itemName = tmpl->Name1;
+    uint32 const itemEntry = tmpl->ItemId;
+    scribe->UpdateCraftSkill(51005 /* Milling */);   // skill-up chance
+    owner->DestroyItemCount(itemEntry, 5, true);      // consume 5 herbs
+
+    std::ostringstream gained;
+    for (auto const& m : pigments)
+    {
+        for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
+        {
+            uint32 const g = WowPsParty::GuidForAccountSlot(account, partySlot);
+            if (!g) continue;
+            Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g));
+            if (!p) continue;
+            ItemPosCountVec dest;
+            if (p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, m.first, m.second) != EQUIP_ERR_OK)
+                continue;
+            p->StoreNewItem(dest, m.first, true);
+            ItemTemplate const* mt = sObjectMgr->GetItemTemplate(m.first);
+            if (!gained.str().empty()) gained << ", ";
+            gained << m.second << "x " << (mt ? mt->Name1 : "?");
+            break;
+        }
+    }
+
+    ch.PSendSysMessage("|cff66ccff[WowPsParty]|r {} milled 5x |cffffffff{}|r -> {}.",
+        scribe->GetName(), itemName,
+        gained.str().empty() ? "nothing (party bags full)" : gained.str());
+    LOG_INFO("module",
+        "[WowPsParty Mill] requester={} owner={} scribe={} herb='{}'(entry={}) -> {}",
+        requester->GetGUID().GetCounter(), owner->GetGUID().GetCounter(),
+        scribe->GetGUID().GetCounter(), itemName, itemEntry,
+        gained.str().empty() ? "NOTHING (bags full)" : gained.str());
+
+    WowPsParty::SendInventoryTo(requester);
+}
+
 // PICKLOCK\t<srcPartySlot>\t<srcItemGuidLow> — pick a locked box (junkbox / lockbox /
 // strongbox) from any party member's bags using a party ROGUE's Lockpicking skill.
 // Mirrors HandleDisenchant: any party member whose Lockpicking >= the box's required
@@ -5388,6 +5531,10 @@ public:
         else if (command == "PROSPECT")
         {
             HandleProspect(player, payload);
+        }
+        else if (command == "MILL")
+        {
+            HandleMill(player, payload);
         }
         else if (command == "PICKLOCK")
         {
