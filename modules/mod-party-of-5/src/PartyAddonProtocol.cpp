@@ -4716,7 +4716,12 @@ static void HandleMove(Player* requester, std::string_view payload)
             item->SetOwnerGUID(srcChar->GetGUID());
             ItemPosCountVec backPos;
             if (srcChar->CanStoreItem(NULL_BAG, NULL_SLOT, backPos, item, false) == EQUIP_ERR_OK)
+            {
                 srcChar->MoveItemToInventory(backPos, item, true);
+                // Re-credit the collect-quest counter MoveItemFromInventory decremented;
+                // the item never actually left srcChar.
+                srcChar->ItemAddedQuestCheck(item->GetEntry(), item->GetCount());
+            }
             CharacterDatabaseTransaction tx2 = CharacterDatabase.BeginTransaction();
             item->SaveToDB(tx2);
             CharacterDatabase.CommitTransaction(tx2);
@@ -4783,7 +4788,12 @@ static void HandleTake(Player* requester, std::string_view payload)
         item->SetOwnerGUID(srcChar->GetGUID());
         ItemPosCountVec backPos;
         if (srcChar->CanStoreItem(NULL_BAG, NULL_SLOT, backPos, item, false) == EQUIP_ERR_OK)
+        {
             srcChar->MoveItemToInventory(backPos, item, true);
+            // MoveItemFromInventory above decremented srcChar's collect-quest counter;
+            // the item is back on srcChar, so re-credit it or the counter desyncs down.
+            srcChar->ItemAddedQuestCheck(item->GetEntry(), item->GetCount());
+        }
         CharacterDatabaseTransaction tx2 = CharacterDatabase.BeginTransaction();
         item->SaveToDB(tx2);
         CharacterDatabase.CommitTransaction(tx2);
