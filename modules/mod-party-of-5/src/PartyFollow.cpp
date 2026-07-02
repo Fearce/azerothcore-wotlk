@@ -2750,6 +2750,268 @@ namespace WowPsParty
         EndTankGather(tankLow);
     }
 
+    // ===== CAREFUL PULL (dangerous-cluster drag-back) =======================
+    //
+    // Some pulls can't be fought where the pack stands: a few OTHER packs sit close
+    // enough that standing the party at the pack's location would social/proximity-aggro
+    // them too — three packs at once, a wipe. Kevin: "notice a few packs very close to the
+    // initial pack ... don't fight in the exact location of that pack. Proximity-aggro the
+    // first mob and walk it back towards the party." So instead of charging in, the tank
+    // walks in just far enough to aggro the opener (NOT a Charge), then drags the pack back
+    // to a safe spot near the party and fights THERE. Only trips on a genuinely dangerous
+    // cluster — a handful of extra mobs is fine (Kevin: "3 nearby is OK; beyond that each
+    // one raises wipe odds"). Rare by design; tunable via the constants below.
+    static constexpr float  DANGER_SCAN         = 60.0f;   // radius around the fight we scan for joinable mobs
+    static constexpr float  DANGER_PROXIMITY_R  = 22.0f;   // party standing at the pull spot aggros un-aggroed
+                                                           // mobs within this of it (party spread + aggro radius)
+    static constexpr uint32 DANGER_EXTRA_MAX    = 3;       // > this many EXTRA mobs dragged in = dangerous
+    static constexpr float  DANGER_Z_TOLERANCE  = 10.0f;   // ignore mobs on a clearly different vertical level
+    static constexpr float  DANGER_PULLBACK_YDS = 22.0f;   // how far back toward the party we drag the pack
+    static constexpr float  DANGER_MIN_PULLBACK = 14.0f;   // ...but never less than this (must clear the pack)
+    static constexpr uint32 CAREFUL_PULL_MAX_MS = 20000;   // overall safety cap on the whole manoeuvre
+
+    // A mob that could JOIN a fight at the tank's pull location: un-aggroed, hostile,
+    // non-trivial creature (not a boss/totem/critter). Deliberately LOOSER than
+    // GatherEligible — social and proximity aggro don't care about the tank's navmesh path
+    // or line of sight, only about the mob's own distance to the pulled pack / the party.
+    static bool DangerPoolEligible(Player* tank, Unit* u)
+    {
+        if (!u || !u->IsAlive() || u->IsInCombat()) return false;   // un-aggroed only
+        if (u->IsTotem() || !u->ToCreature()) return false;
+        if (IsBossUnit(u)) return false;
+        if (!u->IsHostileTo(tank)) return false;
+        if (!tank->IsValidAttackTarget(u)) return false;
+        if (WontAutoAggro(tank, u)) return false;                   // gray/trivial won't meaningfully aggro
+        return true;
+    }
+
+    // Simulate what fighting the opener AT ITS LOCATION drags in, and return how many EXTRA
+    // mobs that is beyond the opener's own social pack (the deliberate pull). Model:
+    //   pack    = the opener's connected social component (mobs transitively within
+    //             SOCIAL_AGGRO_R of each other) — these come the moment you engage the opener,
+    //             so they're the intended pull, not "extra".
+    //   dragged = pack, then repeatedly add any pool mob that (a) is within DANGER_PROXIMITY_R
+    //             of the fight (the party stands there and proximity-aggros it) or (b) is within
+    //             SOCIAL_AGGRO_R of an already-dragged mob (its own pack chains in). Fixpoint.
+    //   extra   = |dragged| - |pack|.
+    // A separate neighbouring pack only enters via proximity (it's > SOCIAL_AGGRO_R from the
+    // opener's pack by definition), then its members chain in — exactly the "will it proximity
+    // pull, and how many come with it" question Kevin described.
+    static uint32 CountExtraDraggedMobs(Player* tank, Unit* opener)
+    {
+        if (!tank || !opener) return 0;
+        float const fz = opener->GetPositionZ();
+        std::list<Unit*> nearby;
+        // obj=opener (scan centre), funit=TANK: the filter keeps units unfriendly to funit,
+        // and it's the tank (a player) the neighbouring mobs are hostile to. Passing the opener
+        // as funit would instead keep units unfriendly to the OPENER (the party) and drop the
+        // same-faction mobs we count, silently zeroing `extra` and disabling the whole manoeuvre.
+        Acore::AnyUnfriendlyUnitInObjectRangeCheck check(opener, tank, DANGER_SCAN);
+        Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck> searcher(opener, nearby, check);
+        Cell::VisitObjects(opener, searcher, DANGER_SCAN);
+
+        std::vector<Unit*> pool;
+        for (Unit* u : nearby)
+            if (DangerPoolEligible(tank, u) && std::fabs(u->GetPositionZ() - fz) <= DANGER_Z_TOLERANCE)
+                pool.push_back(u);
+
+        // Bound the working set: the social closure below is O(N^2) per tick and runs on every
+        // staged pull, so on a dense field (AoE-farm rooms) cap N to the nearest DANGER_POOL_MAX.
+        // Anything past that is already far beyond DANGER_EXTRA_MAX and only pushes the count up.
+        constexpr size_t DANGER_POOL_MAX = 48;
+        if (pool.size() > DANGER_POOL_MAX)
+        {
+            std::nth_element(pool.begin(), pool.begin() + DANGER_POOL_MAX, pool.end(),
+                [&](Unit* a, Unit* b){ return opener->GetDistance(a) < opener->GetDistance(b); });
+            pool.resize(DANGER_POOL_MAX);
+        }
+
+        // pack = opener's connected social component (BFS over SOCIAL_AGGRO_R links).
+        std::unordered_set<Unit*> pack;
+        pack.insert(opener);
+        std::vector<Unit*> frontier = { opener };
+        while (!frontier.empty())
+        {
+            Unit* const cur = frontier.back();
+            frontier.pop_back();
+            for (Unit* u : pool)
+                if (!pack.count(u) && cur->GetDistance(u) <= SOCIAL_AGGRO_R)
+                { pack.insert(u); frontier.push_back(u); }
+        }
+
+        // dragged = pack + proximity seeds + their social closure (to a fixpoint).
+        std::unordered_set<Unit*> dragged = pack;
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+            for (Unit* u : pool)
+            {
+                if (dragged.count(u)) continue;
+                bool join = opener->GetDistance(u) <= DANGER_PROXIMITY_R;   // party at the fight aggros it
+                if (!join)
+                    for (Unit* d : dragged)
+                        if (d->GetDistance(u) <= SOCIAL_AGGRO_R) { join = true; break; }
+                if (join)
+                {
+                    dragged.insert(u); changed = true;
+                    // The decision is binary (extra > DANGER_EXTRA_MAX); once we're past the
+                    // threshold the exact surplus doesn't matter, so stop the closure early —
+                    // this is the case that would otherwise iterate a dense field to a fixpoint.
+                    if (dragged.size() - pack.size() > DANGER_EXTRA_MAX)
+                        return uint32(dragged.size() - pack.size());
+                }
+            }
+        }
+        return uint32(dragged.size() - pack.size());
+    }
+
+    // Active careful-pull state, mirroring the gather-drive pattern (map + mutex + step). One
+    // per lead tank; armed by TankLeadEngagement when a pull is judged dangerous, driven each
+    // tick by TankCarefulPullStep, and cleared on conclude (arrived / opener gone / HP-bail /
+    // timeout), at which point the safe spot becomes the pull-spot and normal combat resumes.
+    struct CarefulPull
+    {
+        uint32     startMs;
+        ObjectGuid opener;
+        float      sx, sy, sz;        // safe spot (the party rear), stamped once at arm time
+        bool       aggroed;           // phase 1 (walk in to aggro) -> phase 2 (drag back)
+        bool       moveIssued;        // a MovePoint has been issued for the current phase
+        uint32     extra;             // extra-mob count that tripped it (for logging)
+    };
+    static std::unordered_map<uint32, CarefulPull> g_carefulPull;
+    static std::mutex g_carefulPullMutex;
+
+    bool TankCarefulPullActive(uint32 tankLow)
+    {
+        std::lock_guard<std::mutex> lock(g_carefulPullMutex);
+        return g_carefulPull.count(tankLow) != 0;
+    }
+    static bool GetCarefulPull(uint32 tankLow, CarefulPull& out)
+    {
+        std::lock_guard<std::mutex> lock(g_carefulPullMutex);
+        auto it = g_carefulPull.find(tankLow);
+        if (it == g_carefulPull.end()) return false;
+        out = it->second;
+        return true;
+    }
+    static void ArmCarefulPull(uint32 tankLow, CarefulPull const& cp)
+    {
+        std::lock_guard<std::mutex> lock(g_carefulPullMutex);
+        uint32 const now = getMSTime();
+        for (auto it = g_carefulPull.begin(); it != g_carefulPull.end(); )   // prune stale (left mid-pull)
+            it = (it->first != tankLow && now - it->second.startMs > CAREFUL_PULL_MAX_MS * 3)
+                     ? g_carefulPull.erase(it) : std::next(it);
+        g_carefulPull[tankLow] = cp;
+    }
+    static void UpdateCarefulPull(uint32 tankLow, bool aggroed, bool moveIssued)
+    {
+        std::lock_guard<std::mutex> lock(g_carefulPullMutex);
+        auto it = g_carefulPull.find(tankLow);
+        if (it == g_carefulPull.end()) return;
+        it->second.aggroed = aggroed; it->second.moveIssued = moveIssued;
+    }
+    static void EndCarefulPull(uint32 tankLow)
+    {
+        std::lock_guard<std::mutex> lock(g_carefulPullMutex);
+        g_carefulPull.erase(tankLow);
+    }
+
+    // "Possibly dangerous pull ahead, I'll be careful." — one party-chat callout per careful
+    // pull so Kevin can eyeball false positives. Throttled per tank so a re-arm can't spam it.
+    static void AnnounceCarefulPull(Player* bot)
+    {
+        Group* g = bot->GetGroup();
+        if (!g) return;
+        static thread_local std::unordered_map<uint32, uint32> lastMs;
+        uint32 const now = getMSTime();
+        uint32& lm = lastMs[bot->GetGUID().GetCounter()];
+        if (lm != 0 && now - lm < 8000) return;
+        lm = now;
+        std::string const msg = "Possibly dangerous pull ahead, I'll be careful.";
+        WorldPacket data;
+        ChatMsg const type = g->isRaidGroup() ? CHAT_MSG_RAID : CHAT_MSG_PARTY;
+        ChatHandler::BuildChatPacket(data, type, LANG_UNIVERSAL, bot, nullptr, msg.c_str());
+        g->BroadcastPacket(&data, true, -1, bot->GetGUID());
+    }
+
+    // One tick of an active careful pull. Phase 1: walk to the opener until it aggros (proximity,
+    // NOT a Charge — we must not blast into the pack). Phase 2: once aggroed, drag it (and the
+    // pack that social-aggros with it) back to the safe spot; on arrival stamp that spot as the
+    // pull-spot so the leash holds the fight there, and hand back to the normal rotation/assist.
+    // DPS/healer are held for the whole manoeuvre (MarkTankGathering) so nobody engages at the
+    // pack. Runs from TankLeadEngagement, which fires after AssistTarget so its MovePoint wins.
+    static void TankCarefulPullStep(Player* tank)
+    {
+        uint32 const low = tank->GetGUID().GetCounter();
+        CarefulPull cp;
+        if (!GetCarefulPull(low, cp)) return;
+        uint32 const now = getMSTime();
+        MovementGeneratorType const mg = tank->GetMotionMaster()->GetCurrentMovementGeneratorType();
+        Unit* const opener = ObjectAccessor::GetUnit(*tank, cp.opener);
+
+        // ---- CONCLUDE: anchor the fight at the safe spot, resume normal combat -------------
+        char const* end = nullptr;
+        if      (now - cp.startMs > CAREFUL_PULL_MAX_MS)     end = "timeout";
+        else if (tank->GetHealthPct() <= GATHER_LOW_HP_PCT)  end = "hp-bail";
+        else if (!opener || !opener->IsAlive())              end = "opener-gone";
+        if (end)
+        {
+            g_pullSpot[low] = { cp.sx, cp.sy, cp.sz, true };   // fight here from now on
+            LOG_INFO("module", "[WowPsParty CarefulPull] guid={} END({}) aggroed={} ageMs={}",
+                     low, end, cp.aggroed, now - cp.startMs);
+            EndCarefulPull(low);
+            return;
+        }
+
+        // Hold DPS/healer for the whole pull (approach + drag) — same gate the gather uses.
+        {
+            std::vector<ObjectGuid> set;
+            for (auto const& [rg, ref] : tank->GetCombatManager().GetPvECombatRefs())
+                if (Unit* o = ref->GetOther(tank))
+                    if (o->IsAlive() && o->ToCreature()) set.push_back(o->GetGUID());
+            if (set.empty()) set.push_back(cp.opener);   // pre-aggro -> hold on the opener
+            MarkTankGathering(low, set);
+        }
+
+        if (!cp.aggroed)
+        {
+            // PHASE 1 — walk IN just far enough to proximity-aggro the opener. NOT DriveTankChase
+            // (that would Charge). The instant it (or we) enters combat, lock it and flip to drag.
+            if (tank->IsInCombat() || opener->IsInCombat())
+            {
+                tank->Attack(opener, true);          // keep it on us so it follows the drag-back
+                UpdateCarefulPull(low, /*aggroed=*/true, /*moveIssued=*/false);
+                return;
+            }
+            if (!cp.moveIssued || mg != POINT_MOTION_TYPE)
+            {
+                tank->SetFacingToObject(opener);
+                tank->GetMotionMaster()->MovePoint(0, opener->GetPositionX(),
+                                                   opener->GetPositionY(), opener->GetPositionZ());
+                UpdateCarefulPull(low, /*aggroed=*/false, /*moveIssued=*/true);
+            }
+            return;
+        }
+
+        // PHASE 2 — drag the aggroed pack back to the safe spot near the party.
+        if (opener->IsAlive() && tank->GetVictim() != opener)
+            tank->Attack(opener, true);              // keep it swinging at us / following
+        if (tank->GetExactDist2d(cp.sx, cp.sy) <= 4.0f)
+        {
+            g_pullSpot[low] = { cp.sx, cp.sy, cp.sz, true };   // arrived — fight here
+            LOG_INFO("module", "[WowPsParty CarefulPull] guid={} ARRIVED at safe spot (extra was {}) — engaging",
+                     low, cp.extra);
+            EndCarefulPull(low);
+            return;
+        }
+        if (!cp.moveIssued || mg != POINT_MOTION_TYPE)
+        {
+            tank->GetMotionMaster()->MovePoint(0, cp.sx, cp.sy, cp.sz);
+            UpdateCarefulPull(low, /*aggroed=*/true, /*moveIssued=*/true);
+        }
+    }
+
     void TankLeadEngagement(Player* bot)
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
@@ -2772,6 +3034,15 @@ namespace WowPsParty
         if (!leader || !leader->IsInWorld()) return;
         if (leader->GetMapId() != bot->GetMapId()) return;
         if (!leader->GetMap() || !leader->GetMap()->IsDungeon()) return;
+
+        // Active careful pull (dangerous-cluster drag-back): drive it BEFORE the gather and the
+        // out-of-combat pull logic — once it aggros the opener the tank is in combat, so the
+        // settle/leash/victim guards below would otherwise bail mid-manoeuvre.
+        if (TankCarefulPullActive(bot->GetGUID().GetCounter()))
+        {
+            TankCarefulPullStep(bot);
+            return;
+        }
 
         // Active maintain-N gather: drive it (walk/taunt to the next safe add) BEFORE
         // the out-of-combat-only pull logic below — the tank is mid-gather (in combat),
@@ -2930,6 +3201,45 @@ namespace WowPsParty
                     }
                     return;
                 }
+            }
+        }
+
+        // CAREFUL PULL: would fighting AT this pack's spot drag in too many NEIGHBOURING mobs
+        // (proximity + social aggro)? If so, don't charge in — aggro the opener and drag the
+        // pack back to a safe spot near the party, fighting there instead. Replaces BOTH the
+        // multi-pull and the single-pull barge for this pull. Trips only on a genuinely
+        // dangerous cluster (> DANGER_EXTRA_MAX extra mobs); the ordinary pull is untouched.
+        if (!IsBossUnit(nearest))
+        {
+            uint32 const extra = CountExtraDraggedMobs(bot, nearest);
+            if (extra > DANGER_EXTRA_MAX)
+            {
+                // Safe spot: back toward the leader (the party rear — the direction the party
+                // came from). Clamp so we don't overshoot past the leader, but never less than
+                // DANGER_MIN_PULLBACK (a shorter drag wouldn't clear the pack). Validate it's
+                // navmesh-reachable; fall back to the leader's own position if not.
+                float const ang = nearest->GetAngle(leader->GetPositionX(), leader->GetPositionY());
+                float back = std::min(nearest->GetExactDist2d(leader), DANGER_PULLBACK_YDS);
+                if (back < DANGER_MIN_PULLBACK) back = DANGER_MIN_PULLBACK;
+                float sx = nearest->GetPositionX() + std::cos(ang) * back;
+                float sy = nearest->GetPositionY() + std::sin(ang) * back;
+                float sz = leader->GetPositionZ();
+                if (!NavReachable(bot, sx, sy, sz, bot->GetExactDist2d(sx, sy)))
+                { sx = leader->GetPositionX(); sy = leader->GetPositionY(); sz = leader->GetPositionZ(); }
+
+                CarefulPull cp{};
+                cp.startMs = getMSTime();
+                cp.opener  = nearest->GetGUID();
+                cp.sx = sx; cp.sy = sy; cp.sz = sz;
+                cp.aggroed = false; cp.moveIssued = false; cp.extra = extra;
+                ArmCarefulPull(bot->GetGUID().GetCounter(), cp);
+                AnnounceCarefulPull(bot);
+                LOG_INFO("module",
+                    "[WowPsParty CarefulPull] guid={} ARM: entry={} would drag {} extra mob(s) "
+                    "(> {}) — pulling back {:.0f}y to a safe spot",
+                    bot->GetGUID().GetCounter(), nearest->GetEntry(), extra, DANGER_EXTRA_MAX, back);
+                TankCarefulPullStep(bot);   // start moving THIS tick
+                return;
             }
         }
 
@@ -4610,6 +4920,14 @@ namespace WowPsParty
         // fights and the threat gate (TankLeadActive / THREAT_CAP) governs the real release.
         if (TankGatherActive(tank->GetGUID().GetCounter())) return true;
 
+        // CAREFUL PULL active: HOLD for the whole drag-back. The per-mob MarkTankGathering hold
+        // self-releases the instant the tank has an engage lead, but in phase 2 the tank is
+        // Attack()-ing and building threat *while still walking back*, so on a short drag that
+        // hold can lapse and the DPS would path to the mobs at their still-forward position —
+        // the exact danger zone this manoeuvre exists to avoid. Gate on the manoeuvre itself so
+        // the party stays put until it concludes and the safe-spot pull-spot + threat gate take over.
+        if (TankCarefulPullActive(tank->GetGUID().GetCounter())) return true;
+
         // (Legacy) multi-pull gather mark — held until the tank has a threat lead; self-
         // releases per mob. Kept for the non-gather mark path.
         if (IsTankGathering(tank)) return true;
@@ -5531,7 +5849,8 @@ namespace WowPsParty
         // builds NO threat until the pack is grouped), no chase. TankLeadEngagement /
         // TankGatherStep own the feet and the rotation is suppressed (TickRotation). Resumes
         // the instant the gather concludes -> then it engages, builds threat, DPS follow (Mill).
-        if (TankIsBodyPulling(bot)) { AssistLog(gLow, "skip: body-pulling (gather) — move only"); return; }
+        if (TankIsBodyPulling(bot) || TankCarefulPullActive(gLow))
+        { AssistLog(gLow, "skip: body-pull / careful-pull — TankLeadEngagement owns the feet"); return; }
         // stop_attacking hold (e.g. Mirrored Soul): drop the victim and DON'T engage or
         // chase — heals/movement run elsewhere; this governs offence only.
         if (IsOffensiveHeld(bot->GetGUID()))

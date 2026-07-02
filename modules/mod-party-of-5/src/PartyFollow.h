@@ -74,6 +74,11 @@ namespace WowPsParty
     // pack in, building no threat). The rotation engine reads it to keep a bear in form
     // mid-pull and to hold DPS offense for the whole gather.
     bool   TankGatherActive(uint32 tankLow);
+    // True while a lead tank is running a CAREFUL PULL: a pull it judged dangerous to fight
+    // at the pack's location (too many neighbouring mobs would social/proximity-aggro), so
+    // it aggros the opener and drags it back to a safe spot near the party instead of
+    // charging in. Like the gather it owns the feet and suppresses rotation for the drag.
+    bool   TankCarefulPullActive(uint32 tankLow);
     // Suppress the group-removal dismiss hook while a (re-)hire moves a henchman
     // between groups (so pulling it out of a stale LFG group doesn't dismiss it).
     void   SetHenchmanRegrouping(ObjectGuid henchGuid, bool on);
