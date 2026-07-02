@@ -282,6 +282,15 @@ namespace WowPsParty
     void MarkCleanseHold(ObjectGuid followerGuid, uint32 holdMs);
     bool IsCleanseHeld(ObjectGuid guid);
 
+    // Cast hold ("stop & hold casting"). While set, the bot declines every spell with a
+    // cast time OR channel — instants still fire — so it can ride out an enemy silence /
+    // school-lockout (e.g. Disrupting Shout) on instants only instead of eating a wasted
+    // hard-cast. The `stop_hold_cast` rotation action re-arms it each tick its condition
+    // holds and also cancels the in-progress hard cast. Enforced in the rotation's cast
+    // path (faceAndCast/faceAndCastAt), which already knows a spell's cast/channel time.
+    void MarkCastHold(ObjectGuid followerGuid, uint32 holdMs);
+    bool IsCastHeld(ObjectGuid guid);
+
     // Vehicle behaviour (Oculus drakes, etc.). Both are gated behind a vehicle scenario by
     // their callers, so normal follow/rotation is untouched otherwise.
     //  - TickBotVehicleMovement: from the follow ticker — board/acquire a vehicle when the

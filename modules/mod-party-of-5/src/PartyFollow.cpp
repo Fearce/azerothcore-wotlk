@@ -804,6 +804,29 @@ namespace WowPsParty
         return true;
     }
 
+    // Cast hold (mirror of the offensive/cleanse holds): while live the bot declines any
+    // spell with a cast time or channel; instants still fire. Lets `stop_hold_cast` ride
+    // out an enemy silence / school-lockout on instants only. Re-armed each tick its rule
+    // condition holds.
+    static std::unordered_map<uint32, uint32> g_castHoldUntilMs;
+    void MarkCastHold(ObjectGuid followerGuid, uint32 holdMs)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_castHoldUntilMs[followerGuid.GetCounter()] = getMSTime() + holdMs;
+    }
+    bool IsCastHeld(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_castHoldUntilMs.find(guid.GetCounter());
+        if (it == g_castHoldUntilMs.end()) return false;
+        if (getMSTime() >= it->second)
+        {
+            g_castHoldUntilMs.erase(it);
+            return false;
+        }
+        return true;
+    }
+
     // Force a freshly-revived / stuck bot back into a MOVABLE state.
     //
     // Root/stun/etc. live in two places: the unit-state mask (m_state, gated by

@@ -3945,6 +3945,30 @@ namespace WowPsParty
             return false;
         }
 
+        // "stop_hold_cast[:seconds]": arm the cast hold — the bot declines every spell
+        // with a cast time or channel while it's live, so it rides an enemy silence /
+        // school-lockout (e.g. Disrupting Shout) on INSTANTS only instead of eating a
+        // wasted hard-cast. Optional arg = hold seconds (default 7, sized for a typical
+        // silence); re-armed each tick its condition holds. Also cancels the in-progress
+        // HARD cast/channel right now so a Healing Touch already in flight isn't finished
+        // into the silence — an instant or wand/auto-shot is left running. Returns false
+        // so the SAME tick falls through to the bot's instant rules (Rejuv/Swiftmend/…).
+        if (verb == "stop_hold_cast")
+        {
+            static constexpr uint32 STOP_HOLD_CAST_DEFAULT_SEC = 7;
+            static constexpr uint32 STOP_HOLD_CAST_MAX_SEC     = 60;   // clamp fat-fingered args
+            uint32 secs = arg.empty() ? 0 : uint32(std::max(0, std::atoi(arg.c_str())));
+            if (secs == 0) secs = STOP_HOLD_CAST_DEFAULT_SEC;
+            secs = std::min(secs, STOP_HOLD_CAST_MAX_SEC);
+            WowPsParty::MarkCastHold(bot->GetGUID(), secs * 1000);
+            for (uint32 slot : { CURRENT_GENERIC_SPELL, CURRENT_CHANNELED_SPELL })
+                if (Spell* s = bot->GetCurrentSpell(CurrentSpellTypes(slot)))
+                    if (SpellInfo const* si = s->GetSpellInfo())
+                        if (si->CalcCastTime() > 0 || (si->IsChanneled() && si->GetDuration() > 0))
+                            bot->InterruptSpell(CurrentSpellTypes(slot), false);
+            return false;
+        }
+
         // "clip" flag: let this cast interrupt the bot's own in-progress
         // cast/channel. Without it, a rule is skipped while the bot is
         // mid-cast (the default — don't clip your own Frostbolt). With it,
@@ -4194,6 +4218,12 @@ namespace WowPsParty
                 if (isChannel && info->GetDuration() > holdMs)
                     holdMs = info->GetDuration();
             }
+            // stop_hold_cast: while the cast hold is live, decline anything with a cast
+            // time or channel (holdMs > 0) so the bot rides an enemy silence / school-
+            // lockout (Disrupting Shout) on INSTANTS only. Instants (holdMs == 0) fall
+            // straight through, so Rejuv/Swiftmend/Wild Growth keep flowing while
+            // Healing Touch/Regrowth/Nourish/Tranquility are held.
+            if (holdMs > 0 && WowPsParty::IsCastHeld(bot->GetGUID())) return false;
             // Mid "Come Hither" recall: keep RUNNING to the leader. A cast-time spell
             // or channel would StopMoving/plant here and abandon the recall, so skip
             // it and let the rotation fall through to an INSTANT (instants don't plant
@@ -4339,6 +4369,10 @@ namespace WowPsParty
                 if (isChannel && info->GetDuration() > holdMs)
                     holdMs = info->GetDuration();
             }
+            // stop_hold_cast: hold cast-time / channeled ground AoEs too (Blizzard,
+            // Flamestrike, Rain of Fire) while the cast hold is live — instants are
+            // unaffected. See faceAndCast.
+            if (holdMs > 0 && WowPsParty::IsCastHeld(bot->GetGUID())) return false;
             // Mid "Come Hither" recall: don't plant for a ground cast/channel — keep
             // running to the leader (see faceAndCast).
             if (holdMs > 0 && WowPsParty::IsBeingRecalled(bot->GetGUID()))
@@ -7585,7 +7619,12 @@ namespace WowPsParty
             // A survival-dodge movement verb (reposition_random / walk_away_from_source
             // / move_out_of_los) overrides a cast OR channel in flight — see
             // IsReactiveMoveVerb. So it's exempt from both suppressions below.
-            if (committed && !IsReactiveMoveVerb(verb) && !CsvContains(Lower(r.flags), "clip"))
+            // stop_hold_cast is likewise exempt: its whole job is to CANCEL the cast/
+            // channel in flight (and hold new ones), so it must reach ExecAction while
+            // one is up — its condition (e.g. target_casting:Disrupting Shout) still
+            // gates it, so it only clips when an enemy is actually casting the silence.
+            if (committed && !IsReactiveMoveVerb(verb) && verb != "stop_hold_cast"
+                && !CsvContains(Lower(r.flags), "clip"))
             {
                 if (trace)
                     LOG_INFO("module",
@@ -7610,6 +7649,7 @@ namespace WowPsParty
             if (castTimeInFlight
                 && !IsReactiveHealVerb(verb)
                 && !IsReactiveMoveVerb(verb)
+                && verb != "stop_hold_cast"   // must reach ExecAction to cancel the cast in flight
                 && !CsvContains(Lower(r.flags), "clip"))
             {
                 if (trace)
