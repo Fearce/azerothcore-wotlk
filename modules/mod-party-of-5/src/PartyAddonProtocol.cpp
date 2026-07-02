@@ -4729,6 +4729,72 @@ static void HandleMove(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// TAKE\t<srcPartySlot>\t<srcItemGuidLow> — move the FULL item (whole stack) out of
+// the party member in srcPartySlot and into the REQUESTER's own bags. The mirror of
+// HandleMove's cross-char branch, but the destination is always the human who clicked,
+// so loot that landed on the wrong character (e.g. a key/quest item the healer grabbed)
+// can be pulled to yourself. Non-destructive; bounces back untouched if your bags are
+// full or the item already belongs to you.
+static void HandleTake(Player* requester, std::string_view payload)
+{
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const srcSlot        = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+    if (!srcItemGuidLow) return;
+    if (!requester || !requester->GetSession()) return;
+    uint32 const account = requester->GetSession()->GetAccountId();
+
+    uint32 const srcGuid = WowPsParty::GuidForAccountSlot(account, srcSlot);
+    if (!srcGuid) return;
+    Player* srcChar = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(srcGuid));
+    if (!srcChar) return;
+
+    Item* item = SafeGetItemByGuid(srcChar, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!item) return;
+
+    ItemTemplate const* t = WowPsParty::SafeItemTemplate(item);
+    std::string const itemName = t ? t->Name1 : "item";
+
+    if (srcChar == requester)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r |cffffffff{}|r is already in your bags.", itemName);
+        return;
+    }
+
+    srcChar->MoveItemFromInventory(item->GetBagSlot(), item->GetSlot(), true);
+    item->SetOwnerGUID(requester->GetGUID());
+    CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+    item->SaveToDB(tx);
+    CharacterDatabase.CommitTransaction(tx);
+
+    ItemPosCountVec pos;
+    if (requester->CanStoreItem(NULL_BAG, NULL_SLOT, pos, item, false) == EQUIP_ERR_OK)
+    {
+        requester->ItemAddedQuestCheck(item->GetEntry(), item->GetCount());
+        requester->MoveItemToInventory(pos, item, true);
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cff66ccff[WowPsParty]|r Took |cffffffff{}|r from {}.", itemName, srcChar->GetName());
+    }
+    else
+    {
+        // Bags full — bounce the item back to the source character untouched.
+        item->SetOwnerGUID(srcChar->GetGUID());
+        ItemPosCountVec backPos;
+        if (srcChar->CanStoreItem(NULL_BAG, NULL_SLOT, backPos, item, false) == EQUIP_ERR_OK)
+            srcChar->MoveItemToInventory(backPos, item, true);
+        CharacterDatabaseTransaction tx2 = CharacterDatabase.BeginTransaction();
+        item->SaveToDB(tx2);
+        CharacterDatabase.CommitTransaction(tx2);
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Your bags are full — couldn't take |cffffffff{}|r.", itemName);
+    }
+
+    FlushPartyTransfer(srcChar, requester);
+    WowPsParty::SendInventoryTo(requester);
+}
+
 // GOTO_DELTA — DISABLED (2026-06-03). The right-click-the-map teleport was
 // removed: the client hook also fired on Blizzard's NORMAL world map, so a
 // stray right-click teleported the whole party by accident. The feature is
@@ -5437,6 +5503,10 @@ public:
         else if (command == "MOVE")
         {
             HandleMove(player, payload);
+        }
+        else if (command == "TAKE")
+        {
+            HandleTake(player, payload);
         }
         else if (command == "SELL")
         {
