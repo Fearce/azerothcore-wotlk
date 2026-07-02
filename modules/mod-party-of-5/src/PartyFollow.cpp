@@ -3527,7 +3527,15 @@ namespace WowPsParty
     static constexpr float GATHER_SCAN_RANGE   = GATHER_LEADER_LEASH; // node search radius == leash range
     static constexpr float GATHER_REACH        = 11.0f;  // interaction distance — long reach so bots harvest without walking on top of the node
     static constexpr float GATHER_ARRIVED_REACH = 18.0f; // harvest-from-here cap once the navmesh can't get any closer (veins up rocks/ledges)
-    static constexpr uint32 GATHER_APPROACH_TIMEOUT_MS = 6000; // give up if stuck
+    static constexpr uint32 GATHER_APPROACH_TIMEOUT_MS = 6000; // (henchman-loot walk only) give up if stuck
+    // A committed gather node is pursued to completion as long as the bot keeps
+    // getting closer to it — HOWEVER far it is. We only abandon a node the bot has
+    // made NO forward progress toward for this long (genuinely wedged on geometry).
+    // A flat wall-clock timeout was wrong: a 50y walk takes ~7s unmounted, so the
+    // old 6s cap abandoned nodes mid-approach and, with the single avoid slot, made
+    // the bot ping-pong between two nodes forever without reaching either (Mill).
+    static constexpr uint32 GATHER_STUCK_NO_PROGRESS_MS = 5000;
+    static constexpr float  GATHER_PROGRESS_EPSILON = 0.75f; // min yards-closer to count as progress
     static constexpr uint32 GATHER_AVOID_MS = 30000;   // ignore an unreachable node
     static constexpr float GATHER_DUNGEON_ENEMY_CLEAR = 100.0f; // in a dungeon, don't gather a node with a live enemy this close
     static constexpr float INSTANT_GATHER_RANGE = 10.0f; // mining/herb heroes auto-grab any node within this the instant they pass it (no walk, bypasses the avoid-list) — Kevin
@@ -3538,8 +3546,10 @@ namespace WowPsParty
     struct GatherState
     {
         ObjectGuid node;            // node we're walking toward
-        uint32     commitMs   = 0;  // when we committed (stuck timeout)
-        ObjectGuid avoid;           // a node we abandoned as unreachable
+        uint32     commitMs   = 0;  // when we committed (for the arrived-short grace)
+        float      bestDist   = 0.0f; // closest we've gotten to the committed node so far
+        uint32     progressMs = 0;  // last time we got meaningfully closer (wedged detector)
+        ObjectGuid avoid;           // a node we abandoned as genuinely unreachable
         uint32     avoidUntil = 0;
         uint32     lastOffloadMs = 0; // last full-bags offload attempt (throttle)
     };
@@ -3559,6 +3569,18 @@ namespace WowPsParty
         std::lock_guard<std::mutex> lock(g_gatherMutex);
         auto it = g_gather.find(botLow);
         return it != g_gather.end() && it->second.node;
+    }
+
+    // Freeze the wedged-node clock for a bot that is deliberately held still (in
+    // combat, casting). Without this, wall-clock spent paused counts as "no progress
+    // toward the node" and the first tick after a long fight would false-abandon the
+    // committed node — the same class of bug the flat approach-timeout had.
+    static void TouchGatherProgress(uint32 botLow, uint32 now)
+    {
+        std::lock_guard<std::mutex> lock(g_gatherMutex);
+        auto it = g_gather.find(botLow);
+        if (it != g_gather.end() && it->second.node)
+            it->second.progressMs = now;
     }
 
     // Drop a bot's committed gather node. Called when the >100y follow teleport
@@ -4161,8 +4183,8 @@ namespace WowPsParty
         uint32 const gLow = bot->GetGUID().GetCounter();
         uint32 const now  = getMSTime();
 
-        if (bot->IsInCombat())                            { GatherLog(gLow, "skip: in combat"); return; }
-        if (bot->IsNonMeleeSpellCast(false, false, true)) { GatherLog(gLow, "skip: casting"); return; }
+        if (bot->IsInCombat())                            { TouchGatherProgress(gLow, now); GatherLog(gLow, "skip: in combat"); return; }
+        if (bot->IsNonMeleeSpellCast(false, false, true)) { TouchGatherProgress(gLow, now); GatherLog(gLow, "skip: casting"); return; }
         if (IsTankLeading(bot->GetGUID()))                { GatherLog(gLow, "skip: leading the dungeon"); return; }
 
         // Near a node/corpse this hero could gather if trained higher? Call it out in
@@ -4297,50 +4319,38 @@ namespace WowPsParty
 
         WorldObject* target = ResolveHarvest(bot, committed);
 
+        bool recommitted = false;
         if (!IsHarvestableBy(bot, target))
         {
-            // Lost/invalid committed target — pick the nearest valid node or
-            // corpse, skipping any we recently gave up reaching.
+            // The committed node is gone — we harvested it (it depleted + despawned),
+            // or a loot-state change / patrol invalidated it. This is the ONLY place a
+            // new target is chosen: pick the nearest fresh node/corpse (skipping one we
+            // recently gave up as wedged) and start a clean commit with a fresh progress
+            // baseline. A node that is still valid is NEVER swapped for a "closer" one
+            // mid-approach — that swapping was the back-and-forth oscillation (Mill).
             target = FindNearestHarvest(bot, GATHER_SCAN_RANGE,
                                         (now < avoidUntil) ? avoid : ObjectGuid::Empty,
                                         canNode, canSkin);
+            recommitted = (target != nullptr);
             std::lock_guard<std::mutex> lock(g_gatherMutex);
             auto& st = g_gather[gLow];
-            st.node     = target ? target->GetGUID() : ObjectGuid::Empty;
-            st.commitMs = target ? now : 0;
-        }
-        else if (commitMs && (now - commitMs) > GATHER_APPROACH_TIMEOUT_MS &&
-                 !bot->IsWithinDistInMap(target, GATHER_REACH))
-        {
-            // Committed but can't reach it (wedged on geometry). Abandon it and
-            // avoid re-picking it for a while; next tick re-scans for another.
-            // DIAGNOSTIC (mining-hang report): name the node's skill + distance so
-            // the log shows whether MINING nodes time out more than herbs.
-            {
-                uint32 dbgSkill = 0, dbgReq = 0;
-                char const* dbgName = "corpse/other";
-                if (GameObject* dgo = target->ToGameObject())
-                    if (NodeGatherSkill(dgo, dbgSkill, dbgReq)) dbgName = GatherSkillName(dbgSkill);
-                GatherLog(gLow, Acore::StringFormat(
-                    "ABANDON {} node: unreachable after {}ms (dist={:.1f}) — re-scanning",
-                    dbgName, GATHER_APPROACH_TIMEOUT_MS, bot->GetDistance(target)));
-            }
-            std::lock_guard<std::mutex> lock(g_gatherMutex);
-            auto& st = g_gather[gLow];
-            st.avoid      = target->GetGUID();
-            st.avoidUntil = now + GATHER_AVOID_MS;
-            st.node       = ObjectGuid::Empty;
-            st.commitMs   = 0;
-            return;
+            st.node       = target ? target->GetGUID() : ObjectGuid::Empty;
+            st.commitMs   = target ? now : 0;
+            st.bestDist   = target ? bot->GetDistance(target) : 0.0f; // progress baseline
+            st.progressMs = now;
         }
         if (!target) return;
 
-        // Re-read the commit time — the resolution block above may have just
-        // (re)committed this target, so the local copy from the top of the tick can
-        // be stale. Needed for the "arrived" grace below.
+        // Re-read commit time + progress baseline — the block above may have just
+        // (re)committed this target, so the top-of-tick copies can be stale.
+        uint32 progressMs = 0;
+        float  bestDist   = 0.0f;
         {
             std::lock_guard<std::mutex> lock(g_gatherMutex);
-            commitMs = g_gather[gLow].commitMs;
+            auto& st   = g_gather[gLow];
+            commitMs   = st.commitMs;
+            progressMs = st.progressMs;
+            bestDist   = st.bestDist;
         }
 
         // Harvest when in normal reach, OR when the bot has ARRIVED as close as the
@@ -4348,8 +4358,6 @@ namespace WowPsParty
         // is within a larger reach with line of sight. MINING veins commonly sit up
         // on rocks/ledges/walls the navmesh can't path onto, so the bot stops at the
         // base several yards short of GATHER_REACH; without this it just stood there
-        // until the 6s approach-timeout abandoned it, then re-picked it 30s later —
-        // the "miner stares at the vein for 30-60s, copper/herbs are fine" report
         // (herbs sit on flat ground, always within reach). LoS (M2, matching the
         // spell engine) stops harvesting through a wall.
         bool const inReach = bot->IsWithinDistInMap(target, GATHER_REACH);
@@ -4366,15 +4374,67 @@ namespace WowPsParty
             HarvestTarget(bot, target);
             std::lock_guard<std::mutex> lock(g_gatherMutex);
             auto& st = g_gather[gLow];
-            st.node = ObjectGuid::Empty;
-            st.commitMs = 0;
+            st.node       = ObjectGuid::Empty;
+            st.commitMs   = 0;
+            // We just harvested here, so this spot is reachable: clear any stale avoid
+            // so the SIBLING node the bot heads to next isn't skipped (that stale-avoid
+            // wait was the "stands around ~20s before going to the other node" idle).
+            st.avoid      = ObjectGuid::Empty;
+            st.avoidUntil = 0;
+            return;
         }
-        else
+
+        // Walking to the committed node. Track forward progress: as long as the bot
+        // keeps getting closer we pursue it to completion however far it is (the
+        // commit-and-complete design). We ONLY abandon a node the bot has made NO
+        // progress toward for GATHER_STUCK_NO_PROGRESS_MS — genuinely wedged on
+        // geometry (an unreachable vein the navmesh can't path to and that's too far /
+        // out of LoS for the arrived-short harvest above). The arrived-short path fires
+        // first (1.5s) for gettable elevated nodes, so this only trips on real dead-ends.
+        float const dist = bot->GetDistance(target);
+        bool stuck = false;
         {
-            // Walk to the target and keep the 1Hz follow re-asserter off us so
-            // it doesn't yank us back to the leader mid-approach. MovePoint
-            // paths around geometry (generatePath defaults true).
-            HoldFollower(bot->GetGUID(), 2500);
+            std::lock_guard<std::mutex> lock(g_gatherMutex);
+            auto& st = g_gather[gLow];
+            if (st.node == target->GetGUID())
+            {
+                if (dist < bestDist - GATHER_PROGRESS_EPSILON)
+                { st.bestDist = dist; st.progressMs = now; }   // closer — reset the wedged clock
+                else if (progressMs && (now - progressMs) > GATHER_STUCK_NO_PROGRESS_MS)
+                    stuck = true;
+            }
+        }
+
+        if (stuck)
+        {
+            uint32 dbgSkill = 0, dbgReq = 0;
+            char const* dbgName = "corpse/other";
+            if (GameObject* dgo = target->ToGameObject())
+                if (NodeGatherSkill(dgo, dbgSkill, dbgReq)) dbgName = GatherSkillName(dbgSkill);
+            GatherLog(gLow, Acore::StringFormat(
+                "ABANDON {} node: no path progress for {}ms (dist={:.1f}) — wedged, re-scanning",
+                dbgName, GATHER_STUCK_NO_PROGRESS_MS, dist));
+            std::lock_guard<std::mutex> lock(g_gatherMutex);
+            auto& st = g_gather[gLow];
+            st.avoid      = target->GetGUID();
+            st.avoidUntil = now + GATHER_AVOID_MS;
+            st.node       = ObjectGuid::Empty;
+            st.commitMs   = 0;
+            return;
+        }
+
+        // Keep walking to the committed node and hold the follow systems off so they
+        // don't yank us back to the leader mid-approach. Re-issue the MovePoint when
+        // we just (re)committed to a NEW target — so a mid-approach switch redirects
+        // immediately instead of finishing the walk to the now-dead node — or when
+        // we're not already point-moving toward it (another system Cleared our
+        // generator). In the steady-state approach we do NOT re-issue every tick, as
+        // that restarts the path and stutters the walk.
+        HoldFollower(bot->GetGUID(), 2500);
+        if (recommitted
+            || bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE
+            || !bot->isMoving())
+        {
             bot->SetFacingToObject(target);
             bot->GetMotionMaster()->MovePoint(0xA17,
                 target->GetPositionX(), target->GetPositionY(), target->GetPositionZ());
