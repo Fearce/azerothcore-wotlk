@@ -1741,6 +1741,12 @@ namespace WowPsParty
             c.level = (levelGap <= 4) ? r.level : L;
             c.role  = RoleFromTalents(c.cls, known, ClassDefaultRole(c.cls));
             c.spec  = SpecAbbrevFromTalents(c.cls, known);
+            // A candidate SHOWN at level 10+ must have a spec: talents unlock at 10, so an empty
+            // spec there is an anomaly — an un-talented pool char, or (with the wide re-leveled
+            // sample) a sub-10 char displayed at the player's level. Only a char displayed BELOW
+            // level 10 may legitimately be unspecced (Mill: no high-level unspecced henchmen).
+            if (c.spec.empty() && c.level >= 10)
+                continue;
             if (!seenSpec.insert(std::to_string(c.cls) + ":" + c.spec).second)
                 continue;   // already showing this (class, spec)
             ++specsShownByClass[r.cls];
@@ -1776,6 +1782,8 @@ namespace WowPsParty
             c.cls   = cls;
             c.level = L;   // shown + costed at the player's level; re-leveled on hire
             InferHenchmanRoleAndSpec(c.guid, cls, ClassDefaultRole(cls), c.role, c.spec);
+            if (c.spec.empty() && c.level >= 10)
+                continue;   // never offer an unspecced char at level 10+ (see the sampler above)
             out.push_back(std::move(c));
         }
 
@@ -1851,6 +1859,8 @@ namespace WowPsParty
                 c.level = L;            // shown + costed at the player's level; re-leveled on hire
                 c.role  = "tank";
                 c.spec  = SpecAbbrevFromTalents(cls, known);
+                if (c.spec.empty() && c.level >= 10)
+                    continue;   // never offer an unspecced char at level 10+; try the next tank
                 out.push_back(std::move(c));
                 tankClassesShown.insert(cls);
                 shownGuids.insert(t.guid);
