@@ -7969,10 +7969,20 @@ namespace WowPsParty
                 else if (dist < 20.0f) mult = 1.03f;
                 else if (dist < 30.0f) mult = 1.05f;
                 else                   mult = 1.10f;
-                float const target = leader->GetSpeedRate(MOVE_RUN) * mult;
-                float const cur    = follower->GetSpeedRate(MOVE_RUN);
-                if (cur < target - 0.01f || cur > target + 0.01f)
-                    follower->SetSpeed(MOVE_RUN, target, true);
+                // Match BOTH the ground-run and flight rates off the same tier: a
+                // bot on a flying mount travels on MOVE_FLIGHT while airborne, so
+                // syncing only MOVE_RUN left it flying at its own (slower) base
+                // flight speed while the leader pulled away on the mount's flight
+                // rate — one half of the "followers can't keep up in the air" bug.
+                auto matchRate = [&](UnitMoveType mt)
+                {
+                    float const target = leader->GetSpeedRate(mt) * mult;
+                    float const cur    = follower->GetSpeedRate(mt);
+                    if (cur < target - 0.01f || cur > target + 0.01f)
+                        follower->SetSpeed(mt, target, true);
+                };
+                matchRate(MOVE_RUN);
+                matchRate(MOVE_FLIGHT);
             }
 
             // Mount matching — keep the follower's mounted state synced with the
@@ -8049,6 +8059,45 @@ namespace WowPsParty
                 // the aura's OnRemove -> Dismount() and leaves a clean state.
                 follower->RemoveAurasByType(SPELL_AURA_MOUNTED);
                 follower->Dismount();   // belt-and-braces if a mount set the flag without an aura
+            }
+
+            // ---- Flight sync (follow a flying leader into the air) ---------
+            // Casting a flying mount on the bot gives it the model + flight-speed
+            // aura (which flips CanFly on), but NOT the airborne movement flags.
+            // In stock mod-playerbots those flags are applied by
+            // MovementAction::UpdateMovementState — which is gated behind the
+            // "+follow" strategy we deliberately disable (we drive our own
+            // MoveFollow). Without the flags the follow path is built against the
+            // ground navmesh, so the bot rides its flyer along the GROUND at run
+            // speed while the leader flies off and the leash teleport keeps
+            // yanking it forward — exactly the report ("de løber på jorden med
+            // 100% hastighed ... de skal teleporte for at catche op"). Mirror the
+            // leader's airborne state: go airborne when the leader is actually
+            // flying and the bot is on a flying mount, land when the leader is on
+            // the ground. Once CAN_FLY is set, PathGenerator builds a straight 3D
+            // shortcut toward the airborne leader instead of a ground path.
+            if (!follower->IsBeingTeleported())
+            {
+                bool const leaderAirborne = leader->HasUnitMovementFlag(MOVEMENTFLAG_FLYING);
+                bool const wantsFly       = follower->HasIncreaseMountedFlightSpeedAura()
+                                         || follower->HasFlyAura();
+                bool const botAirborne    = follower->HasUnitMovementFlag(MOVEMENTFLAG_FLYING);
+                bool const botGravityOff  = follower->HasUnitMovementFlag(MOVEMENTFLAG_DISABLE_GRAVITY);
+
+                if (wantsFly && leaderAirborne && !botAirborne)
+                {
+                    follower->AddUnitMovementFlag(MOVEMENTFLAG_CAN_FLY);
+                    follower->AddUnitMovementFlag(MOVEMENTFLAG_DISABLE_GRAVITY);
+                    follower->AddUnitMovementFlag(MOVEMENTFLAG_FLYING);
+                    follower->SendMovementFlagUpdate();
+                }
+                else if ((botAirborne || botGravityOff) && (!wantsFly || !leaderAirborne))
+                {
+                    follower->RemoveUnitMovementFlag(MOVEMENTFLAG_CAN_FLY);
+                    follower->RemoveUnitMovementFlag(MOVEMENTFLAG_DISABLE_GRAVITY);
+                    follower->RemoveUnitMovementFlag(MOVEMENTFLAG_FLYING);
+                    follower->SendMovementFlagUpdate();
+                }
             }
 
             // ---- Phase mirror (twilight realms etc.) ----------------------
