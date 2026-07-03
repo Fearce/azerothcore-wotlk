@@ -5334,6 +5334,46 @@ public:
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Safe pull: {}.", on ? "ON" : "OFF");
         }
+        // REQ_FOLLOWPATH\t<token>  ->  FOLLOWPATH\t<token>\t<0|1>
+        // Reports the EFFECTIVE value: explicit override, else the default (ON) — so the
+        // editor checkbox shows the real runtime behaviour even for an unconfigured tank.
+        else if (command == "REQ_FOLLOWPATH")
+        {
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            bool on = true;
+            if (guid)
+            {
+                QueryResult q = CharacterDatabase.Query(
+                    "SELECT `follow_path` FROM `party_loadout` WHERE `guid` = {}", guid);
+                std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+                on = (v != "0");   // '' or '1' -> ON; only an explicit '0' turns it off
+            }
+            std::ostringstream out;
+            out << "FOLLOWPATH\t" << token << '\t' << (on ? 1 : 0);
+            SendWPSP(player, out.str());
+        }
+        // SET_FOLLOWPATH\t<token>\t<0|1>  — explicit override (the user toggled it)
+        else if (command == "SET_FOLLOWPATH")
+        {
+            std::string rest;
+            std::string const token = WowPsParty::SplitToken(std::string(payload), rest);
+            if (rest != "0" && rest != "1") return;   // strict: ignore a malformed/empty value
+            bool const on = (rest == "1");
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            if (!guid) return;
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
+                "`gear_lock_json`, `priority_actions_json`, `follow_path`) "
+                "VALUES ({}, '', '', '', '', '', '{}') "
+                "ON DUPLICATE KEY UPDATE `follow_path` = VALUES(`follow_path`)",
+                guid, on ? "1" : "0");
+            CharacterDatabase.CommitTransaction(tx);
+            WowPsParty::FollowPathCacheSet(guid, on ? 1 : 0);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Follow recorded path: {}.", on ? "ON" : "OFF");
+        }
         // REQ_ANCHORTANK\t<token>  ->  ANCHORTANK\t<token>\t<0|1>
         // Reports the stored value (explicit column, else the default OFF — there
         // is no per-type default) so the editor checkbox shows the real runtime

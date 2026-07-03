@@ -1444,6 +1444,41 @@ namespace WowPsParty
         SafePullCacheSet(guidLow, v == "1" ? 1 : (v == "0" ? 0 : -1));
     }
 
+    // ---- "follow recorded path" toggle (TANK) ------------------------------
+    // Whether the lead tank walks the RECORDED dungeon path ahead of the party
+    // (TankFollowPath) or, when OFF, just leads via ordinary lead-ahead MoveFollow
+    // (mirrors the leader's route, no recording — the same fallback as a wing that
+    // was never recorded). Stored in party_loadout.follow_path as '' (unset), '1'
+    // (follow) or '0' (off). Default ON for every tank: the recorded-path lead is
+    // the intended behaviour; the toggle only exists to turn it off for testing /
+    // preference. An explicit value wins.
+    static std::unordered_map<uint32, int> g_followPath;   // guidLow -> 0/1 (explicit only)
+    static std::mutex g_followPathMutex;
+
+    // val: 0 = explicit off, 1 = explicit follow, <0 = clear (back to default ON).
+    void FollowPathCacheSet(uint32 guidLow, int val)
+    {
+        std::lock_guard<std::mutex> lock(g_followPathMutex);
+        if (val < 0) g_followPath.erase(guidLow);
+        else         g_followPath[guidLow] = val ? 1 : 0;
+    }
+
+    bool BotFollowRecordedPath(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(g_followPathMutex);
+        auto it = g_followPath.find(guid.GetCounter());
+        if (it != g_followPath.end()) return it->second != 0;
+        return true;   // unset -> follow the recorded path by default
+    }
+
+    void FollowPathRefreshFromDB(uint32 guidLow)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `follow_path` FROM `party_loadout` WHERE `guid` = {}", guidLow);
+        std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+        FollowPathCacheSet(guidLow, v == "1" ? 1 : (v == "0" ? 0 : -1));
+    }
+
     // ---- "anchor on tank" toggle (NON-TANK) --------------------------------
     // When ON for a non-tank bot, that bot formation-follows the party TANK
     // instead of the human leader (only while the leader isn't the tank), so
@@ -8765,12 +8800,15 @@ namespace WowPsParty
                 // two while the leader stands still (Mill's idle oscillation).
                 g_humanize[d.followerGuid.GetCounter()].eligible = false;
 
-                // If THIS WING has a recorded path, the path-follow ticker drives
-                // the tank's motion — skip MoveFollow so the two don't fight. Must
-                // be leader-WING-aware (not just "any path on the map"): in an
-                // un-recorded wing of a multi-wing dungeon the path ticker bails, so
-                // MoveFollow has to run or the tank is stranded.
-                if (WowPsParty::HasPathForLeader(leader->GetMapId(), leader))
+                // If THIS WING has a recorded path AND the tank's "follow recorded path"
+                // toggle is ON (default), the path-follow ticker drives the tank's motion —
+                // skip MoveFollow so the two don't fight. Must be leader-WING-aware (not just
+                // "any path on the map"): in an un-recorded wing of a multi-wing dungeon the
+                // path ticker bails, so MoveFollow has to run or the tank is stranded. With
+                // the toggle OFF, TankFollowPath bails too, so we DON'T yield here — the tank
+                // leads via the lead-ahead MoveFollow below instead of the recording.
+                if (WowPsParty::HasPathForLeader(leader->GetMapId(), leader)
+                    && WowPsParty::BotFollowRecordedPath(d.followerGuid))
                     return true;
 
                 // MoveFollow's angle is relative to the leader's facing: 0 =

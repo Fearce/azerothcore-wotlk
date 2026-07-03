@@ -214,6 +214,14 @@ namespace WowPsParty
     void SafePullRefreshFromDB(uint32 guidLow);
     bool GetSafePull(ObjectGuid guid);
 
+    // Per-TANK "follow recorded path" toggle. Default ON everywhere. When ON, the
+    // lead tank walks the recorded dungeon path ahead of the party (TankFollowPath);
+    // when OFF, it leads via ordinary lead-ahead MoveFollow instead (no recording).
+    // val: 0 = off, 1 = follow, -1 = clear the override (back to default ON).
+    void FollowPathCacheSet(uint32 guidLow, int val);
+    void FollowPathRefreshFromDB(uint32 guidLow);
+    bool BotFollowRecordedPath(ObjectGuid guid);
+
     // Per-NON-TANK "anchor on tank" toggle. Default OFF everywhere (no per-type
     // default). When ON, a non-tank bot formation-follows the party TANK instead
     // of the human leader while the leader isn't the tank — melee reach the front

@@ -574,6 +574,16 @@ namespace WowPsParty
         if (!leader->GetMap() || !leader->GetMap()->IsDungeon()) { tlog("skip: leader not in dungeon"); return; }
         if (leader->IsInCombat()) { tlog("skip: leader in combat"); return; }
 
+        // Per-tank "follow recorded path" toggle (rotation editor, default ON). When OFF,
+        // don't drive the recorded route — bail so the lead-tank MoveFollow in PartyFollow
+        // leads the party by mirroring the leader instead (the suppression gate there is
+        // matched on the same toggle, so it won't yield the feet to this ticker).
+        if (!WowPsParty::BotFollowRecordedPath(bot->GetGUID()))
+        {
+            tlog("skip: follow-path toggle off — leading via MoveFollow");
+            return;
+        }
+
         // Pick the recorded path for the WING the leader is actually in (multi-wing
         // dungeons share a map id). Empty -> no recording near the leader -> don't
         // lead (and never walk another wing's route).

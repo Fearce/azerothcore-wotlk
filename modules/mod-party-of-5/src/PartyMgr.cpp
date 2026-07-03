@@ -2698,9 +2698,9 @@ namespace WowPsParty
         bool const hadCustomRotation = false;   // henchmen NEVER keep a custom rotation
         {
             QueryResult lq = CharacterDatabase.Query(
-                "SELECT `strategies_csv`,`glyphs_csv`,`wait_tank_threat`,`safe_pull`,`pull_count`,`engage_range` "
+                "SELECT `strategies_csv`,`glyphs_csv`,`wait_tank_threat`,`safe_pull`,`pull_count`,`engage_range`,`follow_path` "
                 "FROM `party_loadout` WHERE `guid` = {}", candidateGuid);
-            std::string savedMode, savedLead, savedWait, savedSafePull, savedPullCount, savedEngageRange;
+            std::string savedMode, savedLead, savedWait, savedSafePull, savedPullCount, savedEngageRange, savedFollowPath;
             if (lq)
             {
                 Field* lf = lq->Fetch();
@@ -2710,6 +2710,7 @@ namespace WowPsParty
                 savedSafePull    = lf[3].Get<std::string>();
                 savedPullCount   = lf[4].Get<std::string>();
                 savedEngageRange = lf[5].Get<std::string>();
+                savedFollowPath  = lf[6].Get<std::string>();
             }
 
             // Always the class default rotation (identical to "Generate"); never the
@@ -2737,6 +2738,10 @@ namespace WowPsParty
 
             WowPsParty::EngageRangeCacheSet(candidateGuid,
                 savedEngageRange.empty() ? 0 : std::atoi(savedEngageRange.c_str()));
+
+            // follow_path: '0' = explicit off, else (''/'1') the default -> follow.
+            WowPsParty::FollowPathCacheSet(candidateGuid,
+                savedFollowPath == "1" ? 1 : (savedFollowPath == "0" ? 0 : -1));
         }
 
         mgr->AddPlayerBot(henchGuid, account);
@@ -3300,6 +3305,7 @@ namespace WowPsParty
         LeadDistRefreshFromDB(altGuid);
         EngageRangeRefreshFromDB(altGuid);
         AnchorTankRefreshFromDB(altGuid);
+        FollowPathRefreshFromDB(altGuid);
 
         mgr->AddPlayerBot(altObjGuid, account);
 
@@ -3623,6 +3629,7 @@ namespace WowPsParty
                 LeadDistRefreshFromDB(guid);
                 EngageRangeRefreshFromDB(guid);
                 AnchorTankRefreshFromDB(guid);
+                FollowPathRefreshFromDB(guid);
                 if (guid == activeGuid) continue;
                 if (spawned >= 4) break;
                 ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
