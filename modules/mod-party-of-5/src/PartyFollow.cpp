@@ -9294,13 +9294,32 @@ namespace WowPsParty
     {
     public:
         PartyFollowCombatScript() : PlayerScript("PartyFollowCombatScript", {
-            PLAYERHOOK_ON_PLAYER_ENTER_COMBAT
+            PLAYERHOOK_ON_PLAYER_ENTER_COMBAT,
+            PLAYERHOOK_ON_UPDATE
         }) { }
 
         void OnPlayerEnterCombat(Player* player, Unit* /*enemy*/) override
         {
             if (player && WowPsParty::IsHenchman(player->GetGUID()))
                 player->UpdateSpeed(MOVE_RUN, true);
+        }
+
+        // Phantom-combat self-heal for the HUMAN body. SweepPhantomCombat otherwise
+        // only runs from a companion bot's AssistTarget tick, so a player with no
+        // active companion (solo mode — spawn_companions off — or companions
+        // despawned) that AzerothCore leaves stuck IsInCombat() with no live hostile
+        // never recovers: fishing greys out (you can swap weapons in combat but not
+        // fish), health/mana regen and sitting stay blocked, until relog. Player::Update
+        // runs this on the player's own map thread, so the CombatStop inside is
+        // thread-safe (same thread AssistTarget uses); the out-of-combat fast path is
+        // a single flag check, so ticking it every update for every human is cheap.
+        void OnPlayerUpdate(Player* player, uint32 /*p_time*/) override
+        {
+            if (!WowPsParty::IsEnabled() || !player)
+                return;
+            if (sPlayerbotsMgr.GetPlayerbotAI(player))
+                return;   // bots are already swept from AssistTarget
+            SweepPhantomCombat(player, player->GetGUID().GetCounter());
         }
     };
 }
