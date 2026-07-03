@@ -8076,7 +8076,14 @@ namespace WowPsParty
             // flying and the bot is on a flying mount, land when the leader is on
             // the ground. Once CAN_FLY is set, PathGenerator builds a straight 3D
             // shortcut toward the airborne leader instead of a ground path.
-            if (!follower->IsBeingTeleported())
+            // Skip while dead / mid-teleport / movement-restricted (rooted,
+            // frozen, polymorphed, otherwise out of control): poking movement
+            // flags on a CC'd or controlled unit breaks those effects — same
+            // guard the reference wraps its flag changes in.
+            if (follower->IsAlive() && !follower->IsBeingTeleported()
+                && !follower->HasUnitState(UNIT_STATE_LOST_CONTROL)
+                && !follower->IsRooted() && !follower->isFrozen()
+                && !follower->IsPolymorphed())
             {
                 bool const leaderAirborne = leader->HasUnitMovementFlag(MOVEMENTFLAG_FLYING);
                 bool const wantsFly       = follower->HasIncreaseMountedFlightSpeedAura()
@@ -8091,12 +8098,43 @@ namespace WowPsParty
                     follower->AddUnitMovementFlag(MOVEMENTFLAG_FLYING);
                     follower->SendMovementFlagUpdate();
                 }
-                else if ((botAirborne || botGravityOff) && (!wantsFly || !leaderAirborne))
+                else if (botAirborne || botGravityOff)
                 {
-                    follower->RemoveUnitMovementFlag(MOVEMENTFLAG_CAN_FLY);
-                    follower->RemoveUnitMovementFlag(MOVEMENTFLAG_DISABLE_GRAVITY);
-                    follower->RemoveUnitMovementFlag(MOVEMENTFLAG_FLYING);
-                    follower->SendMovementFlagUpdate();
+                    // The bot is airborne. Decide whether to land it, mirroring the
+                    // reference's two descent cases:
+                    auto land = [&]()
+                    {
+                        follower->RemoveUnitMovementFlag(MOVEMENTFLAG_CAN_FLY);
+                        follower->RemoveUnitMovementFlag(MOVEMENTFLAG_DISABLE_GRAVITY);
+                        follower->RemoveUnitMovementFlag(MOVEMENTFLAG_FLYING);
+                        follower->SendMovementFlagUpdate();
+                    };
+                    if (!wantsFly)
+                    {
+                        // Lost the flying mount (e.g. the mount-match block above
+                        // dismounted us because the leader is on foot) -> there is
+                        // nothing holding it up, drop the flags now whatever the
+                        // leader is doing.
+                        land();
+                    }
+                    else if (!leaderAirborne)
+                    {
+                        // Still on the flyer but the leader is on the ground -> keep
+                        // it airborne and let the follow path glide it DOWN toward the
+                        // grounded leader (CAN_FLY makes PathGenerator build a straight
+                        // 3D shortcut to the ground point), pulling the flags only once
+                        // it is basically at ground level. Stripping them while it is
+                        // still high up would leave a clientless bot (no gravity tick
+                        // of its own) hanging in the air until a stuck-teleport rescued
+                        // it. While the leader is still flying we do nothing here, so a
+                        // fresh takeoff (still within 2y of ground) can't yo-yo back
+                        // down either.
+                        float const gz = follower->GetMapWaterOrGroundLevel(
+                            follower->GetPositionX(), follower->GetPositionY(),
+                            follower->GetPositionZ());
+                        if (follower->GetPositionZ() <= gz + 2.0f)
+                            land();
+                    }
                 }
             }
 
