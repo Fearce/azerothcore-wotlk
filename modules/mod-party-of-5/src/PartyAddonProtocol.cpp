@@ -1314,6 +1314,8 @@ static void FlushPartyTransfer(Player* a, Player* b)
 
 // Defined below (shared with HandleUse) — opens a lootable container on its owner.
 static bool OpenLootableContainer(Player* requester, Player* srcChar, Item* srcItem);
+// Defined below (shared with HandleUse) — moves a mate's item onto the requester.
+static Item* PullItemToRequester(Player* requester, Player* srcChar, Item* item);
 
 static void HandleEquip(Player* requester, std::string_view payload)
 {
@@ -1370,6 +1372,33 @@ static void HandleEquip(Player* requester, std::string_view payload)
     // this item". Open it on its owner instead (same path as the USE route).
     if (OpenLootableContainer(requester, srcChar, srcItem))
         return;
+
+    // A quest-STARTER that is ALSO equippable (Monogrammed Sash, and various
+    // trinkets/off-hands) reaches the EQUIP route because the client keys the
+    // action purely off equipLoc — so it would silently equip and the human
+    // could never take the quest ("can equip it, but can't take its quest").
+    // While the quest is still takeable, offer it instead of equipping — same
+    // pull-onto-requester + quest-details flow the USE route uses. Once the
+    // quest is taken/completed CanTakeQuest is false, so a later click falls
+    // through and equips the item as ordinary gear.
+    if (ItemTemplate const* t = srcItem->GetTemplate(); t && t->StartQuest)
+    {
+        if (Quest const* quest = sObjectMgr->GetQuestTemplate(t->StartQuest);
+            quest && requester->CanTakeQuest(quest, false))
+        {
+            Item* pulled = PullItemToRequester(requester, srcChar, srcItem);
+            if (!pulled)
+            {
+                ChatHandler(requester->GetSession()).PSendSysMessage(
+                    "|cffff5555[WowPsParty]|r Your bags are full — free a slot to start |cffffffff{}|r's quest.", t->Name1);
+                return;
+            }
+            requester->PlayerTalkClass->SendQuestGiverQuestDetails(quest, pulled->GetGUID(), true);
+            WowPsParty::SendInventoryTo(requester);
+            if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
+            return;
+        }
+    }
 
     // Resolve destination: if destSlot was specified in payload, look it
     // up; else fall back to the session player (ResolveControlledBody now
