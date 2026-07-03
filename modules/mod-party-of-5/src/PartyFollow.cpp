@@ -41,6 +41,7 @@
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "SpellAuraEffects.h"
+#include "SpellAuras.h"   // Aura::GetDuration — ribbon-pole XP buff top-off check
 #include "ThreatManager.h"   // threat-cap throttle: bots back off near the tank's threat
 #include "CombatManager.h"   // tank gather window: count mobs in combat with the tank
 #include "SpellInfo.h"   // SpellInfo::Effects[] for the leader's mount-type check
@@ -55,6 +56,7 @@
 #include "Chat.h"
 #include "Creature.h"
 #include "Formulas.h"   // Acore::XP::GetGrayLevel — skip trivially-low (gray) mobs from auto-pull
+#include "GameEventMgr.h"   // IsHolidayActive — Midsummer ribbon-pole dance gate
 #include "DBCStores.h"
 #include "GameObject.h"
 #include "GridNotifiers.h"
@@ -4448,6 +4450,126 @@ namespace WowPsParty
             bot->SetFacingToObject(target);
             bot->GetMotionMaster()->MovePoint(0xA17,
                 target->GetPositionX(), target->GetPositionY(), target->GetPositionZ());
+        }
+    }
+
+    // ----- Midsummer Fire Festival ribbon-pole dance -----------------------
+    // "My homies can't dance at the bonfire pole, so they can't get the exp
+    // buff." A player gets the Ribbon Dance XP buff (+10% XP/rep) by USING the
+    // Ribbon Pole (GO 181605), a GOOBER whose on-use spell is 45406. That aura's
+    // script (spell_midsummer_ribbon_pole) periodically grants/extends the buff
+    // 29175 as long as the dancer stays within 10y of the pole's target NPC
+    // (17066). Managed party bots never click the pole on their own, so they were
+    // left out. This walks a bot up to a pole the LEADER is parked at and
+    // self-casts 45406 — the exact spell the GO casts — so the aura script does
+    // the rest, identically to a human dancer (fireworks/flames thresholds too).
+    //
+    // Applies to alts AND henchmen (unlike gathering): the buff benefits everyone.
+    // Self-gates hard so it only fires when the party is actually hanging out at a
+    // bonfire during the festival — outside Midsummer the poles aren't spawned, and
+    // the "pole nearby AND the leader is parked (stationary) at it" gate keeps bots
+    // from peeling off toward a pole the party is merely walking past.
+    static constexpr uint32 GO_RIBBON_POLE          = 181605;
+    static constexpr uint32 SPELL_RIBBON_POLE_USE   = 45406;  // GOOBER on-use → aura script grants the buff
+    static constexpr uint32 SPELL_RIBBON_POLE_XP    = 29175;  // Ribbon Dance: +10% XP/rep
+    static constexpr float  RIBBON_SCAN_RANGE       = 40.0f;  // look for a pole within this of the bot
+    static constexpr float  RIBBON_LEADER_RANGE     = 25.0f;  // ...only if the leader is parked at it too
+    static constexpr float  RIBBON_DANCE_REACH      = 8.0f;   // < 10y of the pole's NPC → the aura sticks
+    // Stop dancing once the XP buff has a healthy chunk of time left, so bots don't
+    // spin at the pole forever ignoring the leader. Each aura tick adds 3 min (caps
+    // at 60), so a few seconds of dancing comfortably clears this.
+    static constexpr int32  RIBBON_BUFF_ENOUGH_MS   = 30 * MINUTE * IN_MILLISECONDS;
+
+    static void RibbonLog(uint32 guidLow, std::string const& reason)
+    {
+        static thread_local std::unordered_map<uint64, uint32> lastMs;
+        uint64 key = (uint64(guidLow) << 32) ^ std::hash<std::string>{}(reason);
+        uint32 nowMs = getMSTime();
+        uint32& last = lastMs[key];
+        if (nowMs - last < 4000) return;
+        last = nowMs;
+        LOG_INFO("module", "[WowPsParty Ribbon] guid={} {}", guidLow, reason);
+    }
+
+    void TickRibbonPole(Player* bot)
+    {
+        if (!bot || !bot->IsAlive() || !bot->IsInWorld() || !bot->GetSession()) return;
+        if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) return;   // the controlled body
+
+        // Cheapest gate first: the poles only exist during the Fire Festival, so
+        // skip the grid search entirely the rest of the year.
+        if (!IsHolidayActive(HOLIDAY_FIRE_FESTIVAL)) return;
+
+        if (bot->IsInCombat()) return;
+        // Don't stomp a real cast — but skipChanneled=true, because the dance ITSELF
+        // is a channeled visual (45406's aura script channels 29705/26/27 on the
+        // dancer). Without skipping it, every tick after the first would early-return
+        // here before re-pinning the bot, and the follow ticker would trail it off
+        // the pole after the leader.
+        if (bot->IsNonMeleeSpellCast(false, true, true)) return;
+        if (IsTankLeading(bot->GetGUID())) return;                 // busy running the dungeon
+
+        uint32 const gLow = bot->GetGUID().GetCounter();
+
+        // Already carrying a healthy Ribbon Dance buff — done, rejoin the party.
+        if (Aura* xp = bot->GetAura(SPELL_RIBBON_POLE_XP))
+            if (xp->GetDuration() >= RIBBON_BUFF_ENOUGH_MS)
+                return;
+
+        ObjectGuid const leaderGuid = GetLeaderFor(bot->GetGUID());
+        if (!leaderGuid) return;
+        Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
+        if (!leader || !leader->IsInWorld() || leader->GetMapId() != bot->GetMapId()) return;
+
+        // Nearest spawned Ribbon Pole within reach of the bot.
+        GameObject* pole = nullptr;
+        {
+            std::list<GameObject*> gos;
+            NearbySpawnedGOCheck check(bot, RIBBON_SCAN_RANGE);
+            Acore::GameObjectListSearcher<NearbySpawnedGOCheck> searcher(bot, gos, check);
+            Cell::VisitObjects(bot, searcher, RIBBON_SCAN_RANGE);
+            float best = RIBBON_SCAN_RANGE + 1.0f;
+            for (GameObject* go : gos)
+            {
+                if (go->GetEntry() != GO_RIBBON_POLE) continue;
+                float const d = bot->GetDistance(go);
+                if (d < best) { best = d; pole = go; }
+            }
+        }
+        if (!pole) return;
+
+        // Only dance when the LEADER is parked (stationary) at this pole — this is a
+        // "the party is chilling at the bonfire together" behaviour, never a solo
+        // detour and never a scatter when the party just walks past a bonfire.
+        if (leader->isMoving()) return;
+        if (!leader->IsWithinDist(pole, RIBBON_LEADER_RANGE)) return;
+
+        // In reach → face the pole and start (or keep) dancing. The aura script
+        // handles the periodic XP grant and self-terminates if we ever stray out of
+        // range, so we only need to (re)apply 45406 whenever it has lapsed.
+        if (bot->IsWithinDist(pole, RIBBON_DANCE_REACH))
+        {
+            HoldFollower(bot->GetGUID(), 2500);
+            bot->SetFacingToObject(pole);
+            if (!bot->HasAura(SPELL_RIBBON_POLE_USE))
+            {
+                bot->CastSpell(bot, SPELL_RIBBON_POLE_USE, true);
+                RibbonLog(gLow, "dancing at the ribbon pole for the Midsummer XP buff");
+            }
+            return;
+        }
+
+        // Walk to the pole. Hold the follow systems off so they don't reel the bot
+        // back to the leader mid-approach; re-issue MovePoint only when not already
+        // heading there (avoids restarting the spline every tick).
+        HoldFollower(bot->GetGUID(), 2500);
+        if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE
+            || !bot->isMoving())
+        {
+            bot->SetFacingToObject(pole);
+            bot->GetMotionMaster()->MovePoint(0xA19,
+                pole->GetPositionX(), pole->GetPositionY(), pole->GetPositionZ());
+            RibbonLog(gLow, "walking to the ribbon pole to dance");
         }
     }
 
@@ -8892,6 +9014,13 @@ void WowPsParty_TickGathering_Trampoline(Player* bot)
 void WowPsParty_TickHenchmanLoot_Trampoline(Player* bot)
 {
     WowPsParty::TickHenchmanLoot(bot);
+}
+
+// Midsummer ribbon-pole dance trampoline — out-of-combat, alts AND henchmen.
+// Self-gates to the Fire Festival + a pole the leader is parked at; no-op otherwise.
+void WowPsParty_TickRibbonPole_Trampoline(Player* bot)
+{
+    WowPsParty::TickRibbonPole(bot);
 }
 
 // Battleground-invite auto-accept trampoline — ports a managed party bot into a

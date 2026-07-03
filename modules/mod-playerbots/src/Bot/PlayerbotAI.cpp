@@ -288,6 +288,7 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
     extern void WowPsParty_TankFollowPath_Trampoline(Player* bot);
     extern void WowPsParty_TickGathering_Trampoline(Player* bot);
     extern void WowPsParty_TickHenchmanLoot_Trampoline(Player* bot);
+    extern void WowPsParty_TickRibbonPole_Trampoline(Player* bot);
     extern void WowPsParty_TickAcceptBgInvite_Trampoline(Player* bot);
     extern void WowPsParty_TickTankPullMore_Trampoline(Player* bot);
     bool const isPartyOfFiveBot = WowPsParty_BotHasActiveFollowDirective_Trampoline(bot->GetGUID());
@@ -314,6 +315,10 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
         // — gold to the leader (party-mirrored), trash into its own bags. Self-
         // gates to henchmen; no-op for alts.
         WowPsParty_TickHenchmanLoot_Trampoline(bot);
+        // Out-of-combat only: during the Midsummer Fire Festival, dance at a
+        // bonfire's Ribbon Pole the leader is parked at to pick up the XP buff
+        // (alts AND henchmen). Self-gates off the holiday + pole proximity.
+        WowPsParty_TickRibbonPole_Trampoline(bot);
         // Manual "pull one more" (keybind) — dispatched LAST so its MoveChase
         // overrides the rotation/AssistTarget combat-chase while armed, walking the
         // lead tank onto the next pack mid-fight. No-op unless armed for this tank.

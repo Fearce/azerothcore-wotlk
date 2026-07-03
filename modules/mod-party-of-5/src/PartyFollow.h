@@ -335,6 +335,14 @@ namespace WowPsParty
     // their own AI and are never managed party bots, so they don't come through here.
     void TickAcceptBgInvite(Player* bot);
 
+    // Midsummer Fire Festival: when the party is hanging out at a bonfire's
+    // Ribbon Pole with the leader, walk each party bot (alts AND henchmen) up to
+    // the pole and make it dance — self-casting the pole's on-use spell — so the
+    // bots pick up the Ribbon Dance XP buff alongside the human. Self-gates hard:
+    // no-op unless the Fire Festival holiday is active and a spawned pole is
+    // nearby with the leader parked at it. Called every AI tick.
+    void TickRibbonPole(Player* bot);
+
     // Dungeon tank-lead engagement. If `bot` is the assigned tank for
     // its account, the leader is in a dungeon and not already engaging
     // a target, and there's a hostile creature within 40 yards of the
