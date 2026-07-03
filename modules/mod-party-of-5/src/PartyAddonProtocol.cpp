@@ -5044,6 +5044,16 @@ public:
                 "|cff66ccff[WowPsParty]|r {}", msg);
             if (ok) WowPsParty::SendHenchmenTo(player);  // refresh (the hired one is now busy)
         }
+        else if (command == "FILL_PARTY")
+        {
+            // Complete the party to 1T/1H/3D with random-pool henchmen, roles chosen
+            // from the current party's set roles (15% off). No arguments.
+            std::string msg;
+            WowPsParty::FillPartyRandomly(player, msg);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r {}", msg);
+            WowPsParty::SendHenchmenTo(player);   // refresh (hired ones are now busy)
+        }
         else if (command == "DISMISS_HENCHMAN")
         {
             uint32 const guid = std::strtoul(std::string(payload).c_str(), nullptr, 10);

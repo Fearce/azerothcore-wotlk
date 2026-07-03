@@ -165,6 +165,13 @@ namespace WowPsParty
     bool HireHenchman(Player* requester, uint32 candidateGuid, std::string const& role,
                       std::string& outMsg, bool skipCharge = false);
 
+    // "Fill party randomly": hire random-pool henchmen to complete the requester's
+    // party to a balanced 1-tank / 1-healer / 3-dps of 5, choosing bot roles from
+    // the roles the CURRENT party members (across accounts) have set. Billed as one
+    // transaction with the same 15% discount as the LFG party-fill. Sets `outMsg`
+    // to a player-facing result either way; returns true if any bot was hired.
+    bool FillPartyRandomly(Player* requester, std::string& outMsg);
+
     // Release one henchman (or all of the account's). Logs the bot out so it
     // returns to the random pool.
     void DismissHenchman(Player* requester, uint32 henchGuid);

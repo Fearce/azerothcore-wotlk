@@ -980,10 +980,14 @@ namespace WowPsParty
                     add("party_injured_clustered:30>2&party_lowest_health<80", "cast_party_lowest:Prayer of Healing", 85);
                     add("party_injured_clustered:30>2&party_lowest_health<80", "cast_party_lowest:Circle of Healing", 84); // Holy talent, instant
 
-                    // SINGLE-TARGET HEALS — PW:Shield (absorb; harmlessly skips a Weakened
-                    // Soul target and falls through) -> Penance -> Flash Heal -> Binding
-                    // Heal -> Greater Heal -> Heal -> Lesser Heal.
-                    add("party_lowest_health<80", "cast_party_lowest:Power Word: Shield", 78);
+                    // SINGLE-TARGET HEALS — Penance -> Flash Heal -> Binding Heal ->
+                    // Greater Heal -> Heal -> Lesser Heal. PW:Shield keeps the top
+                    // priority but is gated hard (<40%): the absorb is mana-inefficient,
+                    // so it's a PANIC instant-absorb on a badly-hurt member — thrown
+                    // first when someone spikes low — NOT a preventative bubble slapped
+                    // on anyone who dips below 80%. (Harmlessly skips a Weakened Soul
+                    // target and falls through to the heals below.)
+                    add("party_lowest_health<40", "cast_party_lowest:Power Word: Shield", 78);
                     add("party_lowest_health<60", "cast_party_lowest:Penance", 77);
                     add("party_lowest_health<50", "cast_party_lowest:Flash Heal", 76);
                     add("party_lowest_health<70", "cast_party_lowest:Binding Heal", 75);  // heals the priest too
@@ -992,7 +996,7 @@ namespace WowPsParty
                     add("party_lowest_health<70", "cast_party_lowest:Lesser Heal", 72);   // if no Flash Heal
 
                     // RENEW — keep a HoT rolling on the lowest member missing it.
-                    add("party_lowest_health<90", "cast_party_lowest_hot:Renew", 66);
+                    add("party_lowest_health<80", "cast_party_lowest_hot:Renew", 66);
 
                     // INTERRUPT a known-dangerous cast (priest: Silence; no-ops if unknown).
                     add("target_casting:known_dangerous", "cast_scan:available_interrupt", 60);
@@ -1739,6 +1743,11 @@ namespace WowPsParty
             // displayed price wouldn't match what's charged).
             uint32 const levelGap = (r.level > L) ? uint32(r.level - L) : uint32(L - r.level);
             c.level = (levelGap <= 4) ? r.level : L;
+            // Never offer a Death Knight below level 58 — a DK only just out of the
+            // 55-58 starting experience is undergeared/awkward. c.level is the level
+            // it is shown, costed and effectively hired at, so gate on that.
+            if (c.cls == CLASS_DEATH_KNIGHT && c.level < 58)
+                continue;
             c.role  = RoleFromTalents(c.cls, known, ClassDefaultRole(c.cls));
             c.spec  = SpecAbbrevFromTalents(c.cls, known);
             // A candidate SHOWN at level 10+ must have a spec: talents unlock at 10, so an empty
@@ -1763,7 +1772,7 @@ namespace WowPsParty
         for (uint8 cls : kAllClasses)
         {
             if (present[cls]) continue;
-            if (cls == 6 && L < 55) continue;   // Death Knights start at level 55
+            if (cls == 6 && L < 58) continue;   // never offer a DK below 58 (coverage char is shown at L)
             QueryResult mq = CharacterDatabase.Query(
                 "SELECT `guid`,`name` FROM `characters` "
                 "WHERE `account` IN ({}) AND `online` = 0 AND `class` = {} AND `race` IN ({}) "
@@ -1794,7 +1803,7 @@ namespace WowPsParty
         // role its nearest char is). Pull the nearest genuinely TANK-specced pool
         // char of each tank-capable class — any level, re-leveled to the player on
         // hire (the hire path preserves the picked tank tree) — until three distinct
-        // tank classes are offered. (Below 55, DK is out, leaving Warr/Pal/Druid —
+        // tank classes are offered. (Below 58, DK is out, leaving Warr/Pal/Druid —
         // still three.)
         std::unordered_set<uint8>  tankClassesShown;
         std::unordered_set<uint32> shownGuids;
@@ -1808,7 +1817,7 @@ namespace WowPsParty
         {
             if (tankClassesShown.size() >= 3) break;
             if (tankClassesShown.count(cls)) continue;   // this tank class already offered
-            if (cls == 6 && L < 55) continue;            // Death Knights start at level 55
+            if (cls == 6 && L < 58) continue;            // never offer a DK below 58 (tank char is shown at L)
 
             // Nearest-level pool chars of this class; pick the closest one that is
             // actually tank-specced. Batch one talent read for the slice.
@@ -3133,6 +3142,184 @@ namespace WowPsParty
         }
         for (ObjectGuid const& gg : hench)
             DismissHenchman(requester, gg.GetCounter());
+    }
+
+    // ===== "Fill party randomly" (hire-screen button) =======================
+    // Hire random-pool henchmen to complete the requester's party to a balanced
+    // 1-tank / 1-healer / 3-dps of 5, choosing bot roles from the roles the CURRENT
+    // party members have set. Billed as ONE transaction with the same 15% discount
+    // as the LFG party-fill (each underlying hire skips its own charge).
+    //
+    // Cross-account correctness (the "Innervate" gotcha): a second human in the WoW
+    // group is on a DIFFERENT account, so their party role lives in THEIR
+    // account_party row — not the requester's. Counting roles from only the
+    // requester's account would misread that player as 'dps' (the same class of bug
+    // that once made role-targeted casts like Beacon/Innervate skip the other
+    // human). So every present member's role is resolved from the account that OWNS
+    // them: the in-memory follow directive first (covers a henchman + a leader),
+    // else a COALESCE over the owning account's account_party / party_loadout.
+    bool FillPartyRandomly(Player* requester, std::string& outMsg)
+    {
+        if (!requester || !requester->GetSession())
+        { outMsg = "No session."; return false; }
+        if (!IsEnabled())
+        { outMsg = "Party features are disabled."; return false; }
+
+        // Present party = our account roster (leader + our bots) folded with the WoW
+        // group (a second human on another account + their bots), deduped.
+        std::vector<ObjectGuid> roster;
+        GetPartyGuidsFor(requester->GetGUID(), roster);
+        auto addUnique = [&](ObjectGuid g)
+        {
+            if (g && std::find(roster.begin(), roster.end(), g) == roster.end())
+                roster.push_back(g);
+        };
+        addUnique(requester->GetGUID());
+        if (Group* grp = requester->GetGroup())
+            for (GroupReference* it = grp->GetFirstMember(); it; it = it->next())
+                if (Player* m = it->GetSource())
+                    addUnique(m->GetGUID());
+
+        // Keep only members actually occupying a slot right now (in-world, same map).
+        std::vector<ObjectGuid> present;
+        for (ObjectGuid const& g : roster)
+            if (Player* p = ObjectAccessor::FindConnectedPlayer(g))
+                if (p->IsInWorld() && p->GetMapId() == requester->GetMapId())
+                    present.push_back(g);
+
+        uint8 const partySize = uint8(present.size());
+        if (partySize >= 5)
+        { outMsg = "Your party is already full."; return false; }
+        uint8 const freeSlots = uint8(5 - partySize);
+
+        // Owning-account role lookup (fallback for a member with no in-memory
+        // directive — a grouped human who hasn't set up a party of their own).
+        std::string ids;
+        for (ObjectGuid const& g : present)
+        { if (!ids.empty()) ids += ','; ids += std::to_string(g.GetCounter()); }
+        std::unordered_map<uint32, std::string> dbRole;
+        if (!ids.empty())
+            if (QueryResult q = CharacterDatabase.Query(
+                    "SELECT c.`guid`, COALESCE(ap.`role`, NULLIF(pl.`role`, ''), 'dps') "
+                    "FROM `characters` c "
+                    "LEFT JOIN `account_party` ap ON ap.`guid` = c.`guid` AND ap.`account` = c.`account` "
+                    "LEFT JOIN `party_loadout` pl ON pl.`guid` = c.`guid` "
+                    "WHERE c.`guid` IN ({})", ids))
+                do { Field* f = q->Fetch(); dbRole[f[0].Get<uint32>()] = f[1].Get<std::string>(); }
+                while (q->NextRow());
+
+        uint8 haveTank = 0, haveHeal = 0;   // dps is implied (everything else)
+        for (ObjectGuid const& g : present)
+        {
+            std::string role = RoleForGuid(g);              // directive / leader role
+            if (role.empty())
+            {
+                auto it = dbRole.find(g.GetCounter());
+                role = (it != dbRole.end()) ? it->second : std::string("dps");
+            }
+            if (role == "tank")        ++haveTank;
+            else if (role == "healer") ++haveHeal;
+        }
+
+        // Fill priority: guarantee a tank, then a healer, rest dps — up to freeSlots.
+        uint8 needTank = std::min<uint8>((haveTank == 0) ? 1 : 0, freeSlots);
+        uint8 needHeal = std::min<uint8>((haveHeal == 0) ? 1 : 0, uint8(freeSlots - needTank));
+        uint8 needDps  = uint8(freeSlots - needTank - needHeal);
+
+        // Bucket the (already RAND()-ordered) candidate pool by role.
+        std::vector<HenchmanCandidate> const cands = BuildHenchmanCandidates(requester);
+        std::vector<HenchmanCandidate> tanks, heals, dps;
+        for (auto const& c : cands)
+        {
+            if (c.role == "tank")        tanks.push_back(c);
+            else if (c.role == "healer") heals.push_back(c);
+            else                         dps.push_back(c);
+        }
+
+        // Float one candidate of each distinct class to the front so multi-hires
+        // (the dps) come out varied when the pool allows; the pool is already
+        // randomised, so this only diversifies, it doesn't re-order deterministically.
+        auto orderForVariety = [](std::vector<HenchmanCandidate> const& bucket) -> std::vector<HenchmanCandidate>
+        {
+            std::vector<HenchmanCandidate> out;
+            bool usedCls[16] = { false };
+            for (auto const& c : bucket)
+                if (c.cls < 16 && !usedCls[c.cls]) { usedCls[c.cls] = true; out.push_back(c); }
+            for (auto const& c : bucket)
+                if (std::find_if(out.begin(), out.end(),
+                        [&](HenchmanCandidate const& x) { return x.guid == c.guid; }) == out.end())
+                    out.push_back(c);
+            return out;
+        };
+        std::vector<HenchmanCandidate> const oT = orderForVariety(tanks);
+        std::vector<HenchmanCandidate> const oH = orderForVariety(heals);
+        std::vector<HenchmanCandidate> const oD = orderForVariety(dps);
+
+        // Best-effort: if the pool can't supply a needed tank/healer, roll that slot
+        // into an extra dps so the free slots still get filled.
+        uint8 const wantT = std::min<uint8>(needTank, uint8(oT.size()));
+        uint8 const wantH = std::min<uint8>(needHeal, uint8(oH.size()));
+        uint8 const shortfall = uint8((needTank - wantT) + (needHeal - wantH));
+        uint8 const wantD = std::min<uint8>(uint8(needDps + shortfall), uint8(oD.size()));
+        if (uint8(wantT + wantH + wantD) == 0)
+        { outMsg = "No adventurers are available to fill your party right now."; return false; }
+
+        auto goldStr = [](uint32 copper) -> std::string
+        {
+            uint32 const g = copper / 10000, s = (copper % 10000) / 100, c = copper % 100;
+            std::string o;
+            if (g) o += std::to_string(g) + "g ";
+            if (g || s) o += std::to_string(s) + "s ";
+            o += std::to_string(c) + "c";
+            return o;
+        };
+
+        // Pre-flight affordability against the intended (max) discounted cost.
+        auto sumCost = [](std::vector<HenchmanCandidate> const& pool, uint8 n) -> uint64
+        { uint64 s = 0; for (uint8 i = 0; i < n && i < pool.size(); ++i) s += HenchmanHireCost(pool[i].level); return s; };
+        uint64 const gross   = sumCost(oT, wantT) + sumCost(oH, wantH) + sumCost(oD, wantD);
+        uint32 const maxCost = uint32((gross * 85 + 50) / 100);   // 15% off, round half-up (matches LFG fill)
+        if (requester->GetMoney() < maxCost)
+        { outMsg = "Not enough gold to fill your party (need " + goldStr(maxCost) + ")."; return false; }
+
+        // Hire (each skips its own charge); bill the discounted ACTUAL total, so a
+        // partial fill (pool raced out) only charges for what was hired.
+        uint64 spent = 0;
+        auto doHire = [&](std::vector<HenchmanCandidate> const& pool, char const* role, uint8 count) -> uint8
+        {
+            uint8 got = 0;
+            for (auto const& c : pool)
+            {
+                if (got >= count) break;
+                std::string m;
+                if (HireHenchman(requester, c.guid, role, m, /*skipCharge=*/true))
+                { ++got; spent += HenchmanHireCost(c.level); }
+            }
+            return got;
+        };
+        uint8 const gotT = doHire(oT, "tank",   wantT);
+        uint8 const gotH = doHire(oH, "healer", wantH);
+        uint8 const gotD = doHire(oD, "dps",    wantD);
+        if (uint8(gotT + gotH + gotD) == 0)
+        { outMsg = "No adventurers were available to fill your party."; return false; }
+
+        // Bill the discounted ACTUAL total, but never above the pre-flighted
+        // maxCost — a hire race can substitute a pricier candidate for a costed
+        // one, and the affordability check only cleared maxCost.
+        uint32 const charge = std::min<uint32>(uint32((spent * 85 + 50) / 100), maxCost);
+        requester->ModifyMoney(-int32(charge));
+
+        std::string list;
+        auto part = [&](uint8 n, char const* label)
+        { if (!n) return; if (!list.empty()) list += ", "; list += std::to_string(uint32(n)) + " " + label; };
+        part(gotT, "tank"); part(gotH, "healer"); part(gotD, "dps");
+        outMsg = "Filled your party — hired " + list + " for " + goldStr(charge) + " (15% off).";
+
+        LOG_INFO("module",
+            "[WowPsParty Fill] guid={} partySize={} hired t={}/h={}/d={} charge={}",
+            requester->GetGUID().GetCounter(), uint32(partySize),
+            uint32(gotT), uint32(gotH), uint32(gotD), charge);
+        return true;
     }
 
     // ===== Hired alts =======================================================
