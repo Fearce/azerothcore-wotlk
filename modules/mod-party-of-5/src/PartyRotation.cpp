@@ -3034,6 +3034,24 @@ namespace WowPsParty
             && !bot->HasAura(5487) && !bot->HasAura(9634) && !bot->HasAura(768)
             && !bot->HasAura(24858);
 
+        // Balance druid ECLIPSE cycle. Wrath procs Lunar Eclipse (48518 -> buffs Starfire);
+        // Starfire procs Solar Eclipse (48517 -> buffs Wrath). TRUE = the druid should cast
+        // Starfire: while Lunar is up AND, "continuing after expiration", until Solar procs.
+        // FALSE = cast Wrath: while Solar is up and until Lunar procs; it opens on Wrath. Auras
+        // alone can't tell us which eclipse JUST faded, so track the pursued phase per bot —
+        // seeing Lunar -> pursue Solar (Starfire); seeing Solar -> pursue Lunar (Wrath); neither
+        // up -> hold the last phase (that's the "continue after expiration"). Default (never
+        // procced) = Wrath. thread_local: the bot's map thread owns it, like the other per-bot
+        // state here; only a handful of druid guids so it needs no pruning.
+        if (cond == "eclipse_favor_starfire")
+        {
+            static thread_local std::unordered_map<uint32, bool> favorStarfire;
+            bool& fav = favorStarfire[bot->GetGUID().GetCounter()];
+            if (bot->HasAura(48518))      fav = true;    // Lunar Eclipse up -> Starfire (pursue Solar)
+            else if (bot->HasAura(48517)) fav = false;   // Solar Eclipse up -> Wrath (pursue Lunar)
+            return fav;                                  // neither up -> continue the last phase
+        }
+
         // Boolean: is there any nearby enemy that's currently attacking an
         // ally OTHER than the bot? Used by the tank's taunt rule.
         if (cond == "enemy_loose_in_melee")

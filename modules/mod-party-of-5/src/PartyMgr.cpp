@@ -911,6 +911,11 @@ namespace WowPsParty
                     // lived/boss mob; FALSE for trash about to die).
                     add("self_combo>4&target_missing_aura:Rupture&target_ttd>8", "cast:Rupture", 70);
                     add("self_combo>4", "cast:Eviscerate", 66);
+                    // Killing Spree (Combat 51-pt talent): burst cleave CD that leaps between
+                    // nearby enemies. Same AoE trigger as Fan of Knives and sits right above it; a
+                    // 2-min cooldown so it self-throttles (falls through while on CD, and is unknown
+                    // -> skipped for Assassination/Subtlety), leaving the high slot free (Mill).
+                    add("enemies_in_melee>2", "cast:Killing Spree", 59);
                     add("enemies_in_melee>2", "cast:Fan of Knives", 58);   // AoE
                     add("has_target", "cast:Sinister Strike", 40);          // universal builder fallback
                 };
@@ -1295,6 +1300,15 @@ namespace WowPsParty
                     mageShared();
                     add("always", "buff_self:Ice Armor", 72);  // Frost's own armor (L34 upgrade of Frost Armor)
                     add("!spell_ready:Ice Armor", "buff_self:Frost Armor", 71);
+                    // Brain Freeze (procs off Frostbolt / Frostfire Bolt) makes the next Fireball
+                    // or Frostfire Bolt INSTANT & free — fire it the instant the proc is up, before
+                    // the buff lapses (mirrors Fire's Hot Streak -> Pyroblast). The proc BUFF shows
+                    // as "Fireball!" (spell 57761); the aura literally named "Brain Freeze" is the
+                    // passive TALENT, which FindNamedAura skips — so match "Fireball!" here.
+                    // Frostfire Bolt (L75, scales with frost+fire) is the preferred dump; a sub-75
+                    // deep-frost mage lacks it and falls through to the Fireball line.
+                    add("self_has_aura:Fireball!", "cast:Frostfire Bolt", 69);
+                    add("self_has_aura:Fireball!", "cast:Fireball", 68);
                     add("enemies_clustered:8>2", "cast:Blizzard", 60);  // frost ground AoE
                     add("has_target", "cast:Frostbolt", 46);   // primary nuke
                     add("has_target", "cast:Ice Lance", 40);   // instant filler (Fingers of Frost / movement)
@@ -1408,6 +1422,15 @@ namespace WowPsParty
             }
 
             case 11: // Druid
+                // Innervate the party's healer the moment their mana bottoms out — applies to
+                // EVERY druid spec (a resto healer innervates itself; a moonkin / feral DPS
+                // innervates whoever heals). cast_role_missing:healer only (re)casts on a healer
+                // who isn't already innervated, and healer_mana<20 is the trigger — so it fires
+                // once when the healer drops under 20% and not again until it wears off. Excluded
+                // in Bear form so a bear TANK never leaves the pack to walk over and cast it
+                // (Innervate has NO stance restriction, so castOrApproach WOULD path a bear to the
+                // healer); a cat / moonkin / tree / caster druid casts it fine.
+                add("healer_mana<20&!form_is_bear", "cast_role_missing:healer:Innervate", 88);
                 if (isHealer)
                 {
                     // Resto druid — HoT-centric, same tiered structure as the priest.
@@ -1544,12 +1567,27 @@ namespace WowPsParty
                         // pull). Falls through harmlessly if untalented. cancel_form reverts it
                         // out of combat.
                         add("party_in_combat&self_missing_aura:Moonkin Form", "buff_self:Moonkin Form", 80);
-                        add("target_missing_aura:Moonfire", "cast:Moonfire", 72);
-                        // Hurricane (ranged ground AoE) above Insect Swarm so it LEADS in AoE.
+                        // --- AoE (higher priority than the single-target filler) --------------
+                        // Starfall: a ~90s-CD nuke used in BOTH AoE and single-target boss fights;
+                        // cast on cooldown (self-throttles — the cast falls through while on CD).
+                        // Gated to a pack OR a boss so it isn't blown on a lone trash mob.
+                        add("enemies_clustered:8>2", "cast:Starfall", 72);
+                        add("target_is_boss", "cast:Starfall", 71);
+                        // Hurricane: ranged ground AoE — spam it on a cluster (leads the AoE).
                         add("enemies_clustered:8>2", "cast:Hurricane", 70);
-                        add("target_missing_aura:Insect Swarm", "cast:Insect Swarm", 68);
-                        add("has_target", "cast:Starfire", 46);
-                        add("has_target", "cast:Wrath", 44);
+                        // --- single-target upkeep: BOSSES ONLY (trash dies too fast to be worth
+                        //     the GCDs / a 3-min treant cooldown) --------------------------------
+                        add("target_is_boss&target_missing_aura:Faerie Fire", "cast:Faerie Fire", 69);
+                        add("target_is_boss", "cast:Force of Nature", 67);   // treant CD; self-throttles
+                        add("target_is_boss&target_missing_aura:Insect Swarm", "cast:Insect Swarm", 66);
+                        // --- Eclipse filler cycle --------------------------------------------
+                        // Wrath procs Lunar Eclipse (buffs Starfire); Starfire procs Solar Eclipse
+                        // (buffs Wrath). eclipse_favor_starfire (coded, in PartyRotation) is TRUE
+                        // while we should cast Starfire — during Lunar AND, continuing after it
+                        // fades, until Solar procs — and FALSE (cast Wrath) during Solar and until
+                        // Lunar procs; it opens on Wrath. So these two lines ARE the whole cycle.
+                        add("eclipse_favor_starfire", "cast:Starfire", 46);
+                        add("has_target", "cast:Wrath", 44);   // filler whenever we're not on Starfire
                         // Revert on PARTY out-of-combat to match the party_in_combat shift above —
                         // keyed to the bot's own out_of_combat it would fight the shift in the
                         // window where the party is fighting but this bot isn't in combat yet.
