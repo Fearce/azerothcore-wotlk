@@ -1649,8 +1649,6 @@ namespace WowPsParty
         if (acctCsv.empty()) return out;
 
         uint8 const L  = requester->GetLevel();
-        uint8 const lo = uint8(std::max(1, int(L) - 4));
-        uint8 const hi = uint8(std::min(80, int(L) + 4));
 
         // Same-faction only — a Horde henchman can't group with / heal an
         // Alliance player. Race ids by team.
@@ -1658,17 +1656,21 @@ namespace WowPsParty
             ? "1,3,4,7,11"   // Human, Dwarf, Night Elf, Gnome, Draenei
             : "2,5,6,8,10";  // Orc, Undead, Tauren, Troll, Blood Elf
 
-        // Broad near-level slice of the OFFLINE pool, every class, ordered by
-        // level-proximity so the char kept per spec is the closest to the player.
-        // `online = 0` already excludes every BUSY pool bot — a hired henchman is
-        // logged in, and so are the LFG/BG/WG fill bots — and IsHenchman below is
-        // the in-memory belt-and-suspenders for the same "not busy" guarantee.
+        // RANDOM slice of the whole OFFLINE faction pool — every Refresh (REQ_HENCHMEN)
+        // re-runs this, so ORDER BY RAND() rerolls the offers to a fresh set (Kevin: the
+        // old level-proximity order was deterministic, so Refresh did nothing and specs
+        // that weren't near the player's level could never be surfaced). NOT level-banded:
+        // any-level picks are re-leveled to the player on hire (HireHenchman's out-of-band
+        // path), so any spec becomes reachable by refreshing. `online = 0` already excludes
+        // every BUSY pool bot (hired henchmen + LFG/BG/WG fill bots are logged in); the
+        // IsHenchman check below is the in-memory belt-and-suspenders. LIMIT is generous so
+        // the random slice covers ~every (class, spec) most refreshes; the per-class cap
+        // below keeps the shown list a reasonable size.
         QueryResult q = CharacterDatabase.Query(
             "SELECT `guid`,`name`,`class`,`level` FROM `characters` "
             "WHERE `account` IN ({}) AND `online` = 0 AND `race` IN ({}) "
-            "AND `level` BETWEEN {} AND {} "
-            "ORDER BY ABS(CAST(`level` AS SIGNED) - {}) ASC LIMIT 150",
-            acctCsv, raceCsv, uint32(lo), uint32(hi), uint32(L));
+            "ORDER BY RAND() LIMIT 400",
+            acctCsv, raceCsv);
 
         struct Raw { uint32 guid; std::string name; uint8 cls; uint8 level; };
         std::vector<Raw> raws;
@@ -1710,12 +1712,19 @@ namespace WowPsParty
             return cls == CLASS_DEATH_KNIGHT && known.empty();
         };
 
-        // Keep ONE candidate per (class, spec) — never a duplicate spec. Proximity
-        // order means the kept one is the nearest-level char for that spec.
+        // Walk the RANDOM-ordered slice and keep up to MAX_SPECS_PER_CLASS distinct specs
+        // per class — the first ones seen, which (because the rows are RAND()-ordered) is a
+        // random pick that reshuffles every Refresh. One representative char per (class,spec).
+        // The per-class cap keeps the shown list a manageable size while still offering more
+        // than one spec per class (Kevin: keep the full multi-candidate list, just randomised).
+        constexpr uint32 MAX_SPECS_PER_CLASS = 2;
         std::unordered_set<uint32> const noTalents;
-        std::unordered_set<std::string> seenSpec;
+        std::unordered_map<uint8, uint32> specsShownByClass;   // class -> distinct specs kept
+        std::unordered_set<std::string> seenSpec;              // "cls:spec" dedup
         for (Raw const& r : raws)
         {
+            if (specsShownByClass[r.cls] >= MAX_SPECS_PER_CLASS)
+                continue;   // already showing enough specs for this class this refresh
             auto const it = talents.find(r.guid);
             std::unordered_set<uint32> const& known = (it != talents.end()) ? it->second : noTalents;
             if (isUntalentedDk(r.cls, known))
@@ -1724,18 +1733,24 @@ namespace WowPsParty
             c.guid  = r.guid;
             c.name  = r.name;
             c.cls   = r.cls;
-            c.level = r.level;
+            // Show + cost at the char's real level only when it's genuinely near the player
+            // (±4, hired as-is); anything further is re-leveled to the player on hire, so show
+            // and cost it at the player's level to match HireHenchman's effLevel (else the
+            // displayed price wouldn't match what's charged).
+            uint32 const levelGap = (r.level > L) ? uint32(r.level - L) : uint32(L - r.level);
+            c.level = (levelGap <= 4) ? r.level : L;
             c.role  = RoleFromTalents(c.cls, known, ClassDefaultRole(c.cls));
             c.spec  = SpecAbbrevFromTalents(c.cls, known);
             if (!seenSpec.insert(std::to_string(c.cls) + ":" + c.spec).second)
                 continue;   // already showing this (class, spec)
+            ++specsShownByClass[r.cls];
             out.push_back(std::move(c));
         }
 
-        // Coverage guarantee: every faction-valid class should be hirable in THIS
-        // bracket. If the ±4 band produced no candidate for a class, pull the
-        // nearest-level pool char of that class (any level) and present it at the
-        // player's level — re-leveled to the player when hired (see HireHenchman).
+        // Coverage guarantee: every faction-valid class should always be hirable. If the
+        // random slice above happened to surface no candidate for a class, pull the
+        // nearest-level pool char of that class and present it at the player's level —
+        // re-leveled to the player when hired (see HireHenchman).
         bool present[12] = { false };
         for (auto const& c : out) if (c.cls < 12) present[c.cls] = true;
         static uint8 const kAllClasses[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 11 };
