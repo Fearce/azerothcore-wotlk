@@ -4790,6 +4790,7 @@ namespace WowPsParty
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld() || !bot->GetSession()) return;
         if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) return;   // the controlled body
+        if (bot->IsMounted()) return;                        // never dismount / detour to dance while riding
 
         // Cheapest gate first: the poles only exist during the Fire Festival, so
         // skip the grid search entirely the rest of the year.
@@ -4815,6 +4816,12 @@ namespace WowPsParty
         if (!leaderGuid) return;
         Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
         if (!leader || !leader->IsInWorld() || leader->GetMapId() != bot->GetMapId()) return;
+
+        // Only join in when the LEADER is actually dancing at a pole — i.e. carries the
+        // ribbon-pole channel aura from using one. Standing near a pole isn't enough; the
+        // party dances only when the leader chooses to (Mill). The leader-at-this-pole
+        // proximity check below then pins us to the SAME bonfire.
+        if (!leader->HasAura(SPELL_RIBBON_POLE_USE)) return;
 
         // Nearest spawned Ribbon Pole within reach of the bot.
         GameObject* pole = nullptr;
