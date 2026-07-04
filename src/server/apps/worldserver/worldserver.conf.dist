@@ -1993,9 +1993,9 @@ CharactersPerRealm = 10
 #    HeroicCharactersPerRealm
 #        Description: Limit number of heroic class characters per account on this realm.
 #        Range:       1-10
-#        Default:     1
+#        Default:     1 - (WowPs: 10, so party-of-5 teams can run multiple Death Knights)
 
-HeroicCharactersPerRealm = 1
+HeroicCharactersPerRealm = 10
 
 #
 #    CharacterCreating.MinLevelForHeroicCharacter
