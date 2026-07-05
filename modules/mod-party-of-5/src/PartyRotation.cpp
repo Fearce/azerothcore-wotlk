@@ -3658,10 +3658,12 @@ namespace WowPsParty
     // ability that LOCKS A MOB IN PLACE (stun / root / incapacitate / sleep / shackle), so
     // an add never reaches the boss (Zombie Chow on Gluth). NO fear/knockback (they scatter
     // the mob) and NO snare-only. Creature-type-gated per spell so we don't burn a GCD on an
-    // invalid cast (Polymorph/Hex don't work on UNDEAD; Shackle is undead-ONLY; Banish is
+    // invalid cast (Sap/Repentance are humanoid-ish; Shackle is undead-ONLY; Banish is
     // demon/elemental; Hibernate is beast/dragon). Type-agnostic stuns/roots (Hammer of
     // Justice, Entangling Roots, Hungering Cold, …) carry mask 0 = any. Highest-priority
     // first; returns a ready one, else the first known (so the caller can wait out a CD).
+    // Transform CC (Polymorph/Hex) is NOT here — it breaks on damage, so it lives in the
+    // separate ResolveTransformCcSpell / cc_transform verb.
     static uint32 ResolveCcSpell(Player* bot, Unit* target)
     {
         if (!bot || !target) return 0;
@@ -3678,8 +3680,8 @@ namespace WowPsParty
             case CLASS_HUNTER:       list = { {"Wyvern Sting", 0} }; break;  // Freezing Trap is ground-placed, not unit-cast
             case CLASS_ROGUE:        list = { {"Kidney Shot", 0}, {"Sap", BEAST|DRAGON|DEMON|HUMANOID} }; break;
             case CLASS_PRIEST:       list = { {"Shackle Undead", UNDEAD} }; break;
-            case CLASS_SHAMAN:       list = { {"Hex", BEAST|HUMANOID} }; break;  // WotLK Hex = humanoid/beast only (no Bind Elemental until Cata)
-            case CLASS_MAGE:         list = { {"Polymorph", BEAST|HUMANOID} }; break;  // (no undead lock; Frost Nova is PBAoE, not single-target)
+            case CLASS_SHAMAN:       break;  // Hex is a TRANSFORM CC (breaks on damage) -> cc_transform, not this stun/root picker
+            case CLASS_MAGE:         break;  // Polymorph is a TRANSFORM CC (breaks on damage) -> cc_transform, not this stun/root picker
             case CLASS_WARLOCK:      list = { {"Banish", DEMON|ELEM}, {"Death Coil", 0} }; break;  // Death Coil = 3s horror, all types
             case CLASS_DRUID:        list = { {"Entangling Roots", 0}, {"Cyclone", 0}, {"Hibernate", BEAST|DRAGON} }; break;
             case CLASS_DEATH_KNIGHT: list = { {"Hungering Cold", 0} }; break;  // Frost-only AoE freeze; Chains of Ice is just a snare (mob still moves)
@@ -3694,6 +3696,33 @@ namespace WowPsParty
                 return id;   // known + ready + lands on this type
         }
         return 0;   // nothing ready to CC this mob (the cc verb then yields)
+    }
+
+    // The bot's best ready TRANSFORM crowd-control (Polymorph / Hex) for `target`. Kept
+    // SEPARATE from ResolveCcSpell / the `cc` verb because a transform breaks on the FIRST
+    // point of damage: folded into the generic "lock the add" it makes a mage/shaman
+    // re-sheep a mob the party is actively DPSing every tick instead of nuking (the whole-
+    // fight-polymorph bug). The dedicated cc_transform verb is opt-in, for an add you
+    // deliberately hold OUT of the fight — gate it with target_name so it's never cast on
+    // the kill target. Humanoid/beast only (a transform never lands on undead), same as the
+    // sheep spells used to be in ResolveCcSpell.
+    static uint32 ResolveTransformCcSpell(Player* bot, Unit* target)
+    {
+        if (!bot || !target) return 0;
+        char const* name = nullptr;
+        switch (bot->getClass())
+        {
+            case CLASS_MAGE:   name = "Polymorph"; break;
+            case CLASS_SHAMAN: name = "Hex";       break;   // WotLK Hex = humanoid/beast only
+            default: return 0;
+        }
+        uint32 const BEAST    = 1u << (CREATURE_TYPE_BEAST    - 1);
+        uint32 const HUMANOID = 1u << (CREATURE_TYPE_HUMANOID - 1);
+        if (!(target->GetCreatureTypeMask() & (BEAST | HUMANOID))) return 0;
+        uint32 const id = FindKnownSpellByName(bot, name);
+        if (id && !bot->HasSpellCooldown(id))
+            return id;
+        return 0;
     }
 
     // A ready, KNOWN slow / snare / short stun this bot can throw on a mob RUNNING AWAY, to
@@ -5524,10 +5553,31 @@ namespace WowPsParty
         // and casts the bot's best in-place CC that can land on that mob's creature type
         // (ResolveCcSpell). No retarget — normal DPS resumes next tick. Put it high in Common
         // gated by target_name so the whole party locks the adds the instant they appear.
-        if (verb == "cc")
+        if (verb == "cc" || verb == "cc_transform")
         {
+            // cc_transform uses the Polymorph/Hex picker (breaks on damage — opt-in,
+            // gate with target_name); plain cc uses the stun/root/incap picker.
+            bool const transform = (verb == "cc_transform");
             std::vector<Player*> party;
             GatherPartyPlayers(bot, party, /*includeDead=*/false);
+            // A transform holds ONE add OUT of a multi-mob fight — never the last enemy
+            // standing (that just gets burst down). If only one engaged hostile is left,
+            // don't transform even if the rule matches, so the CC is trivially easy to use.
+            if (transform)
+            {
+                // Only mage (Polymorph) / shaman (Hex) have a transform CC — skip the
+                // hostile gather entirely for any other class with a stray rule.
+                if (bot->getClass() != CLASS_MAGE && bot->getClass() != CLASS_SHAMAN)
+                    return false;
+                std::list<Unit*> engaged;
+                GatherHostilesAround(bot, 41.0f, engaged);
+                int live = 0;
+                for (Unit* e : engaged)
+                    if (e && e->IsAlive() && bot->IsValidAttackTarget(e)
+                        && MobEngagedByParty(bot, e, party) && ++live > 1)
+                        break;
+                if (live <= 1) return false;   // last enemy — burst it, don't sheep it
+            }
             // Resolve a READY, CASTABLE CC for THIS mob (0 = can't CC it right now). Folding
             // the per-mob spell resolve + canFireSpellOn into the scan (unlike a fixed-spell
             // cast_scan) means we pick the first mob this bot can ACTUALLY lock now, instead
@@ -5539,7 +5589,8 @@ namespace WowPsParty
                 if (!MobEngagedByParty(bot, u, party)) return 0;   // party already fights it → no pull
                 if (IsCrowdControlled(u)) return 0;                // already locked → don't overlap
                 if (!EvalCondition(cond, bot, u)) return 0;        // rule's target_* (target_name) vs THIS mob
-                uint32 const sid = ResolveCcSpell(bot, u);
+                uint32 const sid = transform ? ResolveTransformCcSpell(bot, u)
+                                             : ResolveCcSpell(bot, u);
                 if (!sid || bot->HasSpellCooldown(sid) || !canFireSpellOn(sid, u)) return 0;
                 return sid;
             };
@@ -5556,8 +5607,9 @@ namespace WowPsParty
             if (!pick || !channelClipOk()) return false;
             bool const fired = faceAndCast(pick, pickSpell);
             if (fired)
-                LOG_INFO("module", "[WowPsParty Rotation] {} CC {} -> {}",
-                         bot->GetName(), pickSpell, pick->GetName());
+                LOG_INFO("module", "[WowPsParty Rotation] {} {} {} -> {}",
+                         bot->GetName(), transform ? "TRANSFORM-CC" : "CC",
+                         pickSpell, pick->GetName());
             return fired;
         }
 

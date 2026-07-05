@@ -2107,7 +2107,17 @@ namespace WowPsParty
     // their leash to poke a neutral monster. It just ranks the live combatants by
     // distance. Returns nullptr if nothing qualifies (assist loop then falls back
     // to party-defense).
-    static Unit* PickNearestEngagedTarget(Player* bot, bool skipFullyImmune = false, bool fleeingOnly = false)
+    // A mob held by the party's TRANSFORM crowd-control (Polymorph / Hex — both share
+    // MECHANIC_POLYMORPH). Bots avoid attacking these so they don't shatter the CC
+    // (Polymorph breaks on the first hit); only the last enemy standing is attacked
+    // through it. Deliberately NOT a general CC test — a stun/root/snare doesn't match,
+    // so the party still bursts a stunned mob down.
+    static bool IsUnderTransformCc(Unit* u)
+    {
+        return u && u->HasAuraWithMechanic(1ULL << MECHANIC_POLYMORPH);
+    }
+
+    static Unit* PickNearestEngagedTarget(Player* bot, bool skipFullyImmune = false, bool fleeingOnly = false, bool skipTransformed = false)
     {
         constexpr float MAX_RANGE = 40.0f;
         Unit* best = nullptr;
@@ -2120,6 +2130,9 @@ namespace WowPsParty
             // Divine Shield / Ice Block bubble) so the immune-retarget below lands
             // on something the party can actually hurt.
             if (skipFullyImmune && a->IsImmunedToDamage(SPELL_SCHOOL_MASK_ALL)) return;
+            // skipTransformed: pass over a Polymorphed/Hexed mob so the transform-
+            // avoidance retarget lands on an enemy we can hit without breaking the CC.
+            if (skipTransformed && IsUnderTransformCc(a)) return;
             // fleeingOnly: the DPS "focus them down" flee behaviour — consider ONLY a mob
             // that's RUNNING AWAY (fear / flee-for-assistance), so the party bursts the runner.
             if (fleeingOnly && !IsUnitFleeing(a)) return;
@@ -7068,6 +7081,25 @@ namespace WowPsParty
             AssistLog(gLow, alt ? "immune target -> retarget to a non-immune enemy"
                                 : "immune target, no alternative -> stand down");
             desired = alt;   // nullptr => stand-down block below
+        }
+
+        // Transform-CC avoidance (Polymorph/Hex). Don't shatter the party's own CC: if
+        // the chosen target is under it, retarget to the nearest OTHER engaged enemy
+        // that isn't. Only when one exists — with nothing else engaged the transformed
+        // mob IS the fight's last enemy, so we commit to it and burst it down. (The
+        // cc_transform verb already refuses to sheep a lone mob, so a transform only
+        // survives to here while other adds are up; once they're cleared this falls
+        // through and the party finishes the sheep.) Keeps the CC trivial to use.
+        if (desired && IsUnderTransformCc(desired))
+        {
+            if (Unit* alt = PickNearestEngagedTarget(bot, /*skipFullyImmune=*/true,
+                                                     /*fleeingOnly=*/false, /*skipTransformed=*/true))
+            {
+                AssistLog(gLow, "target under transform CC -> retarget to a non-CC'd enemy");
+                desired = alt;
+            }
+            else
+                AssistLog(gLow, "target under transform CC, no alternative -> burst it (last enemy)");
         }
 
         if (!desired)
