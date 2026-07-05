@@ -4956,12 +4956,29 @@ namespace WowPsParty
         {
             uint32 const spellId = FindKnownSpellByName(bot, arg);
             if (!spellId) return false;
-            if (SwingArmed(bot)) return false;   // already armed for this swing
             Unit* target = bot->GetVictim();
             if (!target) return false;
+            // REACTIVE next-swing abilities (Death Knight Rune Strike, and the
+            // Overpower/Revenge family) are gated by a dodge/parry/block aura-state
+            // (CasterAuraState = AURA_STATE_DEFENSE) that the core CONSUMES on every
+            // successful cast — so they already self-limit to at most once per proc,
+            // and CheckCast turns a cast with no proc up into a free no-op (no power,
+            // no GCD). The swing-throttle below holds off re-arming for a whole weapon
+            // swing after each cast; on a reactive ability that only OVERLAPS and
+            // WASTES the short (~5s, event-driven) reactive windows, starving it to
+            // almost never firing (the "DK never Rune Strikes" report). Detect the
+            // reactive gate and fire it like a plain cast — the aura-state is the rate
+            // limiter. The throttle still applies to the truly spam-prone NON-reactive
+            // next-swing spells (Heroic Strike / Cleave / Maul): those have no proc
+            // gate and would re-cast + dump rage/energy every tick without it.
+            SpellInfo const* nsInfo = sSpellMgr->GetSpellInfo(spellId);
+            bool const reactive = nsInfo && nsInfo->CasterAuraState != 0;
+            if (!reactive && SwingArmed(bot))
+                return false;   // non-reactive: already armed for this swing
             if (castOrApproach(target, spellId))
             {
-                MarkSwingArmed(bot, spellId);
+                if (!reactive)
+                    MarkSwingArmed(bot, spellId);
                 return true;
             }
             return false;
