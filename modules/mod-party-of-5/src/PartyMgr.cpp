@@ -1031,23 +1031,44 @@ namespace WowPsParty
             case 6: // Death Knight
                 if (isTank)
                 {
+                    // Death Grip range-PULLS a loose mob to the tank AND taunts it
+                    // (35s CD) — the preferred way to grab a caster/runner off the
+                    // party. Dark Command is the short-CD ranged taunt backup for
+                    // when Death Grip is down or the mob is already in melee.
+                    add("enemy_loose_in_range&enemies_in_melee>1", "cast_loose_enemy:Death Grip", 91);
                     add("enemy_loose_in_range", "cast_loose_enemy:Dark Command", 90);
                     // Icebound Fortitude = damage reduction + stun immunity panic
                     // (baseline). Vampiric Blood = +max HP & +healing taken (Blood
                     // talent; falls through if unspecced). Both off the GCD.
                     add("self_health<35", "buff_self:Icebound Fortitude", 89);
                     add("self_health<45", "buff_self:Vampiric Blood", 88);
+                    // Mind Freeze is the melee kick; Strangulate the ranged silence
+                    // for a caster the tank can't reach (falls through when it's on
+                    // its long CD, or unlearned).
                     add("target_casting&target_interruptible", "cast:Mind Freeze", 86);
+                    add("target_casting&target_interruptible", "cast:Strangulate", 85);
                     add("self_health<55", "cast:Death Strike", 80);
                     add("self_health<40", "cast_self:Rune Tap", 78);
-                    add("always", "buff_self:Blood Presence", 74);
+                    // Frost Presence is the TANK presence (+HP, +threat, -damage).
+                    add("always", "buff_self:Frost Presence", 74);
+                    // Horn of Winter: self-cast, buffs the whole nearby party's AP
+                    // (and tops up runic power); maintained when the buff drops.
+                    add("always", "buff_self:Horn of Winter", 72);
                     add("target_missing_aura:Frost Fever", "cast:Icy Touch", 70);
                     add("target_missing_aura:Blood Plague", "cast:Plague Strike", 69);
+                    // Mark of Blood on bosses: their melee heals whoever they hit
+                    // (self-sustain for the tank). Blood talent — skips if unspecced.
+                    add("target_is_boss&target_missing_aura:Mark of Blood", "cast:Mark of Blood", 68);
                     add("enemies_in_melee>2", "cast:Death and Decay", 64);
-                    add("enemies_in_melee>2", "cast:Pestilence", 58);
+                    // Pestilence spreads the tank's diseases to the pack — only worth
+                    // a rune while a nearby engaged mob still lacks one, so gate it on
+                    // that instead of re-casting every tick.
+                    add("enemies_in_melee>2&enemy_needs_aura:Frost Fever,Blood Plague", "cast:Pestilence", 58);
+                    // Rune Strike is a NEXT-SWING runic-power dump — arm it once per
+                    // swing (not spammed), above the rune strikes as requested.
+                    add("has_target", "cast_on_swing:Rune Strike", 54);
                     add("has_target", "cast:Heart Strike", 52);
                     add("has_target", "cast:Blood Strike", 48);
-                    add("has_target", "cast:Rune Strike", 44);
                     add("has_target", "cast:Death Coil", 38);
                 }
                 else   // DPS — Blood(0) / Frost(1) / Unholy(2), baked per spec.
@@ -1058,10 +1079,11 @@ namespace WowPsParty
                     {
                         add("target_casting&target_interruptible", "cast:Mind Freeze", 86);
                         add("self_health<50", "cast:Death Strike", 80);   // self-heal strike
+                        add("always", "buff_self:Horn of Winter", 72);
                         add("target_missing_aura:Frost Fever", "cast:Icy Touch", 70);
                         add("target_missing_aura:Blood Plague", "cast:Plague Strike", 69);
                         add("enemies_in_melee>2", "cast:Death and Decay", 64);   // ground AoE
-                        add("enemies_in_melee>2", "cast:Pestilence", 58);        // spread diseases
+                        add("enemies_in_melee>2&enemy_needs_aura:Frost Fever,Blood Plague", "cast:Pestilence", 63);        // spread diseases
                         add("has_target", "cast:Blood Strike", 46);   // rune builder
                         add("has_target", "cast:Death Coil", 40);     // runic-power dump
                     };
@@ -1077,7 +1099,7 @@ namespace WowPsParty
                     else if (tree == 2)   // UNHOLY — Scourge Strike + Death Coil
                     {
                         dkDpsShared();
-                        add("always", "buff_self:Unholy Presence", 74);   // +haste
+                        add("always", "buff_self:Blood Presence", 74);   // the DPS presence (+damage)
                         add("has_target", "cast:Scourge Strike", 54);     // signature
                     }
                     else   // BLOOD dps(0) — Heart Strike; also the low-level fallback.

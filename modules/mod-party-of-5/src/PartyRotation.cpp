@@ -2321,6 +2321,54 @@ namespace WowPsParty
         g_channelLocks.erase(bot->GetGUID().GetCounter());
     }
 
+    // ---- Next-melee-swing queued attacks (Rune Strike / Heroic Strike / Maul) ----
+    // These abilities don't fire on the button press: the client ARMS them and the
+    // game consumes them on the character's NEXT white main-hand swing. A bot that
+    // calls CastSpell for one every rotation tick re-arms it dozens of times per
+    // swing — packet + ability-toggle spam, and for the damage-dealing 0x400
+    // variants that AzerothCore routes to the generic slot (rather than queuing via
+    // IsNextMeleeSwingSpell, which only tests the 0x4 bit) an actual instant re-cast
+    // that dumps rage/runic power every tick. The cast_on_swing verb arms it at most
+    // ONCE per swing: after a successful arm we refuse to re-arm the bot until its
+    // main-hand has swung.
+    struct SwingArm { uint32 untilMs = 0; uint32 spellId = 0; };
+    static std::mutex g_swingArmMutex;
+    static std::unordered_map<uint32, SwingArm> g_swingArms;   // guidLow -> arm
+
+    // True while the bot still has a next-swing attack armed (don't re-arm). Only
+    // one next-swing spell can be pending at a time, so this is per-bot, not per-
+    // spell — a second cast_on_swing rule is correctly held until the swing lands.
+    static bool SwingArmed(Player* bot)
+    {
+        // The core queues the 0x4 (ON_NEXT_SWING_NO_DAMAGE) variants into this slot
+        // and fires them on the swing; while it's populated the arm is unambiguously
+        // still live, independent of our own timer.
+        if (bot->GetCurrentSpell(CURRENT_MELEE_SPELL)) return true;
+        std::lock_guard<std::mutex> lock(g_swingArmMutex);
+        auto it = g_swingArms.find(bot->GetGUID().GetCounter());
+        if (it == g_swingArms.end()) return false;
+        if (getMSTime() >= it->second.untilMs) { g_swingArms.erase(it); return false; }
+        return true;
+    }
+
+    // Record that the bot just armed a next-swing attack. Hold off re-arming until
+    // its next main-hand swing has landed (attack timer + a little slack) so the
+    // instantly-cast 0x400 variants fire at most once per swing instead of every
+    // tick.
+    static void MarkSwingArmed(Player* bot, uint32 spellId)
+    {
+        int32 const remain = bot->getAttackTimer(BASE_ATTACK);
+        // Clamp: a ~0 (imminent / hasted) timer must still block for a beat so we
+        // don't re-arm next tick; a stalled timer must not lock us out for long.
+        int32 wait = remain + 250;
+        if (wait < 500)  wait = 500;
+        if (wait > 4000) wait = 4000;
+        std::lock_guard<std::mutex> lock(g_swingArmMutex);
+        SwingArm& sa = g_swingArms[bot->GetGUID().GetCounter()];
+        sa.untilMs = getMSTime() + uint32(wait);
+        sa.spellId = spellId;
+    }
+
     // Forward decls: EvalCondition recurses through AND-chains, and the
     // aura/cooldown conditions resolve spells by name (defined further down).
     static bool EvalSingleCondition(std::string const& cond, Player* bot,
@@ -2740,6 +2788,64 @@ namespace WowPsParty
                 int const countN = std::atoi(arg.substr(opPosA + 1).c_str());
                 int const found  = int(CountHostilesWithin(bot, radius));
                 return opA == '<' ? (found < countN) : (found > countN);
+            }
+            // "enemy_needs_aura:[<radius>:]<aura[,aura...]>" — TRUE when at least one
+            // nearby ENGAGED hostile is missing one of the listed auras (a "spread
+            // target" still exists). Distinct from enemy_missing_aura above, which is
+            // TRUE only when NO enemy has the aura. Gates a disease/DoT SPREAD (DK
+            // Pestilence) so it fires only while a mob nearby still lacks a disease,
+            // instead of every tick. Optional leading "<radius>:" sets the scan
+            // radius in yards (default 10 — Pestilence's spread range — clamped
+            // 3-30). Auras match by display name, any caster by default (a mob dotted
+            // by another party member counts as covered); the "enemy_needs_my_aura:"
+            // form (handled by the my_aura rewrite above) narrows it to THIS bot's
+            // own diseases.
+            if (cname == "enemy_needs_aura")
+            {
+                std::string list = arg;
+                float radius = 10.0f;
+                // Optional "<radius>:<list>" prefix. Spell names never contain ':',
+                // so a leading all-numeric token before a ':' is unambiguously the
+                // radius, not an aura name.
+                if (size_t const rc = arg.find(':'); rc != std::string::npos)
+                {
+                    std::string const head = arg.substr(0, rc);
+                    if (!head.empty()
+                        && head.find_first_not_of("0123456789. ") == std::string::npos)
+                    {
+                        float const r = float(std::atof(head.c_str()));
+                        if (r > 0.0f) { radius = r; list = arg.substr(rc + 1); }
+                    }
+                }
+                if (radius < 3.0f)  radius = 3.0f;
+                if (radius > 30.0f) radius = 30.0f;
+                if (list.empty()) return false;
+
+                std::list<Unit*> hostiles;
+                GatherHostilesAround(bot, radius, hostiles);
+                for (Unit* u : hostiles)
+                {
+                    if (!u || !u->IsAlive() || !u->IsInCombat()) continue;
+                    if (!bot->IsValidAttackTarget(u)) continue;
+                    // Missing ANY one listed aura on an engaged mob = a worthwhile
+                    // spread target exists. Comma-split the list, trim each name.
+                    for (size_t start = 0; start <= list.size(); )
+                    {
+                        size_t const comma = list.find(',', start);
+                        std::string const raw = list.substr(start,
+                            comma == std::string::npos ? std::string::npos
+                                                       : comma - start);
+                        size_t const a = raw.find_first_not_of(" \t");
+                        size_t const b = raw.find_last_not_of(" \t");
+                        if (a != std::string::npos
+                            && !TargetHasNamedAura(u, raw.substr(a, b - a + 1),
+                                                   auraCaster))
+                            return true;   // this mob lacks a listed disease
+                        if (comma == std::string::npos) break;
+                        start = comma + 1;
+                    }
+                }
+                return false;
             }
             // "allies_within:<radius><op><count>" — OTHER party members within
             // radius (excludes self). For clump-punishing mechanics: pair
@@ -4811,6 +4917,26 @@ namespace WowPsParty
                 || verb == "reposition_random" || verb == "walk_away_from_source"
                 || verb == "dodge_frontals"   || verb == "face_away"))
             return false;
+
+        // "cast_on_swing:<spell>" — arm a NEXT-MELEE-SWING attack (Rune Strike,
+        // Heroic Strike, Maul, Cleave) on the current victim. Same gates and
+        // positioning as a plain melee cast (AssistTarget owns the chase on a range
+        // block), but armed at most once per main-hand swing so it isn't re-cast
+        // every tick (see SwingArmed / MarkSwingArmed).
+        if (verb == "cast_on_swing")
+        {
+            uint32 const spellId = FindKnownSpellByName(bot, arg);
+            if (!spellId) return false;
+            if (SwingArmed(bot)) return false;   // already armed for this swing
+            Unit* target = bot->GetVictim();
+            if (!target) return false;
+            if (castOrApproach(target, spellId))
+            {
+                MarkSwingArmed(bot, spellId);
+                return true;
+            }
+            return false;
+        }
 
         if (verb == "cast" || verb == "cast_self")
         {
@@ -7131,6 +7257,7 @@ namespace WowPsParty
     static bool IsOffensiveEnemyVerb(std::string const& verb)
     {
         return verb == "cast"               // single-target nuke on the victim (e.g. Moonfire)
+            || verb == "cast_on_swing"      // armed melee attack (Heroic Strike / Rune Strike)
             || verb == "cast_spread"
             || verb == "cast_combo_spread"
             || verb == "cast_scan"

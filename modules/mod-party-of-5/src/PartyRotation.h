@@ -43,6 +43,12 @@
  *     enemies_within:<R><op>N  enemies_in_melee  enemies_in_range
  *     enemies_clustered:<R><op>N  most enemies within R yd of each other
  *                                 (gate for Blizzard/Flamestrike-style AoE)
+ *     enemy_needs_aura:[<R>:]<aura[,aura...]>  TRUE while a nearby engaged enemy
+ *                                 still LACKS one of the listed auras — a "spread
+ *                                 target" exists. Gates a DoT spread (DK Pestilence)
+ *                                 so it fires only until the pack is fully dotted.
+ *                                 Optional "<R>:" prefix sets the scan radius
+ *                                 (default 10y). enemy_needs_my_aura: = own diseases.
  *     party_injured_clustered:<R><op>N  most INJURED allies (<90% HP, in cast
  *                                 range) within R yd of each other — gate for
  *                                 Chain Heal / Wild Growth / Prayer of Healing
@@ -59,6 +65,10 @@
  *
  * Supported actions:
  *     cast:<spell name>            cast on the bot's current target
+ *     cast_on_swing:<spell name>   arm a NEXT-MELEE-SWING attack (Heroic Strike,
+ *                                  Rune Strike, Maul, Cleave) on the current target;
+ *                                  armed at most once per main-hand swing instead of
+ *                                  re-cast every tick. Same range/chase as cast.
  *     cast_self:<spell name>       cast on the bot itself
  *     cast_pet:<spell name>        cast on the bot's pet (Mend Pet)
  *     buff_self:<spell name>       cast on self, skip if the aura is active
