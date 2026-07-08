@@ -311,10 +311,14 @@ namespace WowPsParty
                 if (tree == 0) return "dps";       // Balance
                 if (tree == 2) return "healer";    // Restoration
                 // Feral covers BOTH the bear tank and the cat DPS build, so a
-                // tree-only check wrongly tanks every feral. Disambiguate the
-                // way mod-playerbots does: a bear maxes Thick Hide (rank 3,
-                // talent spell 16931); a cat doesn't. No rank 3 → it's a cat.
-                return known.count(16931) ? "tank" : "dps";
+                // tree-only check wrongly tanks every feral. Disambiguate the way
+                // mod-playerbots does (PlayerbotFactory: "cat = does NOT have the
+                // Thick Hide talent"): a bear takes Thick Hide, a cat doesn't.
+                // character_talent stores only the HIGHEST learned rank, so a bear
+                // specced 3/3 stores 16933 — NOT 16931 (rank 1). Match ANY rank
+                // (16931/16932/16933), else a maxed bear wrongly reads as a cat.
+                return (known.count(16931) || known.count(16932) || known.count(16933))
+                           ? "tank" : "dps";
             default: return "dps";                                            // Hunter/Rogue/Mage/Warlock
         }
     }
@@ -495,6 +499,24 @@ namespace WowPsParty
         if (role == "healer")
             switch (cls) { case 2: return 0; case 5: return 1; case 7: return 2; case 11: return 2; default: return -1; }
         return -1;   // dps (any dps spec is fine), or this class can't fill the role
+    }
+
+    // The premade spec-TEMPLATE index a live henchman currently embodies. Used to
+    // preserve the player's picked spec across a PlayerbotFactory::Randomize re-roll
+    // (relevel), which otherwise re-rolls to a RANDOM tree. randomClassSpecIndex maps
+    // a tabpage (0/1/2) to its template index for most classes — but a druid feral
+    // cat and bear share tree 1, so a bare tabpage can't tell them apart and a hired
+    // cat would rebuild as a bear tank. Resolve that one split from the live talents
+    // (same Thick Hide test as RoleFromTalents): bear=index 1, cat=index 3. Returns
+    // -1 when the bot has no talents yet (nothing to preserve).
+    static int LiveSpecNo(Player* p)
+    {
+        int const tab = DominantTalentTabLive(p);
+        if (tab < 0) return -1;
+        uint8 const cls = p->getClass();
+        if (cls == CLASS_DRUID && tab == 1)   // Feral: bear(1) vs cat(3) share the tree
+            return (InferHenchmanRoleLive(p, "dps") == "tank") ? 1 : 3;
+        return int(sPlayerbotAIConfig.randomClassSpecIndex[cls][uint32(tab)]);
     }
 
     // Dominant talent tree (0/1/2) for baking a per-spec rotation, -1 if none.
@@ -2544,19 +2566,20 @@ namespace WowPsParty
         if (uint8(oldLvl) == target) return;
 
         uint8 const cls = hen->getClass();
-        // Capture role + tree BEFORE the re-roll (the bot's hired/forced identity).
+        // Capture role + spec BEFORE the re-roll (the bot's hired/forced identity).
+        // LiveSpecNo (not a bare tabpage) so a feral cat isn't rebuilt as a bear —
+        // they share tree 1 (see LiveSpecNo).
         std::string const role = InferHenchmanRoleLive(hen, ClassDefaultRole(cls));
-        int const intendedTab  = DominantTalentTabLive(hen);
+        int const intendedSpec = LiveSpecNo(hen);
 
         PlayerbotFactory factory(hen, target);
         factory.Randomize(false);
 
         bool talentsChanged = false;
-        // Restore the captured tree if the re-roll moved off it.
-        if (intendedTab >= 0 && DominantTalentTabLive(hen) != intendedTab)
+        // Restore the captured spec if the re-roll moved off it.
+        if (intendedSpec >= 0 && LiveSpecNo(hen) != intendedSpec)
         {
-            int const specNo = int(sPlayerbotAIConfig.randomClassSpecIndex[cls][uint32(intendedTab)]);
-            PlayerbotFactory::InitTalentsBySpecNo(hen, specNo, /*reset=*/true);
+            PlayerbotFactory::InitTalentsBySpecNo(hen, intendedSpec, /*reset=*/true);
             hen->SendTalentsInfoData(false);
             talentsChanged = true;
         }
@@ -2834,26 +2857,24 @@ namespace WowPsParty
                     // re-roll. Randomize(false) re-rolls talents to a RANDOM tree, which
                     // flips the role out from under the player — a Ret paladin hired and
                     // downleveled came back Holy, invalidating the party (wasted gold).
-                    int const intendedTab = DominantTalentTabLive(hen);
+                    // LiveSpecNo resolves the druid feral cat/bear split (shared tree 1),
+                    // so a hired feral cat isn't rebuilt as a bear tank.
+                    int const intendedSpec = LiveSpecNo(hen);
                     PlayerbotFactory factory(hen, target);
                     factory.Randomize(false);
-                    // Restore the picked tree if the re-roll moved off it. randomClassSpecIndex
-                    // maps a tree (0/1/2) to its spec-template index — the same mapping
-                    // InitTalentsTree uses — so InitTalentsBySpecNo re-spends the points into
-                    // the chosen tree. (Druid feral cat vs bear share tree 1, so that one
-                    // edge can still pick the wrong feral build; every other class is exact.)
-                    if (intendedTab >= 0 && DominantTalentTabLive(hen) != intendedTab)
+                    // Restore the picked spec if the re-roll moved off it —
+                    // InitTalentsBySpecNo re-spends the points into that exact template.
+                    if (intendedSpec >= 0 && LiveSpecNo(hen) != intendedSpec)
                     {
-                        int const specNo = int(sPlayerbotAIConfig.randomClassSpecIndex[hen->getClass()][uint32(intendedTab)]);
-                        PlayerbotFactory::InitTalentsBySpecNo(hen, specNo, /*reset=*/true);
+                        PlayerbotFactory::InitTalentsBySpecNo(hen, intendedSpec, /*reset=*/true);
                         hen->SendTalentsInfoData(false);
                         // Randomize itemized gear for the tree it rolled, not the one we
                         // just restored — re-roll equipment so the gear matches the spec
                         // (else a Ret re-roll leaves a restored Prot tank in a Ret 2H).
                         PlayerbotFactory(hen, target).InitEquipment(false, false);
                         LOG_INFO("module",
-                            "[WowPsParty Henchmen] re-leveled hench guid={} restored picked spec (tree {})",
-                            henchGuid.GetCounter(), intendedTab);
+                            "[WowPsParty Henchmen] re-leveled hench guid={} restored picked spec (index {})",
+                            henchGuid.GetCounter(), intendedSpec);
                     }
                     hen->SaveToDB(false, false);
                     LOG_INFO("module",
