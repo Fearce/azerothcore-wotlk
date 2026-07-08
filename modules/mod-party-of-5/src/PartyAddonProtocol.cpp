@@ -3023,24 +3023,18 @@ static void HandleMill(Player* requester, std::string_view payload)
 // Player::SendLoot uses) into the party's bags, then the emptied box is consumed —
 // equivalent to picking the lock and looting it out. The point is the "tell your rogue
 // to open it" feel: you still have to log in your rogue hero and train Lockpicking.
-static void HandlePickLock(Player* requester, std::string_view payload)
+// TryPartyPickLock — shared pick-lock core. Picks a Lockpicking-locked box in `owner`'s bags
+// with a party rogue's skill, rolls its loot into the party, and consumes it. Returns TRUE if
+// the item IS a lockpicking-pickable box (a no-rogue / bags-full / empty case still emits its
+// own message and counts as handled), FALSE only when it is NOT a lockpicking box (key box /
+// no lock / already unlocked) so the caller can fall back. Shared by the Ctrl+K PICKLOCK
+// keybind AND the right-click "open" path, so right-clicking a lockbox opens it the same way.
+static bool TryPartyPickLock(Player* requester, Player* owner, Item* item)
 {
-    if (!requester || !requester->GetSession()) return;
-    auto tab = payload.find('\t');
-    if (tab == std::string_view::npos) return;
-    uint32 const srcSlot        = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
-    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
-    if (!srcItemGuidLow) return;
-
-    uint32 const account   = requester->GetSession()->GetAccountId();
-    uint32 const ownerGuid = WowPsParty::GuidForAccountSlot(account, srcSlot);
-    if (!ownerGuid) return;
-    Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(ownerGuid));
-    if (!owner) return;
-    Item* item = SafeGetItemByGuid(owner, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
-    if (!item) return;
+    if (!requester || !requester->GetSession() || !owner || !item) return false;
     ItemTemplate const* tmpl = item->GetTemplate();
-    if (!tmpl) return;
+    if (!tmpl) return false;
+    uint32 const account = requester->GetSession()->GetAccountId();
 
     ChatHandler ch(requester->GetSession());
 
@@ -3060,10 +3054,7 @@ static void HandlePickLock(Player* requester, std::string_view payload)
     if (item->HasFlag(ITEM_FIELD_FLAGS, ITEM_FIELD_FLAG_UNLOCKED))
         pickable = false;   // already opened
     if (!pickable)
-    {
-        ch.PSendSysMessage("|cffff5555[WowPsParty]|r |cffffffff{}|r isn't a pickable lockbox.", tmpl->Name1);
-        return;
-    }
+        return false;   // not a Lockpicking box (key required / no lock) — the caller handles it
 
     // A party member whose Lockpicking covers the box. Per-slot diagnostic like
     // HandleDisenchant so a failure (a rogue momentarily zoning / skills not loaded)
@@ -3091,7 +3082,7 @@ static void HandlePickLock(Player* requester, std::string_view payload)
         ch.PSendSysMessage(
             "|cffff5555[WowPsParty]|r No party rogue skilled enough to pick |cffffffff{}|r "
             "(needs Lockpicking {}). Train a rogue hero's Lockpicking.", tmpl->Name1, reqSkill);
-        return;
+        return true;
     }
 
     // Roll the box's contents the same way Player::SendLoot opens an item: money first,
@@ -3117,7 +3108,7 @@ static void HandlePickLock(Player* requester, std::string_view payload)
         ch.PSendSysMessage("|cff66ccff[WowPsParty]|r {} unlocked |cffffffff{}|r (it was empty).",
             picker->GetName(), tmpl->Name1);
         WowPsParty::SendInventoryTo(requester);
-        return;
+        return true;
     }
 
     // Picking is IRREVERSIBLE (the box is consumed), so confirm the party can actually
@@ -3149,7 +3140,7 @@ static void HandlePickLock(Player* requester, std::string_view payload)
         ch.PSendSysMessage(
             "|cffff5555[WowPsParty]|r Not enough free bag space for |cffffffff{}|r's contents "
             "— make room and try again. (Box kept.)", tmpl->Name1);
-        return;
+        return true;
     }
 
     std::string const itemName = tmpl->Name1;
@@ -3198,6 +3189,31 @@ static void HandlePickLock(Player* requester, std::string_view payload)
         gained.str().empty() ? "NOTHING (bags full)" : gained.str());
 
     WowPsParty::SendInventoryTo(requester);
+    return true;
+}
+
+// PICKLOCK\t<srcPartySlot>\t<srcItemGuidLow> — pick a locked box from any party member's bags
+// with a party rogue's Lockpicking (the Ctrl+K hover keybind). Resolves the box, then defers to
+// the shared TryPartyPickLock core. A box that isn't a lockpicking lock reports so here.
+static void HandlePickLock(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+    if (!srcItemGuidLow) return;
+    uint32 const srcSlot   = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const account   = requester->GetSession()->GetAccountId();
+    uint32 const ownerGuid = WowPsParty::GuidForAccountSlot(account, srcSlot);
+    if (!ownerGuid) return;
+    Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(ownerGuid));
+    if (!owner) return;
+    Item* item = SafeGetItemByGuid(owner, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!item) return;
+    if (!TryPartyPickLock(requester, owner, item))
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r |cffffffff{}|r isn't a pickable lockbox.",
+            item->GetTemplate() ? item->GetTemplate()->Name1 : "That item");
 }
 
 // MAIL_SEND\t<srcPartySlot>\t<srcItemGuidLow>\t<recipientName> — mail a bagged item from
@@ -3557,6 +3573,12 @@ static bool OpenLootableContainer(Player* requester, Player* srcChar, Item* srcI
     // IsLocked() check produced the bogus "is locked".
     if (t->LockID && srcItem->IsLocked())
     {
+        // A Lockpicking-locked box: hand off to the party rogue (the same core the Ctrl+K
+        // PICKLOCK keybind uses) so right-clicking a lockbox just opens it when a party rogue
+        // has the skill, instead of dead-ending. A non-lockpicking lock (key required) isn't
+        // pickable, so TryPartyPickLock returns false and we report it locked as before.
+        if (TryPartyPickLock(requester, srcChar, srcItem))
+            return true;
         ChatHandler(requester->GetSession()).PSendSysMessage(
             "|cffff5555[WowPsParty]|r |cffffffff{}|r is locked.", t->Name1);
         return true;
