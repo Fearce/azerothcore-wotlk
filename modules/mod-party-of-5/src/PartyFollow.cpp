@@ -5412,6 +5412,18 @@ namespace WowPsParty
             && (getMSTime() - it->second) < FERAL_FORM_GRACE_MS;
     }
 
+    // A DEMONOLOGY warlock in Metamorphosis (spell 47241 — self-transform into a
+    // demon for 30s, whose signature abilities are melee-range) fights in melee,
+    // so it anchors and engages like a melee dps while the aura is up. No grace
+    // window (unlike WasRecentlyFeral): a feral druid DROPS form to cast and would
+    // flap without one, but a Metamorphosis warlock casts normally in-form and
+    // holds it the full duration — so the bare aura check is stable, and reverting
+    // to ranged the instant it ends is the correct positioning.
+    static bool IsMetamorphosisMelee(Player* bot)
+    {
+        return bot && bot->getClass() == CLASS_WARLOCK && bot->HasAura(47241);
+    }
+
     // True if this bot fights in MELEE (anchors closer to the tank during a pull,
     // ready to engage). Mirrors AssistTarget's ranged/melee split: tanks and the
     // physical classes are melee; healers and the caster classes are ranged,
@@ -5431,6 +5443,7 @@ namespace WowPsParty
         if ((acls == CLASS_DRUID || acls == CLASS_SHAMAN)
             && WowPsParty::PrimaryTalentTree(bot) == 1) return true;
         if (bot->IsInFeralForm() || WasRecentlyFeral(bot->GetGUID())) return true;
+        if (IsMetamorphosisMelee(bot)) return true;
         return false;
     }
 
@@ -7331,7 +7344,8 @@ namespace WowPsParty
                 role == "tank" ||
                 ((acls == CLASS_DRUID || acls == CLASS_SHAMAN)
                     && WowPsParty::PrimaryTalentTree(bot) == 1) ||
-                bot->IsInFeralForm() || WasRecentlyFeral(bot->GetGUID());
+                bot->IsInFeralForm() || WasRecentlyFeral(bot->GetGUID()) ||
+                IsMetamorphosisMelee(bot);
             if (melee) rangedCaster = false;
         }
 
