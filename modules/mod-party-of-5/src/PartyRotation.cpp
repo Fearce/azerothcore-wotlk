@@ -4702,6 +4702,32 @@ namespace WowPsParty
                     return false;   // nothing reachable can reach AND see the cluster — yield
                                     // (no hold) so AssistTarget closes for single-target LoS
 
+                // BOUNDED SEEK: PickGroundCastLosPoint's ground-LoS model only APPROXIMATES
+                // the engine's, so around a tight corner it can keep handing back "LoS" spots
+                // the SERVER then rejects (result=47), and the bot holds -> hops -> fails ->
+                // re-seeks forever. Held the whole time, AssistTarget yields ("skip: held by
+                // rotation") and the caster stands blind at range doing ZERO single-target
+                // damage while its pet solos the mob (Kevin, Slave Pens: Nissejeppe just sent
+                // his pet around the corner). Bound a seek that can't gain GROUND-LoS: once the
+                // window lapses, yield (return false, NO hold) so AssistTarget's LoS-aware close
+                // drags the bot into real range+LoS and single-target casts resume. A seek that
+                // CAN see the ground (or a LoS-immune spell) resets the timer — only a genuinely
+                // stuck seek gives up, so the real behind-cover reposition (Kruthkes/Mynya) is
+                // untouched.
+                {
+                    static thread_local std::unordered_map<uint64, uint32> seekSinceMs;
+                    uint64 const sk   = (uint64(bot->GetGUID().GetCounter()) << 32) | spellId;
+                    uint32 const nowS = getMSTime();
+                    if (!ignoresLos && !haveGroundLos)
+                    {
+                        uint32& since = seekSinceMs[sk];
+                        if (since == 0) since = nowS;
+                        else if (nowS - since > 2000) { since = 0; return false; }
+                    }
+                    else
+                        seekSinceMs[sk] = 0;
+                }
+
                 WowPsParty::HoldFollower(bot->GetGUID(), 1200);
                 // Issue the move ONCE and let it RUN to the spot — do NOT re-path every tick.
                 // The anchor (BestClusterAnchor) flips between equidistant pack members tick
