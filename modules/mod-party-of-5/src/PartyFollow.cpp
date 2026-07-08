@@ -8337,27 +8337,7 @@ namespace WowPsParty
             bool const botMounted      = follower->IsMounted();
             bool const botCasting      = follower->IsNonMeleeSpellCast(false, false, true);
             bool const leaderTravelling = leaderMounted && !leader->IsInCombat();
-            // You can't ride in a 5-man/raid, so a mounted bot INSIDE an instance is
-            // always a bug: the leader entered still carrying a mount aura, or is
-            // parked mounted + out of combat, and the travel-aggro force-mount below
-            // then mounts the heroes MID-FIGHT (its `|| leaderTravelling` clause
-            // overrides the follower's own combat state). AssistTarget skips a mounted
-            // bot ("transport fly-by"), so it stops fighting and only its pet keeps
-            // going — Kevin, Slave Pens: "Nissejeppe stood around the corner and just
-            // sent his pet". Never mount-sync in a dungeon: force-DISMOUNT instead so
-            // the hero engages. ToC joust mounts are VEHICLES (GetVehicleBase() != null)
-            // — leave those to the vehicle path; this only strips a lingering
-            // SPELL_AURA_MOUNTED off a bot that's on foot in the instance.
-            bool const followerInDungeon = follower->GetMap() && follower->GetMap()->IsDungeon();
-            if (followerInDungeon)
-            {
-                if (botMounted && !botCasting && !follower->GetVehicleBase())
-                {
-                    follower->RemoveAurasByType(SPELL_AURA_MOUNTED);
-                    follower->Dismount();
-                }
-            }
-            else if (leaderMounted && !botMounted && !botCasting
+            if (leaderMounted && !botMounted && !botCasting
                 && (!follower->IsInCombat() || leaderTravelling))
             {
                 // Is the leader on a FLYING mount? (a mount aura whose speed
