@@ -4970,7 +4970,8 @@ namespace WowPsParty
                 || verb == "interrupt_caster_melee"   // travels to a far caster
                 || verb == "charge"                   // leaps to a far enemy (away from the leader)
                 || verb == "reposition_random" || verb == "walk_away_from_source"
-                || verb == "dodge_frontals"   || verb == "face_away"))
+                || verb == "dodge_frontals"   || verb == "face_away"
+                || verb == "stand_on_side"))
             return false;
 
         // "cast_on_swing:<spell>" — arm a NEXT-MELEE-SWING attack (Rune Strike,
@@ -6301,6 +6302,62 @@ namespace WowPsParty
             return true;   // boxed both sides — hold rather than walk deeper into the cone
         }
 
+        // "stand_on_side" — hold the target's FLANK (~90° off its facing), clear of BOTH the
+        // frontal breath cone AND the rear tail-swipe arc. For dragons / large mobs that have
+        // both a front breath and a rear tail sweep, the ONLY safe melee spot is the side:
+        // move_behind (rear) eats the tail, stay_in_front / standing ahead eats the breath,
+        // and dodge_frontals only clears the FRONT so a bot it pushes to the rear still gets
+        // tail-swiped. This steps to the nearest side on the arc the bot is already on,
+        // PRESERVING range, and recomputes each tick so it slides to the new flank the instant
+        // the enemy turns. Yields (returns false) once on a safe flank so casts fire from
+        // there. Uses the bot's victim, else the nearest engaged enemy (so a support bot
+        // flanks the boss too). Avoids damaging ground clouds. Make it a HIGH-priority Common
+        // rule for a breath+tail boss.
+        if (verb == "stand_on_side")
+        {
+            Unit* enemy = bot->GetVictim();
+            if (!enemy || !enemy->IsAlive()) enemy = NearestEngagedEnemy(bot, 60.0f);
+            if (!enemy || !enemy->IsAlive()) return false;
+
+            float const gap    = bot->GetDistance(enemy);            // keep our current range
+            float const facing = enemy->GetOrientation();
+            float rel = enemy->GetAngle(bot) - facing;               // our bearing vs its facing
+            while (rel >  float(M_PI)) rel -= 2.0f * float(M_PI);
+            while (rel < -float(M_PI)) rel += 2.0f * float(M_PI);
+            float const amag = std::fabs(rel);                       // 0 = dead front, π = dead rear
+
+            // Safe wedge between the two danger arcs. FRONT_DANGER = half-width of the breath
+            // cone (from front); REAR_DANGER = half-width of the tail-swipe arc (from directly
+            // behind). Both deliberately generous so the bot clears the real cones with margin.
+            // Safe when the bearing magnitude sits between them (centred on the 90° flank).
+            constexpr float FRONT_DANGER = float(M_PI) * 0.40f;   // ±72° front  (wide breath)
+            constexpr float REAR_DANGER  = float(M_PI) * 0.33f;   // ±60° rear   (tail swipe)
+            if (amag >= FRONT_DANGER && amag <= float(M_PI) - REAR_DANGER)
+                return false;                                     // already on a safe flank → cast
+
+            float const side = (rel >= 0.0f) ? 1.0f : -1.0f;      // slide to the arc we're on
+            constexpr float FLANK = float(M_PI) * 0.5f;           // 90° — the true side
+
+            WowPsParty::HoldFollower(bot->GetGUID(), 1200);
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE
+                && bot->isMoving())
+                return true;                                      // let the in-flight sidestep finish
+            std::vector<Unit*> clouds;
+            GatherDamagingClouds(bot, 45.0f, clouds);
+            for (float s : { side, -side })   // preferred side first, other if blocked/hazardous
+            {
+                float x, y, z;
+                enemy->GetNearPoint(bot, x, y, z, 0.0f, gap, facing + s * FLANK);
+                if (!clouds.empty() && PointInClouds(clouds, x, y)) continue;
+                if (!NavReachable(bot, x, y, z, gap)) continue;
+                bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
+                                                  0.0f, 0.0f, /*generatePath=*/true,
+                                                  /*forceDestination=*/false);
+                return true;
+            }
+            return true;   // boxed both sides — hold rather than walk into a danger arc
+        }
+
         // "stay_in_front:N" — hold the target's FRONTAL arc, N yards out (the direction it
         // faces). The mirror of move_behind, for "stack in front" / frontal-soak phases.
         // Default to melee reach if no number. HoldFollower's so AssistTarget keeps its
@@ -7341,6 +7398,7 @@ namespace WowPsParty
             || verb == "walk_away_from_source"
             || verb == "move_out_of_los"
             || verb == "dodge_frontals"   // get out of the cone NOW, even mid-cast
+            || verb == "stand_on_side"    // slip to the flank NOW (breath+tail), even mid-cast
             || verb == "face_away";       // turn from the gaze NOW, even mid-cast (turning never breaks a cast)
     }
 
