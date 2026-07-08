@@ -99,7 +99,7 @@ namespace WowPsParty
         constexpr float  TANK_LEASH         = 45.0f;   // stop & wait past this from leader
         // LEAD_DISTANCE (how far ahead the tank aims ALONG the path) is now per-tank:
         // a local in TankFollowPath sourced from WowPsParty::BotLeadDistance (set by
-        // the rotation-editor slider, default 15). It used to be a fixed 30y constant.
+        // the rotation-editor slider, default 10). It used to be a fixed 30y constant.
         constexpr float  WAYPOINT_REACHED   = 3.5f;
         // Halt hysteresis: once the tank parks at the lead distance, it stays parked until the
         // leader has closed the gap by this much — so it doesn't flicker walk/halt at the edge.
@@ -130,6 +130,23 @@ namespace WowPsParty
         // down the same ramp) can't snap the cursor to the post-boss leg. A genuine
         // long jump (teleport / recorded drop) still resyncs via the unbounded scan.
         constexpr float  CURSOR_ADVANCE_WINDOW = 40.0f;
+        // The tank's OWN on-route position (tankNearest) is resolved within a BAND
+        // around the leader's cursor, never by a global argmin. A hub dungeon that
+        // threads the same central chamber several times (Halls of Stone: every wing
+        // returns through the centre) stacks a later pass's waypoints physically on top
+        // of the current pass's, so a global nearest-scan on the tank's position snapped
+        // tankNearest to whichever pass was momentarily closest — and when it caught a
+        // LATER pass, the steer lookahead (tankNearest + lead) leapt the tank a whole
+        // wing ahead, skipping the wing in between (Kevin: Halls of Stone wing-skip).
+        // The leader cursor is already hub-safe (forward-only + windowed), so anchor the
+        // tank's resolution to it: search only the stretch of route from TANK_NEAREST_BACK
+        // behind the cursor to LEAD_DISTANCE + TANK_NEAREST_FWD_SLACK ahead — the band a
+        // correctly-leading tank can occupy, far shorter (in path length) than a wing
+        // loop, so a later hub pass can never win. The back margin preserves the halt's
+        // `ahead` detection (the tank must still resolve BEHIND the cursor when the
+        // leader has caught up to it).
+        constexpr float  TANK_NEAREST_BACK      = 15.0f;
+        constexpr float  TANK_NEAREST_FWD_SLACK = 20.0f;
 
         static float Dist3D(float ax, float ay, float az, float bx, float by, float bz)
         {
@@ -626,7 +643,7 @@ namespace WowPsParty
 
         // Per-tank lead distance (yds) — how far ahead ALONG the path we aim.
         // Sourced from the rotation-editor slider (party_loadout.lead_distance),
-        // default 15. Shadows the former file-scope 30y constant.
+        // default 10. Shadows the former file-scope 30y constant.
         float const LEAD_DISTANCE = float(WowPsParty::BotLeadDistance(bot->GetGUID()));
 
         // Find the leader's nearest waypoint (the "cursor") — FORWARD-ONLY and
@@ -727,14 +744,38 @@ namespace WowPsParty
         uint32 const botGuidLow = bot->GetGUID().GetCounter();
 
         // Tank's own nearest recorded node — its position ON the route. Used by the steer,
-        // halt, stall-blink and cliff-blink logic below.
-        uint32 tankNearest = 0;
-        float  tankNearD   = std::numeric_limits<float>::max();
-        for (uint32 i = 0; i < path.size(); ++i)
+        // halt, stall-blink and cliff-blink logic below. WINDOWED around the leader's
+        // (hub-safe) cursor rather than a global argmin, so in a hub dungeon it can't snap
+        // to a later pass stacked on the current one and skip a wing (see TANK_NEAREST_*).
+        uint32 tankNearest = nearestIdx;
         {
-            float const d = Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
-                                   path[i].x, path[i].y, path[i].z);
-            if (d < tankNearD) { tankNearD = d; tankNearest = i; }
+            // Backward bound: step back from the leader cursor by TANK_NEAREST_BACK yards.
+            uint32 lo = nearestIdx;
+            float back = 0.0f;
+            while (lo > 0 && back < TANK_NEAREST_BACK)
+            {
+                back += Dist3D(path[lo].x, path[lo].y, path[lo].z,
+                               path[lo - 1].x, path[lo - 1].y, path[lo - 1].z);
+                --lo;
+            }
+            // Forward bound: LEAD_DISTANCE (where a leading tank sits) plus slack, measured
+            // as path length AHEAD of the cursor. Nodes between lo and the cursor accumulate
+            // nothing, so the whole [lo, cursor] stretch is always searched.
+            float const fwdBudget = LEAD_DISTANCE + TANK_NEAREST_FWD_SLACK;
+            float  tankNearD = std::numeric_limits<float>::max();
+            float  fwd = 0.0f;
+            for (uint32 i = lo; i < path.size(); ++i)
+            {
+                if (i > nearestIdx)
+                {
+                    fwd += Dist3D(path[i - 1].x, path[i - 1].y, path[i - 1].z,
+                                  path[i].x, path[i].y, path[i].z);
+                    if (fwd > fwdBudget) break;
+                }
+                float const d = Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                                       path[i].x, path[i].y, path[i].z);
+                if (d < tankNearD) { tankNearD = d; tankNearest = i; }
+            }
         }
 
         // STEER NODE (Kevin's model): TRACE the recorded line — always head toward a node AHEAD
