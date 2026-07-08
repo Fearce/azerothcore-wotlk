@@ -502,7 +502,13 @@ void Loot::AddItem(LootStoreItem const& item)
         bool canSeeItemInLootWindow = false;
         if (auto player = ObjectAccessor::FindPlayer(lootOwnerGUID))
         {
-            if (auto group = player->GetGroup())
+            // Item-container loot (crates, lockboxes, …) is personal: SendLoot grants only the
+            // owner OWNER_PERMISSION, so a group-mate can never open it. Counting an item the
+            // owner can't take (e.g. a bind-on-pickup recipe they already know) just because a
+            // group-mate is eligible keeps unlootedCount above zero, so the emptied container is
+            // never destroyed. Evaluate owner-only when this loot belongs to an item container.
+            Group* group = containerGUID ? nullptr : player->GetGroup();
+            if (group)
             {
                 for (auto itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
                 {
