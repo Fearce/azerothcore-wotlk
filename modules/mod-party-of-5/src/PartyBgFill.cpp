@@ -1077,14 +1077,11 @@ public:
         if (!WowPsParty::IsEnabled() || !player || !player->GetSession()) return;
         if (sPlayerbotsMgr.GetPlayerbotAI(player)) return;   // a bot joined; only react to the human leader
 
-        // Fill for ANY companions-enabled human who queues — INCLUDING a solo player with
-        // zero henchmen (Kevin: "solo players should also get filled BGs"). Scoped to
-        // companions accounts (spawnCompanions, the same signal the entry hook uses, default
-        // on) so a real player who deliberately opted OUT of the bot-party system doesn't get
-        // their queue auto-filled. Bots were already excluded above.
-        if (!WowPsParty::GetAccountSettings(player->GetSession()->GetAccountId()).spawnCompanions)
-            return;
-
+        // Fill for ANY human who queues a BG — solo included, and NOT gated on
+        // spawnCompanions: Kevin plays in SOLO MODE (companions OFF) and still wants full
+        // bot-filled matches, since BGs never pop naturally on this low-pop server. (Bots
+        // were already excluded above; the delayed fire in the world tick lets any real
+        // players queue first before StartFill tops both teams to a full N-v-N.)
         uint32 const bgTypeId = PickQueuedBg(player);
         if (!bgTypeId) return;
 
@@ -1885,11 +1882,10 @@ public:
         if (!WowPsParty::IsEnabled() || !bg || !player || !player->GetSession()) return;
         if (sPlayerbotsMgr.GetPlayerbotAI(player)) return;   // a bot entered; only the human leader
         if (bg->isArena()) return;
-        // Track even with no heroes grouped YET — they may group after entry; the
-        // world tick brings them in once they're in the party. Scoped to managed
-        // (companions-enabled) accounts so we don't track unrelated real players.
-        if (!WowPsParty::GetAccountSettings(player->GetSession()->GetAccountId()).spawnCompanions)
-            return;
+        // Track even with no heroes grouped YET — they may group after entry; the world tick
+        // brings them in once they're in the party. Tracks any human (solo mode included) to
+        // match the queue-time hook — deliberately NOT gated on spawnCompanions, so a
+        // companions-OFF solo player still gets the entry-time top-up safety net.
         std::lock_guard<std::mutex> lk(g_mutex);
         g_activeLeaders[player->GetGUID().GetCounter()] = uint32(bg->GetBgTypeID());
     }
