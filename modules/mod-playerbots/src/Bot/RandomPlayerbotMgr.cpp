@@ -2593,7 +2593,9 @@ void RandomPlayerbotMgr::OnPlayerLogin(Player* player)
             PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
             if (botAI && member == player && (!botAI->GetMaster() || GET_PLAYERBOT_AI(botAI->GetMaster())))
             {
-                if (!bot->InBattleground())
+                // Never adopt a master from a battlefield war raid (Wintergrasp) — see
+                // PlayerbotAI::UpdateAIGroupMaster: it makes the whole zone follow one human.
+                if (!bot->InBattleground() && !group->isBFGroup())
                 {
                     botAI->SetMaster(player);
                     botAI->ResetStrategies();

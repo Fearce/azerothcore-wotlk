@@ -374,6 +374,10 @@ public:
     /// Define if player can interact with the relic
     void SetRelicInteractible(bool allow) { IsRelicInteractible = allow; }
 
+    /// Read-only battle-state access for scripts/modules (workshop control, wall/door states)
+    Workshop const& GetWorkshopsList() const { return WorkshopsList; }
+    GameObjectBuilding const& GetBuildingsInZone() const { return BuildingsInZone; }
+
     /// Vehicle world states update
     void UpdateCounterVehicle(bool init);
     void UpdateVehicleCountWG();

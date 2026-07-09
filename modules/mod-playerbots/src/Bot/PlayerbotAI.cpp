@@ -516,6 +516,12 @@ void PlayerbotAI::UpdateAIGroupMaster()
 
     if (!master || (masterBotAI && !masterBotAI->IsRealPlayer()))
     {
+        // A battlefield war raid (Wintergrasp) auto-groups the whole team with any real
+        // player in it — adopting that player as master made every fill bot in the zone
+        // anchor to them ("Hello, I follow you!" x30). Only a bot's own social/BG group
+        // may assign a master; battlefield groups never do.
+        if (group->isBFGroup())
+            return;
         Player* newMaster = FindNewMaster();
         if (newMaster)
         {
