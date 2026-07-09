@@ -343,7 +343,10 @@ namespace
         // an ally fill can only ever backfill the human's own match.
         std::vector<ObjectGuid> party;
         WowPsParty::GetPartyGuidsFor(human->GetGUID(), party);
-        uint32 const ownSide   = uint32(party.size());                       // human + heroes
+        // human + heroes. A solo player has no party directives (empty vector), so floor at
+        // 1: the human always holds one slot on their own side, else the ally side spawns
+        // one fill too many (11 on a 10-cap team).
+        uint32 const ownSide   = std::max<uint32>(uint32(party.size()), 1);  // human + heroes
         uint32 const allyNeed  = maxPerTeam > ownSide ? maxPerTeam - ownSide : 0;
         uint32 const enemyNeed = maxPerTeam;
 
@@ -1074,11 +1077,13 @@ public:
         if (!WowPsParty::IsEnabled() || !player || !player->GetSession()) return;
         if (sPlayerbotsMgr.GetPlayerbotAI(player)) return;   // a bot joined; only react to the human leader
 
-        // Only fill for a MANAGED party (a human running with heroes/henchmen) — not
-        // every incidental real player who queues.
-        std::vector<ObjectGuid> party;
-        WowPsParty::GetPartyGuidsFor(player->GetGUID(), party);
-        if (party.size() < 2) return;
+        // Fill for ANY companions-enabled human who queues — INCLUDING a solo player with
+        // zero henchmen (Kevin: "solo players should also get filled BGs"). Scoped to
+        // companions accounts (spawnCompanions, the same signal the entry hook uses, default
+        // on) so a real player who deliberately opted OUT of the bot-party system doesn't get
+        // their queue auto-filled. Bots were already excluded above.
+        if (!WowPsParty::GetAccountSettings(player->GetSession()->GetAccountId()).spawnCompanions)
+            return;
 
         uint32 const bgTypeId = PickQueuedBg(player);
         if (!bgTypeId) return;
