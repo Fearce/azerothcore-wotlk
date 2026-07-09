@@ -9,6 +9,7 @@
 #include "Bag.h"
 #include "Cell.h"
 #include "CellImpl.h"
+#include "Chat.h"            // ChatHandler — sys-message feedback for the on-demand "Cast X" command
 #include "Creature.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
@@ -3630,6 +3631,185 @@ namespace WowPsParty
             if (!bot->HasSpellCooldown(id)) return id;   // ready → use this one
         }
         return firstKnown;
+    }
+
+    // ---- on-demand "Cast <spell>" party-chat command -------------------------
+    // Backing helpers for HandleOnDemandCast (declared in PartyRotation.h).
+
+    // Classic Levenshtein edit distance between two (already-lowercased) strings,
+    // two-row rolling buffer. Backs the fuzzy spell-name fallback.
+    static int EditDistance(std::string const& a, std::string const& b)
+    {
+        size_t const n = a.size(), m = b.size();
+        if (!n) return int(m);
+        if (!m) return int(n);
+        std::vector<int> prev(m + 1), cur(m + 1);
+        for (size_t j = 0; j <= m; ++j) prev[j] = int(j);
+        for (size_t i = 1; i <= n; ++i)
+        {
+            cur[0] = int(i);
+            for (size_t j = 1; j <= m; ++j)
+            {
+                int const cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+                cur[j] = std::min({ prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost });
+            }
+            std::swap(prev, cur);
+        }
+        return prev[m];
+    }
+
+    // Similarity in [0,1] == 1 - edit_distance / longer_length. 1.0 == identical;
+    // "Portal: Ironforg" vs "Portal: Ironforge" scores ~0.94 (1 edit / 17).
+    static double NameSimilarity(std::string const& a, std::string const& b)
+    {
+        size_t const longer = std::max(a.size(), b.size());
+        if (!longer) return 1.0;
+        return 1.0 - double(EditDistance(a, b)) / double(longer);
+    }
+
+    static std::string ToLower(std::string const& s)
+    {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s) out.push_back(char(std::tolower(static_cast<unsigned char>(c))));
+        return out;
+    }
+
+    bool HandleOnDemandCast(Player* speaker, std::string const& message)
+    {
+        if (!speaker || !speaker->GetSession() || !IsEnabled()) return false;
+        // A bot's own chat never triggers the command — only a real human drives it.
+        if (sPlayerbotsMgr.GetPlayerbotAI(speaker)) return false;
+
+        // Require a leading "cast" token (case-insensitive), optionally "cast:",
+        // then whitespace before the spell name. "castle …" is NOT a command.
+        size_t i = message.find_first_not_of(" \t");
+        if (i == std::string::npos) return false;
+        static char const kWord[] = "cast";
+        size_t k = 0;
+        for (; k < 4 && i + k < message.size(); ++k)
+            if (std::tolower(static_cast<unsigned char>(message[i + k])) != kWord[k])
+                return false;
+        if (k < 4) return false;
+        size_t p = i + 4;
+        bool const sawColon = (p < message.size() && message[p] == ':');
+        if (sawColon) ++p;                                           // "cast:Heroism"
+        // A bare "cast" token must be followed by whitespace (so "castle"/"casting"
+        // aren't commands); a colon already delimits it, so "cast:Heroism" is fine.
+        if (!sawColon && (p >= message.size() ||
+                          (message[p] != ' ' && message[p] != '\t')))
+            return false;
+
+        size_t s = message.find_first_not_of(" \t", p);
+        if (s == std::string::npos) return false;
+        size_t e = message.find_last_not_of(" \t");
+        std::string requested = message.substr(s, e - s + 1);
+        // Strip wrapping quotes a macro might add.
+        if (requested.size() >= 2 &&
+            ((requested.front() == '"'  && requested.back() == '"') ||
+             (requested.front() == '\'' && requested.back() == '\'')))
+            requested = requested.substr(1, requested.size() - 2);
+        if (requested.empty()) return false;
+
+        // This leader's managed party bots (heroes + henchmen). GetPartyGuidsFor
+        // returns the in-memory directive roster (leader + followers) for OUR
+        // account only — a second human's bots are correctly out of scope.
+        std::vector<ObjectGuid> guids;
+        GetPartyGuidsFor(speaker->GetGUID(), guids);
+        std::vector<Player*> bots;
+        for (ObjectGuid const& g : guids)
+        {
+            if (g == speaker->GetGUID()) continue;
+            Player* b = ObjectAccessor::FindConnectedPlayer(g);
+            if (!b || !b->IsInWorld() || !b->IsAlive()) continue;
+            if (!sPlayerbotsMgr.GetPlayerbotAI(b)) continue;         // managed bot only
+            bots.push_back(b);
+        }
+        if (bots.empty()) return false;   // speaker leads no party bots — not for us
+
+        ChatHandler handler(speaker->GetSession());
+
+        // Pass 1 — exact name match (highest rank the bot knows).
+        Player* caster  = nullptr;
+        uint32  spellId = 0;
+        for (Player* b : bots)
+        {
+            uint32 const id = FindKnownSpellByName(b, requested);
+            if (id) { caster = b; spellId = id; break; }
+        }
+
+        // Pass 2 — fuzzy fallback: closest known spell name across the party at
+        // >90% similarity, then resolve to that name's highest known rank.
+        if (!spellId)
+        {
+            std::string const needle = ToLower(requested);
+            double bestScore = 0.0;
+            std::string bestName;
+            for (Player* b : bots)
+            {
+                for (auto const& kv : b->GetSpellMap())
+                {
+                    if (kv.second->State == PLAYERSPELL_REMOVED) continue;
+                    if (!kv.second->IsInSpec(b->GetActiveSpec())) continue;
+                    SpellInfo const* si = sSpellMgr->GetSpellInfo(kv.first);
+                    if (!si || !si->SpellName[0]) continue;
+                    // Cheap pre-filter: edit distance is at least the length gap, so a
+                    // name whose length differs by >10% can never clear the 0.90 bar —
+                    // skip the Levenshtein for most of the spellbook.
+                    size_t const nameLen = std::strlen(si->SpellName[0]);
+                    size_t const longer  = std::max(needle.size(), nameLen);
+                    size_t const gap     = needle.size() > nameLen
+                                             ? needle.size() - nameLen : nameLen - needle.size();
+                    if (double(gap) > 0.10 * double(longer)) continue;
+                    double const score = NameSimilarity(needle, ToLower(si->SpellName[0]));
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestName  = si->SpellName[0];
+                        caster    = b;
+                    }
+                }
+            }
+            if (bestScore >= 0.90 && caster && !bestName.empty())
+                spellId = FindKnownSpellByName(caster, bestName);
+            else
+                caster = nullptr;
+        }
+
+        if (!spellId || !caster)
+        {
+            handler.PSendSysMessage("No party member knows a spell like \"%s\".", requested.c_str());
+            return true;
+        }
+
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+        std::string const displayName =
+            (info && info->SpellName[0]) ? std::string(info->SpellName[0]) : requested;
+
+        // Target: a friendly single-target spell lands on the requester; area /
+        // self / portal spells (Heroism, Portal: X) self-cast; a hostile explicit-
+        // target spell uses the leader's current enemy selection.
+        Unit* target = caster;
+        if (info && info->NeedsExplicitUnitTarget())
+        {
+            if (info->IsPositive())
+                target = speaker;
+            else if (Unit* sel = speaker->GetSelectedUnit())
+                target = sel;
+        }
+        if (!target) target = caster;
+
+        // An on-demand request wins over whatever the bot is mid-casting.
+        if (caster->IsNonMeleeSpellCast(false, false, true))
+            caster->InterruptNonMeleeSpells(false);
+
+        SpellCastResult const r = caster->CastSpell(target, spellId, false);
+        if (r == SPELL_CAST_OK)
+            handler.PSendSysMessage("%s is casting %s.", caster->GetName().c_str(), displayName.c_str());
+        else
+            handler.PSendSysMessage("%s can't cast %s right now (result %u).",
+                                    caster->GetName().c_str(), displayName.c_str(), uint32(r));
+        return true;
     }
 
     // Is `u` already locked down by a CC, so a second CC would be wasted/overlapping?

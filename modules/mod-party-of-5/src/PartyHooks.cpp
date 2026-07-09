@@ -419,8 +419,34 @@ public:
         PLAYERHOOK_ON_LEARN_TAXI_NODE,
         PLAYERHOOK_ON_MAP_CHANGED,
         PLAYERHOOK_ON_REMOVE_FROM_BATTLEGROUND,
-        PLAYERHOOK_CAN_PLAYER_USE_PRIVATE_CHAT
+        PLAYERHOOK_CAN_PLAYER_USE_PRIVATE_CHAT,
+        PLAYERHOOK_ON_BEFORE_SEND_CHAT_MESSAGE
     }) { }
+
+    // On-demand "Cast <spell>" party command: a human leader typing e.g.
+    // "Cast Portal: Ironforge" or "Cast Heroism" in party/raid chat makes whichever
+    // of their party bots knows that spell cast it. Fires on the outgoing message
+    // (before it broadcasts, so the chat line still shows normally). Restricted to
+    // the GROUP channels — henchmen and heroes are always in the WoW group, so party/
+    // raid always reaches them, and /say is left out so a conversational "cast a wide
+    // net" can't false-trigger. LANG_ADDON is skipped so WPSP protocol traffic (which
+    // also rides these hooks) never touches the handler. All remaining guarding
+    // (human leader, managed party, spell resolution) lives in HandleOnDemandCast.
+    void OnPlayerBeforeSendChatMessage(Player* player, uint32& type, uint32& lang, std::string& msg) override
+    {
+        if (!WowPsParty::IsEnabled() || !player || lang == LANG_ADDON) return;
+        switch (type)
+        {
+            case CHAT_MSG_PARTY:
+            case CHAT_MSG_PARTY_LEADER:
+            case CHAT_MSG_RAID:
+            case CHAT_MSG_RAID_LEADER:
+                WowPsParty::HandleOnDemandCast(player, msg);
+                break;
+            default:
+                break;
+        }
+    }
 
     // Stop managed bots from whisper-spamming humans (Desouza got whispered by the Nisse
     // heroes in Naxx). Player::Whisper drops the whisper when this returns false.

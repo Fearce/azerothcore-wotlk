@@ -262,6 +262,18 @@ namespace WowPsParty
     // the bot's normal AI tick — our rule wins, normal AI still runs after for
     // positioning/follow.
     bool TickRotation(Player* bot);
+
+    // On-demand "Cast <spell>" party-chat command. When a human party leader
+    // types e.g. "Cast Portal: Ironforge" or "Cast Heroism" in party/raid chat,
+    // whichever of their party bots (hero OR henchman) actually knows that spell
+    // casts it — a macro-friendly way to pull portals / Heroism / buffs without a
+    // rotation rule. Matching is exact-first (case-insensitive, highest rank) with
+    // a >90%-similarity fuzzy fallback so a typo still resolves. Returns true if
+    // the message was a cast command (so the caller knows it was consumed);
+    // feedback (which bot cast, or "nobody knows it") is a sys-message to the
+    // speaker. A no-op when the module is disabled or the speaker isn't a human
+    // leading a managed party. Called from the OnPlayerBeforeSendChatMessage hook.
+    bool HandleOnDemandCast(Player* speaker, std::string const& message);
 }
 
 #endif
