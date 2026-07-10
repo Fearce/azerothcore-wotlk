@@ -80,6 +80,20 @@ void IsleStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
     triggers.push_back(new TriggerNode("in vehicle", { NextAction("glaive throw", ACTION_MOVE + 9.0f)}));
 }
 
+void StrandStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
+{
+    triggers.push_back(new TriggerNode("bg active", { NextAction("bg check flag", ACTION_MOVE)}));
+    // attackers board demolishers, defenders board the anti-personnel cannons; no
+    // random "leave vehicle" — SA vehicles are objectives, dismounts are explicit
+    // in BGTactics (relic run, stale cannon)
+    triggers.push_back(new TriggerNode("timer", { NextAction("enter vehicle", ACTION_MOVE + 8.0f)}));
+    // unit-target fallbacks while the positional shelling in BGTactics has no shot
+    triggers.push_back(new TriggerNode("in vehicle", { NextAction("hurl boulder", ACTION_MOVE + 9.0f)}));
+    triggers.push_back(new TriggerNode("in vehicle", { NextAction("ram", ACTION_MOVE + 9.0f)}));
+    triggers.push_back(new TriggerNode("in vehicle", { NextAction("rocket blast", ACTION_MOVE + 9.0f)}));
+    triggers.push_back(new TriggerNode("often", { NextAction("bg use buff", ACTION_BG)}));
+}
+
 void ArenaStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
 {
     triggers.push_back(

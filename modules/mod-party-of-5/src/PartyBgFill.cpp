@@ -75,6 +75,7 @@
 #include "WorldPacket.h"
 #include "WorldSession.h"
 
+#include "AiObjectContext.h"    // "bg role" roll for fill bots (BGTactics job split)
 #include "PlayerbotAI.h"
 #include "PlayerbotAIConfig.h"  // sPlayerbotAIConfig.randomBotJoinBG (the "bg" strategy gate)
 #include "PlayerbotFactory.h"   // re-level a pool fill bot to the BG bracket on spawn
@@ -597,51 +598,6 @@ namespace
     {
         Battleground* tpl = sBattlegroundMgr->GetBattlegroundTemplate(BattlegroundTypeId(bgTypeId));
         return tpl && !tpl->isArena() && tpl->GetMaxPlayersPerTeam() > 0;
-    }
-
-    // ===== Strand of the Ancients on-foot combat driver ====================
-    // mod-playerbots' BattleGroundTactics has cases for AB/AV/WS/EY/IC but NONE for SA — so
-    // our master-0 fill bots get the "+bg" strategy yet it no-ops in Strand and they stand
-    // COMPLETELY AFK (Kevin), handing the human a free win since the entire enemy team is
-    // fills. A full objective SA AI (attacker/defender roles + gate-breaking demolishers) is
-    // a Wintergrasp-scale follow-up: it needs a core-state exposure (BattlegroundSA::Attackers
-    // is private) and a live SA match to validate. Until then, drive a self-contained
-    // advance-and-engage so nobody is AFK: seek the nearest enemy player, march to intercept,
-    // and fight it. Symmetric — needs no knowledge of which side attacks — so both teams
-    // converge and brawl (attackers pressing the gates, defenders holding them). Modeled on
-    // the WG DriveAI foot loop below.
-    constexpr uint32 SOTA_ENGAGE_RANGE = 40;
-
-    void DriveSotaFill(Player* bot, Battleground* bg)
-    {
-        if (!bot->IsAlive()) return;                          // dead -> the BG's spirit-res handles it
-        if (bot->IsInCombat() && bot->GetVictim()) return;    // fighting -> the class combat AI owns it
-        if (bot->IsNonMeleeSpellCast(false, false, true)) return;
-        if (bot->GetVehicle()) return;                        // seated in a demolisher/cannon -> leave it
-
-        Unit* enemy = nullptr; float bestD = 1e9f;
-        for (auto const& itr : bg->GetPlayers())
-        {
-            Player* e = ObjectAccessor::FindConnectedPlayer(itr.first);
-            if (!e || e == bot || !e->IsAlive() || e->GetMapId() != bot->GetMapId()) continue;
-            if (!bot->IsValidAttackTarget(e)) continue;       // false during warmup / for same team
-            float const d = bot->GetDistance(e);
-            if (d < bestD) { bestD = d; enemy = e; }
-        }
-        if (!enemy) return;                                   // no live enemy yet (warmup) -> stand put
-
-        if (bestD <= float(SOTA_ENGAGE_RANGE))
-        {
-            if (bot->GetVictim() != enemy)
-            { bot->Attack(enemy, true); bot->GetMotionMaster()->MoveChase(enemy); }
-            else if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
-                bot->GetMotionMaster()->MoveChase(enemy);
-            return;
-        }
-        // Too far to engage -> march to intercept. Re-issue only when stopped; the 1s tick
-        // keeps it walking toward a moving front without spamming MovePoint every tick.
-        if (!bot->isMoving())
-            bot->GetMotionMaster()->MovePoint(0, enemy->GetPositionX(), enemy->GetPositionY(), enemy->GetPositionZ());
     }
 
     // The (non-arena) battleground the human just queued — INCLUDING Random BG. We
@@ -1181,12 +1137,14 @@ public:
                 if (sPlayerbotAIConfig.randomBotJoinBG)
                     if (PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot))
                         if (!ai->HasStrategy("bg", BOT_STATE_NON_COMBAT))
+                        {
                             ai->ChangeStrategy("+bg", BOT_STATE_NON_COMBAT);
-                // Strand of the Ancients has no mod-playerbots tactics, so the "+bg" strategy
-                // above no-ops and the fill stands AFK — drive it on foot ourselves instead.
-                if (Battleground* fbg = bot->GetBattleground())
-                    if (fbg->GetBgTypeID() == BATTLEGROUND_SA)
-                        DriveSotaFill(bot, fbg);
+                            // BGTactics splits jobs by "bg role" (0-9). Bots that accept the
+                            // pop themselves roll it in BGStatusAction, but fill bots accept
+                            // via AcceptBgInvite and would all stay role 0 — same objective,
+                            // no flank split — without this roll.
+                            ai->GetAiObjectContext()->GetValue<uint32>("bg role")->Set(urand(0, 9));
+                        }
                 // Remember it made it in, so when the match ENDS (below) we retire it from
                 // HERE — never from the BG-removal hook, where a synchronous LogoutPlayer
                 // mid-teardown (×10-40 bots on a BG end) is a crash risk.

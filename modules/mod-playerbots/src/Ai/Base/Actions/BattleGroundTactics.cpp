@@ -26,6 +26,7 @@
 #include "Event.h"
 #include "GameObject.h"
 #include "IVMapMgr.h"
+#include "ObjectAccessor.h"
 #include "PathGenerator.h"
 #include "Playerbots.h"
 #include "PositionValue.h"
@@ -106,6 +107,42 @@ Position const IC_CANNON_POS_ALLIANCE2 = {425.525f, -779.538f, 87.717f, 5.88f};
 Position const IC_GATE_ATTACK_POS_HORDE = {506.782f, -828.594f, 24.313f, 0.0f};
 Position const IC_GATE_ATTACK_POS_ALLIANCE = {1091.273f, -763.619f, 42.352f, 0.0f};
 
+// Strand of the Ancients. Attackers land on the eastern beach (x ~1600) and push
+// WEST through the gate chain to the Titan Relic (x ~837): Green/Blue (beach line)
+// -> Purple/Red (either unlocks once ANY beach gate falls) -> Yellow -> Chamber of
+// Ancients. All positions derive from the core's own spawn tables in BattlegroundSA.h.
+enum SABotVehicleSpells
+{
+    SA_SPELL_HURL_BOULDER = 52338,  // demolisher, creature_template_spell 28781
+    SA_SPELL_RAM          = 60206,  // demolisher
+    SA_SPELL_ROCKET_BLAST = 49872,  // anti-personnel cannon, creature_template_spell 27894
+};
+
+// where the core drops attackers who join after the ships landed — the disembark point
+Position const SA_BEACH_LANDING = {1600.381f, -106.263f, 8.8745f, 3.78f};
+
+// stand-off spot on the attacker side of each gate (indexed by BG_SA_Objects gate id):
+// demolisher drivers park here to shell the gate, the foot escort brawls here
+Position const SA_GATE_ATTACK_POS[6] = {
+    {1429.7f, 112.2f, 24.1f, 0.0f},    // green
+    {1064.9f, -124.2f, 78.1f, 0.0f},   // yellow
+    {1423.6f, -202.2f, 27.4f, 0.0f},   // blue
+    {1227.1f, -194.4f, 51.6f, 0.0f},   // red
+    {1231.3f, 90.3f, 49.7f, 0.0f},     // purple
+    {902.0f, -108.0f, 114.0f, 0.0f},   // ancient
+};
+
+// defender rally point on the keep side of each gate: the core's own defender-portal
+// destinations (SOTADefPortalDest) for gates 0-4, hand-picked for the Chamber
+Position const SA_GATE_DEFEND_POS[6] = {
+    {1388.94f, 103.067f, 34.49f, 0.0f},    // green
+    {1043.69f, -87.95f, 87.12f, 0.0f},     // yellow
+    {1441.04f, -240.974f, 35.264f, 0.0f},  // blue
+    {1228.34f, -235.234f, 60.03f, 0.0f},   // red
+    {1193.86f, 69.9f, 58.046f, 0.0f},      // purple
+    {855.0f, -107.8f, 121.5f, 0.0f},       // ancient (between gate and relic platform)
+};
+
 enum BattleBotWsgWaitSpot
 {
     BB_WSG_WAIT_SPOT_SPAWN,
@@ -172,6 +209,14 @@ std::vector<uint32> const vFlagsIC = {GO_HORDE_BANNER,
                                       GO_ALLIANCE_BANNER_GRAVEYARD_H_CONT,
                                       GO_HORDE_BANNER_GRAVEYARD_H,
                                       GO_HORDE_BANNER_GRAVEYARD_H_CONT};
+
+// SA graveyard flags (both faction versions — capture swaps the entry) + the Titan Relic
+std::vector<uint32> const vFlagsSA = {
+    191305, 191306,  // east/right graveyard flag (horde/alliance)
+    191307, 191308,  // west/left graveyard flag
+    191309, 191310,  // central graveyard flag
+    192834,          // Titan Relic — clicking it wins the round
+};
 
 // BG Waypoints (vmangos)
 
@@ -1204,6 +1249,104 @@ std::vector<BattleBotPath*> const vPaths_NoReverseAllowed = {
     &vPath_IC_Docks_Graveyard_to_Docks_Flag,
 };
 
+// Strand of the Ancients attacker routes (beach -> gate chain -> relic). Paths
+// crossing a gate are only ever selected once the objective logic targets a point
+// beyond it, i.e. after that gate is destroyed (mmaps don't know gate collision,
+// so routing through a standing gate would grind bots against the door).
+BattleBotPath vPath_SA_Beach_to_GreenGate = {
+    {1600.4f, -106.3f, 8.9f, nullptr},  {1602.6f, -60.0f, 8.6f, nullptr},  {1605.0f, -10.0f, 7.6f, nullptr},
+    {1600.0f, 40.0f, 6.8f, nullptr},    {1580.0f, 80.0f, 4.4f, nullptr},   {1540.0f, 97.0f, 9.6f, nullptr},
+    {1500.0f, 104.0f, 16.2f, nullptr},  {1460.0f, 108.0f, 21.8f, nullptr}, {1429.7f, 112.2f, 24.1f, nullptr},
+};
+
+BattleBotPath vPath_SA_Beach_to_BlueGate = {
+    {1600.4f, -106.3f, 8.9f, nullptr},  {1585.0f, -140.0f, 6.5f, nullptr},  {1560.0f, -168.0f, 6.0f, nullptr},
+    {1520.0f, -185.0f, 11.7f, nullptr}, {1480.0f, -196.0f, 18.9f, nullptr}, {1450.0f, -200.0f, 24.4f, nullptr},
+    {1423.6f, -202.2f, 27.4f, nullptr},
+};
+
+BattleBotPath vPath_SA_GreenGate_to_WestGY = {
+    {1429.7f, 112.2f, 24.1f, nullptr}, {1411.6f, 108.2f, 28.7f, nullptr}, {1381.0f, 92.0f, 30.5f, nullptr},
+    {1350.0f, 62.0f, 30.6f, nullptr},  {1330.0f, 35.0f, 30.7f, nullptr},  {1309.1f, 9.4f, 30.9f, nullptr},
+};
+
+BattleBotPath vPath_SA_BlueGate_to_EastGY = {
+    {1423.6f, -202.2f, 27.4f, nullptr}, {1431.3f, -219.4f, 30.9f, nullptr}, {1400.0f, -207.0f, 31.5f, nullptr},
+    {1370.0f, -185.0f, 30.9f, nullptr}, {1338.9f, -153.3f, 30.9f, nullptr},
+};
+
+BattleBotPath vPath_SA_WestGY_to_PurpleGate = {
+    {1309.1f, 9.4f, 30.9f, nullptr},  {1288.0f, 35.0f, 34.0f, nullptr}, {1264.0f, 58.0f, 40.5f, nullptr},
+    {1244.0f, 76.0f, 46.5f, nullptr}, {1231.3f, 90.3f, 49.7f, nullptr},
+};
+
+BattleBotPath vPath_SA_EastGY_to_RedGate = {
+    {1338.9f, -153.3f, 30.9f, nullptr}, {1308.0f, -167.0f, 35.0f, nullptr}, {1279.0f, -180.0f, 41.5f, nullptr},
+    {1251.0f, -189.0f, 47.5f, nullptr}, {1227.1f, -194.4f, 51.6f, nullptr},
+};
+
+BattleBotPath vPath_SA_PurpleGate_to_CentralGY = {
+    {1231.3f, 90.3f, 49.7f, nullptr}, {1214.7f, 81.2f, 53.4f, nullptr}, {1206.0f, 40.0f, 61.0f, nullptr},
+    {1209.0f, -10.0f, 66.5f, nullptr}, {1215.1f, -65.7f, 70.1f, nullptr},
+};
+
+BattleBotPath vPath_SA_RedGate_to_CentralGY = {
+    {1227.1f, -194.4f, 51.6f, nullptr}, {1227.7f, -212.6f, 55.4f, nullptr}, {1220.0f, -160.0f, 62.0f, nullptr},
+    {1216.0f, -110.0f, 67.5f, nullptr}, {1215.1f, -65.7f, 70.1f, nullptr},
+};
+
+BattleBotPath vPath_SA_CentralGY_to_YellowGate = {
+    {1215.1f, -65.7f, 70.1f, nullptr}, {1180.0f, -90.0f, 72.0f, nullptr}, {1140.0f, -105.0f, 74.5f, nullptr},
+    {1100.0f, -115.0f, 76.5f, nullptr}, {1064.9f, -124.2f, 78.1f, nullptr},
+};
+
+BattleBotPath vPath_SA_YellowGate_to_Chamber = {
+    {1064.9f, -124.2f, 78.1f, nullptr}, {1055.5f, -108.1f, 82.1f, nullptr}, {1030.0f, -108.0f, 86.0f, nullptr},
+    {990.0f, -108.0f, 94.0f, nullptr},  {950.0f, -108.0f, 103.0f, nullptr}, {902.0f, -108.0f, 114.0f, nullptr},
+};
+
+BattleBotPath vPath_SA_Chamber_to_Relic = {
+    {902.0f, -108.0f, 114.0f, nullptr}, {878.6f, -108.2f, 117.8f, nullptr}, {855.0f, -107.8f, 121.5f, nullptr},
+    {837.1f, -107.5f, 127.0f, nullptr},
+};
+
+std::vector<BattleBotPath*> const vPaths_SA = {
+    &vPath_SA_Beach_to_GreenGate,     &vPath_SA_Beach_to_BlueGate,     &vPath_SA_GreenGate_to_WestGY,
+    &vPath_SA_BlueGate_to_EastGY,     &vPath_SA_WestGY_to_PurpleGate,  &vPath_SA_EastGY_to_RedGate,
+    &vPath_SA_PurpleGate_to_CentralGY, &vPath_SA_RedGate_to_CentralGY, &vPath_SA_CentralGY_to_YellowGate,
+    &vPath_SA_YellowGate_to_Chamber,  &vPath_SA_Chamber_to_Relic,
+};
+
+// The next gate the attack should hit: the deepest line the attackers can currently
+// damage. The second line (purple/red) unlocks once EITHER beach gate falls (core rule
+// in BattlegroundSA::EventPlayerDamagedGO), yellow after purple|red, the Chamber after
+// yellow. A DAMAGED gate pulls everyone (it's the one being hit); same-depth pairs
+// split by role parity so both flanks see action. Returns BG_SA_TITAN_RELIC once the
+// Chamber is breached.
+static uint32 SA_PickTargetGate(BattlegroundSA* saBg, uint32 role)
+{
+    auto open = [saBg](uint32 g) { return saBg->GetGateState(g) == BG_SA_GATE_DESTROYED; };
+
+    if (open(BG_SA_YELLOW_GATE))
+        return open(BG_SA_ANCIENT_GATE) ? BG_SA_TITAN_RELIC : BG_SA_ANCIENT_GATE;
+
+    std::vector<uint32> line;
+    if (open(BG_SA_GREEN_GATE) || open(BG_SA_BLUE_GATE))
+    {
+        if (open(BG_SA_PURPLE_GATE) || open(BG_SA_RED_GATE))
+            return BG_SA_YELLOW_GATE;
+        line = {BG_SA_PURPLE_GATE, BG_SA_RED_GATE};
+    }
+    else
+        line = {BG_SA_GREEN_GATE, BG_SA_BLUE_GATE};
+
+    for (uint32 g : line)
+        if (saBg->GetGateState(g) == BG_SA_GATE_DAMAGED)
+            return g;
+
+    return line[role % 2];
+}
+
 static std::vector<std::pair<uint8, uint32>> AV_AttackObjectives_Horde = {
     // Attack - these are in order they should be attacked
     {BG_AV_NODES_STONEHEART_GRAVE, BG_AV_OBJECT_FLAG_A_STONEHEART_GRAVE},
@@ -1554,6 +1697,125 @@ bool BGTactics::eyJumpDown()
     return false;
 }
 
+// SA attackers start each round on the boats: hold still while at sea (pathing off a
+// transport is impossible), then hop off at the shore the moment the round is live —
+// the same spot the core teleports late joiners to once the ships have landed.
+bool BGTactics::saBoatHold()
+{
+    Battleground* bg = bot->GetBattleground();
+    if (!bg)
+        return false;
+
+    BattlegroundSA* saBg = static_cast<BattlegroundSA*>(bg);
+    if (bot->GetTeamId() != saBg->GetAttackerTeam())
+        return false;
+
+    bool const roundActive = saBg->GetSAStatus() == BG_SA_ROUND_ONE || saBg->GetSAStatus() == BG_SA_ROUND_TWO;
+    if (bot->GetTransport())
+    {
+        if (!roundActive)
+            return true;  // boat still sailing — sit tight
+
+        if (!bot->IsBeingTeleported())
+        {
+            bot->TeleportTo(bg->GetMapId(), SA_BEACH_LANDING.GetPositionX() + frand(-3.0f, 3.0f),
+                            SA_BEACH_LANDING.GetPositionY() + frand(-3.0f, 3.0f), SA_BEACH_LANDING.GetPositionZ(),
+                            SA_BEACH_LANDING.GetOrientation());
+            LOG_INFO("playerbots", "[SA] {} disembarks at the beach", bot->GetName());
+        }
+        return true;
+    }
+
+    return !roundActive;  // ashore during a warmup (round-two reset): hold position
+}
+
+// A parked demolisher shells the contested gate; a manned cannon shells whatever is
+// pushing the front. Fired from the move-to-objective tick so it keeps shooting for
+// as long as the bot holds its spot (spell cooldowns pace the rate).
+bool BGTactics::saVehicleShoot()
+{
+    if (!botAI->IsInVehicle(false, true))  // needs a gun seat
+        return false;
+
+    Battleground* bg = bot->GetBattleground();
+    if (!bg)
+        return false;
+
+    BattlegroundSA* saBg = static_cast<BattlegroundSA*>(bg);
+    Unit* vehicleBase = bot->GetVehicleBase();
+    if (!vehicleBase || !vehicleBase->IsAlive())
+        return false;
+
+    if (bot->GetTeamId() == saBg->GetAttackerTeam())
+    {
+        if (vehicleBase->GetEntry() != NPC_DEMOLISHER_SA || vehicleBase->isMoving())
+            return false;
+
+        uint32 const targetGate = SA_PickTargetGate(saBg, context->GetValue<uint32>("bg role")->Get());
+        if (targetGate == BG_SA_TITAN_RELIC)
+            return false;  // chamber breached — objective logic parks and dismounts
+
+        GameObject* gate = bg->GetBGObject(targetGate);
+        if (!gate)
+            return false;
+
+        float const dist = vehicleBase->GetDistance2d(gate->GetPositionX(), gate->GetPositionY());
+        if (dist > 60.0f)
+            return false;
+
+        if (botAI->CastVehicleSpell(SA_SPELL_HURL_BOULDER, gate->GetPositionX(), gate->GetPositionY(),
+                                    gate->GetPositionZ()))
+            return true;
+
+        return dist < 20.0f && botAI->CastVehicleSpell(SA_SPELL_RAM, gate->GetPositionX(), gate->GetPositionY(),
+                                                       gate->GetPositionZ());
+    }
+
+    // defender cannon: enemy players first (they take graveyards and click the relic),
+    // then any manned demolisher in range
+    if (vehicleBase->GetEntry() != NPC_ANTI_PERSONNAL_CANNON)
+        return false;
+
+    Unit* target = nullptr;
+    float best = 70.0f;
+    for (auto const& itr : bg->GetPlayers())
+    {
+        Player* player = ObjectAccessor::FindConnectedPlayer(itr.first);
+        if (!player || !player->IsAlive() || player->GetTeamId() != saBg->GetAttackerTeam())
+            continue;
+        if (player->GetVehicle())
+            continue;  // riders die with the demolisher below
+        float const d = vehicleBase->GetDistance2d(player);
+        if (d < best)
+        {
+            best = d;
+            target = player;
+        }
+    }
+    if (!target)
+    {
+        std::list<Creature*> demolishers;
+        vehicleBase->GetCreatureListWithEntryInGrid(demolishers, NPC_DEMOLISHER_SA, 70.0f);
+        for (Creature* demolisher : demolishers)
+        {
+            if (!demolisher->IsAlive() || !demolisher->GetVehicleKit() ||
+                !demolisher->GetVehicleKit()->IsVehicleInUse())
+                continue;
+            float const d = vehicleBase->GetDistance2d(demolisher);
+            if (d < best)
+            {
+                best = d;
+                target = demolisher;
+            }
+        }
+    }
+    if (!target)
+        return false;
+
+    return botAI->CastVehicleSpell(SA_SPELL_ROCKET_BLAST, target->GetPositionX(), target->GetPositionY(),
+                                   target->GetPositionZ());
+}
+
 //
 // actual bg tactics below
 //
@@ -1617,6 +1879,12 @@ bool BGTactics::Execute(Event /*event*/)
             vFlagIds = &vFlagsIC;
             break;
         }
+        case BATTLEGROUND_SA:
+        {
+            vPaths = &vPaths_SA;
+            vFlagIds = &vFlagsSA;
+            break;
+        }
         default:
             // can't use this in this BG - no vPaths/vFlagIds (will crash server)
             botAI->ResetStrategies();
@@ -1674,6 +1942,15 @@ bool BGTactics::Execute(Event /*event*/)
 
         if (vFlagIds && atFlag(*vPaths, *vFlagIds))
             return true;
+
+        if (bgType == BATTLEGROUND_SA)
+        {
+            if (saBoatHold())       // attackers at sea: ride it out / hop off at the shore
+                return true;
+
+            if (saVehicleShoot())   // parked demolisher or manned cannon with a shot: take it
+                return true;
+        }
 
         if (useBuff())
             return true;
@@ -1834,6 +2111,13 @@ bool BGTactics::moveToStart(bool force)
                        IC_WAITING_POS_ALLIANCE.GetPositionY() + frand(-5.0f, 5.0f),
                        IC_WAITING_POS_ALLIANCE.GetPositionZ());
         }
+    }
+    else if (bgType == BATTLEGROUND_SA)
+    {
+        // attackers ride the boats in, defenders hover at the keep portal pads until the
+        // round starts (they can't walk to the beach gates — the courtyards are sealed
+        // until a gate falls, real defenders take the portals; selectObjective mirrors
+        // that with a portal-style teleport once the round is live)
     }
 
     return true;
@@ -3167,6 +3451,221 @@ bool BGTactics::selectObjective(bool reset)
             }
             break;
         }
+        case BATTLEGROUND_SA:
+        {
+            BattlegroundSA* saBg = (BattlegroundSA*)bg;
+
+            uint32 const role = context->GetValue<uint32>("bg role")->Get();
+            bool const isAttacker = bot->GetTeamId() == saBg->GetAttackerTeam();
+            bool const roundActive =
+                saBg->GetSAStatus() == BG_SA_ROUND_ONE || saBg->GetSAStatus() == BG_SA_ROUND_TWO;
+            bool const controlsVehicle = botAI->IsInVehicle(true);
+            bool const gunSeat = botAI->IsInVehicle(false, true);
+
+            // passenger without a gun: nothing to decide
+            if (botAI->IsInVehicle() && !controlsVehicle && !gunSeat)
+                return false;
+
+            uint32 const targetGate = SA_PickTargetGate(saBg, role);
+
+            if (isAttacker)
+            {
+                // still at sea (or between rounds): saBoatHold handles it
+                if (!roundActive || bot->GetTransport())
+                    return false;
+
+                if (controlsVehicle)  // demolisher driver
+                {
+                    Unit* vehicleBase = bot->GetVehicleBase();
+                    if (!vehicleBase)
+                        return false;
+                    // a control seat without CAN_CAST would silently turn the whole
+                    // siege into a no-op — surface it (only fires if seat flags are off)
+                    if (!gunSeat && vehicleBase->GetEntry() == NPC_DEMOLISHER_SA)
+                        LOG_INFO("playerbots",
+                                 "[SA] {}'s demolisher seat can't cast — gate shelling will no-op (check vehicle seat flags)",
+                                 bot->GetName());
+                    if (targetGate == BG_SA_TITAN_RELIC)
+                    {
+                        // Chamber breached — park and claim the relic on foot
+                        if (GameObject* relic = bg->GetBGObject(BG_SA_TITAN_RELIC))
+                        {
+                            if (vehicleBase->GetDistance2d(relic->GetPositionX(), relic->GetPositionY()) < 60.0f)
+                            {
+                                bot->ExitVehicle();
+                                LOG_INFO("playerbots", "[SA] {} leaves the demolisher to claim the relic",
+                                         bot->GetName());
+                                pos.Set(relic->GetPositionX(), relic->GetPositionY(), relic->GetPositionZ(),
+                                        bot->GetMapId());
+                            }
+                            else
+                            {
+                                Position const& drive = SA_GATE_ATTACK_POS[BG_SA_ANCIENT_GATE];
+                                pos.Set(drive.GetPositionX(), drive.GetPositionY(), drive.GetPositionZ(),
+                                        bot->GetMapId());
+                            }
+                            posMap["bg objective"] = pos;
+                            return true;
+                        }
+                        return false;
+                    }
+
+                    if (GameObject* gate = bg->GetBGObject(targetGate))
+                    {
+                        // keep the siege position fresh — vehicle spells aim at it
+                        PositionInfo siegePos = context->GetValue<PositionMap&>("position")->Get()["bg siege"];
+                        siegePos.Set(gate->GetPositionX(), gate->GetPositionY(), gate->GetPositionZ(),
+                                     bot->GetMapId());
+                        posMap["bg siege"] = siegePos;
+
+                        // park at the stand-off spot; saVehicleShoot does the shelling
+                        Position const& park = SA_GATE_ATTACK_POS[targetGate];
+                        if (vehicleBase->GetDistance2d(park.GetPositionX(), park.GetPositionY()) < 10.0f)
+                            pos.Set(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), bot->GetMapId());
+                        else
+                            pos.Set(park.GetPositionX() + frand(-5.0f, 5.0f), park.GetPositionY() + frand(-5.0f, 5.0f),
+                                    park.GetPositionZ(), bot->GetMapId());
+                        posMap["bg objective"] = pos;
+                        return true;
+                    }
+                    return false;
+                }
+
+                // on foot. Chamber breached -> everyone races the relic (atFlag clicks it)
+                if (targetGate == BG_SA_TITAN_RELIC)
+                {
+                    if (GameObject* relic = bg->GetBGObject(BG_SA_TITAN_RELIC))
+                        BgObjective = relic;
+                }
+
+                // graveyard runners: taking a flag moves our spawn up AND spawns fresh
+                // demolishers at the factory next to it
+                if (!BgObjective && role < 4)
+                {
+                    bool const beachLineOpen = saBg->GetGateState(BG_SA_GREEN_GATE) == BG_SA_GATE_DESTROYED ||
+                                               saBg->GetGateState(BG_SA_BLUE_GATE) == BG_SA_GATE_DESTROYED;
+                    bool const secondLineOpen = saBg->GetGateState(BG_SA_PURPLE_GATE) == BG_SA_GATE_DESTROYED ||
+                                                saBg->GetGateState(BG_SA_RED_GATE) == BG_SA_GATE_DESTROYED;
+                    static std::pair<uint32, uint32> const saGyFlags[] = {
+                        {BG_SA_LEFT_FLAG, BG_SA_LEFT_CAPTURABLE_GY},
+                        {BG_SA_RIGHT_FLAG, BG_SA_RIGHT_CAPTURABLE_GY},
+                        {BG_SA_CENTRAL_FLAG, BG_SA_CENTRAL_CAPTURABLE_GY},
+                    };
+                    float bestDist = FLT_MAX;
+                    for (auto const& [flagIdx, gyIdx] : saGyFlags)
+                    {
+                        if (saBg->GetGraveyardTeam(gyIdx) == bot->GetTeamId())
+                            continue;  // already ours
+                        // mirror BattlegroundSA::CanInteractWithObject's gate gating
+                        if (!beachLineOpen || (flagIdx == BG_SA_CENTRAL_FLAG && !secondLineOpen))
+                            continue;
+                        if (GameObject* go = bg->GetBGObject(flagIdx))
+                        {
+                            float const d = bot->GetDistance(go);
+                            if (d < bestDist)
+                            {
+                                bestDist = d;
+                                BgObjective = go;
+                            }
+                        }
+                    }
+                }
+
+                // everyone else escorts the siege: brawl at the contested gate
+                if (!BgObjective)
+                {
+                    uint32 const frontGate =
+                        targetGate == BG_SA_TITAN_RELIC ? BG_SA_ANCIENT_GATE : targetGate;
+                    Position const& front = SA_GATE_ATTACK_POS[frontGate];
+                    if (bot->GetDistance(front) < 10.0f)
+                        pos.Set(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), bot->GetMapId());
+                    else
+                        pos.Set(front.GetPositionX() + frand(-6.0f, 6.0f), front.GetPositionY() + frand(-6.0f, 6.0f),
+                                front.GetPositionZ(), bot->GetMapId());
+                    posMap["bg objective"] = pos;
+                    return true;
+                }
+            }
+            else  // defender
+            {
+                uint32 const defendGate = targetGate == BG_SA_TITAN_RELIC ? BG_SA_ANCIENT_GATE : targetGate;
+                Position const& post = SA_GATE_DEFEND_POS[defendGate];
+
+                if (gunSeat)  // manning an anti-personnel cannon
+                {
+                    Unit* vehicleBase = bot->GetVehicleBase();
+                    // the front moved away from this cannon: hop out and re-rally
+                    if (vehicleBase &&
+                        vehicleBase->GetDistance2d(post.GetPositionX(), post.GetPositionY()) > 70.0f)
+                    {
+                        bot->ExitVehicle();
+                        LOG_INFO("playerbots", "[SA] {} abandons a stale cannon to re-rally", bot->GetName());
+                    }
+                    else
+                        return false;  // hold the gun; saVehicleShoot does the firing
+                }
+
+                // defenders can't walk to a beach-line post while the courtyards are
+                // sealed — real defenders take the keep portals, whose destinations are
+                // exactly these posts. Mirror that with a teleport when out of range.
+                if (bot->GetDistance2d(post.GetPositionX(), post.GetPositionY()) > 120.0f)
+                {
+                    if (bot->IsAlive() && !bot->IsInCombat() && !bot->IsBeingTeleported() && !bot->GetVehicle())
+                    {
+                        bot->TeleportTo(bg->GetMapId(), post.GetPositionX() + frand(-4.0f, 4.0f),
+                                        post.GetPositionY() + frand(-4.0f, 4.0f), post.GetPositionZ(),
+                                        post.GetOrientation());
+                        LOG_INFO("playerbots", "[SA] {} takes the defender portal to gate {}", bot->GetName(),
+                                 defendGate);
+                    }
+                    return true;
+                }
+
+                // a manned enemy demolisher pushing our line outranks standing around
+                std::list<Creature*> demolishers;
+                bot->GetCreatureListWithEntryInGrid(demolishers, NPC_DEMOLISHER_SA, 150.0f);
+                Creature* threat = nullptr;
+                float bestDist = FLT_MAX;
+                for (Creature* demolisher : demolishers)
+                {
+                    if (!demolisher->IsAlive() || !demolisher->GetVehicleKit() ||
+                        !demolisher->GetVehicleKit()->IsVehicleInUse())
+                        continue;
+                    float const d = demolisher->GetDistance2d(post.GetPositionX(), post.GetPositionY());
+                    if (d < 125.0f && d < bestDist)
+                    {
+                        bestDist = d;
+                        threat = demolisher;
+                    }
+                }
+                if (threat)
+                {
+                    if (bot->GetVictim() != threat)
+                        bot->Attack(threat, true);
+                    pos.Set(threat->GetPositionX(), threat->GetPositionY(), threat->GetPositionZ(), bot->GetMapId());
+                    posMap["bg objective"] = pos;
+                    return true;
+                }
+
+                // hold the line (nearby cannons get manned via the enter-vehicle trigger)
+                if (bot->GetDistance(post) < 10.0f)
+                    pos.Set(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), bot->GetMapId());
+                else
+                    pos.Set(post.GetPositionX() + frand(-6.0f, 6.0f), post.GetPositionY() + frand(-6.0f, 6.0f),
+                            post.GetPositionZ(), bot->GetMapId());
+                posMap["bg objective"] = pos;
+                return true;
+            }
+
+            if (BgObjective)
+            {
+                pos.Set(BgObjective->GetPositionX(), BgObjective->GetPositionY(), BgObjective->GetPositionZ(),
+                        bot->GetMapId());
+                posMap["bg objective"] = pos;
+                return true;
+            }
+            break;
+        }
         default:
             break;
     }
@@ -3611,6 +4110,19 @@ bool BGTactics::atFlag(std::vector<BattleBotPath*> const& vPaths, std::vector<ui
             flagRange = 25.0f;
             break;
         }
+        case BATTLEGROUND_SA:
+        {
+            // graveyard flags and the relic are attacker-side clicks only, and a
+            // demolisher driver mustn't derail its siege run to chase a flag
+            BattlegroundSA* saBg = static_cast<BattlegroundSA*>(bg);
+            if (bot->GetTeamId() != saBg->GetAttackerTeam() || bot->GetVehicle())
+                return false;
+
+            closeObjects = *context->GetValue<GuidVector>("nearest game objects no los");
+            closePlayers = *context->GetValue<GuidVector>("closest friendly players");
+            flagRange = 25.0f;
+            break;
+        }
         default:
             break;
     }
@@ -3865,6 +4377,34 @@ bool BGTactics::atFlag(std::vector<BattleBotPath*> const& vPaths, std::vector<ui
 
                 resetObjective();
                 return true;
+            }
+            case BATTLEGROUND_SA:
+            {
+                if (dist < INTERACTION_DISTANCE)
+                {
+                    if (bot->IsMounted())
+                        bot->RemoveAurasByType(SPELL_AURA_MOUNTED);
+
+                    if (bot->IsInDisallowedMountForm())
+                        bot->RemoveAurasByType(SPELL_AURA_MOD_SHAPESHIFT);
+
+                    // graveyard flag or the Titan Relic — both are plain GO uses
+                    // (EventPlayerClickedOnFlag / EventPlayerUsedGO revalidate server-side)
+                    WorldPacket data(CMSG_GAMEOBJ_USE);
+                    data << go->GetGUID();
+                    bot->GetSession()->HandleGameObjectUseOpcode(data);
+
+                    LOG_INFO("playerbots", "[SA] {} uses {} (entry {})", bot->GetName(),
+                             go->GetGOInfo() ? go->GetGOInfo()->name : "object", go->GetEntry());
+
+                    resetObjective();
+                    return true;
+                }
+                else
+                {
+                    // Move to flag if not in range
+                    return MoveTo(bot->GetMapId(), go->GetPositionX(), go->GetPositionY(), go->GetPositionZ());
+                }
             }
             case BATTLEGROUND_WS:
             {

@@ -106,6 +106,7 @@ public:
         creators["arathi"] = &StrategyContext::arathi;
         creators["eye"] = &StrategyContext::eye;
         creators["isle"] = &StrategyContext::isle;
+        creators["strand"] = &StrategyContext::strand;
         creators["arena"] = &StrategyContext::arena;
         creators["mount"] = &StrategyContext::mount;
         creators["rtsc"] = &StrategyContext::rtsc;
@@ -181,6 +182,7 @@ private:
     static Strategy* arathi(PlayerbotAI* botAI) { return new ArathiStrategy(botAI); }
     static Strategy* eye(PlayerbotAI* botAI) { return new EyeStrategy(botAI); }
     static Strategy* isle(PlayerbotAI* botAI) { return new IsleStrategy(botAI); }
+    static Strategy* strand(PlayerbotAI* botAI) { return new StrandStrategy(botAI); }
     static Strategy* arena(PlayerbotAI* botAI) { return new ArenaStrategy(botAI); }
     static Strategy* rtsc(PlayerbotAI* botAI) { return new RTSCStrategy(botAI); }
     static Strategy* attack_tagged(PlayerbotAI* botAI) { return new AttackTaggedStrategy(botAI); }

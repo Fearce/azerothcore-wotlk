@@ -503,6 +503,12 @@ public:
     // Achievement: Not Even a Scratch
     bool notEvenAScratch(TeamId teamId) const { return _notEvenAScratch[teamId]; }
 
+    // Match-state accessors for bot AI (mod-playerbots BGTactics)
+    TeamId GetAttackerTeam() const { return Attackers; }
+    BG_SA_GateState GetGateState(uint32 gateId) const { return gateId < 6 ? GateStatus[gateId] : BG_SA_GATE_OK; }
+    BG_SA_Status GetSAStatus() const { return Status; }
+    TeamId GetGraveyardTeam(uint32 gyId) const { return gyId < BG_SA_MAX_GY ? GraveyardStatus[gyId] : TEAM_NEUTRAL; }
+
 private:
     /// Return gate id, relative to bg data, according to gameobject id
     uint32 GetGateIDFromEntry(uint32 id)

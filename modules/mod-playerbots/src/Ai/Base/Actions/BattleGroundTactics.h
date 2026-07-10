@@ -101,6 +101,7 @@ extern std::vector<BattleBotPath*> const vPaths_AB;
 extern std::vector<BattleBotPath*> const vPaths_AV;
 extern std::vector<BattleBotPath*> const vPaths_EY;
 extern std::vector<BattleBotPath*> const vPaths_IC;
+extern std::vector<BattleBotPath*> const vPaths_SA;
 
 class BGTactics : public MovementAction
 {
@@ -124,6 +125,8 @@ private:
     bool resetObjective();
     bool wsJumpDown();
     bool eyJumpDown();
+    bool saBoatHold();
+    bool saVehicleShoot();
     bool atFlag(std::vector<BattleBotPath*> const& vPaths, std::vector<uint32> const& vFlagIds);
     bool flagTaken();
     bool teamFlagTaken();

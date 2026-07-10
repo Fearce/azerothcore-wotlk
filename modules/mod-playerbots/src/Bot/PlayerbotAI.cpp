@@ -4295,6 +4295,62 @@ bool PlayerbotAI::CastVehicleSpell(uint32 spellId, Unit* target)
     return true;
 }
 
+// Position-targeted vehicle cast — for siege targets that aren't units (BG gates:
+// a destructible GameObject can't go through the Unit* overload above).
+bool PlayerbotAI::CastVehicleSpell(uint32 spellId, float x, float y, float z)
+{
+    if (!spellId)
+        return false;
+
+    Vehicle* vehicle = bot->GetVehicle();
+    if (!vehicle)
+        return false;
+
+    VehicleSeatEntry const* seat = vehicle->GetSeatForPassenger(bot);
+    if (!seat || !(seat->m_flags & VEHICLE_SEAT_FLAG_CAN_CAST))
+        return false;
+
+    Unit* vehicleBase = vehicle->GetBase();
+    if (!vehicleBase || !vehicleBase->IsAlive() || vehicleBase->HasSpellCooldown(spellId))
+        return false;
+
+    SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!spellInfo)
+        return false;
+
+    if (ServerFacade::instance().GetDistance2d(vehicleBase, x, y) > 120.0f)
+        return false;
+
+    if (seat->CanControl() || (seat->m_flags & VEHICLE_SEAT_FLAG_ALLOW_TURNING))
+        vehicleBase->SetFacingTo(vehicleBase->GetAngle(x, y));
+
+    Spell* spell = new Spell(vehicleBase, spellInfo, TRIGGERED_NONE);
+
+    SpellCastTargets targets;
+    WorldLocation dest(bot->GetMapId(), x, y, z, 0.0f);
+    targets.SetDst(dest);
+    targets.SetSpeed(30.0f);
+    float dist = vehicleBase->GetPosition().GetExactDist(&dest);
+    // very much an approximation of the real projectile arc
+    float elev = dist >= 110.0f ? 1.0f : pow(((dist + 10.0f) / 120.0f), 2.0f);
+    targets.SetElevation(elev);
+
+    if (spellInfo->Targets & TARGET_FLAG_SOURCE_LOCATION)
+        targets.SetSrc(vehicleBase->GetPositionX(), vehicleBase->GetPositionY(), vehicleBase->GetPositionZ());
+
+    spell->prepare(&targets);
+
+    if (seat->CanControl() && vehicleBase->isMoving() && spell->GetCastTime())
+    {
+        vehicleBase->StopMoving();
+        SetNextCheckDelay(sPlayerbotAIConfig.globalCoolDown);
+        spell->cancel();
+        return false;
+    }
+
+    return true;
+}
+
 bool PlayerbotAI::IsInVehicle(bool canControl, bool canCast, bool canAttack, bool canTurn, bool fixed)
 {
     Vehicle* vehicle = bot->GetVehicle();
