@@ -2616,6 +2616,16 @@ namespace WowPsParty
             freshRole == "tank" ? "loose" : "master");
 
         SanitizeHenchmanSpellsIfNeeded(hen);
+
+        // Recompute the live unit's stats from its final level/gear/talents. Same
+        // stale-max-health guard as HireHenchman: the GiveLevel + re-equip sequence
+        // can leave UNIT_MOD_HEALTH out of date on the in-world object even though
+        // SaveToDB stored it correctly, leaving the henchman at ~half its real HP.
+        hen->UpdateAllStats();
+        hen->SetFullHealth();
+        if (hen->getPowerType() == POWER_MANA)
+            hen->SetPower(POWER_MANA, hen->GetMaxPower(POWER_MANA));
+
         LOG_INFO("module",
             "[WowPsParty LfgScale] re-leveled hench guid={} {} -> {} for dungeon range",
             hen->GetGUID().GetCounter(), oldLvl, uint32(target));
@@ -2962,6 +2972,19 @@ namespace WowPsParty
             // level. Deterministic here for both in-band and re-leveled hires;
             // the upkeep tick re-checks as a safety net.
             SanitizeHenchmanSpellsIfNeeded(hen);
+
+            // Force the LIVE unit to recompute stats from its final level/gear/talents.
+            // The re-level path (GiveLevel down + resetTalents + re-equip inside the
+            // async bot login) can leave UNIT_MOD_HEALTH stale: gear stamina gets
+            // stored while CanModifyStats() is still false during the spawn, so
+            // UpdateMaxHealth never fires and the henchman shows ~half its real max HP
+            // (correct in the DB — a dismiss+re-hire reloads it right). SaveToDB
+            // persisted the right stats, but this in-world object needs the explicit
+            // recompute the core does after GiveLevel/load. Cheap and idempotent.
+            hen->UpdateAllStats();
+            hen->SetFullHealth();
+            if (hen->getPowerType() == POWER_MANA)
+                hen->SetPower(POWER_MANA, hen->GetMaxPower(POWER_MANA));
 
             Group* g = lead->GetGroup();
             if (!g)
