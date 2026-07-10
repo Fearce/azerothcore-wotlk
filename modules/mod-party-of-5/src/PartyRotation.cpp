@@ -1928,10 +1928,10 @@ namespace WowPsParty
         return info;
     }
 
-    // Case-insensitive match of a casting spell against an editor-typed needle:
+    // Case-insensitive match of a casting spell against ONE editor-typed needle:
     // a pure-digit needle matches the spell ID (locale- and rank-proof), anything
-    // else matches the spell's display name. Backs target_casting:<spell>.
-    static bool SpellNameOrIdMatches(SpellInfo const* info, std::string const& want)
+    // else matches the spell's display name.
+    static bool SpellNameOrIdMatchesOne(SpellInfo const* info, std::string const& want)
     {
         if (!info || want.empty()) return false;
         bool allDigits = true;
@@ -1945,6 +1945,29 @@ namespace WowPsParty
                 std::tolower(static_cast<unsigned char>(want[i])))
                 return false;
         return i == want.size() && nm[i] == '\0';
+    }
+
+    // `want` may be a COMMA-SEPARATED list of such needles ("Coldflame, Bone Storm,
+    // 69146") — any one matching wins — so a single rule covers a whole family of
+    // spells instead of one rule per name. Tokens are trimmed of surrounding spaces.
+    // Backs target_casting / target_channeling / took_damage_from /
+    // walk_away_from_source args.
+    static bool SpellNameOrIdMatches(SpellInfo const* info, std::string const& want)
+    {
+        if (!info || want.empty()) return false;
+        size_t start = 0;
+        for (;;)
+        {
+            size_t const comma = want.find(',', start);
+            size_t b = start;
+            size_t e = (comma == std::string::npos) ? want.size() : comma;
+            while (b < e && std::isspace(static_cast<unsigned char>(want[b]))) ++b;
+            while (e > b && std::isspace(static_cast<unsigned char>(want[e - 1]))) --e;
+            if (e > b && SpellNameOrIdMatchesOne(info, want.substr(b, e - b)))
+                return true;
+            if (comma == std::string::npos) return false;
+            start = comma + 1;
+        }
     }
 
     // ---- recent spell-damage tracker (backs took_damage_from:<name>) ----------
@@ -2009,6 +2032,29 @@ namespace WowPsParty
             return true;
         }
         return false;
+    }
+
+    // All KNOWN source positions of matching hits within the window, oldest first.
+    // A MOVING hazard (Marrowgar chasing under Bone Storm, Coldflame patches dropped
+    // every 450ms along a line) leaves a TRAIL of these; walk_away_from_source scores
+    // its escape step against ALL of them, because "away from the freshest point"
+    // alone aims straight ALONG the trail of a moving source.
+    struct HazardPoint { float x, y; };
+    static void RecentDamageSourcePoints(uint32 guidLow, std::string const& want,
+                                         std::vector<HazardPoint>& out)
+    {
+        uint32 const now = getMSTime();
+        std::lock_guard<std::mutex> lock(g_recentDamageMutex);
+        auto it = g_recentDamage.find(guidLow);
+        if (it == g_recentDamage.end()) return;
+        for (RecentHit const& h : it->second)
+        {
+            if (!h.hasSrc || now - h.ms > RECENT_DMG_WINDOW_MS) continue;
+            if (!want.empty()
+                && !SpellNameOrIdMatches(sSpellMgr->GetSpellInfo(h.spellId), want))
+                continue;
+            out.push_back({ h.sx, h.sy });
+        }
     }
 
     // True if (x,y) is within `margin` of ANY source position the bot took damage from in
@@ -2965,9 +3011,10 @@ namespace WowPsParty
 
             // target_casting:<spell> / target_channeling:<spell> — fire only while
             // the target is mid-cast of a SPECIFIC spell, by display name or by
-            // numeric id. Pair with cast_scan to stun/kick a dangerous off-target
-            // cast (e.g. a Shadowmoon Technician's "Throw Dynamite", stun-only).
-            // Empty arg = any cast (same as the bare target_casting condition).
+            // numeric id; a COMMA-SEPARATED list matches any entry, so one rule
+            // covers a family of casts. Pair with cast_scan to stun/kick a dangerous
+            // off-target cast (e.g. a Shadowmoon Technician's "Throw Dynamite",
+            // stun-only). Empty arg = any cast (same as bare target_casting).
             if (cname == "target_casting" || cname == "target_channeling")
             {
                 bool const wantChannel = (cname == "target_channeling");
@@ -3006,8 +3053,9 @@ namespace WowPsParty
             }
 
             // took_damage_from:<spell> — true if THIS bot took damage from a spell
-            // matching <name/id> in the last ~1.5s. React to a specific hit (reposition
-            // out of Ingvar's spinning axe) even when it leaves no debuff to test for.
+            // matching <name/id> in the last ~1.5s; a COMMA-SEPARATED list matches any
+            // entry ("Coldflame, Bone Storm"). React to a specific hit (reposition out
+            // of Ingvar's spinning axe) even when it leaves no debuff to test for.
             if (cname == "took_damage_from")
                 return !arg.empty() && TookDamageFrom(bot->GetGUID().GetCounter(), arg);
         }
@@ -6999,7 +7047,8 @@ namespace WowPsParty
         // walk_away_from_source". The source position is whatever the engine billed as the
         // attacker when it hit us (the casting add / the ground-aura's caster); for a beam
         // (Sear Beam) that's the caster, for a ground patch it's the patch's owner. Optional
-        // <name> flees only that spell's source; blank flees the freshest hit's source.
+        // <name> flees only that spell's source (comma-separated list OK); blank flees the
+        // freshest hit's source.
         if (verb == "walk_away_from_source")
         {
             float sx, sy, sz; uint32 ageMs = 0;
@@ -7034,55 +7083,83 @@ namespace WowPsParty
             // the edge by ~10y (out of range -> run back -> loop) and, in a tight room,
             // put the whole escape ring behind walls so no spot was reachable and the bot
             // just froze (Nissemichael "finished positioning, stood there not casting").
-            constexpr float STEP = 3.0f;    // yards farther from the source per hop
+            constexpr float STEP = 3.0f;    // yards per hop
+
+            // The hazard is EVERY source point that hit us this window, not only the
+            // freshest: a moving source (Marrowgar chasing under Bone Storm, Coldflame
+            // patches dropped along a line every 450ms) leaves a TRAIL, and stepping
+            // away from just the freshest point aims ALONG that trail — the "walks
+            // around inside the Bone Storm" bug. When the trail shows motion,
+            // extrapolate it a few steps ahead too, so we never hop INTO where the
+            // hazard is headed (a chasing storm forces a perpendicular sidestep out of
+            // its path — outrunning it straight back is a race we lose).
+            std::vector<HazardPoint> hazard;
+            RecentDamageSourcePoints(bot->GetGUID().GetCounter(), arg, hazard);
+            if (hazard.empty()) hazard.push_back({ sx, sy });
+            if (hazard.size() >= 2)
+            {
+                float const mx = hazard.back().x - hazard.front().x;
+                float const my = hazard.back().y - hazard.front().y;
+                float const mlen = std::sqrt(mx * mx + my * my);
+                if (mlen > 2.0f)
+                    for (int k = 1; k <= 3; ++k)
+                        hazard.push_back({ sx + mx / mlen * STEP * float(k),
+                                           sy + my / mlen * STEP * float(k) });
+            }
+            auto minHazardDist = [&hazard](float x, float y) -> float
+            {
+                float best2 = 1.0e18f;
+                for (HazardPoint const& p : hazard)
+                {
+                    float const hx = x - p.x, hy = y - p.y;
+                    best2 = std::min(best2, hx * hx + hy * hy);
+                }
+                return std::sqrt(best2);
+            };
+            float const curDist = minHazardDist(bot->GetPositionX(), bot->GetPositionY());
+
             float const dx = bot->GetPositionX() - sx;
             float const dy = bot->GetPositionY() - sy;
             float const len = std::sqrt(dx * dx + dy * dy);
-            // Distance from the source we want the destination to sit at: always farther
-            // than we are now, so EVERY candidate moves us OUTWARD (never toward the source
-            // = never deeper into a centred patch).
-            float const outDist = std::max(len, 1.0f) + STEP;
-            float const awayAng = (len > 0.5f) ? std::atan2(dy, dx) : frand(0.0f, 2.0f * 3.14159265f);
+            float const awayAng = (len > 0.5f) ? std::atan2(dy, dx)
+                                               : frand(0.0f, 2.0f * 3.14159265f);
 
-            // Sweep candidate spots on the RING of radius outDist around the source —
-            // every one is the same (outward) distance from the source, so none is
-            // deeper into a centred patch. Among the navmesh-reachable ones, pick the
-            // spot CLOSEST to the bot's enemy target: that moves us AROUND the source
-            // toward the enemy and keeps it in range, instead of straight away (which
-            // overshot out of range, so the bot ran back IN -> the back-and-forth loop
-            // Kevin saw). With no target, fall back to the straight-away bearing.
-            Unit* const foeTar = bot->GetVictim();
-            constexpr int N = 16;   // 22.5° steps around the full circle
+            // Candidate hops on a circle of STEP yards around the BOT — the literal
+            // small step out — fanning from the straight-away bearing (0, ±22.5°, …).
+            // Every accepted candidate must land STRICTLY farther from the nearest
+            // hazard point than we stand now, so no pick ever walks along or into the
+            // effect; among survivors take the farthest-out, breaking near-ties toward
+            // straight-away. (The old scoring picked the reachable spot CLOSEST to the
+            // bot's enemy target — on Marrowgar that's a tangential orbit around/inside
+            // the storm, Kevin's "they walk along the damage source".)
+            constexpr int N = 16;   // 22.5° fan steps around the full circle
             float bestX = 0.0f, bestY = 0.0f, bestZ = 0.0f, bestScore = 0.0f;
             bool  haveBest = false;
             for (int i = 0; i < N; ++i)
             {
-                float const ang = awayAng + (2.0f * 3.14159265f * float(i) / float(N));
-                float const x = sx + std::cos(ang) * outDist;
-                float const y = sy + std::sin(ang) * outDist;
+                int const notch = (i + 1) / 2;                 // 0, 1, 1, 2, 2, ...
+                float const side = (i % 2) ? 1.0f : -1.0f;
+                float const ang = awayAng + side * float(notch) * (3.14159265f / 8.0f);
+                float const x = bot->GetPositionX() + std::cos(ang) * STEP;
+                float const y = bot->GetPositionY() + std::sin(ang) * STEP;
+                float const d = minHazardDist(x, y);
+                if (d <= curDist + 0.5f) continue;             // sideways/inward — never
+                float const score = d - 0.15f * float(notch);  // out-most first, then radial
+                if (haveBest && score <= bestScore) continue;
                 float z = bot->GetPositionZ();
                 bot->UpdateAllowedPositionZ(x, y, z);
                 if (!bot->IsWithinLOS(x, y, z)) continue;      // don't aim through a wall
-                float const bx = x - bot->GetPositionX();
-                float const by = y - bot->GetPositionY();
-                if (!NavReachable(bot, x, y, z, std::sqrt(bx * bx + by * by))) continue;
-                // Higher score = better. With a target, prefer the spot nearest it
-                // (stay in range). Without one, prefer the earliest = straight-away.
-                float score;
-                if (foeTar)
-                {
-                    float const vdx = x - foeTar->GetPositionX();
-                    float const vdy = y - foeTar->GetPositionY();
-                    score = -std::sqrt(vdx * vdx + vdy * vdy);
-                }
-                else
-                    score = -float(i);
-                if (!haveBest || score > bestScore)
-                { haveBest = true; bestScore = score; bestX = x; bestY = y; bestZ = z; }
+                if (!NavReachable(bot, x, y, z, STEP)) continue;
+                haveBest = true; bestScore = score; bestX = x; bestY = y; bestZ = z;
             }
             if (!haveBest)
-                return false;   // boxed in (tight room, every bearing walled/blind) —
+                return false;   // boxed in (every outward bearing walled/blind) —
                                 // fight in place rather than freeze doing nothing
+            LOG_INFO("module",
+                "[WowPsParty Rotation] {} walk_away_from_source: hop ({:.1f},{:.1f})->({:.1f},{:.1f}) "
+                "hazardPts={} curDist={:.1f} newDist={:.1f} ageMs={}",
+                bot->GetName(), bot->GetPositionX(), bot->GetPositionY(), bestX, bestY,
+                hazard.size(), curDist, minHazardDist(bestX, bestY), ageMs);
             bot->GetMotionMaster()->MovePoint(0, bestX, bestY, bestZ, FORCED_MOVEMENT_NONE,
                                               0.0f, 0.0f, /*generatePath=*/true,
                                               /*forceDestination=*/false);
