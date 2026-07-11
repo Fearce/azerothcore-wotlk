@@ -1479,6 +1479,38 @@ namespace WowPsParty
         FollowPathCacheSet(guidLow, v == "1" ? 1 : (v == "0" ? 0 : -1));
     }
 
+    // ---- "pull gray/trivial mobs" toggle (tank) ----------------------------
+    // Default OFF for every tank: the auto-pull normally skips gray (trivial) mobs
+    // via WontAutoAggro. When ON, the lead tank engages + pulls them too — the
+    // "random low-level dungeon where the tank refuses to pull anything" case.
+    // Stored in party_loadout.pull_grays as '' (unset->OFF), '1' (on) or '0' (off).
+    static std::unordered_map<uint32, int> g_pullGrays;   // guidLow -> 0/1 (explicit only)
+    static std::mutex g_pullGraysMutex;
+
+    // val: 0 = explicit off, 1 = explicit on, <0 = clear (back to default OFF).
+    void PullGraysCacheSet(uint32 guidLow, int val)
+    {
+        std::lock_guard<std::mutex> lock(g_pullGraysMutex);
+        if (val < 0) g_pullGrays.erase(guidLow);
+        else         g_pullGrays[guidLow] = val ? 1 : 0;
+    }
+
+    bool GetPullGrays(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(g_pullGraysMutex);
+        auto it = g_pullGrays.find(guid.GetCounter());
+        if (it != g_pullGrays.end()) return it->second != 0;
+        return false;   // unset -> don't pull gray mobs by default
+    }
+
+    void PullGraysRefreshFromDB(uint32 guidLow)
+    {
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `pull_grays` FROM `party_loadout` WHERE `guid` = {}", guidLow);
+        std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+        PullGraysCacheSet(guidLow, v == "1" ? 1 : (v == "0" ? 0 : -1));
+    }
+
     // ---- "anchor on tank" toggle (NON-TANK) --------------------------------
     // When ON for a non-tank bot, that bot formation-follows the party TANK
     // instead of the human leader (only while the leader isn't the tank), so
@@ -3366,7 +3398,11 @@ namespace WowPsParty
         Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
         if (!leader || !leader->IsInWorld()) return;
         if (leader->GetMapId() != bot->GetMapId()) return;
-        if (!leader->GetMap() || !leader->GetMap()->IsDungeon()) return;
+        // "Lead the party" (formerly "lead in dungeons") leads + auto-pulls ANYWHERE now,
+        // not just inside instances — the GetLeadInDungeon toggle above is the only gate.
+        // (The recorded-PATH walk in TankFollowPath stays dungeon-only, since a recorded
+        // route only exists inside a dungeon; out in the open world the tank leads via the
+        // lead-ahead MoveFollow instead.)
 
         // Active careful pull (dangerous-cluster drag-back): drive it BEFORE the gather and the
         // out-of-combat pull logic — once it aggros the opener the tank is in combat, so the
@@ -3474,7 +3510,12 @@ namespace WowPsParty
         if (!nearest || !nearest->IsAlive()) return;
         if (!bot->IsValidAttackTarget(nearest)) return;
         if (!nearest->IsHostileTo(bot)) return;   // never auto-engage a PASSIVE/neutral (yellow) mob (Mill)
-        if (WontAutoAggro(bot, nearest)) return;  // trivial/gray (won't aggro) — don't open on it (SM GY victims)
+        // Trivial/gray mob (won't auto-aggro): normally don't open on it (SM GY victims).
+        // The per-tank "pull gray mobs" toggle overrides that — the tank ACTIVE-attacks it
+        // via the single-pull Attack path below (a gray won't proximity-aggro, so a body-pull
+        // can't grab it — an explicit Attack is the only way). This is the fix for a low-level
+        // dungeon where every mob is gray and the tank otherwise refuses to pull anything.
+        if (WontAutoAggro(bot, nearest) && !GetPullGrays(bot->GetGUID())) return;
         // SelectNearbyTarget returns the nearest valid target even if it's NAVMESH-UNREACHABLE
         // (a mob across a gap/ledge). Opening on it locks the tank onto a mob it can never
         // close on — the live "OPEN+GATHER entry=4308 dist=27 -> 18s timeout, engaged=0, no
@@ -3611,8 +3652,13 @@ namespace WowPsParty
         // (IsTankGathering); on CONCLUDE the rotation resumes, the tank builds threat, DPS
         // engage. N==1 (or a BOSS — never multi-pull a boss) falls through to the single-pull
         // opener below, which DOES open with an auto-attack.
+        // A gray opener (only reachable here with the "pull gray mobs" toggle on) can't be
+        // body-pulled — a trivial mob ignores proximity aggro, so DriveTankChase would just
+        // stand on it. Force it down the single-pull AUTO-ATTACK path below, which actively
+        // engages it. (Grays are still excluded from the multi-pull GATHER via WontAutoAggro,
+        // so the tank chain-pulls them one at a time.)
         uint32 const pullN = WowPsParty::BotInitialPullCount(bot->GetGUID());
-        if (pullN >= 2 && !IsBossUnit(nearest))
+        if (pullN >= 2 && !IsBossUnit(nearest) && !WontAutoAggro(bot, nearest))
         {
             uint32 const tankLow = bot->GetGUID().GetCounter();
             MarkTankGathering(tankLow, { nearest->GetGUID() });                    // DPS hold
@@ -8720,8 +8766,8 @@ namespace WowPsParty
             // the detector recover it (this closes the "dead follow path within 60y freezes
             // forever" hole: the moment the leader moves, a frozen tank is re-armed).
             bool const leadTankExempt =
-                leader->GetMap() && leader->GetMap()->IsDungeon()
-                && IsLeadTank(d.followerGuid) && dist < 60.0f && !leader->isMoving();
+                IsLeadTank(d.followerGuid) && GetLeadInDungeon(d.followerGuid.GetCounter())
+                && dist < 60.0f && !leader->isMoving();
             if (dist > 8.0f && movedSelf < 1.0f && !leadTankExempt) ++s.idle;
             else { s.idle = 0; s.unstickAttempts = 0; }   // moved / caught up / leading = recovered
             // Genuine long-distance gaps are already handled above (the >50y
@@ -8813,8 +8859,11 @@ namespace WowPsParty
             // FORM_ANGLES (rear-arc fan-out bearings, indexed by formation
             // ordinal) is defined at namespace scope above so the pull anchor
             // shares it. Extra companions beyond the table wrap to an outer ring.
-            bool const inDungeon = leader->GetMap() && leader->GetMap()->IsDungeon();
-            bool const isLeadTank = inDungeon && IsLeadTank(d.followerGuid);
+            // Lead tank = the assigned lead tank with "Lead the party" ON. Formerly this
+            // required being in a dungeon; now the tank takes the front lead slot (and
+            // body-pulls) ANYWHERE the toggle is on — open world included.
+            bool const isLeadTank = IsLeadTank(d.followerGuid)
+                                 && GetLeadInDungeon(d.followerGuid.GetCounter());
 
             // If the bot was sitting (post-drink), stand up before moving
             // so the spline doesn't fight the seated stand-state.
@@ -9175,9 +9224,9 @@ namespace WowPsParty
                     && !follower->HasAuraType(SPELL_AURA_MOD_DECREASE_SPEED)
                     && !follower->HasAuraType(SPELL_AURA_MOD_SPEED_ALWAYS)
                     && !follower->HasAuraType(SPELL_AURA_MOD_SPEED_NOT_STACK);
-                bool const inDungeon = leader->GetMap() && leader->GetMap()->IsDungeon();
-                bool const leadTank  = inDungeon && IsLeadTank(d.followerGuid);
-                // A rear follower only needs catch-up while the leader walks away. A dungeon lead
+                bool const leadTank  = IsLeadTank(d.followerGuid)
+                                    && GetLeadInDungeon(d.followerGuid.GetCounter());
+                // A rear follower only needs catch-up while the leader walks away. A lead
                 // tank ALSO has to close the gap to its FRONT slot when the leader pauses (it must
                 // move UP to lead), so it isn't gated on leader movement — except while it's mid
                 // pull/gather, where the pull drive owns its feet and a boost would rush the body-pull.

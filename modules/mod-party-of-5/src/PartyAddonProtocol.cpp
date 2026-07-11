@@ -5406,6 +5406,46 @@ public:
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Follow recorded path: {}.", on ? "ON" : "OFF");
         }
+        // REQ_PULLGRAYS\t<token>  ->  PULLGRAYS\t<token>\t<0|1>
+        // Reports the stored value (explicit column, else the default OFF) so the editor
+        // checkbox shows the real runtime behaviour even for an unconfigured tank.
+        else if (command == "REQ_PULLGRAYS")
+        {
+            std::string const token(payload);
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            bool on = false;
+            if (guid)
+            {
+                QueryResult q = CharacterDatabase.Query(
+                    "SELECT `pull_grays` FROM `party_loadout` WHERE `guid` = {}", guid);
+                std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
+                on = (v == "1");   // '' or '0' -> OFF; only an explicit '1' turns it on
+            }
+            std::ostringstream out;
+            out << "PULLGRAYS\t" << token << '\t' << (on ? 1 : 0);
+            SendWPSP(player, out.str());
+        }
+        // SET_PULLGRAYS\t<token>\t<0|1>  — explicit override (the user toggled it)
+        else if (command == "SET_PULLGRAYS")
+        {
+            std::string rest;
+            std::string const token = WowPsParty::SplitToken(std::string(payload), rest);
+            if (rest != "0" && rest != "1") return;   // strict: ignore a malformed/empty value
+            bool const on = (rest == "1");
+            uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
+            if (!guid) return;
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            tx->Append(
+                "INSERT INTO `party_loadout` (`guid`, `strategies_csv`, `talents_hex`, `glyphs_csv`, "
+                "`gear_lock_json`, `priority_actions_json`, `pull_grays`) "
+                "VALUES ({}, '', '', '', '', '', '{}') "
+                "ON DUPLICATE KEY UPDATE `pull_grays` = VALUES(`pull_grays`)",
+                guid, on ? "1" : "0");
+            CharacterDatabase.CommitTransaction(tx);
+            WowPsParty::PullGraysCacheSet(guid, on ? 1 : 0);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Pull gray mobs: {}.", on ? "ON" : "OFF");
+        }
         // REQ_ANCHORTANK\t<token>  ->  ANCHORTANK\t<token>\t<0|1>
         // Reports the stored value (explicit column, else the default OFF — there
         // is no per-type default) so the editor checkbox shows the real runtime

@@ -1565,12 +1565,15 @@ namespace WowPsParty
                     // Shout; the cast's own range check covers "in range".
                     add("enemies_in_melee>2&target_missing_aura:Demoralizing Roar", "cast:Demoralizing Roar", 73);
                     add("target_is_boss&target_missing_aura:Demoralizing Roar", "cast:Demoralizing Roar", 72);
-                    add("enemies_in_melee>2", "cast:Swipe (Bear)", 70);
+                    add("enemies_in_melee>1", "cast:Swipe (Bear)", 70);
                     add("has_target", "cast:Mangle (Bear)", 68);
                     add("target_missing_aura:Lacerate", "cast:Lacerate", 64);
                     add("has_target", "cast:Lacerate", 58);
                     add("target_missing_aura:Faerie Fire (Feral)", "cast:Faerie Fire (Feral)", 54);
-                    add("has_target", "cast:Maul", 40);
+                    // Maul is a next-swing rage dump (off the GCD): only fire it when rage
+                    // is plentiful (>50%) so it burns the surplus instead of starving the
+                    // threat rotation of rage for Mangle/Lacerate/Swipe.
+                    add("self_rage>50", "cast:Maul", 40);
                 }
                 else   // DPS — Feral cat(1) vs Balance(0). The follow layer reads live
                 {      // talents (PrimaryTalentTree) to kite/close, independent of this.
@@ -2772,9 +2775,9 @@ namespace WowPsParty
         bool const hadCustomRotation = false;   // henchmen NEVER keep a custom rotation
         {
             QueryResult lq = CharacterDatabase.Query(
-                "SELECT `strategies_csv`,`glyphs_csv`,`wait_tank_threat`,`safe_pull`,`pull_count`,`engage_range`,`follow_path` "
+                "SELECT `strategies_csv`,`glyphs_csv`,`wait_tank_threat`,`safe_pull`,`pull_count`,`engage_range`,`follow_path`,`pull_grays` "
                 "FROM `party_loadout` WHERE `guid` = {}", candidateGuid);
-            std::string savedMode, savedLead, savedWait, savedSafePull, savedPullCount, savedEngageRange, savedFollowPath;
+            std::string savedMode, savedLead, savedWait, savedSafePull, savedPullCount, savedEngageRange, savedFollowPath, savedPullGrays;
             if (lq)
             {
                 Field* lf = lq->Fetch();
@@ -2785,6 +2788,7 @@ namespace WowPsParty
                 savedPullCount   = lf[4].Get<std::string>();
                 savedEngageRange = lf[5].Get<std::string>();
                 savedFollowPath  = lf[6].Get<std::string>();
+                savedPullGrays   = lf[7].Get<std::string>();
             }
 
             // Always the class default rotation (identical to "Generate"); never the
@@ -2816,6 +2820,10 @@ namespace WowPsParty
             // follow_path: '0' = explicit off, else (''/'1') the default -> follow.
             WowPsParty::FollowPathCacheSet(candidateGuid,
                 savedFollowPath == "1" ? 1 : (savedFollowPath == "0" ? 0 : -1));
+
+            // pull_grays: '1' = explicit on, '0' = explicit off, '' = default OFF.
+            WowPsParty::PullGraysCacheSet(candidateGuid,
+                savedPullGrays == "1" ? 1 : (savedPullGrays == "0" ? 0 : -1));
         }
 
         mgr->AddPlayerBot(henchGuid, account);
@@ -3569,6 +3577,7 @@ namespace WowPsParty
         EngageRangeRefreshFromDB(altGuid);
         AnchorTankRefreshFromDB(altGuid);
         FollowPathRefreshFromDB(altGuid);
+        PullGraysRefreshFromDB(altGuid);
 
         mgr->AddPlayerBot(altObjGuid, account);
 
@@ -3893,6 +3902,7 @@ namespace WowPsParty
                 EngageRangeRefreshFromDB(guid);
                 AnchorTankRefreshFromDB(guid);
                 FollowPathRefreshFromDB(guid);
+                PullGraysRefreshFromDB(guid);
                 if (guid == activeGuid) continue;
                 if (spawned >= 4) break;
                 ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);

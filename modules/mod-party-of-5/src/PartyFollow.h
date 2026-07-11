@@ -222,6 +222,14 @@ namespace WowPsParty
     void FollowPathRefreshFromDB(uint32 guidLow);
     bool BotFollowRecordedPath(ObjectGuid guid);
 
+    // Per-TANK "pull gray (trivial) mobs" toggle. Default OFF for every tank. When
+    // ON, the lead tank engages + pulls mobs that are gray/trivial to it (the
+    // low-level-dungeon case where it otherwise refuses to pull anything).
+    // val: 0 = off, 1 = pull grays, -1 = clear the override (back to default OFF).
+    void PullGraysCacheSet(uint32 guidLow, int val);
+    void PullGraysRefreshFromDB(uint32 guidLow);
+    bool GetPullGrays(ObjectGuid guid);
+
     // Per-NON-TANK "anchor on tank" toggle. Default OFF everywhere (no per-type
     // default). When ON, a non-tank bot formation-follows the party TANK instead
     // of the human leader while the leader isn't the tank — melee reach the front
