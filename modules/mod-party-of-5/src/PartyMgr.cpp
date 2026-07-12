@@ -519,6 +519,26 @@ namespace WowPsParty
         return int(sPlayerbotAIConfig.randomClassSpecIndex[cls][uint32(tab)]);
     }
 
+    // Same premade spec-template index as LiveSpecNo, but read from the OFFLINE DB
+    // (character_talent) instead of a live object. This is the AUTHORITATIVE "what
+    // the player picked": it reads the SAME unfiltered character_talent rows the
+    // hire screen's SpecAbbrevFromTalents/InferHenchmanRole use, so it matches
+    // exactly what was shown at hire. Captured BEFORE spawn — unlike the live read,
+    // it can't return -1 because the bot's talents haven't loaded yet at the deferred
+    // spawn tick, and it can't be perturbed by any login-time re-randomization of the
+    // live object. That live/DB divergence was the "hired Shadow priest -> got Holy"
+    // bug: LiveSpecNo captured the wrong (or no) spec, so the picked-spec restore was
+    // silently skipped and Randomize's RANDOM re-roll stood. -1 only when the
+    // candidate genuinely has no talents. Mirrors the druid feral cat(3)/bear(1) split.
+    static int DbSpecNo(uint32 guid, uint8 cls)
+    {
+        int const tab = DominantTalentTabDB(guid);
+        if (tab < 0) return -1;
+        if (cls == CLASS_DRUID && tab == 1)   // Feral: bear(1) vs cat(3) share the tree
+            return (InferHenchmanRole(guid, cls, "dps") == "tank") ? 1 : 3;
+        return int(sPlayerbotAIConfig.randomClassSpecIndex[cls][uint32(tab)]);
+    }
+
     // Dominant talent tree (0/1/2) for baking a per-spec rotation, -1 if none.
     // Public wrapper: a connected bot's live talents win (authoritative right
     // after a re-spec), else the offline character_talent table.
@@ -2761,6 +2781,13 @@ namespace WowPsParty
         std::string const useRole =
             InferHenchmanRole(candidateGuid, cls, role.empty() ? std::string("dps") : role);
 
+        // Capture the spec the player picked NOW, from the DB, while it's still the
+        // pool char's real (unre-rolled) spec — the same source the hire screen used.
+        // Threaded into the deferred spawn lambda so the out-of-band re-level restores
+        // THIS spec, not whatever the live object happens to show after spawn (which a
+        // load-timing gap or login re-randomization can corrupt — the picked-spec bug).
+        int const intendedSpecDB = DbSpecNo(candidateGuid, cls);
+
         // Register as a henchman BEFORE spawning so the patched AddPlayerBot
         // permission check (WowPsParty_IsHenchman_Trampoline) lets the cross-
         // account random-pool char in.
@@ -2838,7 +2865,7 @@ namespace WowPsParty
         // (drop the directive, refund the gold) so we never leak a directive or
         // charge the player for a no-show.
         ObjectGuid const leaderGuid = requester->GetGUID();
-        requester->m_Events.AddEventAtOffset([leaderGuid, henchGuid, cost, refundAmt, cls, hadCustomRotation, useRole]()
+        requester->m_Events.AddEventAtOffset([leaderGuid, henchGuid, cost, refundAmt, cls, hadCustomRotation, useRole, intendedSpecDB]()
         {
             Player* lead = ObjectAccessor::FindConnectedPlayer(leaderGuid);
             Player* hen  = ObjectAccessor::FindConnectedPlayer(henchGuid);
@@ -2876,13 +2903,17 @@ namespace WowPsParty
                 {
                     uint32 const oldLvl = hen->GetLevel();
                     uint32 const target = lead->GetLevel();
-                    // Capture the spec the PLAYER picked at the hire screen BEFORE the
-                    // re-roll. Randomize(false) re-rolls talents to a RANDOM tree, which
-                    // flips the role out from under the player — a Ret paladin hired and
-                    // downleveled came back Holy, invalidating the party (wasted gold).
-                    // LiveSpecNo resolves the druid feral cat/bear split (shared tree 1),
-                    // so a hired feral cat isn't rebuilt as a bear tank.
-                    int const intendedSpec = LiveSpecNo(hen);
+                    // The spec the PLAYER picked at the hire screen, captured from the
+                    // DB BEFORE spawn (intendedSpecDB) — NOT from the live object here.
+                    // Randomize(false) re-rolls talents to a RANDOM tree, which flips the
+                    // role out from under the player — a Ret paladin hired and downleveled
+                    // came back Holy, invalidating the party (wasted gold). The old code
+                    // captured LiveSpecNo(hen) at this point, but a live read only sees the
+                    // ACTIVE talent group and returns -1 before the bot's talents finish
+                    // loading (or after a login re-randomization) — so it silently missed
+                    // the pick and let the random re-roll stand. The DB capture matches
+                    // exactly what the screen showed (druid feral cat/bear split included).
+                    int const intendedSpec = intendedSpecDB;
                     PlayerbotFactory factory(hen, target);
                     factory.Randomize(false);
                     // Restore the picked spec if the re-roll moved off it —
