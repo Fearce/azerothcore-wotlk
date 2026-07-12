@@ -1947,10 +1947,14 @@ namespace WowPsParty
         return out;
     }
 
-    // Set the group's loot rule based on whether any SELF-LOOTING companion is
-    // present (a hired henchman or a hired alt): if so → GROUP_LOOT (rolls /
-    // round-robin) so each can claim its own share by looting the corpse; else →
-    // FREE_FOR_ALL (the all-enrolled premade, which auto-distributes on kill).
+    // Ensure the group uses GROUP_LOOT while any SELF-LOOTING companion (a hired
+    // henchman or a hired alt) is present, so each can claim its own share by
+    // looting the corpse. When NONE are present we deliberately DON'T force a loot
+    // method — we leave whatever the party already has. That "none present" case is
+    // only ever reached when a dismiss removes the last companion; forcing
+    // FREE_FOR_ALL there was an unwanted override of the player's chosen loot rule
+    // (dismissing henchmen would silently flip the party to free-for-all). Fresh
+    // all-enrolled premades that want FFA still get it set at group creation.
     static void UpdateGroupLootForHenchmen(Player* leader)
     {
         if (!leader) return;
@@ -1958,10 +1962,11 @@ namespace WowPsParty
         if (!g) return;
         bool const hasSelfLooter = WowPsParty::CountHenchmenFor(leader->GetGUID()) > 0
                                 || WowPsParty::CountHiredAltsFor(leader->GetGUID()) > 0;
-        g->SetLootMethod(hasSelfLooter ? GROUP_LOOT : FREE_FOR_ALL);
+        if (!hasSelfLooter)
+            return;   // keep the player's current loot method — never auto-revert to FFA on dismiss
+        g->SetLootMethod(GROUP_LOOT);
         g->SendUpdate();
-        LOG_INFO("module", "[WowPsParty Henchmen] loot method -> {} (self-looters present={})",
-                 hasSelfLooter ? "GROUP_LOOT" : "FREE_FOR_ALL", hasSelfLooter);
+        LOG_INFO("module", "[WowPsParty Henchmen] loot method -> GROUP_LOOT (self-looters present)");
     }
 
     // ===== Consumable upkeep (ammo + poisons) ===============================
