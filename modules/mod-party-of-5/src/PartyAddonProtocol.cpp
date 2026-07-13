@@ -71,11 +71,21 @@
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <unordered_set>
 #include <vector>
 #ifdef _WIN32
 #include <excpt.h>   // SEH (__try/__except) guard for the item-field reads below
+#endif
+
+// mod-ah-bot-plus is a gitignored clone that may be absent on a fresh
+// checkout, so the priced-to-sell AH_SELL clamp only compiles in when the
+// header is present and degrades to listing at the requested price otherwise.
+#include "Config.h"
+#if __has_include("../../mod-ah-bot-plus/src/AuctionHouseBot.h")
+#include "../../mod-ah-bot-plus/src/AuctionHouseBot.h"
+#define WOWPS_HAS_AHBOT 1
 #endif
 
 namespace WowPsParty
@@ -3302,7 +3312,88 @@ static void HandleMailSend(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
-// AH_SELL\t<srcPartySlot>\t<srcItemGuidLow>\t<copperBuyout>
+// How the priced-to-sell clamp relates to the mod-ah-bot-plus buyer: each buy
+// cycle (1/min) the buyer re-rolls the item's valuation through the same
+// public CalculateItemValue used here — a urand roll spanning
+// [base*(1-BuyoutVariationReducePercent), base*(1+BuyoutVariationAddPercent)]
+// — scales it by Buyer.AcceptablePriceModifier and count, and buys out any
+// player auction with buyout strictly below that. A listing is therefore only
+// GUARANTEED to sell when it sits under the roll's floor.
+enum class AhBotPricing
+{
+    Unavailable,    // module absent or buyer disabled — no clamp possible
+    VendorCapped,   // a vendor sells this item; the buyer never pays above its
+                    // vendor price, which plain vendoring already beats
+    Priced,         // outCopper = highest stack buyout the buyer always takes
+};
+
+#if defined(WOWPS_HAS_AHBOT)
+// Mirror of the buyer's PreventOverpayingForVendorItems lookup (the ahbot
+// keeps its copy private): every non-trade-good item some npc_vendor sells.
+// Restart-scoped by design, like the ahbot's own copy — vendor tables are
+// static world content.
+static std::unordered_set<uint32> const& VendorSoldItemIds()
+{
+    static std::unordered_set<uint32> const ids = []
+    {
+        std::unordered_set<uint32> set;
+        if (QueryResult r = WorldDatabase.Query(
+            "SELECT DISTINCT v.entry FROM item_template v JOIN npc_vendor p ON v.entry = p.item WHERE v.class != {}",
+            uint32(ITEM_CLASS_TRADE_GOODS)))
+            do { set.insert(r->Fetch()[0].Get<uint32>()); } while (r->NextRow());
+        return set;
+    }();
+    return ids;
+}
+
+static AhBotPricing AhBotGuaranteedStackPrice(ItemTemplate const* tmpl, uint32 count, uint32& outCopper)
+{
+    if (!auctionbot->IsModuleEnabled()
+        || !sConfigMgr->GetOption<bool>("AuctionHouseBot.Buyer.Enabled", false))
+        return AhBotPricing::Unavailable;
+
+    if (sConfigMgr->GetOption<bool>("AuctionHouseBot.Buyer.PreventOverpayingForVendorItems", true)
+        && VendorSoldItemIds().count(tmpl->ItemId))
+        return AhBotPricing::VendorCapped;
+
+    // CalculateItemValue returns one random roll, not the base value. The roll
+    // is the base scaled linearly into [1-reduce, 1+add], so the highest of N
+    // samples scaled by (1-reduce)/(1+add) is always <= the lowest roll the
+    // buyer can make, and converges on it as N grows (~1% short at N=24).
+    // Identical samples mean variations are configured off — the valuation is
+    // deterministic and the sample IS the floor.
+    uint64 maxSample = 0;
+    uint64 minSample = std::numeric_limits<uint64>::max();
+    for (int i = 0; i < 24; ++i)
+    {
+        uint64 bid = 0, buyout = 0;
+        auctionbot->CalculateItemValue(tmpl, bid, buyout);
+        maxSample = std::max(maxSample, buyout);
+        minSample = std::min(minSample, buyout);
+    }
+
+    float const reduce   = std::clamp(sConfigMgr->GetOption<float>("AuctionHouseBot.BuyoutVariationReducePercent", 0.15f), 0.0f, 0.99f);
+    float const add      = std::max(sConfigMgr->GetOption<float>("AuctionHouseBot.BuyoutVariationAddPercent", 0.25f), 0.0f);
+    float const modifier = sConfigMgr->GetOption<float>("AuctionHouseBot.Buyer.AcceptablePriceModifier", 1.0f);
+
+    double const perItemFloor = minSample == maxSample
+        ? double(maxSample)
+        : double(maxSample) * (1.0 - reduce) / (1.0 + add);
+
+    uint64 stack = uint64(perItemFloor * modifier) * count;
+    if (stack > 0)
+        --stack;   // the buyer requires buyout STRICTLY below its willing price
+    outCopper = uint32(std::min<uint64>(stack, MAX_MONEY_AMOUNT));
+    return AhBotPricing::Priced;
+}
+#else
+static AhBotPricing AhBotGuaranteedStackPrice(ItemTemplate const* /*tmpl*/, uint32 /*count*/, uint32& /*outCopper*/)
+{
+    return AhBotPricing::Unavailable;
+}
+#endif
+
+// AH_SELL\t<srcPartySlot>\t<srcItemGuidLow>\t<copperBuyout>[\t1]
 //   Lists an item out of any party member's bag on the owner's faction Auction
 //   House — no auctioneer required (same auctioneer-less posting the AH bot uses).
 //   24h listing, start bid == buyout == the requested copper price. The deposit
@@ -3312,6 +3403,11 @@ static void HandleMailSend(Player* requester, std::string_view payload)
 //   path, and collecting that mail re-mirrors the gold. Item must be tradeable
 //   (not soulbound), unequipped and an empty bag — the same gates the real AH
 //   applies, surfaced as chat errors so the click isn't silently dropped.
+//   The optional trailing "1" (the bulk AuctionAll path) means "price to sell":
+//   the requested copper is clamped down to what the AH buyer bot is guaranteed
+//   to pay, and items the bot won't sensibly buy (vendor-sold, or worth more at
+//   a vendor) are kept in the bag with a chat notice instead of expiring on the
+//   AH. The manual popup path omits the flag and lists at the exact typed price.
 static void HandleAhSell(Player* requester, std::string_view payload)
 {
     if (!requester || !requester->GetSession()) return;
@@ -3321,9 +3417,14 @@ static void HandleAhSell(Player* requester, std::string_view payload)
     auto t2 = payload.find('\t', t1 + 1);
     if (t2 == std::string_view::npos) return;
 
+    auto t3 = payload.find('\t', t2 + 1);
+
     uint32 const srcSlot = std::strtoul(std::string(payload.substr(0, t1)).c_str(), nullptr, 10);
     uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(t1 + 1, t2 - t1 - 1)).c_str(), nullptr, 10);
-    uint32 const copper = std::strtoul(std::string(payload.substr(t2 + 1)).c_str(), nullptr, 10);
+    std::string_view const copperField = t3 == std::string_view::npos
+        ? payload.substr(t2 + 1) : payload.substr(t2 + 1, t3 - t2 - 1);
+    uint32 copper = std::strtoul(std::string(copperField).c_str(), nullptr, 10);
+    bool const priceToSell = t3 != std::string_view::npos && payload.substr(t3 + 1) == "1";
     if (!srcItemGuidLow || copper == 0) return;
 
     auto err = [&](std::string const& msg)
@@ -3369,6 +3470,43 @@ static void HandleAhSell(Player* requester, std::string_view payload)
 
     uint32 const etime   = 2 * MIN_AUCTION_TIME;   // 24h, in seconds
     uint32 const count   = srcItem->GetCount();
+
+    if (priceToSell)
+    {
+        uint32 const requested = copper;
+        uint32 botPrice = 0;
+        switch (AhBotGuaranteedStackPrice(tmpl, count, botPrice))
+        {
+        case AhBotPricing::VendorCapped:
+            err(Acore::StringFormat("|cffffd100[WowPsParty]|r Kept |cffffffff{}|r — a vendor sells it, so the auction bot won't outbid the vendor price. Sell it instead.", tmpl->Name1));
+            LOG_INFO("module", "[WowPsParty AhSell] priced-to-sell '{}'(entry={}) x{} skipped: vendor-sold, buyer capped at vendor price (requested={})",
+                tmpl->Name1, tmpl->ItemId, count, requested);
+            return;
+        case AhBotPricing::Priced:
+        {
+            if (botPrice < copper)
+                copper = botPrice;
+            // 5% AH cut on the sale; if the vendor pays as much or more, listing
+            // is a strict loss — keep the item for the Sell button instead.
+            uint64 const vendorTotal = uint64(tmpl->SellPrice) * count;
+            if (copper == 0 || uint64(copper) * 95 / 100 <= vendorTotal)
+            {
+                err(Acore::StringFormat("|cffffd100[WowPsParty]|r Kept |cffffffff{}|r — a vendor pays more than the auction bot will. Sell it instead.", tmpl->Name1));
+                LOG_INFO("module", "[WowPsParty AhSell] priced-to-sell '{}'(entry={}) x{} skipped: bot max {} <= vendor total {} (requested={})",
+                    tmpl->Name1, tmpl->ItemId, count, botPrice, vendorTotal, requested);
+                return;
+            }
+            LOG_INFO("module", "[WowPsParty AhSell] priced-to-sell '{}'(entry={}) x{}: requested={} botGuaranteed={} listing={}",
+                tmpl->Name1, tmpl->ItemId, count, requested, botPrice, copper);
+            break;
+        }
+        case AhBotPricing::Unavailable:
+            LOG_INFO("module", "[WowPsParty AhSell] priced-to-sell requested but AH buyer bot inactive; listing '{}'(entry={}) x{} at requested {}",
+                tmpl->Name1, tmpl->ItemId, count, copper);
+            break;
+        }
+    }
+
     uint32 const deposit = sAuctionMgr->GetAuctionDeposit(ahEntry, etime, srcItem, count);
     if (!srcChar->HasEnoughMoney(deposit))
     {
