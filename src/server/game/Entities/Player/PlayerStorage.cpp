@@ -2649,6 +2649,66 @@ void Player::RemoveAmmo()
         UpdateDamagePhysical(RANGED_ATTACK);
 }
 
+bool Player::AutoEquipNextAmmo()
+{
+    // Requires No Ammo (Thori'dal) - ammo slot must stay empty
+    if (HasAura(46699))
+        return false;
+
+    Item* weapon = GetWeaponForAttack(RANGED_ATTACK);
+    if (!weapon || weapon->IsBroken())
+        return false;
+
+    uint32 depleted = GetUInt32Value(PLAYER_AMMO_ID);
+    uint32 bestId = 0;
+    float bestDps = 0.0f;
+
+    auto considerAmmo = [&](Item* pItem)
+    {
+        if (!pItem)
+            return;
+
+        ItemTemplate const* proto = pItem->GetTemplate();
+        if (!proto || proto->Class != ITEM_CLASS_PROJECTILE || proto->ItemId == depleted)
+            return;
+
+        if (!CheckAmmoCompatibility(proto) || CanUseAmmo(proto->ItemId) != EQUIP_ERR_OK)
+            return;
+
+        float dps = (proto->Damage[0].DamageMin + proto->Damage[0].DamageMax) / 2;
+        if (!bestId || dps > bestDps)
+        {
+            bestId = proto->ItemId;
+            bestDps = dps;
+        }
+    };
+
+    for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+        considerAmmo(GetItemByPos(INVENTORY_SLOT_BAG_0, i));
+
+    for (uint8 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_END; ++i)
+        if (Bag* pBag = GetBagByPos(i))
+            for (uint32 j = 0; j < pBag->GetBagSize(); ++j)
+                considerAmmo(GetItemByPos(i, j));
+
+    if (!bestId)
+        return false;
+
+    SetAmmo(bestId);
+    if (GetUInt32Value(PLAYER_AMMO_ID) != bestId)
+        return false;
+
+    uint32 remaining = GetItemCount(bestId);
+    LOG_INFO("entities.player.items", "[AutoAmmo] {} depleted ammo {}, auto-equipped {} ({} in bags)",
+        GetName(), depleted, bestId, remaining);
+
+    if (GetSession())
+        if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(bestId))
+            ChatHandler(GetSession()).PSendSysMessage("Out of ammo - equipped {} ({} left).", proto->Name1, remaining);
+
+    return true;
+}
+
 Item* Player::StoreNewItem(ItemPosCountVec const& dest, uint32 item, bool update, int32 randomPropertyId, bool refund)
 {
     AllowedLooterSet allowedLooters;

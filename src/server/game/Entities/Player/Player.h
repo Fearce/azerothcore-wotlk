@@ -1345,6 +1345,7 @@ public:
     void ApplyEquipCooldown(Item* pItem);
     void SetAmmo(uint32 item);
     void RemoveAmmo();
+    bool AutoEquipNextAmmo();
     [[nodiscard]] float GetAmmoDPS() const { return m_ammoDPS; }
     bool CheckAmmoCompatibility(ItemTemplate const* ammo_proto) const;
     void QuickEquipItem(uint16 pos, Item* pItem);

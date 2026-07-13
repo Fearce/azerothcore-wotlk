@@ -5352,7 +5352,12 @@ void Spell::TakeAmmo()
         }
         else if (!sWorld->getBoolConfig(CONFIG_ENABLE_INFINITEAMMO))
             if (uint32 ammo = m_caster->ToPlayer()->GetUInt32Value(PLAYER_AMMO_ID))
-                m_caster->ToPlayer()->DestroyItemCount(ammo, 1, true);
+            {
+                Player* player = m_caster->ToPlayer();
+                player->DestroyItemCount(ammo, 1, true);
+                if (!player->HasItemCount(ammo))
+                    player->AutoEquipNextAmmo();
+            }
     }
 }
 
@@ -7734,6 +7739,9 @@ SpellCastResult Spell::CheckItems(uint32* param1, uint32* param2)
                                     if (m_caster->HasAura(46699))
                                         break;                      // skip other checks
 
+                                    if (m_caster->ToPlayer()->AutoEquipNextAmmo())
+                                        break;
+
                                     return SPELL_FAILED_NO_AMMO;
                                 }
 
@@ -7762,6 +7770,9 @@ SpellCastResult Spell::CheckItems(uint32* param1, uint32* param2)
 
                                 if (!m_caster->ToPlayer()->HasItemCount(ammo))
                                 {
+                                    if (m_caster->ToPlayer()->AutoEquipNextAmmo())
+                                        break;
+
                                     m_caster->ToPlayer()->SetUInt32Value(PLAYER_AMMO_ID, 0);
                                     return SPELL_FAILED_NO_AMMO;
                                 }
