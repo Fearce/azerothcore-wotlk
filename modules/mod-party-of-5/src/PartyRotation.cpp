@@ -5900,11 +5900,11 @@ namespace WowPsParty
                     && EvalCondition(cond, bot, u);           // rule's target_* gates vs THIS enemy
             };
             Unit* pick = nullptr;
+            std::list<Unit*> hostiles;                        // shared with the no-candidate diagnostic below
             if (Unit* v = bot->GetVictim())
                 if (eligible(v)) pick = v;                    // dot what we're on first
             if (!pick)
             {
-                std::list<Unit*> hostiles;
                 GatherHostilesAround(bot, 41.0f, hostiles);   // canFireSpellOn does the precise range check
                 uint32 bestHp = 0;
                 for (Unit* a : hostiles)
@@ -5930,9 +5930,8 @@ namespace WowPsParty
                     uint32& lastMs = lastWhy[bot->GetGUID().GetRawValue()];
                     if (nowMs - lastMs > 5000)
                     {
+                        lastMs = nowMs;   // advance even when silent, like the rule trace
                         std::string why;
-                        std::list<Unit*> hostiles;
-                        GatherHostilesAround(bot, 41.0f, hostiles);
                         for (Unit* a : hostiles)
                         {
                             if (!a || !a->IsAlive() || !bot->IsValidAttackTarget(a)) continue;
@@ -5949,7 +5948,6 @@ namespace WowPsParty
                         }
                         if (!why.empty())
                         {
-                            lastMs = nowMs;
                             LOG_INFO("module",
                                 "[WowPsParty Rotation] {} spread {} found no candidate: {} cond=[{}]",
                                 bot->GetName(), arg, why, cond);
