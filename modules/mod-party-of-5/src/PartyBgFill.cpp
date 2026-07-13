@@ -86,13 +86,11 @@
 #include "BattlefieldWG.h"      // CanInteractWithRelic (final-gate breach -> defenders to core)
 #include "MotionMaster.h"       // WG bot AI movement (MovePoint / MoveChase)
 #include "GameObject.h"         // WG siege: destructible keep-wall damage (ModifyHealth)
+#include "Creature.h"           // WG siege vehicles (steer / react state / despawn)
 #include "Map.h"                // WG waypoint ground-snap (Map::GetHeight)
-#include "Cell.h"               // grid search for the keep walls
-#include "CellImpl.h"
-#include "GridNotifiers.h"      // GameObjectListSearcher
-#include "GridNotifiersImpl.h"
 
 #include <algorithm>
+#include <cmath>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -1312,6 +1310,9 @@ constexpr float  WG_VEH_WALL_RANGE    = 16.0f;    // within this of the target -
 constexpr uint32 WG_VEH_WALL_DMG_DEN  = 25;       // damage/tick = target maxHealth / this (~50s solo)
 constexpr float  WG_LEG_REACH         = 15.0f;    // a route leg counts as reached within this
 constexpr uint32 WG_LEG_TIMEOUT_MS    = 90000;    // stuck on a leg this long -> skip to the next
+constexpr uint32 WG_VEH_SPAWN_CD_MS   = 15000;    // min gap between vehicle spawns — a farmed
+                                                  // convoy respawns as a trickle, not a 2s-tick
+                                                  // pile-up stacking on the workshop pad
 struct WgPt { float x, y, z; };
 struct WgVehicle
 {
@@ -1320,6 +1321,8 @@ struct WgVehicle
     std::vector<WgPt> legs;   // convoy route: workshop -> road/bridge -> gate approach
     size_t leg = 0;
     uint32 legSinceMs = 0;
+    float steerX = 0.0f;      // last point SteerVehicle issued — a changed corridor
+    float steerY = 0.0f;      // target re-steers immediately instead of after arrival
 };
 std::unordered_map<ObjectGuid, WgVehicle> g_wgVehicles;   // vehicle GUID -> state
 
@@ -1329,19 +1332,6 @@ uint32 const WG_VEH_SIEGE_ALLY  = 28312;
 uint32 const WG_VEH_SIEGE_HORDE = 32627;
 uint32 const WG_VEH_DEMOLISHER  = 28094;
 uint32 const WG_VEH_CATAPULT    = 27881;
-
-// Finds intact destructible buildings (the keep walls/towers) near a point.
-struct WgWallCheck
-{
-    float x, y, z, range;
-    WgWallCheck(float _x, float _y, float _z, float _r) : x(_x), y(_y), z(_z), range(_r) {}
-    bool operator()(GameObject* go) const
-    {
-        if (!go || go->GetGoType() != GAMEOBJECT_TYPE_DESTRUCTIBLE_BUILDING) return false;
-        if (go->GetDestructibleState() == GO_DESTRUCTIBLE_DESTROYED) return false;
-        return go->IsWithinDist3d(x, y, z, range);
-    }
-};
 
 // Real WG objective coordinates (live-DB factory-banner + core tower positions) so pathing
 // stays on the navmesh. Bots are fanned ACROSS these by faction + guid-hash so the sides
@@ -1363,16 +1353,31 @@ WgPt const WG_TOWER_FLAMEWATCH  { 4459.1f, 1944.3f, 435.0f };   // GO 190358 (ea
 
 // The fortress assault corridor, south -> north along y~2841. The keep walls are
 // destructible GAMEOBJECTS, which the navmesh knows nothing about — a straight
-// MovePoint "walks through" them. Everything that wants in or out of the keep on the
-// ground is therefore routed through the front gate, and inside objectives only
-// unlock once the gate is actually breached.
+// MovePoint "walks through" them. The fortress is therefore modelled as STAGES whose
+// only legit crossings are the corridor openings: outdoors -> [front gate, breachable]
+// -> front courtyard -> [inner-ring arch GO 191805, always open] -> keep ->
+// [vault door, breachable] -> relic vault. All routed movement steps stage by stage.
 uint32 const WG_GO_FRONT_GATE = 190375;   // "Wintergrasp Fortress Gate" (outer ring, faces south)
-uint32 const WG_GO_LAST_DOOR  = 191810;   // the relic room door (breach -> relic clickable)
+uint32 const WG_GO_LAST_DOOR  = 191810;   // the relic vault door (breach -> relic clickable)
 WgPt const WG_GATE_APPROACH { 5090.0f, 2841.0f, 407.0f };   // siege line just outside the gate
 WgPt const WG_GATE          { 5163.0f, 2841.2f, 410.2f };
 WgPt const WG_COURTYARD     { 5230.0f, 2841.0f, 409.3f };
-WgPt const WG_INNER_PASSAGE { 5279.1f, 2840.8f, 409.8f };   // archway through the inner ring
-float const WG_WALL_X = 5150.0f;   // south wall line: x >= this ~= "inside the fortress"
+WgPt const WG_INNER_ARCH    { 5279.1f, 2840.8f, 409.8f };   // open archway through the inner ring (GO 191805, "wall with passage")
+WgPt const WG_INNER_COURT   { 5340.0f, 2841.0f, 409.8f };   // keep floor between the arch and the vault ramp
+WgPt const WG_VAULT_DOOR    { 5397.1f, 2841.5f, 425.9f };   // the relic vault door GO (top of the ramp)
+WgPt const WG_CORE_GATE_GUARD { 5382.0f, 2841.0f, 424.0f }; // defender stand on the ramp in FRONT of the vault door
+
+// Which fortress stage a position is in: 0 = outdoors, 1 = front courtyard,
+// 2 = keep, 3 = relic vault. The wall boxes come off the core's building spawn
+// table (BattlefieldWG.h): front section walls at x~5163/5280 spanning y 2747..2934;
+// keep section out to x~5510 spanning y 2630..3050; the vault door line at x~5397.
+int WgStage(float x, float y)
+{
+    if (x < 5163.0f) return 0;
+    if (x < 5280.0f) return (y >= 2747.0f && y <= 2934.0f) ? 1 : 0;
+    if (x <= 5510.0f && y >= 2630.0f && y <= 3050.0f) return x < 5397.0f ? 2 : 3;
+    return 0;
+}
 
 // Road waypoints from the workshops to the fortress front. The southern workshops sit
 // across the central canyon, so their routes cross the bridges.
@@ -1440,18 +1445,18 @@ std::vector<uint8> WgWorkshopsNotHeldBy(BattlefieldWG* bf, TeamId team, bool nor
     return out;
 }
 
-// The attacker-held workshop nearest the fortress, for vehicle spawns (-1 = none —
-// the defenders flipped every workshop, so no siege can be fielded: real WG rules).
-int WgVehicleSpawnWorkshop(BattlefieldWG* bf, TeamId atk)
+// Every outer workshop the attacker holds, for vehicle spawns (sorted for a stable
+// round-robin; empty = the defenders flipped every workshop, so no siege can be
+// fielded: real WG rules). Spawning across ALL held workshops instead of only the
+// nearest one keeps a replacement convoy from piling onto one spawn pad.
+std::vector<uint8> WgAttackerWorkshops(BattlefieldWG* bf, TeamId atk)
 {
-    int best = -1;
+    std::vector<uint8> held;
     for (WGWorkshop* ws : bf->GetWorkshopsList())
-    {
-        if (!ws || ws->workshopId >= BATTLEFIELD_WG_WORKSHOP_KEEP_WEST) continue;
-        if (ws->teamControl != atk) continue;
-        if (best < 0 || WG_WS[ws->workshopId].x > WG_WS[best].x) best = ws->workshopId;
-    }
-    return best;
+        if (ws && ws->workshopId < BATTLEFIELD_WG_WORKSHOP_KEEP_WEST && ws->teamControl == atk)
+            held.push_back(ws->workshopId);
+    std::sort(held.begin(), held.end());
+    return held;
 }
 
 // Per-bot objective, aware of the LIVE battle state (workshop control, gate breach,
@@ -1466,9 +1471,11 @@ WgPt WgObjectiveFor(Player* bot, Battlefield* wg)
     bool const defender = (bot->GetTeamId() == wg->GetDefenderTeam());
     uint32 const h = bot->GetGUID().GetCounter();
 
-    // Relic door breached -> endgame for BOTH sides: defend/claim the relic room.
+    // Vault door breached -> endgame: attackers rush the relic; defenders make their
+    // stand at the CORE GATE (the vault-ramp doorway) — blocking the way in, not
+    // AFK-stacked on top of the relic itself.
     if (bfwg->CanInteractWithRelic())
-        return WG_RELIC;
+        return defender ? WG_CORE_GATE_GUARD : WG_RELIC;
 
     bool const gateDown = WgBuildingDestroyed(bfwg, WG_GO_FRONT_GATE);
 
@@ -1490,7 +1497,7 @@ WgPt WgObjectiveFor(Player* bot, Battlefield* wg)
             }
         }
         if (gateDown)
-            return WG_COURTYARD;   // mass at the breach
+            return (h & 1) ? WG_COURTYARD : WG_INNER_ARCH;   // plug the breach + hold the inner choke
         static WgPt const GARRISON[3] = { { 5192.0f, 2841.0f, 409.3f },    // inside the gate
                                           { 5255.0f, 2954.0f, 409.0f },    // west courtyard
                                           { 5255.0f, 2728.0f, 409.0f } };  // east courtyard
@@ -1499,7 +1506,7 @@ WgPt WgObjectiveFor(Player* bot, Battlefield* wg)
 
     // Attackers.
     if (gateDown)
-        return (h % 3 == 0) ? WG_INNER_PASSAGE : WG_COURTYARD;   // pour into the keep
+        return (h % 3 == 0) ? WG_COURTYARD : WG_INNER_COURT;   // pour up the corridor toward the vault
     if (h % 10 < 2)   // small detail defends the towers the attackers own
     {
         switch (h % 3)
@@ -1515,40 +1522,62 @@ WgPt WgObjectiveFor(Player* bot, Battlefield* wg)
     return WG_GATE_APPROACH;                   // escort the siege at the gate front
 }
 
-// Move `bot` toward (tx,ty,tz), routed around the fortress walls: crossing the wall
-// line goes through the front gate. Defenders hop an INTACT gate via the keep portals
-// (a teleport — exactly how defenders really leave/re-enter the WG fortress); once
-// the gate is down everyone files through the breach on foot.
-void WgMoveRouted(Player* bot, Battlefield* wg, float tx, float ty, float tz)
+// Move `bot` toward (tx,ty,tz) without ghosting through standing fortress walls:
+// stage crossings go through the gate / inner arch / vault door in corridor order.
+// A blocked crossing (intact gate or vault door) holds attackers at the obstacle's
+// approach; defenders hop an INTACT front gate via a keep-portal-style teleport
+// (exactly how defenders really leave/re-enter the WG fortress). stopDist tightens
+// the arrive threshold for targets that must be reached exactly (the relic click).
+void WgMoveRouted(Player* bot, Battlefield* wg, float tx, float ty, float tz, float stopDist = 10.0f)
 {
-    bool const botIn = bot->GetPositionX() >= WG_WALL_X;
-    bool const tgtIn = tx >= WG_WALL_X;
-    if (botIn != tgtIn)
+    int const bs = WgStage(bot->GetPositionX(), bot->GetPositionY());
+    int const ts = WgStage(tx, ty);
+    if (bs != ts)
     {
         BattlefieldWG* bfwg = static_cast<BattlefieldWG*>(wg);
-        if (!WgBuildingDestroyed(bfwg, WG_GO_FRONT_GATE))
+        bool const deeper = ts > bs;
+        int const boundary = deeper ? bs : bs - 1;   // 0 = gate, 1 = arch, 2 = vault door
+        float const spread = float(int(bot->GetGUID().GetCounter() % 5) - 2) * 3.0f;
+        if (boundary == 0)
         {
-            if (bot->GetTeamId() == wg->GetDefenderTeam())
+            if (!WgBuildingDestroyed(bfwg, WG_GO_FRONT_GATE))
             {
-                if (bot->IsInCombat() || bot->IsBeingTeleported()) return;   // no combat portal-hopping
-                WgPt const& dst = tgtIn ? WG_COURTYARD : WG_GATE_APPROACH;
-                bot->TeleportTo(WG_MAP_ID, dst.x, dst.y,
-                                WgSnapZ(bot->GetMap(), dst.x, dst.y, dst.z), tgtIn ? 0.0f : 3.14f);
-                return;
+                if (bot->GetTeamId() == wg->GetDefenderTeam())
+                {
+                    if (bot->IsInCombat() || bot->IsBeingTeleported()) return;   // no combat portal-hopping
+                    WgPt const& dst = deeper ? WG_COURTYARD : WG_GATE_APPROACH;
+                    bot->TeleportTo(WG_MAP_ID, dst.x, dst.y,
+                                    WgSnapZ(bot->GetMap(), dst.x, dst.y, dst.z), deeper ? 0.0f : 3.14f);
+                    return;
+                }
+                if (!deeper)
+                {
+                    // Attacker INSIDE with the gate still standing is a wall-ghost anomaly
+                    // (pre-fix stragglers, a bad res spot) — put it back on the siege line.
+                    if (!bot->IsBeingTeleported())
+                        bot->TeleportTo(WG_MAP_ID, WG_GATE_APPROACH.x, WG_GATE_APPROACH.y, WG_GATE_APPROACH.z, 3.14f);
+                    return;
+                }
+                // Attacker vs an intact gate: hold the siege line and let the vehicles work.
+                tx = WG_GATE_APPROACH.x; ty = WG_GATE_APPROACH.y + spread; tz = WG_GATE_APPROACH.z;
             }
-            // Attacker vs an intact gate: hold the siege line and let the vehicles work.
-            tx = WG_GATE_APPROACH.x; ty = WG_GATE_APPROACH.y; tz = WG_GATE_APPROACH.z;
+            else if (bot->GetExactDist2d(WG_GATE.x, WG_GATE.y) > 25.0f)
+            { tx = WG_GATE.x; ty = WG_GATE.y + spread; tz = WG_GATE.z; }
         }
-        else if (bot->GetExactDist2d(WG_GATE.x, WG_GATE.y) > 25.0f)
+        else if (boundary == 1)
         {
-            // Through the breached gate first, then on to the objective next ticks. A
-            // small per-bot spread keeps a wave from stacking on one tile in the arch.
-            tx = WG_GATE.x;
-            ty = WG_GATE.y + float(int(bot->GetGUID().GetCounter() % 5) - 2) * 3.0f;
-            tz = WG_GATE.z;
+            if (bot->GetExactDist2d(WG_INNER_ARCH.x, WG_INNER_ARCH.y) > 15.0f)
+            { tx = WG_INNER_ARCH.x; ty = WG_INNER_ARCH.y + spread * 0.5f; tz = WG_INNER_ARCH.z; }
+        }
+        else
+        {
+            if (!WgBuildingDestroyed(bfwg, WG_GO_LAST_DOOR))
+            { tx = WG_CORE_GATE_GUARD.x; ty = WG_CORE_GATE_GUARD.y + spread; tz = WG_CORE_GATE_GUARD.z; }
+            else if (bot->GetExactDist2d(WG_VAULT_DOOR.x, WG_VAULT_DOOR.y) > 12.0f)
+            { tx = WG_VAULT_DOOR.x; ty = WG_VAULT_DOOR.y + spread * 0.5f; tz = WG_VAULT_DOOR.z; }
         }
     }
-    if (!bot->isMoving() && bot->GetExactDist2d(tx, ty) > 10.0f)
+    if (!bot->isMoving() && bot->GetExactDist2d(tx, ty) > stopDist)
         bot->GetMotionMaster()->MovePoint(0, tx, ty, tz);
 }
 
@@ -1682,8 +1711,37 @@ private:
     static void DriveAI(Player* bot, Battlefield* wg)
     {
         if (!bot->IsAlive()) return;                          // dead -> battlefield res handles it
+        if (bot->GetVehicle()) return;                        // seated in a siege vehicle — the convoy drives it
+        // WG is force-PvP for real players (zone 4197 carries AREA_FLAG_WINTERGRASP ->
+        // hostile-area flag on zone update), but teleported-in bots miss/lose that update
+        // and fought unflagged until they attacked (Kevin). Enforce it every drive tick.
+        if (!bot->IsPvP()) bot->UpdatePvP(true, true);
         if (bot->IsInCombat() && bot->GetVictim()) return;    // fighting -> combat AI owns it
         if (bot->IsNonMeleeSpellCast(false, false, true)) return;
+
+        // Attacker endgame FIRST — before any enemy-chasing: claim the relic, which is
+        // how a WG assault actually ends. Ranked above the engage scan so a won siege
+        // converges on the relic instead of being diverted by lingering defenders every
+        // tick until the battle times out. Approach it EXACTLY (no objective jitter,
+        // tight stop) and click from interact range: the old 8y check off a jittered
+        // 10y-stop walk left bots permanently a few yards out of click range (Kevin:
+        // "attackers don't click the core"). ProcessEvent is invoked directly so ending
+        // the battle never depends on the relic GO's goober-event wiring.
+        if (bot->GetTeamId() != wg->GetDefenderTeam())
+            if (BattlefieldWG* bfwg = static_cast<BattlefieldWG*>(wg); bfwg->CanInteractWithRelic())
+                if (GameObject* relic = bfwg->GetRelic())
+                {
+                    if (bot->IsWithinDistInMap(relic, 10.0f))
+                    {
+                        LOG_INFO("module", "[WowPsParty WGFill] attacker {} claims the Titan relic", bot->GetName());
+                        relic->Use(bot);
+                        bfwg->ProcessEvent(relic, 0);   // no-ops if Use() already ended the war
+                        return;
+                    }
+                    WgMoveRouted(bot, wg, relic->GetPositionX(), relic->GetPositionY(),
+                                 relic->GetPositionZ(), /*stopDist=*/4.0f);
+                    return;
+                }
 
         TeamId const enemyTeam = bot->GetTeamId() == TEAM_ALLIANCE ? TEAM_HORDE : TEAM_ALLIANCE;
         Unit* enemy = nullptr; float bestD = WG_ENGAGE_RANGE;
@@ -1697,6 +1755,14 @@ private:
         }
         if (enemy)
         {
+            // Never chase THROUGH a standing wall: LoS respects destructible-GO state,
+            // so no sight line means a wall is in the way — walk the routed corridor
+            // toward the enemy instead of ghosting a straight MoveChase at them.
+            if (!bot->IsWithinLOSInMap(enemy))
+            {
+                WgMoveRouted(bot, wg, enemy->GetPositionX(), enemy->GetPositionY(), enemy->GetPositionZ());
+                return;
+            }
             if (bot->GetVictim() != enemy)
             {
                 bot->Attack(enemy, true);
@@ -1737,19 +1803,6 @@ private:
             }
         }
 
-        // Attacker at the breached relic room -> CLICK the relic. This is how a WG
-        // assault actually ends (the goober event fires EndBattle); without it a
-        // bot-won siege just stood next to the core until the timer ran out.
-        if (bot->GetTeamId() != wg->GetDefenderTeam())
-            if (BattlefieldWG* bfwg = static_cast<BattlefieldWG*>(wg); bfwg->CanInteractWithRelic())
-                if (GameObject* relic = bfwg->GetRelic())
-                    if (bot->IsWithinDistInMap(relic, 8.0f))
-                    {
-                        LOG_INFO("module", "[WowPsParty WGFill] attacker {} claims the Titan relic", bot->GetName());
-                        relic->Use(bot);
-                        return;
-                    }
-
         // No enemy/vehicle in range -> head to this bot's assigned OBJECTIVE so the sides
         // spread across the map (workshops / towers / breach) instead of all bunching. A
         // small per-bot jitter keeps a shared objective from stacking pixel-perfect, and
@@ -1786,7 +1839,13 @@ private:
                     Player* hero = ObjectAccessor::FindConnectedPlayer(hg);
                     if (!hero || !sPlayerbotsMgr.GetPlayerbotAI(hero)) continue;   // managed heroes only
                     if (hero->GetTeamId() != leader->GetTeamId()) continue;
-                    if (IsInWar(wg, hero)) continue;                                // already enrolled
+                    if (IsInWar(wg, hero))
+                    {
+                        // Enrolled heroes get the same PvP enforcement as the fills —
+                        // they miss/lose the zone's force-flag update just like them.
+                        if (!hero->IsPvP()) hero->UpdatePvP(true, true);
+                        continue;
+                    }
                     if (hero->GetZoneId() != WG_ZONE_ID) { TeleportToStaging(hero, wg); continue; }
                     wg->InvitePlayerToWar(hero);
                     wg->PlayerAcceptInviteToWar(hero);
@@ -1819,7 +1878,16 @@ private:
             Creature* veh = ObjectAccessor::GetCreature(*anchor, vg);
             if (!veh || !veh->IsAlive())
             {
-                if (veh) veh->DespawnOrUnsummon();
+                if (veh)
+                {
+                    LOG_INFO("module",
+                        "[WowPsParty WGFill] vehicle {} destroyed at ({:.0f},{:.0f}) leg {}/{}",
+                        veh->GetEntry(), veh->GetPositionX(), veh->GetPositionY(), st.leg, st.legs.size());
+                    veh->DespawnOrUnsummon();
+                }
+                else
+                    LOG_INFO("module", "[WowPsParty WGFill] vehicle {} vanished (leg {}/{})",
+                             vg.GetCounter(), st.leg, st.legs.size());
                 { std::lock_guard<std::mutex> lk(g_wgMutex); g_wgVehicles.erase(vg); }
                 continue;
             }
@@ -1830,58 +1898,97 @@ private:
             if (st.leg < st.legs.size())
             {
                 WgPt const& t = st.legs[st.leg];
-                if (veh->GetExactDist2d(t.x, t.y) < WG_LEG_REACH
-                    || getMSTime() - st.legSinceMs > WG_LEG_TIMEOUT_MS)
+                bool const timedOut = getMSTime() - st.legSinceMs > WG_LEG_TIMEOUT_MS;
+                if (veh->GetExactDist2d(t.x, t.y) < WG_LEG_REACH || timedOut)
                 {
+                    if (timedOut)
+                        LOG_INFO("module",
+                            "[WowPsParty WGFill] vehicle {} stuck on leg {} at ({:.0f},{:.0f}) — skipping",
+                            veh->GetEntry(), st.leg, veh->GetPositionX(), veh->GetPositionY());
+                    // Home follows the convoy: an evade / combat-drop reset must never
+                    // send the vehicle crawling all the way back to its spawn workshop
+                    // (SpawnCreature homes it there — the "stacked at the workshop" loop).
+                    veh->SetHomePosition(veh->GetPositionX(), veh->GetPositionY(),
+                                         veh->GetPositionZ(), veh->GetOrientation());
                     std::lock_guard<std::mutex> lk(g_wgMutex);
                     auto it = g_wgVehicles.find(vg);
                     if (it != g_wgVehicles.end()) { ++it->second.leg; it->second.legSinceMs = getMSTime(); }
                 }
-                else if (!veh->isMoving())
-                    veh->GetMotionMaster()->MovePoint(0, t.x, t.y, WgSnapZ(veh->GetMap(), t.x, t.y, t.z));
+                else
+                    SteerVehicle(vg, veh, t.x, t.y, WgSnapZ(veh->GetMap(), t.x, t.y, t.z));
                 continue;
             }
 
-            // At the front: batter the corridor obstacle. Both doors face SOUTH, so the
-            // hold-off point is a few yards south of the GO — never inside its collision.
-            GameObject* target = nullptr;
-            if (GameObject* gate = WgBuildingGo(bfwg, WG_GO_FRONT_GATE))
-                if (gate->GetDestructibleState() != GO_DESTRUCTIBLE_DESTROYED)
-                    target = gate;
-            if (!target)
-                if (GameObject* door = WgBuildingGo(bfwg, WG_GO_LAST_DOOR))
-                    if (door->GetDestructibleState() != GO_DESTRUCTIBLE_DESTROYED)
-                        target = door;
-            if (!target)
+            // At the front: batter the assault corridor in REAL siege order, advancing
+            // stage by stage — the gate first, then THROUGH the gate and inner arch on
+            // the open centre line, then shell the vault door from the keep floor.
+            // ModifyHealth needs no LoS, so every swing is position-gated: the vault
+            // door is only ever hit from INSIDE the keep, past the arch — never through
+            // standing walls (the "relic door died while every inner wall stood" bug).
+            float const yOff = float(int(vg.GetCounter() % 5) - 2) * 4.0f;
+            GameObject* gate = WgBuildingGo(bfwg, WG_GO_FRONT_GATE);
+            GameObject* door = WgBuildingGo(bfwg, WG_GO_LAST_DOOR);
+            if (gate && !WgBuildingDestroyed(bfwg, WG_GO_FRONT_GATE))
             {
-                // Corridor fully open (relic stage) — flavour-batter a nearby wall, else hold.
-                std::list<GameObject*> walls;
-                WgWallCheck check(veh->GetPositionX(), veh->GetPositionY(), veh->GetPositionZ(), 60.0f);
-                Acore::GameObjectListSearcher<WgWallCheck> searcher(veh, walls, check);
-                Cell::VisitObjects(veh, searcher, 60.0f);
-                float bestD = 1e9f;
-                for (GameObject* w : walls)
-                {
-                    float const d = veh->GetDistance(w);
-                    if (d < bestD) { bestD = d; target = w; }
-                }
-                if (!target) continue;
+                if (veh->GetDistance(gate) > WG_VEH_WALL_RANGE)
+                    SteerVehicle(vg, veh, WG_GATE.x - 16.0f, WG_GATE.y + yOff, WG_GATE.z);
+                else
+                    Batter(veh, gate);
             }
-            float const d = veh->GetDistance(target);
-            if (d > WG_VEH_WALL_RANGE)
+            else if (door && !WgBuildingDestroyed(bfwg, WG_GO_LAST_DOOR))
             {
-                if (!veh->isMoving())
-                    veh->GetMotionMaster()->MovePoint(0, target->GetPositionX() - 13.0f,
-                                                      target->GetPositionY(), target->GetPositionZ());
+                // Corridor bands by x: <5222 head for the courtyard; <5284 line up on
+                // the arch; >=5330 and within 45y shell the door; the 5284..5330 gap
+                // advances to the keep floor via the else — every x moves or swings.
+                float const vx = veh->GetPositionX();
+                if (vx < WG_COURTYARD.x - 8.0f)
+                    SteerVehicle(vg, veh, WG_COURTYARD.x, WG_COURTYARD.y + yOff * 0.5f, WG_COURTYARD.z);
+                else if (vx < WG_INNER_ARCH.x + 5.0f)
+                    SteerVehicle(vg, veh, WG_INNER_ARCH.x + 10.0f, WG_INNER_ARCH.y + yOff * 0.25f, WG_INNER_ARCH.z);
+                else if (vx >= WG_INNER_COURT.x - 10.0f && veh->GetDistance(door) <= 45.0f)
+                    Batter(veh, door);   // shell the vault door from the keep floor, demolisher-style
+                else
+                    SteerVehicle(vg, veh, WG_INNER_COURT.x + 15.0f, WG_INNER_COURT.y + yOff * 0.5f, WG_INNER_COURT.z);
+            }
+            // Corridor fully open (relic stage): hold position as an occupying siege. No
+            // flavour-battering of random walls — stray demolition is exactly what made
+            // the battle state incomprehensible before.
+        }
+        return live;
+    }
+
+    // Re-steer unless the vehicle is already executing OUR point move TO THIS target:
+    // an evade/home or charm-driven motion reset would otherwise leave it parked (or
+    // crawling back to its spawn) until the next leg change, and a corridor target
+    // that advanced mid-move (courtyard -> arch -> vault front) would lag a full
+    // arrival behind without the changed-destination check.
+    static void SteerVehicle(ObjectGuid vg, Creature* veh, float x, float y, float z)
+    {
+        bool const onPointMove = veh->isMoving()
+            && veh->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE;
+        {
+            std::lock_guard<std::mutex> lk(g_wgMutex);
+            auto it = g_wgVehicles.find(vg);
+            if (it == g_wgVehicles.end())
+            {
+                if (onPointMove) return;
             }
             else
             {
-                uint32 const maxHp = target->GetGOValue()->Building.MaxHealth;
-                int32 const dmg = std::max<int32>(1, int32(maxHp / WG_VEH_WALL_DMG_DEN));
-                target->ModifyHealth(-dmg, veh);   // siege damage; WG building hooks react -> battle progresses
+                if (onPointMove && std::abs(it->second.steerX - x) < 4.0f
+                                && std::abs(it->second.steerY - y) < 4.0f)
+                    return;   // already driving to (roughly) this point
+                it->second.steerX = x; it->second.steerY = y;
             }
         }
-        return live;
+        veh->GetMotionMaster()->MovePoint(0, x, y, z);
+    }
+
+    static void Batter(Creature* veh, GameObject* target)
+    {
+        uint32 const maxHp = target->GetGOValue()->Building.MaxHealth;
+        int32 const dmg = std::max<int32>(1, int32(maxHp / WG_VEH_WALL_DMG_DEN));
+        target->ModifyHealth(-dmg, veh);   // siege damage; WG building hooks react -> battle progresses
     }
 
     // Keep up to WG_MAX_VEHICLES attacker siege vehicles in the field. Spawn near the
@@ -1897,16 +2004,19 @@ private:
         uint32 const target = std::max<uint32>(WG_MAX_VEHICLES, (maxSlots + 1) / 2);
         if (live >= target) return;
 
+        // Trickle replacements: a convoy the defenders are farming must not respawn a
+        // vehicle every 2s tick onto the same pad — that's the "vehicles stack on top
+        // of each other" pile-up. One spawn per cooldown window, tops.
+        static uint32 lastSpawnMs = 0;
+        if (lastSpawnMs && getMSTime() - lastSpawnMs < WG_VEH_SPAWN_CD_MS) return;
+
         // Spawn the siege AT a workshop the attacker CONTROLS — that's where WG vehicles
         // actually come from — then let DriveVehicles run the convoy up the road to the
-        // gate. (Earlier iterations spawned at the rear staging — the vehicles died long
-        // before reaching a wall — and then anchored on the nearest wall GO at the wall's
-        // own Z, which dropped them ON TOP of the walls / next to the core. The workshop
-        // spawn is on real ground, ground-snapped, with a per-spawn jitter so a convoy
-        // doesn't stack.) No attacker-held workshop -> no siege, the real WG rule.
+        // gate. Round-robin across ALL held workshops so replacements spread out instead
+        // of piling onto one pad. No attacker-held workshop -> no siege, the real WG rule.
         BattlefieldWG* bfwg = static_cast<BattlefieldWG*>(wg);
-        int const wsId = WgVehicleSpawnWorkshop(bfwg, atk);
-        if (wsId < 0) return;
+        std::vector<uint8> const held = WgAttackerWorkshops(bfwg, atk);
+        if (held.empty()) return;
 
         WorldObject* anchor = nullptr;
         for (uint8 ti = 0; ti < 2 && !anchor; ++ti)
@@ -1915,8 +2025,9 @@ private:
         if (!anchor) return;   // nobody loaded to resolve the map yet — retry next tick
 
         static uint32 vehRoll = 0;
+        uint8 const wsId = held[vehRoll % held.size()];
         WgPt const& ws = WG_WS[wsId];
-        std::vector<WgPt> const legs = WgVehicleRoute(uint8(wsId));
+        std::vector<WgPt> const legs = WgVehicleRoute(wsId);
         float const sx = ws.x + float(int(vehRoll % 5) - 2) * 6.0f;
         float const sy = ws.y + float(int(vehRoll / 5 % 5) - 2) * 6.0f;
         float const sz = WgSnapZ(anchor->GetMap(), sx, sy, ws.z);
@@ -1927,6 +2038,9 @@ private:
         uint32 const pick = entries[(vehRoll++) % 4];   // vary the entry across spawns
         Creature* veh = wg->SpawnCreature(pick, spawnPos, atk);
         if (!veh) return;
+        lastSpawnMs = getMSTime();
+        // Never fight back / evade off the convoy: the drive loop owns this creature.
+        veh->SetReactState(REACT_PASSIVE);
 
         // Seat an idle attacking fill bot as the driver (flavour — the vehicle drives itself
         // server-side regardless). Pick one not already in a vehicle / fighting.
@@ -1948,7 +2062,7 @@ private:
           g_wgVehicles[veh->GetGUID()] = WgVehicle{ driver, getMSTime(), legs, 0, getMSTime() }; }
         LOG_INFO("module",
             "[WowPsParty WGFill] spawned attacker vehicle entry={} at workshop {} (live now {})",
-            pick, wsId, live + 1);
+            pick, uint32(wsId), live + 1);
     }
 
     // Spawn rndbot-pool chars (race-correct, offline, prefer already-high-level to skip
