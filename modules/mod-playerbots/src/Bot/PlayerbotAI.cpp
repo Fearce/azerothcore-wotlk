@@ -4254,11 +4254,17 @@ bool PlayerbotAI::CastVehicleSpell(uint32 spellId, Unit* target)
     if ((spellTarget != vehicleBase || siegePos.isSet()) && (spellInfo->Targets & TARGET_FLAG_DEST_LOCATION))
     {
         WorldLocation dest;
-        if (spellTarget != vehicleBase)
-            dest = WorldLocation(spellTarget->GetMapId(), spellTarget->GetPosition());
-        else if (siegePos.isSet())
+        // The battleground objective must win over a selected enemy player.
+        // Vehicle spell actions have much higher relevance than "move to
+        // objective", so preferring spellTarget here would consume every
+        // boulder/glaive cooldown on players before BGTactics can shell the gate.
+        // CanCastVehicleSpell already validates destination spells against
+        // siegePos first; keep the real cast consistent with that decision.
+        if (siegePos.isSet())
             dest = WorldLocation(bot->GetMapId(), siegePos.x + frand(-5.0f, 5.0f), siegePos.y + frand(-5.0f, 5.0f),
                                  siegePos.z, 0.0f);
+        else if (spellTarget != vehicleBase)
+            dest = WorldLocation(spellTarget->GetMapId(), spellTarget->GetPosition());
         else
             return false;
 
@@ -4290,6 +4296,11 @@ bool PlayerbotAI::CastVehicleSpell(uint32 spellId, Unit* target)
         // delete spell;
         return false;
     }
+
+    if (siegePos.isSet() && (spellInfo->Targets & TARGET_FLAG_DEST_LOCATION))
+        LOG_INFO("playerbots", "[BG Siege] {} casts {} ({}) at ({:.1f}, {:.1f}, {:.1f}); selectedTarget={}",
+                 bot->GetName(), spellInfo->SpellName[LOCALE_enUS], spellId, siegePos.x, siegePos.y, siegePos.z,
+                 target ? target->GetName() : "none");
 
     // WaitForSpellCast(spell);
 
