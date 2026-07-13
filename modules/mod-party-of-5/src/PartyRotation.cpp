@@ -4329,14 +4329,25 @@ namespace WowPsParty
         // "stop_hold_cast[:seconds]": arm the cast hold — the bot declines every spell
         // with a cast time or channel while it's live, so it rides an enemy silence /
         // school-lockout (e.g. Disrupting Shout) on INSTANTS only instead of eating a
-        // wasted hard-cast. Optional arg = hold seconds (default 7, sized for a typical
-        // silence); re-armed each tick its condition holds. Also cancels the in-progress
-        // HARD cast/channel right now so a Healing Touch already in flight isn't finished
-        // into the silence — an instant or wand/auto-shot is left running. Returns false
-        // so the SAME tick falls through to the bot's instant rules (Rejuv/Swiftmend/…).
+        // wasted hard-cast. Also cancels the in-progress HARD cast/channel right now so a
+        // Healing Touch already in flight isn't finished into the silence — an instant or
+        // wand/auto-shot is left running. Returns false so the SAME tick falls through to
+        // the bot's instant rules (Rejuv/Swiftmend/…).
+        //
+        // The hold is a SHORT bridge, re-armed each tick its condition holds — NOT a fixed
+        // "wait N seconds after the silence lands". Once the silence actually lands the CORE
+        // enforces it (a hard cast is rejected SPELL_FAILED_SILENCED and falls through to
+        // instants anyway), so the only job of the hold past the trigger is a small tail:
+        // keep declining hard casts for a beat after the enemy stops casting the silence,
+        // so the bot doesn't start a cast in the instant before the aura registers. The
+        // moment the school-lock actually lifts the bot must resume hard-casting — a long
+        // blind tail is exactly the "waits too long to cast again after stop_hold_cast"
+        // report. Default is therefore short (2s ≈ two rotation ticks). The optional arg is
+        // for a KNOWN-long lockout (Counterspell 6-8s) where you'd rather not re-attempt-
+        // and-fail each tick: "stop_hold_cast:6" holds the full window.
         if (verb == "stop_hold_cast")
         {
-            static constexpr uint32 STOP_HOLD_CAST_DEFAULT_SEC = 7;
+            static constexpr uint32 STOP_HOLD_CAST_DEFAULT_SEC = 2;
             static constexpr uint32 STOP_HOLD_CAST_MAX_SEC     = 60;   // clamp fat-fingered args
             uint32 secs = arg.empty() ? 0 : uint32(std::max(0, std::atoi(arg.c_str())));
             if (secs == 0) secs = STOP_HOLD_CAST_DEFAULT_SEC;
@@ -4663,6 +4674,21 @@ namespace WowPsParty
             // stutter in place. A ranged bot settles at its standoff and shoots
             // while stationary; the only cost is a transient UNIT_NOT_INFRONT on a
             // shot fired mid-reposition, which simply retries next tick.
+            // A live WAND auto-repeat (5019 "Shoot") fires AURA_INTERRUPT_FLAG_CAST on
+            // its NEXT swing, which would interrupt the cast-time/channel we're about to
+            // start — the "wand-wielding caster takes ages to get back to hard-casting"
+            // report (esp. resuming after a stop_hold_cast: the bot wanded through the
+            // silence and the wand's pending swing keeps clipping the first Frostbolt).
+            // EnsureRangedAutoAttack stands the wand down while casting, but only on the
+            // NEXT tick — a swing pending in this tick's window still clips the cast.
+            // Cancel it HERE, same tick, before CastSpell, so the resume lands cleanly;
+            // the wand resumes on its own once the bot has nothing to hard-cast. Only the
+            // wand (5019) is cancelled — a hunter's Auto Shot (75) weaves between casts
+            // and must keep running. Gated on holdMs>0: an instant can't be clipped.
+            if (holdMs > 0)
+                if (Spell* wand = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+                    if (wand->GetSpellInfo() && wand->GetSpellInfo()->Id == 5019)
+                        bot->InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
             if (target && target != bot && holdMs > 0)
             {
                 bot->StopMoving();
@@ -7579,7 +7605,15 @@ namespace WowPsParty
         if (needAmmo && bot->GetUInt32Value(PLAYER_AMMO_ID) == 0) return;
         if (bot->GetDistance(victim) > maxRange) return;       // out of ranged range
         if (!bot->IsWithinLOSInMap(victim, VMAP::ModelIgnoreFlags::M2)) return;  // M2: match Spell::CheckCast
-        if (autoSpell == 5019) bot->SetFacingToObject(victim); // wand repeat fails NOT_INFRONT otherwise
+        // Aim at the target for the wand shot (5019 fails NOT_INFRONT otherwise).
+        // SetOrientation, NOT SetFacingToObject: the latter LAUNCHES a facing move-spline,
+        // which counts as movement — SampleMovement then flags the bot RecentlyMoved and
+        // leaves movespline->Finalized() false, so the very next tick's hard cast is held
+        // by faceAndCast's settle/spline gates. A wanding caster thus kept deferring its
+        // return to hard-casting (the "takes a long time to get back to spell-casting"
+        // report). SetOrientation aims it synchronously with no spline (HasInArc passes,
+        // nothing left in flight) — the same primitive faceAndCast uses for its casts.
+        if (autoSpell == 5019) bot->SetOrientation(bot->GetAngle(victim));
         SpellCastResult const r = bot->CastSpell(victim, autoSpell, false);
         if (r != SPELL_CAST_OK)
         {
