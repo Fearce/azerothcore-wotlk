@@ -917,6 +917,11 @@ namespace WowPsParty
     // false when every lane is crowded, so the caller skips the kite and casts
     // in place. (Reachability/lava is still handled by MovePoint's
     // forceDestination=false at the call site.)
+    static bool DestInDamage(Player* bot, std::vector<Unit*> const& clouds,
+                             float x, float y, Unit const* anchor,
+                             std::string const& exceptSpell);   // defined below (g_recentDamage)
+    static bool HazardLogThrottled(uint32 guidLow);             // defined below
+
     static bool PickSafeKitePoint(Player* bot, Unit* enemy, float dist,
                                   float& ox, float& oy, float& oz)
     {
@@ -924,6 +929,10 @@ namespace WowPsParty
 
         std::list<Unit*> hostiles;
         GatherHostilesAround(bot, 40.0f, hostiles);
+        // A kite spot must not END in damage (a ground cloud / a fresh Coldflame
+        // patch) — fleeing a mob into the bad is the same death, slower.
+        std::vector<Unit*> clouds;
+        GatherDamagingClouds(bot, 45.0f, clouds);
 
         float const DANGER = 12.0f;                 // keep the whole lane this clear
         float const baseAngle = enemy->GetAngle(bot);  // directly away from enemy
@@ -964,9 +973,17 @@ namespace WowPsParty
             if (!enemy->IsWithinLOS(x, y, z))
                 continue;
 
+            if (DestInDamage(bot, clouds, x, y, enemy, std::string()))
+                continue;
+
             ox = x; oy = y; oz = z;
             return true;
         }
+        if (HazardLogThrottled(bot->GetGUID().GetCounter()))
+            LOG_INFO("module",
+                "[WowPsParty Rotation] {} kite: no lane away from {} is clear of "
+                "mobs/damage with LoS - casting in place",
+                bot->GetName(), enemy->GetName());
         return false;   // no safe + in-LoS spot — caller skips the kite
     }
 
@@ -2075,6 +2092,116 @@ namespace WowPsParty
             float const dx = h.sx - x, dy = h.sy - y;
             if (dx * dx + dy * dy <= m2) return true;
         }
+        return false;
+    }
+
+    // ---- shared "never END a move inside damage" gate ------------------------
+    // Kevin's rule for EVERY positioning verb: the path may cross a hazard, but
+    // the FINAL coordinate must never sit in one — stepping out of Bone Storm
+    // into Coldflame trades one death for another. Two hazard models exist:
+    //   * damaging ground-cloud props (GatherDamagingClouds/PointInClouds) —
+    //     Grobbulus poison, Sapphiron blizzard, …
+    //   * recent located spell hits (g_recentDamage) — Coldflame patches, the
+    //     fire that just hit us — the same points RecentDamageNear tests.
+    // A destination is only safe when it clears BOTH. `clouds` is gathered once
+    // per tick by the caller, not per candidate.
+    //
+    // `anchor` is the HOSTILE unit the verb positions around (the fight target),
+    // when there is one: recent hits recorded AT the anchor's own body (its
+    // direct breath / cleave / storm — the engine bills the caster's position)
+    // are ignored, because the verb's own geometry (rear arc, cone edge, flank)
+    // is what answers those; a blanket veto would poison every melee-range spot
+    // for 1.5 s after each boss spell and freeze melee entirely. Detached ground
+    // patches (Coldflame) sit at their OWN positions and still veto.
+    //
+    // `exceptSpell` names the hazard being actively FLED (walk_away_from_source's
+    // arg): its own trail points are excluded — the caller already maximises
+    // distance to them — so they can't veto every escape bearing; every OTHER
+    // source still does (out of Bone Storm but never into Coldflame).
+    static constexpr float DEST_HAZARD_MARGIN = 6.0f;   // matches PickLosBreakPoint's margin
+    static bool DestInDamage(Player* bot, std::vector<Unit*> const& clouds,
+                             float x, float y, Unit const* anchor,
+                             std::string const& exceptSpell)
+    {
+        if (PointInClouds(clouds, x, y)) return true;
+        float ax = 0.0f, ay = 0.0f, anchorNear2 = 0.0f;
+        if (anchor)
+        {
+            ax = anchor->GetPositionX();
+            ay = anchor->GetPositionY();
+            float const r = anchor->GetCombatReach() + 5.0f;
+            anchorNear2 = r * r;
+        }
+        uint32 const now = getMSTime();
+        std::lock_guard<std::mutex> lock(g_recentDamageMutex);
+        auto it = g_recentDamage.find(bot->GetGUID().GetCounter());
+        if (it == g_recentDamage.end()) return false;
+        float const m2 = DEST_HAZARD_MARGIN * DEST_HAZARD_MARGIN;
+        for (RecentHit const& h : it->second)
+        {
+            if (!h.hasSrc || now - h.ms > RECENT_DMG_WINDOW_MS) continue;
+            if (anchor)
+            {
+                float const adx = h.sx - ax, ady = h.sy - ay;
+                if (adx * adx + ady * ady <= anchorNear2) continue;   // the anchor's own direct hit
+            }
+            if (!exceptSpell.empty()
+                && SpellNameOrIdMatches(sSpellMgr->GetSpellInfo(h.spellId), exceptSpell))
+                continue;
+            float const dx = h.sx - x, dy = h.sy - y;
+            if (dx * dx + dy * dy <= m2) return true;
+        }
+        return false;
+    }
+
+    // Fan around `around` at radius `dist`, starting from `baseAngle` (the spot
+    // the verb actually WANTS) and widening in small steps, returning the FIRST
+    // candidate whose final coordinate is clear of damage — i.e. the minimal
+    // deviation from the wanted spot that still ends safe. `hostileAnchor` is
+    // the fight target for DestInDamage's own-hit exclusion (null when `around`
+    // is a friendly — an enemy ground patch at the healer's feet must still
+    // veto). Returns false when EVERY bearing ends in damage, so the caller
+    // stands and casts instead of walking into the bad.
+    // Per-bot throttle for hazard-gate diagnostics: the veto paths re-evaluate
+    // every rotation tick while a bot stays boxed in, and an unthrottled line
+    // per tick would flood Server.log for the whole hazard window.
+    static bool HazardLogThrottled(uint32 guidLow)
+    {
+        static std::mutex mx;
+        static std::unordered_map<uint32, uint32> last;
+        std::lock_guard<std::mutex> lk(mx);
+        uint32 const now = getMSTime();
+        uint32& t = last[guidLow];
+        if (t && now - t < 2000) return false;
+        t = now;
+        return true;
+    }
+
+    static bool PickSafeDestAround(Player* bot, Unit* around, Unit const* hostileAnchor,
+                                   float dist, float baseAngle,
+                                   float& ox, float& oy, float& oz)
+    {
+        std::vector<Unit*> clouds;
+        GatherDamagingClouds(bot, 45.0f, clouds);
+        static float const offsets[] = { 0.0f, 0.4f, -0.4f, 0.8f, -0.8f, 1.3f, -1.3f };
+        for (float off : offsets)
+        {
+            float x, y, z;
+            around->GetNearPoint(bot, x, y, z, 0.0f, dist, baseAngle + off);
+            if (DestInDamage(bot, clouds, x, y, hostileAnchor, std::string())) continue;
+            if (off != 0.0f)
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] {} hazard-gate: wanted spot near {} in damage, "
+                    "deviating {:.2f} rad to ({:.1f},{:.1f})",
+                    bot->GetName(), around->GetName(), off, x, y);
+            ox = x; oy = y; oz = z;
+            return true;
+        }
+        if (HazardLogThrottled(bot->GetGUID().GetCounter()))
+            LOG_INFO("module",
+                "[WowPsParty Rotation] {} hazard-gate: every bearing around {} at {:.1f}y "
+                "ends in damage - holding position",
+                bot->GetName(), around->GetName(), dist);
         return false;
     }
 
@@ -6457,12 +6584,13 @@ namespace WowPsParty
             return true;
         }
 
-        // "move_behind" — step around to the BACK of the current target so back-only
-        // attacks land (rogue Backstab / Ambush, feral Shred / Ravage). No spell —
-        // it only positions. Returns false (fall through to the back-attack rule)
-        // once we're already behind AND in melee; otherwise it MovePoints to a spot
-        // directly behind the target and briefly holds off the assist re-chase so it
-        // doesn't drag us back to the front. Place it ABOVE the back-attack ability.
+        // "move_behind" — step out of the target's FRONT so back-only attacks land
+        // (rogue Backstab / Ambush, feral Shred / Ravage). No spell — it only
+        // positions. Returns false (fall through to the back-attack rule) once
+        // we're out of the frontal arc; otherwise it MovePoints to the NEAREST
+        // safe spot past the arc edge and briefly holds off the assist re-chase
+        // so it doesn't drag us back to the front. Place it ABOVE the back-attack
+        // ability.
         if (verb == "move_behind")
         {
             Unit* v = bot->GetVictim();
@@ -6476,27 +6604,52 @@ namespace WowPsParty
             // until perfectly behind + in melee, which never converged on a mob that
             // keeps rotating to face its tank.
             if (!v->isInFront(bot)) return false;
-            // In the frontal arc: strafe to the target's REAR, PRESERVING our
-            // current distance (so a ranged bot just steps to the back at range
-            // instead of being yanked into melee). Sweep a few rear angles and take
-            // the first spot that ISN'T inside a damaging ground cloud — moving
-            // blindly to the exact back ran bots straight into Grobbulus's poison
-            // cloud. If EVERY rear spot is hazardous, DON'T move (stay put + cast)
-            // rather than strafe into damage. Block only while clearing the cone —
-            // the check above yields the instant we're out of the front.
-            float const baseBack = v->GetOrientation() + 3.14159265f;   // opposite the target's facing
-            float const gap      = bot->GetDistance(v);                 // keep our current range
+            // In the frontal arc: step to the NEAREST spot that satisfies the
+            // yield condition (!isInFront — just past the ±90° arc edge on the
+            // side we're already on), PRESERVING our current distance so a
+            // ranged bot steps around at range instead of being yanked into
+            // melee. Minimal move by construction: candidates sweep from the
+            // near edge deeper toward the exact rear, and the FIRST safe one
+            // wins — strafing the full half-circle to the exact back was both
+            // the long way around and what ran bots straight through (and into)
+            // Grobbulus's poison cloud. Each candidate's FINAL coordinate must
+            // be clear of damage (clouds + fresh ground hits — DestInDamage) and
+            // navmesh-reachable. If EVERY spot is hazardous, DON'T move (stay
+            // put + cast) rather than strafe into damage. Block only while
+            // clearing the cone — the check above yields the instant we're out.
+            float const facing = v->GetOrientation();
+            float const gap    = std::max(bot->GetDistance(v), 1.5f);   // keep our current range
+            float rel = v->GetAngle(bot) - facing;                      // our bearing vs its facing
+            while (rel >  float(M_PI)) rel -= 2.0f * float(M_PI);
+            while (rel < -float(M_PI)) rel += 2.0f * float(M_PI);
+            float const side = (rel >= 0.0f) ? 1.0f : -1.0f;            // exit toward the side we're on
+            constexpr float EDGE = float(M_PI) * 0.5f + 0.30f;          // just past the front-arc edge
+            // Near edge first, then deeper on our side, then the far side, and
+            // the exact rear only as the last resort.
+            float const sweep[] = { side * EDGE,  side * (EDGE + 0.55f),
+                                    -side * EDGE, -side * (EDGE + 0.55f),
+                                    float(M_PI) };
             std::vector<Unit*> clouds;
             GatherDamagingClouds(bot, 45.0f, clouds);
             float bx, by, bz; bool safe = false;
-            for (float off : { 0.0f, 0.5f, -0.5f, 1.0f, -1.0f })   // rear, then ±29°, ±57°
+            int skipped = 0; float chosen = 0.0f;
+            for (float a : sweep)
             {
                 float tx, ty, tz;
-                v->GetNearPoint(bot, tx, ty, tz, 0.0f, gap, baseBack + off);
-                if (clouds.empty() || !PointInClouds(clouds, tx, ty))
-                { bx = tx; by = ty; bz = tz; safe = true; break; }
+                v->GetNearPoint(bot, tx, ty, tz, 0.0f, gap, facing + a);
+                if (DestInDamage(bot, clouds, tx, ty, v, std::string())) { ++skipped; continue; }
+                if (!NavReachable(bot, tx, ty, tz, gap)) { ++skipped; continue; }
+                bx = tx; by = ty; bz = tz; chosen = a; safe = true; break;
             }
-            if (!safe) return false;   // nowhere safe behind — hold position and cast
+            if (!safe)
+            {
+                if (HazardLogThrottled(bot->GetGUID().GetCounter()))
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation] {} move_behind: every rear spot around {} "
+                        "hazardous/unreachable - holding position",
+                        bot->GetName(), v->GetName());
+                return false;   // nowhere safe behind — hold position and cast
+            }
             WowPsParty::HoldFollower(bot->GetGUID(), 1500);
             static thread_local std::unordered_map<uint32, uint32> lastMoveMs;
             uint32 const gLow = bot->GetGUID().GetCounter();
@@ -6506,7 +6659,14 @@ namespace WowPsParty
                 || now - last > 400)
             {
                 last = now;
-                bot->GetMotionMaster()->MovePoint(0, bx, by, bz);
+                if (skipped > 0)
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation] {} move_behind: {} candidate(s) vetoed, "
+                        "settling at {:.2f} rad off {}'s facing",
+                        bot->GetName(), skipped, chosen, v->GetName());
+                bot->GetMotionMaster()->MovePoint(0, bx, by, bz, FORCED_MOVEMENT_NONE,
+                                                  0.0f, 0.0f, /*generatePath=*/true,
+                                                  /*forceDestination=*/false);
             }
             return true;
         }
@@ -6546,13 +6706,18 @@ namespace WowPsParty
             {
                 float x, y, z;
                 enemy->GetNearPoint(bot, x, y, z, 0.0f, gap, facing + s * EDGE);
-                if (!clouds.empty() && PointInClouds(clouds, x, y)) continue;
+                if (DestInDamage(bot, clouds, x, y, enemy, std::string())) continue;
                 if (!NavReachable(bot, x, y, z, gap)) continue;
                 bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
                                                   0.0f, 0.0f, /*generatePath=*/true,
                                                   /*forceDestination=*/false);
                 return true;
             }
+            if (HazardLogThrottled(bot->GetGUID().GetCounter()))
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] {} dodge_frontals: both cone-edge exits around {} "
+                    "hazardous/unreachable - holding",
+                    bot->GetName(), enemy->GetName());
             return true;   // boxed both sides — hold rather than walk deeper into the cone
         }
 
@@ -6602,13 +6767,18 @@ namespace WowPsParty
             {
                 float x, y, z;
                 enemy->GetNearPoint(bot, x, y, z, 0.0f, gap, facing + s * FLANK);
-                if (!clouds.empty() && PointInClouds(clouds, x, y)) continue;
+                if (DestInDamage(bot, clouds, x, y, enemy, std::string())) continue;
                 if (!NavReachable(bot, x, y, z, gap)) continue;
                 bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
                                                   0.0f, 0.0f, /*generatePath=*/true,
                                                   /*forceDestination=*/false);
                 return true;
             }
+            if (HazardLogThrottled(bot->GetGUID().GetCounter()))
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] {} stand_on_side: both flanks of {} "
+                    "hazardous/unreachable - holding",
+                    bot->GetName(), enemy->GetName());
             return true;   // boxed both sides — hold rather than walk into a danger arc
         }
 
@@ -6627,8 +6797,13 @@ namespace WowPsParty
                 return false;   // already in the frontal arc at range -> hold + let casts fire
             if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
             {
+                // Fan stays inside the ±90° frontal arc (max offset 1.3 rad), so
+                // every safe pick still satisfies the yield check above; if the
+                // whole front is hazardous, DON'T walk into it — cast from here.
                 float fx, fy, fz;
-                v->GetNearPoint(bot, fx, fy, fz, 0.0f, want, v->GetOrientation());
+                if (!PickSafeDestAround(bot, v, v, want, v->GetOrientation(),
+                                        fx, fy, fz))
+                    return false;
                 bot->GetMotionMaster()->MovePoint(0, fx, fy, fz, FORCED_MOVEMENT_NONE,
                                                   0.0f, 0.0f, /*generatePath=*/true,
                                                   /*forceDestination=*/false);
@@ -6651,9 +6826,14 @@ namespace WowPsParty
             if (bot->GetDistance(tank) <= want) return false;   // stacked -> let casts fire
             if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
             {
+                // Nearest safe spot around the tank on OUR side first — never
+                // finish the stack move inside a ground hazard; if every spot by
+                // the tank is in the bad, cast from here instead.
                 float tx, ty, tz;
-                tank->GetNearPoint(bot, tx, ty, tz, 0.0f, std::max(want - 2.0f, 2.0f),
-                                   tank->GetAngle(bot));
+                if (!PickSafeDestAround(bot, tank, nullptr,
+                                        std::max(want - 2.0f, 2.0f),
+                                        tank->GetAngle(bot), tx, ty, tz))
+                    return false;
                 bot->GetMotionMaster()->MovePoint(0, tx, ty, tz, FORCED_MOVEMENT_NONE,
                                                   0.0f, 0.0f, /*generatePath=*/true,
                                                   /*forceDestination=*/false);
@@ -6926,10 +7106,13 @@ namespace WowPsParty
             {
                 if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
                 {
+                    // Regain LoS at the nearest safe bearing — never fix a blind
+                    // corner by planting ourselves in a ground hazard.
                     float x, y, z;
-                    enemy->GetNearPoint(bot, x, y, z, 0.0f,
-                                        std::max(want - 4.0f, 5.0f),
-                                        enemy->GetAngle(bot));
+                    if (!PickSafeDestAround(bot, enemy, enemy,
+                                            std::max(want - 4.0f, 5.0f),
+                                            enemy->GetAngle(bot), x, y, z))
+                        return false;
                     bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
                                                       0.0f, 0.0f, true, false);
                 }
@@ -6974,9 +7157,13 @@ namespace WowPsParty
             if (bot->GetDistance(healer) <= want) return false;  // close enough
             if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
             {
+                // Nearest safe spot on our side of the healer — never close the
+                // heal-range gap by ending the move in a ground hazard.
                 float x, y, z;
-                healer->GetNearPoint(bot, x, y, z, 0.0f, std::max(want - 2.0f, 3.0f),
-                                     healer->GetAngle(bot));
+                if (!PickSafeDestAround(bot, healer, nullptr,
+                                        std::max(want - 2.0f, 3.0f),
+                                        healer->GetAngle(bot), x, y, z))
+                    return false;
                 // forceDestination=false: only move to a point the navmesh can
                 // actually REACH. Without it MovePoint forces the bot straight to
                 // the computed spot even when it's through a wall or over lava —
@@ -7017,9 +7204,13 @@ namespace WowPsParty
             if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
             {
                 // A point want+4 from the nearest ally, in the direction AWAY from
-                // it (the ally->bot bearing), so the bot moves further out.
+                // it (the ally->bot bearing), so the bot moves further out — but
+                // never a spread spot that ENDS in a ground hazard; if every
+                // bearing out is in the bad, stay clumped and let casts fire.
                 float x, y, z;
-                nearest->GetNearPoint(bot, x, y, z, 0.0f, want + 4.0f, nearest->GetAngle(bot));
+                if (!PickSafeDestAround(bot, nearest, nullptr, want + 4.0f,
+                                        nearest->GetAngle(bot), x, y, z))
+                    return false;
                 bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
                                                   0.0f, 0.0f, /*generatePath=*/true,
                                                   /*forceDestination=*/false);
@@ -7050,9 +7241,14 @@ namespace WowPsParty
             if (bot->GetDistance(enemy) <= want) return false;   // in range — stand & cast
             if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
             {
+                // Close to the nearest safe in-range bearing — advancing INTO a
+                // ground hazard to reach cast range is never worth it; if every
+                // approach spot is in the bad, stand and wait it out.
                 float x, y, z;
-                enemy->GetNearPoint(bot, x, y, z, 0.0f, std::max(want - 2.0f, 3.0f),
-                                    enemy->GetAngle(bot));
+                if (!PickSafeDestAround(bot, enemy, enemy,
+                                        std::max(want - 2.0f, 3.0f),
+                                        enemy->GetAngle(bot), x, y, z))
+                    return false;
                 // forceDestination=false: only move to a point the navmesh can
                 // actually REACH. Without it MovePoint forces the bot straight to
                 // the computed spot even when it's through a wall or over lava —
@@ -7158,6 +7354,15 @@ namespace WowPsParty
             // straight-away. (The old scoring picked the reachable spot CLOSEST to the
             // bot's enemy target — on Marrowgar that's a tangential orbit around/inside
             // the storm, Kevin's "they walk along the damage source".)
+            // The hop must also never END in a DIFFERENT damage source — out of
+            // Bone Storm but never into Coldflame. With a NAMED arg the fled
+            // spell's own trail is excluded from the veto (the minHazardDist
+            // scoring already pushes away from those points) but every OTHER
+            // located source still vetoes; with a BARE arg the hazard set above
+            // already holds ALL recent sources — the strictly-farther scoring
+            // handles them — so only ground clouds can veto.
+            std::vector<Unit*> clouds;
+            GatherDamagingClouds(bot, 45.0f, clouds);
             constexpr int N = 16;   // 22.5° fan steps around the full circle
             float bestX = 0.0f, bestY = 0.0f, bestZ = 0.0f, bestScore = 0.0f;
             bool  haveBest = false;
@@ -7170,6 +7375,9 @@ namespace WowPsParty
                 float const y = bot->GetPositionY() + std::sin(ang) * STEP;
                 float const d = minHazardDist(x, y);
                 if (d <= curDist + 0.5f) continue;             // sideways/inward — never
+                if (arg.empty() ? PointInClouds(clouds, x, y)
+                                : DestInDamage(bot, clouds, x, y, nullptr, arg))
+                    continue;
                 float const score = d - 0.15f * float(notch);  // out-most first, then radial
                 if (haveBest && score <= bestScore) continue;
                 float z = bot->GetPositionZ();
@@ -7215,11 +7423,17 @@ namespace WowPsParty
                 return true;
             // Try a few random directions so a wall on one side doesn't stop the hop;
             // forceDestination=false means an unreachable pick simply isn't taken.
+            // A pick that lands IN a damage source (ground cloud / fresh ground
+            // hit) is rejected too — a random hop into the fire defeats the verb.
+            std::vector<Unit*> clouds;
+            GatherDamagingClouds(bot, 45.0f, clouds);
             for (int i = 0; i < 5; ++i)
             {
                 float const ang = frand(0.0f, 2.0f * 3.14159265f);
                 float x, y, z;
                 bot->GetNearPoint(bot, x, y, z, 0.0f, dist, ang);
+                if (DestInDamage(bot, clouds, x, y, nullptr, std::string()))
+                    continue;
                 if (bot->IsWithinLOS(x, y, z))   // don't aim through a wall
                 {
                     bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
