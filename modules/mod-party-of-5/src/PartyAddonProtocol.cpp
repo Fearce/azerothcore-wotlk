@@ -1667,6 +1667,88 @@ namespace {
         static std::unordered_map<uint32, std::vector<WowPsParty::RotationRule>> m;
         return m;
     }
+
+    // -------- Oversized-message (WPSP_FRAG) reassembly -----------------------
+    // 3.3.5a's SendAddonMessage silently DROPS any single message whose wire form
+    // exceeds ~255 bytes. Each rotation rule is sent as its own ROTATION_RULE /
+    // SHARED_ROTATION_RULE line, so one rule with a long comma-separated name list
+    // (a Focus-fire rule naming a dozen mobs, a big target_name: clause, ...) could
+    // blow past that limit and vanish mid-save without any error — exactly how a
+    // long Common-tab focus rule disappeared. The addon now splits any oversized
+    // line into ordered WPSP_FRAG chunks; we buffer them here and hand back the
+    // reassembled original the moment the final chunk lands.
+    struct FragmentBuffer
+    {
+        uint32                   total = 0;
+        std::vector<std::string> chunks;
+    };
+
+    // Partial reassembly buffers keyed by (playerGuidLow << 16 | msgId). A buffer
+    // is erased as soon as its message completes, so at most a handful of tiny
+    // partials ever linger (one per in-flight fragmented line).
+    std::unordered_map<uint64, FragmentBuffer>& FragmentBuffers()
+    {
+        static std::unordered_map<uint64, FragmentBuffer> m;
+        return m;
+    }
+
+    // Accept one WPSP_FRAG payload: "<msgId>\t<seq>\t<total>\t<chunk>". Returns
+    // true and fills `out` with the reassembled original body once every chunk has
+    // arrived; false while chunks are still pending (or the fragment is malformed).
+    // Every field is bounded so a broken/hostile client can't drive an allocation.
+    bool ReassembleFragment(Player* player, std::string_view payload, std::string& out)
+    {
+        std::string_view rest = payload;
+        auto nextField = [&rest]() -> std::string_view
+        {
+            size_t tab = rest.find('\t');
+            if (tab == std::string_view::npos)
+            {
+                std::string_view f = rest;
+                rest = std::string_view();
+                return f;
+            }
+            std::string_view f = rest.substr(0, tab);
+            rest = rest.substr(tab + 1);
+            return f;
+        };
+
+        std::string_view idSv    = nextField();
+        std::string_view seqSv   = nextField();
+        std::string_view totalSv = nextField();
+        std::string_view chunk   = rest;   // remainder is the chunk, verbatim
+
+        if (idSv.empty() || seqSv.empty() || totalSv.empty())
+            return false;
+
+        uint32 const msgId = uint32(std::strtoul(std::string(idSv).c_str(), nullptr, 10));
+        uint32 const seq   = uint32(std::strtoul(std::string(seqSv).c_str(), nullptr, 10));
+        uint32 const total = uint32(std::strtoul(std::string(totalSv).c_str(), nullptr, 10));
+
+        // A rotation rule fragments into a few ~200-byte chunks, never dozens.
+        if (total == 0 || total > 64 || seq == 0 || seq > total)
+            return false;
+
+        uint64 const key = (uint64(player->GetGUID().GetCounter()) << 16) | (msgId & 0xFFFF);
+        FragmentBuffer& buf = FragmentBuffers()[key];
+        if (buf.total != total)   // first chunk of this id (or a restarted send)
+        {
+            buf.total = total;
+            buf.chunks.assign(total, std::string());
+        }
+        buf.chunks[seq - 1].assign(chunk.data(), chunk.size());
+
+        // Chunks are never empty on the wire, so "no empty slot" == complete.
+        for (std::string const& c : buf.chunks)
+            if (c.empty())
+                return false;
+
+        out.clear();
+        for (std::string const& c : buf.chunks)
+            out += c;
+        FragmentBuffers().erase(key);
+        return true;
+    }
 }
 
 // SELL\t<srcPartySlot>\t<srcItemGuidLow>
@@ -5136,6 +5218,29 @@ public:
             payload = body.substr(tab + 1);
         }
 
+        // Reassemble an oversized line the addon split into WPSP_FRAG chunks (a
+        // single rotation rule can exceed the 3.3.5a ~255-byte addon-message cap).
+        // Once complete, dispatch the reassembled body as if it had arrived whole;
+        // `reassembled` is the backing store the string_views point into, so it
+        // must outlive the rest of this method.
+        std::string reassembled;
+        if (command == "WPSP_FRAG")
+        {
+            if (!ReassembleFragment(player, payload, reassembled))
+                return;   // more chunks pending (or malformed) — nothing to dispatch yet
+            body = reassembled;
+            command = body;
+            payload = std::string_view();
+            if (auto tab = body.find('\t'); tab != std::string_view::npos)
+            {
+                command = body.substr(0, tab);
+                payload = body.substr(tab + 1);
+            }
+            LOG_INFO("module",
+                "[WowPsParty] WPSP_FRAG reassembled from guid={} -> cmd='{}' body_len={}",
+                player->GetGUID().GetCounter(), std::string(command), uint32(body.size()));
+        }
+
         // Unconditional inbound-message trace: every WPSP command, who sent
         // it, and the payload length. Lets me see in Server.log exactly which
         // commands reach the dispatcher versus which never arrive (i.e., the
@@ -6019,7 +6124,10 @@ public:
         // bytes. A 9-rule rotation easily exceeds 350 chars, so the whole
         // SET_ROTATION message used to vanish without a trace. The chunked
         // BEGIN / ROTATION_RULE / COMMIT_ROTATION sequence keeps every
-        // individual message tiny.
+        // individual message tiny — and a single rule that is itself over-long
+        // (a big comma-separated focus/target_name list) arrives pre-reassembled
+        // from its WPSP_FRAG chunks (see the dispatch head), so it can't be the
+        // one message that silently vanishes either.
         else if (command == "BEGIN_ROTATION")
         {
             std::string const token(payload);
