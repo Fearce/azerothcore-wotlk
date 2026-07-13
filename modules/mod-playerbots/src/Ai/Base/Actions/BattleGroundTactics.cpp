@@ -1711,7 +1711,12 @@ bool BGTactics::saBoatHold()
         return false;
 
     bool const roundActive = saBg->GetSAStatus() == BG_SA_ROUND_ONE || saBg->GetSAStatus() == BG_SA_ROUND_TWO;
-    if (bot->GetTransport())
+    // The core "boards" attackers by teleporting them to raw coords above the boat
+    // deck; only a real client then glues itself to the GO transport and reports it
+    // in its movement info. A bot has no client, so GetTransport() stays null and it
+    // hovers at the boat spawn out at sea forever. Detect "at sea" positionally too:
+    // land tops out around x=1620, the boat spawns sit at x=2577/2682.
+    if (bot->GetTransport() || bot->GetPositionX() > 1900.0f)
     {
         if (!roundActive)
             return true;  // boat still sailing — sit tight
@@ -1731,7 +1736,7 @@ bool BGTactics::saBoatHold()
 
 // A parked demolisher shells the contested gate; a manned cannon shells whatever is
 // pushing the front. Fired from the move-to-objective tick so it keeps shooting for
-// as long as the bot holds its spot (spell cooldowns pace the rate).
+// as long as the bot holds its spot (SA_CastVehicleSpellPaced paces the rate).
 bool BGTactics::saVehicleShoot()
 {
     if (!botAI->IsInVehicle(false, true))  // needs a gun seat
@@ -1742,6 +1747,30 @@ bool BGTactics::saVehicleShoot()
         return false;
 
     BattlegroundSA* saBg = static_cast<BattlegroundSA*>(bg);
+// The core never stores vehicle-spell cooldowns server-side for creature casters
+// (Spell::SendSpellCooldown only sends the packet that greys a real player's
+// button), so an unpaced bot re-fires every AI tick — a machine-gun cannon that
+// kills a player in about a second. Apply the pace as an explicit creature
+// cooldown; CastVehicleSpell's HasSpellCooldown check then enforces it.
+static bool SA_CastVehicleSpellPaced(PlayerbotAI* botAI, Unit* vehicleBase, uint32 spellId, float x, float y, float z,
+                                     uint32 paceMs)
+{
+    if (!botAI->CastVehicleSpell(spellId, x, y, z))
+        return false;
+
+    if (Creature* vehicle = vehicleBase->ToCreature())
+        vehicle->AddSpellCooldown(spellId, 0, paceMs);
+    return true;
+}
+
+// fire rates a human in the same seat could plausibly match (GCD + aim time)
+enum SAVehiclePaceMs : uint32
+{
+    SA_PACE_HURL_BOULDER = 3000,
+    SA_PACE_RAM          = 3000,
+    SA_PACE_ROCKET_BLAST = 2500,
+};
+
     Unit* vehicleBase = bot->GetVehicleBase();
     if (!vehicleBase || !vehicleBase->IsAlive())
         return false;
@@ -1763,12 +1792,12 @@ bool BGTactics::saVehicleShoot()
         if (dist > 60.0f)
             return false;
 
-        if (botAI->CastVehicleSpell(SA_SPELL_HURL_BOULDER, gate->GetPositionX(), gate->GetPositionY(),
-                                    gate->GetPositionZ()))
+        if (SA_CastVehicleSpellPaced(botAI, vehicleBase, SA_SPELL_HURL_BOULDER, gate->GetPositionX(),
+                                     gate->GetPositionY(), gate->GetPositionZ(), SA_PACE_HURL_BOULDER))
             return true;
 
-        return dist < 20.0f && botAI->CastVehicleSpell(SA_SPELL_RAM, gate->GetPositionX(), gate->GetPositionY(),
-                                                       gate->GetPositionZ());
+        return dist < 20.0f && SA_CastVehicleSpellPaced(botAI, vehicleBase, SA_SPELL_RAM, gate->GetPositionX(),
+                                                        gate->GetPositionY(), gate->GetPositionZ(), SA_PACE_RAM);
     }
 
     // defender cannon: enemy players first (they take graveyards and click the relic),
@@ -1812,8 +1841,8 @@ bool BGTactics::saVehicleShoot()
     if (!target)
         return false;
 
-    return botAI->CastVehicleSpell(SA_SPELL_ROCKET_BLAST, target->GetPositionX(), target->GetPositionY(),
-                                   target->GetPositionZ());
+    return SA_CastVehicleSpellPaced(botAI, vehicleBase, SA_SPELL_ROCKET_BLAST, target->GetPositionX(),
+                                    target->GetPositionY(), target->GetPositionZ(), SA_PACE_ROCKET_BLAST);
 }
 
 //
@@ -4060,6 +4089,11 @@ bool BGTactics::startNewPathFree(std::vector<BattleBotPath*> const& vPaths)
  * @param vPaths Vector of possible paths the bot can take
  * @param vFlagIds Vector of flag/base GameObjects that can be captured
  * @return true if handling a flag/base action, false otherwise
+    else if (bgType == BATTLEGROUND_SA)
+        // SA roles pick a gate flank on both sides; a re-roll mid-round makes
+        // defenders portal-teleport between posts and attackers re-flank for no
+        // reason (the log showed defenders ping-ponging between gates 0 and 2)
+        oddsToChangeRole = 0;
  */
 bool BGTactics::atFlag(std::vector<BattleBotPath*> const& vPaths, std::vector<uint32> const& vFlagIds)
 {

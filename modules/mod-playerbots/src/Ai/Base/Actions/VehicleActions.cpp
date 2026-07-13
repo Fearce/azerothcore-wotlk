@@ -89,6 +89,9 @@ bool EnterVehicleAction::EnterVehicle(Unit* vehicleBase, bool moveIfFar)
     if (!bot->IsOnVehicle(vehicleBase))
         return false;
 
+    LOG_INFO("playerbots", "{} boards vehicle {} (entry {})", bot->GetName(), vehicleBase->GetName(),
+             vehicleBase->GetEntry());
+
     // dismount because bots can enter vehicle on mount
     WorldPacket emptyPacket;
     bot->GetSession()->HandleCancelMountAuraOpcode(emptyPacket);
