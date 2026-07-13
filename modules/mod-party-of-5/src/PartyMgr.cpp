@@ -797,6 +797,14 @@ namespace WowPsParty
                     // 50% damage reduction when in danger (off the GCD in-game; the
                     // rotation just spends one tick popping it). Forbearance.
                     add("self_health<40", "buff_self:Divine Protection", 89);
+                    // MANA upkeep — cast the moment mana dips, not as a last resort:
+                    // Guarded by the Light (the 80 prot template takes it) refreshes
+                    // Divine Plea on melee hits, so one cast holds ~100% uptime and
+                    // the tank never runs dry. The -50% healing-done side effect only
+                    // dents its own emergency Flash of Light — worth it for a tank.
+                    // buff_self falls through while active/on cooldown, so the high
+                    // priority only ever wins the tick it actually fires.
+                    add("self_mana<90", "buff_self:Divine Plea", 88);
                     add("party_lowest_health<35", "cast_party_lowest:Flash of Light", 86);
                     add("always", "buff_self:Righteous Fury", 82);
                     // Crusader Aura (mount speed) while mounted; Devotion on foot (mutually
