@@ -1363,7 +1363,11 @@ namespace WowPsParty
                     // Gated on the proc aura so the 5s hard-cast Pyroblast never clogs the
                     // rotation; no proc → no Pyroblast, fall through to Fireball.
                     add("self_has_aura:Hot Streak", "cast:Pyroblast", 69);
-                    add("target_missing_aura:Living Bomb", "cast:Living Bomb", 68);
+                    // Living Bomb is a SPREAD dot — keep the whole pull dotted (the verb
+                    // self-gates on who's missing it), like priest SW:P / warlock
+                    // Corruption. in_combat, not target_missing_aura: an already-dotted
+                    // victim must not veto spreading to a fresh add.
+                    add("in_combat", "cast_spread:Living Bomb", 68);
                     // Ground AoE on the densest CLUSTER (a ranged mage stands back, so a
                     // bot-centred melee count reads 0 on a pack it could nuke).
                     add("enemies_clustered:8>2", "cast:Flamestrike", 60);

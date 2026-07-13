@@ -5914,7 +5914,50 @@ namespace WowPsParty
                         if (!pick || hp > bestHp) { bestHp = hp; pick = a; }
                     }
             }
-            if (!pick) return false;
+            if (!pick)
+            {
+                // Why-not diagnostic (throttled): "the mage fireballs while an undotted
+                // mob stands there" is unanswerable from the rule trace alone — it only
+                // shows exec_failed_falling_through, not WHICH gate rejected WHICH mob.
+                // Name the undotted enemies (up to ~a log line) and the first gate each
+                // one failed (condition failures are usually the rule's target_ttd /
+                // target_health clauses, so print the mob's live ttd alongside). Silent when every
+                // enemy is dotted or the bot is out of combat — no idle spam.
+                if (bot->IsInCombat())
+                {
+                    static thread_local std::unordered_map<uint64, uint32> lastWhy;
+                    uint32 const nowMs = getMSTime();
+                    uint32& lastMs = lastWhy[bot->GetGUID().GetRawValue()];
+                    if (nowMs - lastMs > 5000)
+                    {
+                        std::string why;
+                        std::list<Unit*> hostiles;
+                        GatherHostilesAround(bot, 41.0f, hostiles);
+                        for (Unit* a : hostiles)
+                        {
+                            if (!a || !a->IsAlive() || !bot->IsValidAttackTarget(a)) continue;
+                            if (TargetHasNamedAura(a, arg)) continue;   // dotted = working as intended
+                            char const* gate =
+                                !MobEngagedByParty(bot, a, party) ? "not-engaged"
+                                : !canFireSpellOn(spellId, a)     ? "range/LoS/cost"
+                                :                                   "condition";
+                            if (!why.empty()) why += ", ";
+                            why += a->GetName() + "(hp=" + std::to_string(a->GetMaxHealth()
+                                    ? int(100.0f * float(a->GetHealth()) / float(a->GetMaxHealth())) : 0)
+                                 + "% ttd=" + std::to_string(TtdSeconds(a)) + ")=" + gate;
+                            if (why.size() > 200) break;
+                        }
+                        if (!why.empty())
+                        {
+                            lastMs = nowMs;
+                            LOG_INFO("module",
+                                "[WowPsParty Rotation] {} spread {} found no candidate: {} cond=[{}]",
+                                bot->GetName(), arg, why, cond);
+                        }
+                    }
+                }
+                return false;
+            }
             if (!channelClipOk()) return false;
             bool const fired = faceAndCast(pick, spellId);
             if (fired)
