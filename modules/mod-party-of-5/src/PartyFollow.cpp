@@ -1356,8 +1356,9 @@ namespace WowPsParty
     // Whether a DPS bot holds / throttles under the human tank's threat before
     // it engages (so it doesn't rip aggro) or blasts instantly. Stored in
     // party_loadout.wait_tank_threat as '' (unset), '1' (wait) or '0' (blast).
-    // The cache holds only EXPLICIT overrides; an absent entry falls back to the
-    // per-type default (henchman -> wait, hero -> blast) in GetWaitTankThreat.
+    // The cache holds only EXPLICIT overrides; an absent entry falls back to
+    // WAIT in WaitForHumanTank (the gate only runs under a tank lead, where
+    // waiting is the point). REQ_WAITTHREAT reports the same default.
     static std::unordered_map<uint32, int> g_waitTankThreat;  // guidLow -> 0/1 (explicit only)
     static std::mutex g_waitTankMutex;
 
@@ -1850,6 +1851,16 @@ namespace WowPsParty
     // are exempt (IsBossUnit). Tune here if a pull feels too eager (raise) or too
     // sluggish (lower).
     static constexpr float ENGAGE_THREAT_HEALTH_FRAC = 0.07f;
+    // Absolute CEILING on that floor, as a fraction of the TANK's max health.
+    // The mob-HP fraction alone is pathological on high-HP NON-boss mobs: ICC
+    // raid trash (~1M HP) put the floor at ~70k threat — the whole party stood
+    // idle for tens of seconds while the tank ground it out (Kevin: "bots wait
+    // wayyy too long before engaging"). Threat per tank GCD scales with
+    // level/gear roughly like the tank's own HP pool, so a tank-HP fraction
+    // keeps the floor at "a few tank actions" everywhere: ~25% of a 40-50k
+    // level-80 tank ≈ 10-12k threat (~3 GCDs). Five-man trash (60-90k HP) sits
+    // BELOW the ceiling (4-6k), so normal dungeon pacing is untouched.
+    static constexpr float ENGAGE_THREAT_TANKHP_CAP_FRAC = 0.25f;
     // Emergency release: a tank/member at or below this HP gets DPS + heals NOW,
     // engage-lead or not — nobody dies waiting for threat.
     static constexpr float TANK_GATHER_LOW_PCT = 55.0f;
@@ -5775,21 +5786,32 @@ namespace WowPsParty
         return c && (c->IsDungeonBoss() || c->isWorldBoss());
     }
 
+    // The effective engage-lead threat floor for `mob`: frac of its max health,
+    // ceilinged at ENGAGE_THREAT_TANKHP_CAP_FRAC of the tank's max health so a
+    // huge-HP non-boss (raid trash) never demands more than a few tank GCDs.
+    static float EngageLeadFloor(Unit* mob, Unit* tank, float frac)
+    {
+        float floor = float(mob->GetMaxHealth()) * frac;
+        if (tank)
+            floor = std::min(floor, float(tank->GetMaxHealth()) * ENGAGE_THREAT_TANKHP_CAP_FRAC);
+        return floor;
+    }
+
     // PURE-THREAT engage gate: has the tank built a real lead on THIS mob — enough
     // that it's "properly engaged", not just lightly aggroed (a right-click, a
     // passive patrol, a mob the tank merely auto-selected / that wandered in)? The
-    // tank must hold threat >= ENGAGE_THREAT_HEALTH_FRAC of the mob's max health.
-    // No timer: it tracks live threat, so deliberately pulling one extra mob onto a
-    // locked pack only gates that ONE mob, and an accidental patrol-aggro just sits
-    // unengaged instead of freezing the party. Caller has already confirmed the tank
-    // is the mob's top-threat (MobOnTank), so GetVictim() IS the tank.
+    // tank must hold threat >= EngageLeadFloor (frac of the mob's max health, capped
+    // at a fraction of the TANK's max health). No timer: it tracks live threat, so
+    // deliberately pulling one extra mob onto a locked pack only gates that ONE mob,
+    // and an accidental patrol-aggro just sits unengaged instead of freezing the
+    // party. Caller has already confirmed the tank is the mob's top-threat
+    // (MobOnTank), so GetVictim() IS the tank.
     static bool TankHasEngageLead(Unit* mob, float frac = ENGAGE_THREAT_HEALTH_FRAC)
     {
         if (!mob) return false;
         Unit* const tank = mob->GetVictim();
         if (!tank) return false;
-        float const floor = float(mob->GetMaxHealth()) * frac;
-        return mob->GetThreatMgr().GetThreat(tank) >= floor;
+        return mob->GetThreatMgr().GetThreat(tank) >= EngageLeadFloor(mob, tank, frac);
     }
 
     // Bot lead-tank pull gather gate (forward-declared up by g_tankGather). Holds the
@@ -6923,7 +6945,7 @@ namespace WowPsParty
                         leadFrac, desired->GetMaxHealth(),
                         tankU ? tankU->GetGUID().GetCounter() : 0,
                         tankU ? tm.GetThreat(tankU) : 0.0f,
-                        float(desired->GetMaxHealth()) * leadFrac,
+                        EngageLeadFloor(desired, tankU, leadFrac),
                         tm.GetThreat(bot),
                         tankU ? tm.GetThreat(tankU) * THREAT_CAP_RATIO : 0.0f);
                 }

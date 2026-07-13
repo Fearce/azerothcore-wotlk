@@ -5417,23 +5417,27 @@ public:
                 "|cff66ccff[WowPsParty]|r Lead-in-dungeons: {}.", on ? "ON" : "OFF");
         }
         // REQ_WAITTHREAT\t<token>  ->  WAITTHREAT\t<token>\t<0|1>
-        // Reports the EFFECTIVE value (explicit override, else the per-type
-        // default: henchman waits, hero blasts) so the editor checkbox shows the
-        // real runtime behaviour even for a bot the user never configured.
+        // Reports the EFFECTIVE value (explicit override, else the default) so the
+        // editor checkbox shows the REAL runtime behaviour even for a bot the user
+        // never configured. The runtime gate (WaitForHumanTank) defaults EVERY
+        // non-tank — hero and henchman alike — to WAIT under a tank lead, so an
+        // unset bot reports ON. (The old readout showed hero->OFF via a per-type
+        // default the runtime stopped consulting, so heroes appeared "not waiting"
+        // in the editor while they actually held — Kevin: "i dont have wait for
+        // tank threat enabled yet ... bots are just waiting". Unchecking it now
+        // writes an explicit '0' that truly opts the bot into blasting.)
         else if (command == "REQ_WAITTHREAT")
         {
             std::string const token(payload);
             uint32 const guid = WowPsParty::ResolveLoadoutToken(player, token);
-            bool on = false;
+            bool on = true;
             if (guid)
             {
                 QueryResult q = CharacterDatabase.Query(
                     "SELECT `wait_tank_threat` FROM `party_loadout` WHERE `guid` = {}", guid);
                 std::string v = q ? q->Fetch()[0].Get<std::string>() : std::string();
-                if (v == "1")      on = true;
-                else if (v == "0") on = false;
-                else               on = WowPsParty::IsHenchman(
-                                            ObjectGuid::Create<HighGuid::Player>(guid));
+                if (v == "0")      on = false;
+                else               on = true;   // '1' or unset -> wait (runtime default)
             }
             std::ostringstream out;
             out << "WAITTHREAT\t" << token << '\t' << (on ? 1 : 0);
