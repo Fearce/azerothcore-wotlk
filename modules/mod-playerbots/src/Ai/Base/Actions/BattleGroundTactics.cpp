@@ -1734,19 +1734,6 @@ bool BGTactics::saBoatHold()
     return !roundActive;  // ashore during a warmup (round-two reset): hold position
 }
 
-// A parked demolisher shells the contested gate; a manned cannon shells whatever is
-// pushing the front. Fired from the move-to-objective tick so it keeps shooting for
-// as long as the bot holds its spot (SA_CastVehicleSpellPaced paces the rate).
-bool BGTactics::saVehicleShoot()
-{
-    if (!botAI->IsInVehicle(false, true))  // needs a gun seat
-        return false;
-
-    Battleground* bg = bot->GetBattleground();
-    if (!bg)
-        return false;
-
-    BattlegroundSA* saBg = static_cast<BattlegroundSA*>(bg);
 // The core never stores vehicle-spell cooldowns server-side for creature casters
 // (Spell::SendSpellCooldown only sends the packet that greys a real player's
 // button), so an unpaced bot re-fires every AI tick — a machine-gun cannon that
@@ -1771,6 +1758,19 @@ enum SAVehiclePaceMs : uint32
     SA_PACE_ROCKET_BLAST = 2500,
 };
 
+// A parked demolisher shells the contested gate; a manned cannon shells whatever is
+// pushing the front. Fired from the move-to-objective tick so it keeps shooting for
+// as long as the bot holds its spot (SA_CastVehicleSpellPaced paces the rate).
+bool BGTactics::saVehicleShoot()
+{
+    if (!botAI->IsInVehicle(false, true))  // needs a gun seat
+        return false;
+
+    Battleground* bg = bot->GetBattleground();
+    if (!bg)
+        return false;
+
+    BattlegroundSA* saBg = static_cast<BattlegroundSA*>(bg);
     Unit* vehicleBase = bot->GetVehicleBase();
     if (!vehicleBase || !vehicleBase->IsAlive())
         return false;
@@ -3903,6 +3903,11 @@ bool BGTactics::resetObjective()
         oddsToChangeRole = 1;
     else if (bgType == BATTLEGROUND_AV)
         oddsToChangeRole = 0;
+    else if (bgType == BATTLEGROUND_SA)
+        // SA roles pick a gate flank on both sides; a re-roll mid-round makes
+        // defenders portal-teleport between posts and attackers re-flank for no
+        // reason (the log showed defenders ping-ponging between gates 0 and 2)
+        oddsToChangeRole = 0;
 
     bool isCarryingFlag =
         bot->HasAura(BG_WS_SPELL_WARSONG_FLAG) ||
@@ -4089,11 +4094,6 @@ bool BGTactics::startNewPathFree(std::vector<BattleBotPath*> const& vPaths)
  * @param vPaths Vector of possible paths the bot can take
  * @param vFlagIds Vector of flag/base GameObjects that can be captured
  * @return true if handling a flag/base action, false otherwise
-    else if (bgType == BATTLEGROUND_SA)
-        // SA roles pick a gate flank on both sides; a re-roll mid-round makes
-        // defenders portal-teleport between posts and attackers re-flank for no
-        // reason (the log showed defenders ping-ponging between gates 0 and 2)
-        oddsToChangeRole = 0;
  */
 bool BGTactics::atFlag(std::vector<BattleBotPath*> const& vPaths, std::vector<uint32> const& vFlagIds)
 {
