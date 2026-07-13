@@ -107,6 +107,19 @@ Position const IC_CANNON_POS_ALLIANCE2 = {425.525f, -779.538f, 87.717f, 5.88f};
 Position const IC_GATE_ATTACK_POS_HORDE = {506.782f, -828.594f, 24.313f, 0.0f};
 Position const IC_GATE_ATTACK_POS_ALLIANCE = {1091.273f, -763.619f, 42.352f, 0.0f};
 
+// Isle of Conquest siege-vehicle weapons (creature_template_spell of the entries in
+// BattlegroundIC.h). The dest-targeted ones have no meaningful range cap in the DBC;
+// the 120yd limit in CastVehicleSpell is the effective one.
+enum ICBotVehicleSpells
+{
+    IC_SPELL_HURL_BOULDER   = 67440,  // demolisher, 3s cooldown, dest-targeted
+    IC_SPELL_RAM            = 67441,  // demolisher, point-blank finisher
+    IC_SPELL_GLAIVE_THROW_A = 66456,  // glaive thrower (alliance), dest-targeted
+    IC_SPELL_GLAIVE_THROW_H = 67034,  // glaive thrower (horde), dest-targeted
+    IC_SPELL_SIEGE_RAM      = 67796,  // siege engine, point-blank
+    IC_SPELL_STEAM_RUSH     = 67797,  // siege engine, 70yd charge
+};
+
 // Strand of the Ancients. Attackers land on the eastern beach (x ~1600) and push
 // WEST through the gate chain to the Titan Relic (x ~837): Green/Blue (beach line)
 // -> Purple/Red (either unlocks once ANY beach gate falls) -> Yellow -> Chamber of
@@ -1739,8 +1752,8 @@ bool BGTactics::saBoatHold()
 // button), so an unpaced bot re-fires every AI tick — a machine-gun cannon that
 // kills a player in about a second. Apply the pace as an explicit creature
 // cooldown; CastVehicleSpell's HasSpellCooldown check then enforces it.
-static bool SA_CastVehicleSpellPaced(PlayerbotAI* botAI, Unit* vehicleBase, uint32 spellId, float x, float y, float z,
-                                     uint32 paceMs)
+static bool CastVehicleSpellPaced(PlayerbotAI* botAI, Unit* vehicleBase, uint32 spellId, float x, float y, float z,
+                                  uint32 paceMs)
 {
     if (!botAI->CastVehicleSpell(spellId, x, y, z))
         return false;
@@ -1758,9 +1771,18 @@ enum SAVehiclePaceMs : uint32
     SA_PACE_ROCKET_BLAST = 2500,
 };
 
+enum ICVehiclePaceMs : uint32
+{
+    IC_PACE_HURL_BOULDER = 3000,
+    IC_PACE_RAM          = 3000,
+    IC_PACE_GLAIVE_THROW = 3000,
+    IC_PACE_SIEGE_RAM    = 3000,
+    IC_PACE_STEAM_RUSH   = 10000,
+};
+
 // A parked demolisher shells the contested gate; a manned cannon shells whatever is
 // pushing the front. Fired from the move-to-objective tick so it keeps shooting for
-// as long as the bot holds its spot (SA_CastVehicleSpellPaced paces the rate).
+// as long as the bot holds its spot (CastVehicleSpellPaced paces the rate).
 bool BGTactics::saVehicleShoot()
 {
     if (!botAI->IsInVehicle(false, true))  // needs a gun seat
@@ -1792,12 +1814,12 @@ bool BGTactics::saVehicleShoot()
         if (dist > 60.0f)
             return false;
 
-        if (SA_CastVehicleSpellPaced(botAI, vehicleBase, SA_SPELL_HURL_BOULDER, gate->GetPositionX(),
-                                     gate->GetPositionY(), gate->GetPositionZ(), SA_PACE_HURL_BOULDER))
+        if (CastVehicleSpellPaced(botAI, vehicleBase, SA_SPELL_HURL_BOULDER, gate->GetPositionX(),
+                                  gate->GetPositionY(), gate->GetPositionZ(), SA_PACE_HURL_BOULDER))
             return true;
 
-        return dist < 20.0f && SA_CastVehicleSpellPaced(botAI, vehicleBase, SA_SPELL_RAM, gate->GetPositionX(),
-                                                        gate->GetPositionY(), gate->GetPositionZ(), SA_PACE_RAM);
+        return dist < 20.0f && CastVehicleSpellPaced(botAI, vehicleBase, SA_SPELL_RAM, gate->GetPositionX(),
+                                                     gate->GetPositionY(), gate->GetPositionZ(), SA_PACE_RAM);
     }
 
     // defender cannon: enemy players first (they take graveyards and click the relic),
@@ -1841,8 +1863,145 @@ bool BGTactics::saVehicleShoot()
     if (!target)
         return false;
 
-    return SA_CastVehicleSpellPaced(botAI, vehicleBase, SA_SPELL_ROCKET_BLAST, target->GetPositionX(),
-                                    target->GetPositionY(), target->GetPositionZ(), SA_PACE_ROCKET_BLAST);
+    return CastVehicleSpellPaced(botAI, vehicleBase, SA_SPELL_ROCKET_BLAST, target->GetPositionX(),
+                                 target->GetPositionY(), target->GetPositionZ(), SA_PACE_ROCKET_BLAST);
+}
+
+// Nearest unmanned, alive Isle of Conquest siege vehicle owned by the bot's team.
+// Sharded by bg role so the whole raid doesn't converge on one free vehicle: the
+// docks group (role < 3) crews the glaive throwers, the workshop/side-base group
+// (role >= 6) crews the demolishers and the siege engine, the hangar group stays
+// on foot. Catapults are deliberately absent — they launch the passenger, which
+// bots can't use (same exclusion as EnterVehicleAction).
+Creature* BGTactics::icFreeSiegeVehicle()
+{
+    Battleground* bg = bot->GetBattleground();
+    if (!bg)
+        return nullptr;
+
+    uint32 const role = context->GetValue<uint32>("bg role")->Get();
+    bool const horde = bot->GetTeamId() == TEAM_HORDE;
+
+    std::vector<uint32> slots;
+    if (role < 3)
+    {
+        for (uint32 i = 0; i < 2; ++i)
+            slots.push_back((horde ? BG_IC_NPC_GLAIVE_THROWER_1_H : BG_IC_NPC_GLAIVE_THROWER_1_A) + i);
+    }
+    else if (role >= 6)
+    {
+        slots.push_back(horde ? BG_IC_NPC_SIEGE_ENGINE_H : BG_IC_NPC_SIEGE_ENGINE_A);
+        for (uint32 i = 0; i < 4; ++i)
+            slots.push_back((horde ? BG_IC_NPC_DEMOLISHER_1_H : BG_IC_NPC_DEMOLISHER_1_A) + i);
+    }
+
+    Creature* best = nullptr;
+    float bestDist = FLT_MAX;
+    for (uint32 slot : slots)
+    {
+        // read the slot directly — GetBGCreature() error-logs vehicles that
+        // haven't spawned yet (node not held), which is the common case here
+        Creature* vehicle = bg->GetBgMap()->GetCreature(bg->BgCreatures[slot]);
+        if (!vehicle || !vehicle->IsAlive() || vehicle->HasUnitFlag(UNIT_FLAG_NOT_SELECTABLE))
+            continue;
+
+        if (!vehicle->GetVehicleKit() || vehicle->GetVehicleKit()->IsVehicleInUse() ||
+            !vehicle->GetVehicleKit()->GetAvailableSeatCount())
+            continue;
+
+        float const d = bot->GetDistance(vehicle);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            best = vehicle;
+        }
+    }
+
+    return best;
+}
+
+// A parked Isle of Conquest siege vehicle shells the enemy keep's front gate for as
+// long as it stands — the gate is what wins the game, enemy players are only the
+// strategy-level fallback shot. Fired from the move-to-objective tick like the SA
+// version, so it keeps shooting while the bot holds its spot (cooldowns pace it).
+bool BGTactics::icVehicleShoot()
+{
+    if (!botAI->IsInVehicle(false, true))  // needs a cast-capable seat
+        return false;
+
+    Battleground* bg = bot->GetBattleground();
+    if (!bg)
+        return false;
+
+    Unit* vehicleBase = bot->GetVehicleBase();
+    if (!vehicleBase || !vehicleBase->IsAlive() || vehicleBase->isMoving())
+        return false;
+
+    bool const horde = bot->GetTeamId() == TEAM_HORDE;
+
+    // stand down once the enemy keep is breached — the objective logic sends
+    // everyone through the open portcullis on foot
+    if (GameObject* pGO =
+            bg->GetBGObject(horde ? BG_IC_GO_DOODAD_PORTCULLISACTIVE02 : BG_IC_GO_HORDE_KEEP_PORTCULLIS))
+        if (pGO->isSpawned() && pGO->getLootState() == GO_ACTIVATED)
+            return false;
+
+    GameObject* gate = bg->GetBGObject(horde ? BG_IC_GO_ALLIANCE_GATE_3 : BG_IC_GO_HORDE_GATE_1);
+    if (!gate)
+        return false;
+
+    float const x = gate->GetPositionX();
+    float const y = gate->GetPositionY();
+    float const z = gate->GetPositionZ();
+    float const dist = vehicleBase->GetDistance2d(x, y);
+
+    switch (vehicleBase->GetEntry())
+    {
+        case NPC_DEMOLISHER:
+        {
+            if (CastVehicleSpellPaced(botAI, vehicleBase, IC_SPELL_HURL_BOULDER, x, y, z,
+                                      IC_PACE_HURL_BOULDER))
+            {
+                LOG_INFO("playerbots", "[IC] {} hurls a boulder at the enemy gate ({:.0f}yd)", bot->GetName(), dist);
+                return true;
+            }
+            return dist < 20.0f &&
+                   CastVehicleSpellPaced(botAI, vehicleBase, IC_SPELL_RAM, x, y, z, IC_PACE_RAM);
+        }
+        case NPC_GLAIVE_THROWER_A:
+        case NPC_GLAIVE_THROWER_H:
+        {
+            uint32 const glaiveSpell =
+                vehicleBase->GetEntry() == NPC_GLAIVE_THROWER_A ? IC_SPELL_GLAIVE_THROW_A : IC_SPELL_GLAIVE_THROW_H;
+            if (CastVehicleSpellPaced(botAI, vehicleBase, glaiveSpell, x, y, z, IC_PACE_GLAIVE_THROW))
+            {
+                LOG_INFO("playerbots", "[IC] {} throws a glaive at the enemy gate ({:.0f}yd)", bot->GetName(), dist);
+                return true;
+            }
+            return false;
+        }
+        case NPC_SIEGE_ENGINE_A:
+        case NPC_SIEGE_ENGINE_H:
+        {
+            // the engine's weapon is contact: Ram works the gate over point-blank,
+            // Steam Rush closes the last stretch when the approach stalls
+            if (dist < 15.0f &&
+                CastVehicleSpellPaced(botAI, vehicleBase, IC_SPELL_SIEGE_RAM, x, y, z, IC_PACE_SIEGE_RAM))
+            {
+                LOG_INFO("playerbots", "[IC] {} rams the enemy gate", bot->GetName());
+                return true;
+            }
+            if (dist >= 15.0f && dist < 70.0f &&
+                CastVehicleSpellPaced(botAI, vehicleBase, IC_SPELL_STEAM_RUSH, x, y, z, IC_PACE_STEAM_RUSH))
+            {
+                LOG_INFO("playerbots", "[IC] {} steam-rushes the enemy gate ({:.0f}yd)", bot->GetName(), dist);
+                return true;
+            }
+            return false;
+        }
+        default:
+            return false;
+    }
 }
 
 //
@@ -1980,6 +2139,9 @@ bool BGTactics::Execute(Event /*event*/)
             if (saVehicleShoot())   // parked demolisher or manned cannon with a shot: take it
                 return true;
         }
+
+        if (bgType == BATTLEGROUND_IC && icVehicleShoot())  // parked siege vehicle: shell the gate
+            return true;
 
         if (useBuff())
             return true;
@@ -3181,6 +3343,12 @@ bool BGTactics::selectObjective(bool reset)
                         posMap["bg siege"] = siegePos;
                     }
                 }
+                if (gateOpen && controlsVehicle)  // keep breached — join the push on foot
+                {
+                    bot->ExitVehicle();
+                    return false;
+                }
+
                 if (gateOpen && !controlsVehicle &&
                     isleOfConquestBG->GetICNodePoint(NODE_TYPE_GRAVEYARD_A).nodeState ==
                         NODE_STATE_CONTROLLED_H)  // target enemy boss
@@ -3206,7 +3374,6 @@ bool BGTactics::selectObjective(bool reset)
 
                 if (!BgObjective && !gateOpen && controlsVehicle)  // attack gates
                 {
-                    // TODO: check for free vehicles
                     if (GameObject* gate = bg->GetBGObject(BG_IC_GO_ALLIANCE_GATE_3))
                     {
                         if (vehicleId == NPC_SIEGE_ENGINE_H)  // target gate directly if siege engine
@@ -3233,6 +3400,18 @@ bool BGTactics::selectObjective(bool reset)
                             // LOG_INFO("playerbots", "bot={} (in vehicle={}) attack gate", bot->GetName(), vehicleId);
                             return true;
                         }
+                    }
+                }
+
+                // a free siege vehicle beats a foot soldier: walk to it, the
+                // enter-vehicle timer boards it once within interaction range
+                if (!BgObjective && !gateOpen && !inVehicle)
+                {
+                    if (Creature* vehicle = icFreeSiegeVehicle())
+                    {
+                        BgObjective = vehicle;
+                        LOG_INFO("playerbots", "[IC] {} heads for a free {} ({:.0f}yd away)", bot->GetName(),
+                                 vehicle->GetName(), bot->GetDistance(vehicle));
                     }
                 }
 
@@ -3333,6 +3512,12 @@ bool BGTactics::selectObjective(bool reset)
                     }
                 }
 
+                if (gateOpen && controlsVehicle)  // keep breached — join the push on foot
+                {
+                    bot->ExitVehicle();
+                    return false;
+                }
+
                 if (gateOpen && !controlsVehicle &&
                     isleOfConquestBG->GetICNodePoint(NODE_TYPE_GRAVEYARD_H).nodeState ==
                         NODE_STATE_CONTROLLED_A)  // target enemy boss
@@ -3358,7 +3543,6 @@ bool BGTactics::selectObjective(bool reset)
 
                 if (!BgObjective && !gateOpen && controlsVehicle)  // attack gates
                 {
-                    // TODO: check for free vehicles
                     if (GameObject* gate = bg->GetBGObject(BG_IC_GO_HORDE_GATE_1))
                     {
                         if (vehicleId == NPC_SIEGE_ENGINE_A)  // target gate directly if siege engine
@@ -3385,6 +3569,18 @@ bool BGTactics::selectObjective(bool reset)
                             // LOG_INFO("playerbots", "bot={} (in vehicle={}) attack gate", bot->GetName(), vehicleId);
                             return true;
                         }
+                    }
+                }
+
+                // a free siege vehicle beats a foot soldier: walk to it, the
+                // enter-vehicle timer boards it once within interaction range
+                if (!BgObjective && !gateOpen && !inVehicle)
+                {
+                    if (Creature* vehicle = icFreeSiegeVehicle())
+                    {
+                        BgObjective = vehicle;
+                        LOG_INFO("playerbots", "[IC] {} heads for a free {} ({:.0f}yd away)", bot->GetName(),
+                                 vehicle->GetName(), bot->GetDistance(vehicle));
                     }
                 }
 
@@ -3444,7 +3640,10 @@ bool BGTactics::selectObjective(bool reset)
                         auto const& objective =
                             IC_AttackObjectives[(i + role) %
                                                 len];  // use role to determine which objective checked first
-                        if (isleOfConquestBG->GetICNodePoint(objective.first).nodeState != NODE_STATE_CONTROLLED_H)
+                        // "not fully capped" means not OURS: for alliance that's CONTROLLED_A
+                        // (this was a copy of the horde block's CONTROLLED_H check, which parked
+                        // alliance bots on their own captured nodes forever)
+                        if (isleOfConquestBG->GetICNodePoint(objective.first).nodeState != NODE_STATE_CONTROLLED_A)
                         {
                             if (GameObject* pGO = bg->GetBGObject(objective.second))
                             {

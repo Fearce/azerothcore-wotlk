@@ -39,6 +39,23 @@ bool EnterVehicleAction::Execute(Event event)
         return false;
     }
 
+    // IoC: once the enemy keep is breached the siege vehicles are done — without
+    // this, a driver dismounted by BGTactics re-boards within a second (the timer
+    // trigger fires every 1s) instead of joining the push on foot
+    if (Battleground* bg = bot->GetBattleground())
+    {
+        BattlegroundTypeId bgType = bg->GetBgTypeID();
+        if (bgType == BATTLEGROUND_RB)
+            bgType = bg->GetBgTypeID(true);
+
+        if (bgType == BATTLEGROUND_IC)
+            if (GameObject* pGO = bg->GetBGObject(bot->GetTeamId() == TEAM_HORDE
+                                                      ? BG_IC_GO_DOODAD_PORTCULLISACTIVE02
+                                                      : BG_IC_GO_HORDE_KEEP_PORTCULLIS))
+                if (pGO->isSpawned() && pGO->getLootState() == GO_ACTIVATED)
+                    return false;
+    }
+
     GuidVector npcs = AI_VALUE(GuidVector, "nearest vehicles");
     for (GuidVector::iterator i = npcs.begin(); i != npcs.end(); i++)
     {

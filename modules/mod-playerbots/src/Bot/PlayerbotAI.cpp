@@ -4081,7 +4081,8 @@ bool PlayerbotAI::CanCastVehicleSpell(uint32 spellId, Unit* target)
     if (!spellId)
         return false;
 
-    if (!IsValidUnit(target))
+    // a null target is allowed: it means "shoot the BG siege position" (validated below)
+    if (target && !IsValidUnit(target))
         return false;
 
     Vehicle* vehicle = bot->GetVehicle();
@@ -4111,6 +4112,10 @@ bool PlayerbotAI::CanCastVehicleSpell(uint32 spellId, Unit* target)
 
     // check BG siege position set in BG Tactics
     PositionInfo siegePos = GetAiObjectContext()->GetValue<PositionMap&>("position")->Get()["bg siege"];
+
+    // a targetless cast is only meaningful as a ground shot at the siege position
+    if (!target && (!siegePos.isSet() || !(spellInfo->Targets & TARGET_FLAG_DEST_LOCATION)))
+        return false;
 
     // do not cast spell on self if spell is location based
     if (!(siegePos.isSet() || spellTarget != vehicleBase) && spellInfo->Targets & TARGET_FLAG_DEST_LOCATION)
@@ -4166,7 +4171,8 @@ bool PlayerbotAI::CastVehicleSpell(uint32 spellId, Unit* target)
     if (!spellId)
         return false;
 
-    if (!IsValidUnit(target))
+    // a null target is allowed: it means "shoot the BG siege position" (validated below)
+    if (target && !IsValidUnit(target))
         return false;
 
     Vehicle* vehicle = bot->GetVehicle();
@@ -4193,6 +4199,11 @@ bool PlayerbotAI::CastVehicleSpell(uint32 spellId, Unit* target)
 
     // check BG siege position set in BG Tactics
     PositionInfo siegePos = GetAiObjectContext()->GetValue<PositionMap&>("position")->Get()["bg siege"];
+
+    // a targetless cast is only meaningful as a ground shot at the siege position
+    if (!target && (!siegePos.isSet() || !(spellInfo->Targets & TARGET_FLAG_DEST_LOCATION)))
+        return false;
+
     if (!target && siegePos.isSet())
     {
         if (ServerFacade::instance().GetDistance2d(vehicleBase, siegePos.x, siegePos.y) > 120.0f)

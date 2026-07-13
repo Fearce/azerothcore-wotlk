@@ -127,6 +127,8 @@ private:
     bool eyJumpDown();
     bool saBoatHold();
     bool saVehicleShoot();
+    bool icVehicleShoot();
+    Creature* icFreeSiegeVehicle();
     bool atFlag(std::vector<BattleBotPath*> const& vPaths, std::vector<uint32> const& vFlagIds);
     bool flagTaken();
     bool teamFlagTaken();
