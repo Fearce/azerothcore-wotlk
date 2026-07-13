@@ -9,6 +9,8 @@
 
 #include "PartyMgr.h"
 
+#include "ArenaTeam.h"   // GetReqPlayersForType — arena auto-ready progress log
+#include "Battleground.h"
 #include "Chat.h"
 #include "Creature.h"
 #include "DBCStores.h"   // sLockStore — identify "key" items that open world objects
@@ -1174,11 +1176,39 @@ public:
     }
 };
 
+// Every arena spawns a "Ready Marker" gameobject (entry 301337, go_arena_ready_marker);
+// once ALL participants click it the pre-match countdown collapses to 15s. Bots never
+// click, so any match containing henchmen or fill bots always sat out the full wait.
+// Mark each bot ready the moment it enters the arena — ReadyMarkerClicked carries the
+// guards (arena-only, prep phase, not spectating) and the countdown-skip trigger, and
+// its "marked ready" notification is a no-op for socketless bot sessions — leaving
+// only the human clicks outstanding.
+class PartyArenaReadyBgScript : public AllBattlegroundScript
+{
+public:
+    PartyArenaReadyBgScript() : AllBattlegroundScript("PartyArenaReadyBgScript", {
+        ALLBATTLEGROUNDHOOK_ON_BATTLEGROUND_ADD_PLAYER
+    }) { }
+
+    void OnBattlegroundAddPlayer(Battleground* bg, Player* player) override
+    {
+        if (!WowPsParty::IsEnabled() || !bg || !player || !bg->isArena())
+            return;
+        if (!player->GetSession() || !player->GetSession()->IsBot())
+            return;
+        bg->ReadyMarkerClicked(player);
+        LOG_INFO("module", "[WowPsParty] arena auto-ready: bot {} marked ({}/{} ready)",
+            player->GetName(), bg->readyMarkerClickedSet.size(),
+            ArenaTeam::GetReqPlayersForType(bg->GetArenaType()));
+    }
+};
+
 void AddPartyHooksScripts()
 {
     new PartyHooksPlayerScript();
     new PartyHenchmanGroupScript();
     new PartyDamageTrackScript();
+    new PartyArenaReadyBgScript();
 }
 
 // Trampoline called from the [WowPsParty PATCH] in PlayerQuest.cpp::AddQuest.
