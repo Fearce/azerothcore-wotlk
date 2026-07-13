@@ -1729,8 +1729,39 @@ namespace {
         if (total == 0 || total > 64 || seq == 0 || seq > total)
             return false;
 
-        uint64 const key = (uint64(player->GetGUID().GetCounter()) << 16) | (msgId & 0xFFFF);
-        FragmentBuffer& buf = FragmentBuffers()[key];
+        // Key by (playerGuidLow << 16 | msgId). The client id cycles 1..4096, so
+        // the 16-bit msgId mask is lossless — the two never overlap the guid bits.
+        uint32 const guidLow = player->GetGUID().GetCounter();
+        uint64 const key = (uint64(guidLow) << 16) | (msgId & 0xFFFF);
+        auto& buffers = FragmentBuffers();
+
+        auto it = buffers.find(key);
+        if (it == buffers.end())
+        {
+            // Starting a fresh reassembly. We only erase a buffer on successful
+            // completion, so a client that logs out or stops mid-send (or a
+            // hostile one iterating msgId to leak a buffer per id) would grow the
+            // map forever. A single Save & Apply never has more than one
+            // fragmented rule in flight at a time, so more than a handful of live
+            // partials for one player is stale junk — drop all of that player's
+            // partials before starting a new one. Bounds the map at a few entries
+            // per active player without a timer or a logout hook.
+            uint32 live = 0;
+            for (auto const& kv : buffers)
+                if (uint32(kv.first >> 16) == guidLow)
+                    ++live;
+            if (live >= 8)
+                for (auto i = buffers.begin(); i != buffers.end();)
+                {
+                    if (uint32(i->first >> 16) == guidLow)
+                        i = buffers.erase(i);
+                    else
+                        ++i;
+                }
+            it = buffers.emplace(key, FragmentBuffer{}).first;
+        }
+
+        FragmentBuffer& buf = it->second;
         if (buf.total != total)   // first chunk of this id (or a restarted send)
         {
             buf.total = total;
