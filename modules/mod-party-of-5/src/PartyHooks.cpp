@@ -1178,28 +1178,45 @@ public:
 
 // Every arena spawns a "Ready Marker" gameobject (entry 301337, go_arena_ready_marker);
 // once ALL participants click it the pre-match countdown collapses to 15s. Bots never
-// click, so any match containing henchmen or fill bots always sat out the full wait.
-// Mark each bot ready the moment it enters the arena — ReadyMarkerClicked carries the
-// guards (arena-only, prep phase, not spectating) and the countdown-skip trigger, and
-// its "marked ready" notification is a no-op for socketless bot sessions — leaving
-// only the human clicks outstanding.
+// click, so any match containing henchmen or fill bots always sat out the full wait —
+// leaving the human clicking "ready" but still stuck at 1/N because the bots never
+// register. Auto-mark every bot for them, so only the human clicks gate the skip.
+//
+// Do this on the per-tick BG update, NOT at AddPlayer: when a player is added the
+// prep timer is still 0 (Battleground::_ProcessJoin only sets it on the first tick a
+// player is on the map), so ReadyMarkerClicked's `GetStartDelayTime() <= 15s` guard
+// rejected every entry-time mark — the original AddPlayer version raced the timer and
+// lost, which is why the fix never took. The update hook re-attempts each tick and
+// only fires once the prep window is genuinely open, so the marks always land.
 class PartyArenaReadyBgScript : public AllBattlegroundScript
 {
 public:
     PartyArenaReadyBgScript() : AllBattlegroundScript("PartyArenaReadyBgScript", {
-        ALLBATTLEGROUNDHOOK_ON_BATTLEGROUND_ADD_PLAYER
+        ALLBATTLEGROUNDHOOK_ON_BATTLEGROUND_UPDATE
     }) { }
 
-    void OnBattlegroundAddPlayer(Battleground* bg, Player* player) override
+    void OnBattlegroundUpdate(Battleground* bg, uint32 /*diff*/) override
     {
-        if (!WowPsParty::IsEnabled() || !bg || !player || !bg->isArena())
+        if (!WowPsParty::IsEnabled() || !bg || !bg->isArena())
             return;
-        if (!player->GetSession() || !player->GetSession()->IsBot())
+        // Only during the pre-match countdown, and only once the prep timer is set
+        // (delay > 15s) so ReadyMarkerClicked accepts the mark and the countdown-skip
+        // maths (m_StartTime += delay - 15s) stays correct.
+        if (bg->GetStatus() != STATUS_WAIT_JOIN || bg->GetStartDelayTime() <= BG_START_DELAY_15S)
             return;
-        bg->ReadyMarkerClicked(player);
-        LOG_INFO("module", "[WowPsParty] arena auto-ready: bot {} marked ({}/{} ready)",
-            player->GetName(), bg->readyMarkerClickedSet.size(),
-            ArenaTeam::GetReqPlayersForType(bg->GetArenaType()));
+        for (auto const& [guid, player] : bg->GetPlayers())
+        {
+            if (!player || player->IsSpectator())
+                continue;
+            if (!player->GetSession() || !player->GetSession()->IsBot())
+                continue;
+            if (bg->readyMarkerClickedSet.find(guid) != bg->readyMarkerClickedSet.end())
+                continue;
+            bg->ReadyMarkerClicked(player);
+            LOG_INFO("module", "[WowPsParty] arena auto-ready: bot {} marked ({}/{} ready)",
+                player->GetName(), bg->readyMarkerClickedSet.size(),
+                ArenaTeam::GetReqPlayersForType(bg->GetArenaType()));
+        }
     }
 };
 
