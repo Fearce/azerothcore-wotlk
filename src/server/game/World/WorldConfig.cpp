@@ -243,7 +243,7 @@ void WorldConfig::BuildConfigCache()
     SetConfigValue<uint32>(CONFIG_START_PLAYER_MONEY, "StartPlayerMoney", 0, ConfigValueCache::Reloadable::Yes, [](uint32 const& value) { return value <= MAX_MONEY_AMOUNT; }, "<= MAX_MONEY_AMOUNT");
     SetConfigValue<uint32>(CONFIG_START_HEROIC_PLAYER_MONEY, "StartHeroicPlayerMoney", 2000, ConfigValueCache::Reloadable::Yes, [](uint32 const& value) { return value <= MAX_MONEY_AMOUNT; }, "<= MAX_MONEY_AMOUNT");
 
-    SetConfigValue<uint32>(CONFIG_MAX_HONOR_POINTS, "MaxHonorPoints", 75000);
+    SetConfigValue<uint32>(CONFIG_MAX_HONOR_POINTS, "MaxHonorPoints", 500000);
 
     SetConfigValue<uint32>(CONFIG_MAX_HONOR_POINTS_MONEY_PER_POINT, "MaxHonorPointsMoneyPerPoint", 0);
 

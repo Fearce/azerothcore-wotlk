@@ -2485,9 +2485,9 @@ Rate.Pet.LevelXP = 0.05
 #
 #    MaxHonorPoints
 #        Description: Maximum honor points a character can have.
-#        Default:     75000
+#        Default:     500000
 
-MaxHonorPoints = 75000
+MaxHonorPoints = 500000
 
 #
 #    MaxHonorPointsMoneyPerPoint
