@@ -1780,6 +1780,96 @@ enum ICVehiclePaceMs : uint32
     IC_PACE_STEAM_RUSH   = 10000,
 };
 
+// How many anti-personnel cannons may pour fire onto a single attacker at once. Defenders
+// crew up to ten cannons (BG_SA_GUN_1..10); without this cap the whole battery focus-fires
+// whoever steps up first, deleting them in about a second — the "no-cooldown minigun" bug.
+static constexpr uint32 SA_MAX_CANNONS_PER_TARGET = 2;
+
+// A cannon's effective engagement range.
+static constexpr float SA_CANNON_RANGE = 70.0f;
+
+// Choose which attacker this cannon shells. Sharding the pick by the bot's bg role over a
+// GUID-stable ordering fans the battery out across the attacking force — cannon N shoots
+// attacker N instead of every cannon converging on attacker 0. Roles are an independent
+// urand(0,9) per bot, so collisions happen; SA_CannonMayFire (not the shard) is what caps
+// fire on any one victim. Falls back to the nearest manned demolisher when no foot attacker
+// is in range.
+static Unit* SA_PickCannonTarget(BattlegroundSA* saBg, Unit* vehicleBase, uint32 role,
+                                 bool& targetIsPlayer)
+{
+    targetIsPlayer = false;
+
+    std::vector<Player*> attackers;
+    for (auto const& itr : saBg->GetPlayers())
+    {
+        Player* player = ObjectAccessor::FindConnectedPlayer(itr.first);
+        if (!player || !player->IsAlive() || player->GetTeamId() != saBg->GetAttackerTeam())
+            continue;
+        if (player->GetVehicle())
+            continue;  // riders die with the demolisher-targeting fallback below
+        if (vehicleBase->GetDistance2d(player) > SA_CANNON_RANGE)
+            continue;
+        attackers.push_back(player);
+    }
+
+    if (!attackers.empty())
+    {
+        std::sort(attackers.begin(), attackers.end(),
+                  [](Player const* a, Player const* b) { return a->GetGUID() < b->GetGUID(); });
+        targetIsPlayer = true;
+        return attackers[role % attackers.size()];
+    }
+
+    Unit* target = nullptr;
+    float best = SA_CANNON_RANGE;
+    std::list<Creature*> demolishers;
+    vehicleBase->GetCreatureListWithEntryInGrid(demolishers, NPC_DEMOLISHER_SA, SA_CANNON_RANGE);
+    for (Creature* demolisher : demolishers)
+    {
+        if (!demolisher->IsAlive() || !demolisher->GetVehicleKit() ||
+            !demolisher->GetVehicleKit()->IsVehicleInUse())
+            continue;
+        float const d = vehicleBase->GetDistance2d(demolisher);
+        if (d < best)
+        {
+            best = d;
+            target = demolisher;
+        }
+    }
+    return target;
+}
+
+// Even with target-sharding a lone attacker pins every cannon on the same shard index, so
+// cap the fire per victim: rank the crewed cannons already in range of the target by GUID
+// (a view every cannon shares) and let only the first SA_MAX_CANNONS_PER_TARGET open up.
+// No player eats more than a couple of rockets a cycle however many cannons the defenders
+// crewed. Only applied to player victims — demolishers are armored and fine to focus.
+static bool SA_CannonMayFire(Unit* cannon, Unit* target)
+{
+    std::list<Creature*> cannons;
+    target->GetCreatureListWithEntryInGrid(cannons, NPC_ANTI_PERSONNAL_CANNON, 75.0f);
+
+    std::vector<ObjectGuid> crewed;
+    for (Creature* c : cannons)
+    {
+        if (!c->GetVehicleKit() || !c->GetVehicleKit()->IsVehicleInUse())
+            continue;
+        if (c->GetDistance2d(target) > SA_CANNON_RANGE)
+            continue;
+        crewed.push_back(c->GetGUID());
+    }
+    std::sort(crewed.begin(), crewed.end());
+
+    uint32 rank = 0;
+    for (ObjectGuid const& guid : crewed)
+    {
+        if (guid == cannon->GetGUID())
+            return rank < SA_MAX_CANNONS_PER_TARGET;
+        ++rank;
+    }
+    return true;  // self not found (raced out of range) — allow
+}
+
 // A parked demolisher shells the contested gate; a manned cannon shells whatever is
 // pushing the front. Fired from the move-to-objective tick so it keeps shooting for
 // as long as the bot holds its spot (CastVehicleSpellPaced paces the rate).
@@ -1822,49 +1912,30 @@ bool BGTactics::saVehicleShoot()
                                                      gate->GetPositionY(), gate->GetPositionZ(), SA_PACE_RAM);
     }
 
-    // defender cannon: enemy players first (they take graveyards and click the relic),
-    // then any manned demolisher in range
+    // defender cannon: spread the battery across the attacking players (they take
+    // graveyards and click the relic), falling back to any manned demolisher in range
     if (vehicleBase->GetEntry() != NPC_ANTI_PERSONNAL_CANNON)
         return false;
 
-    Unit* target = nullptr;
-    float best = 70.0f;
-    for (auto const& itr : bg->GetPlayers())
-    {
-        Player* player = ObjectAccessor::FindConnectedPlayer(itr.first);
-        if (!player || !player->IsAlive() || player->GetTeamId() != saBg->GetAttackerTeam())
-            continue;
-        if (player->GetVehicle())
-            continue;  // riders die with the demolisher below
-        float const d = vehicleBase->GetDistance2d(player);
-        if (d < best)
-        {
-            best = d;
-            target = player;
-        }
-    }
-    if (!target)
-    {
-        std::list<Creature*> demolishers;
-        vehicleBase->GetCreatureListWithEntryInGrid(demolishers, NPC_DEMOLISHER_SA, 70.0f);
-        for (Creature* demolisher : demolishers)
-        {
-            if (!demolisher->IsAlive() || !demolisher->GetVehicleKit() ||
-                !demolisher->GetVehicleKit()->IsVehicleInUse())
-                continue;
-            float const d = vehicleBase->GetDistance2d(demolisher);
-            if (d < best)
-            {
-                best = d;
-                target = demolisher;
-            }
-        }
-    }
+    bool targetIsPlayer = false;
+    uint32 const role = context->GetValue<uint32>("bg role")->Get();
+    Unit* target = SA_PickCannonTarget(saBg, vehicleBase, role, targetIsPlayer);
     if (!target)
         return false;
 
-    return CastVehicleSpellPaced(botAI, vehicleBase, SA_SPELL_ROCKET_BLAST, target->GetPositionX(),
-                                 target->GetPositionY(), target->GetPositionZ(), SA_PACE_ROCKET_BLAST);
+    // don't let more than a couple of cannons dogpile one player at a time
+    if (targetIsPlayer && !SA_CannonMayFire(vehicleBase, target))
+        return false;
+
+    // small jitter so cannons sharing a target don't fire in lockstep double-taps
+    uint32 const pace = SA_PACE_ROCKET_BLAST + urand(0, 800);
+    if (!CastVehicleSpellPaced(botAI, vehicleBase, SA_SPELL_ROCKET_BLAST, target->GetPositionX(),
+                               target->GetPositionY(), target->GetPositionZ(), pace))
+        return false;
+
+    LOG_DEBUG("playerbots", "[SA] {}'s cannon fires Rocket Blast at {} (role {}, pace {}ms)",
+              bot->GetName(), target->GetName(), role, pace);
+    return true;
 }
 
 // Nearest unmanned, alive Isle of Conquest siege vehicle owned by the bot's team.
