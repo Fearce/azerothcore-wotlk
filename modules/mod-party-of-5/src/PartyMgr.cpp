@@ -3890,6 +3890,20 @@ namespace WowPsParty
         if (!active || !active->GetSession())
             return;
 
+        // Only the real human active player may run the party-spawn/group-reform
+        // path. A freshly-spawned enrolled-alt BOT reaches here too: it shares the
+        // human's account (so FetchPartyRows is non-empty) and PartyBootstrap's
+        // OnPlayerLogin skip missed it — mod-playerbots attaches the PlayerbotAI
+        // ASYNChronously (OnBotLoginOperation) AFTER the synchronous OnPlayerLogin
+        // hook fires, so GetPlayerbotAI was still null there. Left unguarded, the
+        // alt bot's own reform runs with ITSELF as "leader", creating/leading the
+        // party group and pulling the human in as a non-leader member — the player
+        // then has to kick + re-invite to get their party (and leadership) back.
+        // This call is deferred 5s post-login, by when the AI is reliably attached,
+        // so the check is now sound.
+        if (sPlayerbotsMgr.GetPlayerbotAI(active))
+            return;
+
         uint32 const account = active->GetSession()->GetAccountId();
         uint32 const activeGuid = active->GetGUID().GetCounter();
 
