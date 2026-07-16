@@ -2134,9 +2134,93 @@ static void ForEachPartyEnchantScroll(uint32 account, Fn&& fn)
     }
 }
 
-// REQ_ENCHANTS\t<targetPartySlot>\t<targetItemGuidLow> — reply with ENCHANTS, the
-// enchant spell ids any loaded party member knows that FIT that specific item
-// (so the picker only ever shows valid choices for what was clicked).
+// Enchanting skill-up thresholds for an enchant spell, from its SkillLineAbility
+// row. False when the spell isn't taught by the Enchanting skill line.
+static bool EnchantTrivialRanks(uint32 spellId, uint32& low, uint32& high)
+{
+    SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellId);
+    for (SkillLineAbilityMap::const_iterator it = bounds.first; it != bounds.second; ++it)
+    {
+        SkillLineAbilityEntry const* ability = it->second;
+        if (!ability || ability->SkillLine != SKILL_ENCHANTING)
+            continue;
+        low  = ability->TrivialSkillLineRankLow;
+        high = ability->TrivialSkillLineRankHigh;
+        return true;
+    }
+    return false;
+}
+
+// Skill-up odds for THIS enchanter casting THIS enchant, as the recipe-colour
+// tier UpdateCraftSkill's SkillGainChance rolls with: 3=orange, 2=yellow,
+// 1=green, 0=grey/none. Also 0 when the skill sits at its trained cap —
+// UpdateSkillPro can't raise a maxed skill, whatever the recipe colour.
+static uint8 EnchantSkillUpTier(Player* enchanter, uint32 spellId)
+{
+    if (!enchanter)
+        return 0;
+    uint32 low = 0, high = 0;
+    if (!EnchantTrivialRanks(spellId, low, high))
+        return 0;
+    uint32 const skill = enchanter->GetPureSkillValue(SKILL_ENCHANTING);
+    if (!skill || skill >= enchanter->GetPureMaxSkillValue(SKILL_ENCHANTING))
+        return 0;
+    if (skill >= high)             return 0;
+    if (skill >= (high + low) / 2) return 1;
+    if (skill >= low)              return 2;
+    return 3;
+}
+
+// The percent chance UpdateCraftSkill's roll gives that tier (world config).
+static uint32 EnchantSkillUpChancePct(uint8 tier)
+{
+    uint32 pct = 0;
+    switch (tier)
+    {
+        case 3: pct = sWorld->getIntConfig(CONFIG_SKILL_CHANCE_ORANGE); break;
+        case 2: pct = sWorld->getIntConfig(CONFIG_SKILL_CHANCE_YELLOW); break;
+        case 1: pct = sWorld->getIntConfig(CONFIG_SKILL_CHANCE_GREEN);  break;
+        default: break;
+    }
+    return std::min<uint32>(pct, 100);
+}
+
+// The loaded party member HandleEnchant picks to cast an enchant: anyone who
+// knows it, preferring a caster who can still gain a skill point from it, then
+// the lowest-skill one — so casts level the party's weakest enchanter first.
+// Shared with REQ_ENCHANTS so the picker's skill-up preview names the same
+// caster the apply will use.
+static Player* PickPartyEnchanter(uint32 account, uint32 enchantSpellId)
+{
+    Player* enchanter = nullptr;
+    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
+    {
+        uint32 const guid = WowPsParty::GuidForAccountSlot(account, partySlot);
+        if (!guid) continue;
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid));
+        if (!p || !p->HasSpell(enchantSpellId)) continue;
+        if (WowPsParty::MemberStorageUnstable(p)) continue;
+        bool const pCanGain       = EnchantSkillUpTier(p, enchantSpellId) > 0;
+        bool const currentCanGain = EnchantSkillUpTier(enchanter, enchantSpellId) > 0;
+        if (!enchanter || (pCanGain && !currentCanGain)
+            || (pCanGain && currentCanGain
+                && p->GetPureSkillValue(SKILL_ENCHANTING)
+                    < enchanter->GetPureSkillValue(SKILL_ENCHANTING)))
+            enchanter = p;
+    }
+    return enchanter;
+}
+
+// REQ_ENCHANTS\t<targetPartySlot>\t<targetItemGuidLow> — reply with the enchant
+// spell ids any loaded party member knows that FIT that specific item (so the
+// picker only ever shows valid choices for what was clicked), each carrying a
+// skill-up preview for the caster HandleEnchant would pick. Streamed like the
+// inventory (the 3.3.5a client silently DROPS oversized addon messages):
+//   ENCH_BEGIN <slot>\t<guid>                  -> client resets
+//   ENCHANTS   <slot>\t<guid>\t<rec>,<rec>,…  *N -> client APPENDS each
+//   ENCH_END   <slot>\t<guid>                  -> client sorts + renders
+//   rec = spellId:tier:chancePct:casterSkill:casterName
+//   tier: 3=orange 2=yellow 1=green 0=no gain; empty casterName = scroll-only.
 static void HandleReqEnchants(Player* requester, std::string_view payload)
 {
     if (!requester || !requester->GetSession()) return;
@@ -2179,7 +2263,9 @@ static void HandleReqEnchants(Player* requester, std::string_view payload)
     // Also list enchant SCROLLS in the party's bags whose enchant FITS the item, so
     // the user can apply a scroll the same way as a known enchant (HandleEnchant
     // resolves the spell id back to the scroll and consumes it). Deduped against the
-    // known-spell list by spell id.
+    // known-spell list by spell id. A scroll apply is not a cast, so it can never
+    // skill anyone up — remember which ids are scroll-only for the preview below.
+    std::unordered_set<uint32> scrollOnly;
     ForEachPartyEnchantScroll(account, [&](uint32 sp, Item* /*scroll*/, Player* /*owner*/)
     {
         if (seen.count(sp)) return;
@@ -2187,21 +2273,53 @@ static void HandleReqEnchants(Player* requester, std::string_view payload)
         if (!spell || !tgtItem->IsFitToSpellRequirements(spell)) return;
         seen.insert(sp);
         spellIds.push_back(sp);
+        scrollOnly.insert(sp);
     });
+
+    // rec = spellId:tier:chancePct:casterSkill:casterName — the skill-up preview
+    // for the caster HandleEnchant would pick right now.
+    std::vector<std::string> records;
+    uint32 skillUpCount = 0;
+    for (uint32 spellId : spellIds)
+    {
+        Player* enchanter = scrollOnly.count(spellId) ? nullptr : PickPartyEnchanter(account, spellId);
+        uint8 const tier = EnchantSkillUpTier(enchanter, spellId);
+        if (tier) ++skillUpCount;
+        std::ostringstream rec;
+        rec << spellId << ':' << uint32(tier) << ':' << EnchantSkillUpChancePct(tier) << ':'
+            << (enchanter ? enchanter->GetPureSkillValue(SKILL_ENCHANTING) : 0u) << ':'
+            << (enchanter ? enchanter->GetName() : "");
+        records.push_back(rec.str());
+    }
 
     // DIAGNOSTIC ("can't enchant" report): how many applicable enchants the party
     // knows for this item. 0 here = the picker is empty because NO party member is an
     // enchanter (or none fit the item) — that's the usual "can't enchant", not a bug.
     ItemTemplate const* tgtProto = WowPsParty::SafeItemTemplate(tgtItem);
     LOG_INFO("module",
-        "[WowPsParty Enchant] REQ_ENCHANTS by {} for item entry={} -> {} applicable enchant(s) across the party",
-        requester->GetName(), tgtProto ? tgtProto->ItemId : 0u, uint32(spellIds.size()));
+        "[WowPsParty Enchant] REQ_ENCHANTS by {} for item entry={} -> {} applicable enchant(s) across the party, {} would skill up the caster",
+        requester->GetName(), tgtProto ? tgtProto->ItemId : 0u, uint32(spellIds.size()), skillUpCount);
 
-    std::ostringstream out;
-    out << "ENCHANTS\t" << tgtSlot << '\t' << tgtItemGuidLow << '\t';
-    for (size_t i = 0; i < spellIds.size(); ++i)
-        out << (i ? "," : "") << spellIds[i];
-    SendWPSP(requester, out.str());
+    // CHUNKED send (mirrors SendInventoryTo): one message per ~MAX_PAYLOAD bytes
+    // of records, records never split, framed by ENCH_BEGIN/ENCH_END.
+    std::string hdr;
+    { std::ostringstream h; h << tgtSlot << '\t' << tgtItemGuidLow; hdr = h.str(); }
+    SendWPSP(requester, "ENCH_BEGIN\t" + hdr);
+    constexpr size_t MAX_PAYLOAD = 220;
+    std::string chunk;
+    auto flush = [&]()
+    {
+        if (!chunk.empty()) { SendWPSP(requester, "ENCHANTS\t" + hdr + '\t' + chunk); chunk.clear(); }
+    };
+    for (std::string const& rec : records)
+    {
+        if (!chunk.empty() && chunk.size() + 1 + rec.size() > MAX_PAYLOAD)
+            flush();
+        if (!chunk.empty()) chunk += ',';
+        chunk += rec;
+    }
+    flush();
+    SendWPSP(requester, "ENCH_END\t" + hdr);
 }
 
 // ENCHANT\t<targetPartySlot>\t<targetItemGuidLow>\t<enchantSpellId> — apply the
@@ -2244,35 +2362,7 @@ static void HandleEnchant(Player* requester, std::string_view payload)
     }
 
     // Find a loaded party member who actually knows the enchant — the caster.
-    auto canSkillUpFromEnchant = [&](Player* p) -> bool
-    {
-        if (!p) return false;
-        SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(enchantSpellId);
-        for (SkillLineAbilityMap::const_iterator it = bounds.first; it != bounds.second; ++it)
-        {
-            SkillLineAbilityEntry const* ability = it->second;
-            if (!ability || ability->SkillLine != SKILL_ENCHANTING)
-                continue;
-            return p->GetPureSkillValue(SKILL_ENCHANTING) < ability->TrivialSkillLineRankHigh;
-        }
-        return false;
-    };
-
-    Player* enchanter = nullptr;
-    for (uint8 partySlot = 0; partySlot < WowPsParty::PARTY_SIZE; ++partySlot)
-    {
-        uint32 const guid = WowPsParty::GuidForAccountSlot(account, partySlot);
-        if (!guid) continue;
-        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid));
-        if (!p || !p->HasSpell(enchantSpellId)) continue;
-        bool const pCanGain = canSkillUpFromEnchant(p);
-        bool const currentCanGain = canSkillUpFromEnchant(enchanter);
-        if (!enchanter || (pCanGain && !currentCanGain)
-            || (pCanGain && currentCanGain
-                && p->GetPureSkillValue(SKILL_ENCHANTING)
-                    < enchanter->GetPureSkillValue(SKILL_ENCHANTING)))
-            enchanter = p;
-    }
+    Player* enchanter = PickPartyEnchanter(account, enchantSpellId);
     // If nobody KNOWS the enchant, an enchant SCROLL in the party's bags can supply
     // it — the scroll IS the cost (no reagents) and is consumed on a successful apply.
     Item*   scroll      = nullptr;
