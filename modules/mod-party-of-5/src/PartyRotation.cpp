@@ -651,22 +651,24 @@ namespace WowPsParty
         return getMSTime() - it->second < CAST_SETTLE_MS;
     }
 
-    // A unit under a FULL invulnerability that also blocks FRIENDLY spells — Ice
-    // Block, Divine Shield, Hand/Blessing of Protection, Cyclone, Divine
-    // Intervention. Healing, HoTing, buffing or cleansing such a unit is a wasted
-    // GCD (the spell is blocked outright), so it must be excluded from EVERY
-    // friendly target pick — the "resto druid spam-Rejuvs the ice-blocked mage" bug.
-    static bool IsInvulnerable(Unit* u)
+    // A unit whose immunity bubble also blocks FRIENDLY spells — healing, HoTing,
+    // buffing or cleansing it is a wasted GCD (the spell is rejected outright), so
+    // it must be excluded from EVERY friendly target pick — the "resto druid
+    // spam-Rejuvs the ice-blocked mage" bug. ONLY auras whose school immunity
+    // carries SPELL_ATTR1_IMMUNITY_TO_HOSTILE_AND_FRIENDLY_EFFECTS belong here
+    // (see Unit::IgnoresSchoolImmunityFromFriendlyCaster): friendly spells pierce
+    // every other bubble. Divine Shield and Hand of Protection block ATTACKERS
+    // only — heals land through them, so a bubbled paladin must stay a valid heal
+    // target (the offensive-side skip is the IsImmunedToSpell guard in canCast).
+    static bool BlocksFriendlySpells(Unit* u)
     {
         if (!u) return false;
-        static uint32 const kInvuln[] = {
+        static uint32 const kFriendlyImmune[] = {
             45438,             // Ice Block
-            642,               // Divine Shield
-            1022, 5599, 10278, // Hand/Blessing of Protection (ranks)
             33786,             // Cyclone
             19752,             // Divine Intervention
         };
-        for (uint32 id : kInvuln)
+        for (uint32 id : kFriendlyImmune)
             if (u->HasAura(id)) return true;
         return false;
     }
@@ -679,7 +681,7 @@ namespace WowPsParty
         float bestPct = 200.0f;
         for (Player* m : party)
         {
-            if (IsInvulnerable(m)) continue;   // can't be healed — skip
+            if (BlocksFriendlySpells(m)) continue;   // can't be healed — skip
             float const maxHp = float(m->GetMaxHealth());
             if (maxHp <= 0) continue;
             float const pct = (float(m->GetHealth()) / maxHp) * 100.0f;
@@ -4327,7 +4329,7 @@ namespace WowPsParty
             char const* kw = ClassKeyword(m->getClass());
             if (!*kw) continue;
             if (!CsvContains(csv, kw)) continue;
-            if (IsInvulnerable(m)) continue;   // buff blocked by Ice Block/BoP/etc.
+            if (BlocksFriendlySpells(m)) continue;   // buff blocked by Ice Block/Cyclone/etc.
             if (HasAuraFromSpell(m, spellId)) continue;
             return m;
         }
@@ -4384,7 +4386,7 @@ namespace WowPsParty
                 if (pr.first == m->GetGUID().GetCounter()) { memberRole = pr.second; break; }
             bool const matches = (memberRole == wantedRole);
             if (negate ? matches : !matches) continue;
-            if (IsInvulnerable(m)) continue;   // buff blocked by Ice Block/BoP/etc.
+            if (BlocksFriendlySpells(m)) continue;   // buff blocked by Ice Block/Cyclone/etc.
             if (HasAuraFromSpell(m, spellId)) continue;
             return m;   // GatherPartyPlayers already filtered to alive / in-world / same map
         }
@@ -4399,7 +4401,7 @@ namespace WowPsParty
         std::vector<Player*> party;
         GatherPartyPlayers(bot, party, /*includeDead=*/false);
         for (Player* m : party)
-            if (!IsInvulnerable(m) && !HasAuraFromSpell(m, spellId)) return m;
+            if (!BlocksFriendlySpells(m) && !HasAuraFromSpell(m, spellId)) return m;
         return nullptr;
     }
 
@@ -5760,7 +5762,7 @@ namespace WowPsParty
             if (!spellId) return false;
             Player* tank = FindPartyMemberByRole(bot, "tank");
             if (!tank) return false;
-            if (IsInvulnerable(tank)) return false;   // BoP/Ice Block etc. blocks it
+            if (BlocksFriendlySpells(tank)) return false;   // Ice Block/Cyclone etc. blocks it
             return castOrApproach(tank, spellId, /*friendlyApproach=*/true);
         }
 
@@ -6468,7 +6470,7 @@ namespace WowPsParty
                 target = FindPartyMemberWithDispelType(bot, dt, exclude);
             }
             if (!target) return false;
-            if (IsInvulnerable(target)) return false;   // can't cleanse an invuln unit
+            if (BlocksFriendlySpells(target)) return false;   // cleanse can't land through Ice Block/Cyclone
             return castOrApproach(target, spellId, /*friendlyApproach=*/true);
         }
 
@@ -7991,10 +7993,10 @@ namespace WowPsParty
             return bot;
         Unit* t = nullptr;
         if (verb == "cast_party_lowest" || verb == "cast_party_lowest_hot")
-            t = GetLowestHpPartyMember(bot);   // already invuln-filtered
+            t = GetLowestHpPartyMember(bot);   // already friendly-immune-filtered
         else if (verb == "cast_tank")
             t = FindPartyMemberByRole(bot, "tank");
-        if (t && IsInvulnerable(t)) return nullptr;   // wasted on an invuln target
+        if (t && BlocksFriendlySpells(t)) return nullptr;   // wasted on a friendly-immune target
         return t;
     }
 
