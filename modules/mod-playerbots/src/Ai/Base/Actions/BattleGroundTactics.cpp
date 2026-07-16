@@ -92,12 +92,12 @@ Position const EY_GY_CAMPING_HORDE = {1874.854f, 1530.405f, 1207.432f, 0.0f};
 Position const EY_GY_CAMPING_ALLIANCE = {2456.887f, 1599.025f, 1206.280f, 0.0f};
 
 Position const IC_WAITING_POS_HORDE = {1166.322f, -762.402f, 48.628f};
-Position const IC_WEST_WAITING_POS_HORDE = {1217.666f, -685.449f, 48.915f};
-Position const IC_EAST_WAITING_POS_HORDE = {1219.068f, -838.791f, 48.916f};
-
 Position const IC_WAITING_POS_ALLIANCE = {387.893f, -833.384f, 48.714f};
-Position const IC_WEST_WAITING_POS_ALLIANCE = {352.129f, -788.029f, 48.916f};
-Position const IC_EAST_WAITING_POS_ALLIANCE = {351.517f, -882.477f, 48.916f};
+
+// own keep graveyard banner (BG_IC_ObjSpawnlocs) — the enemy must flip this
+// before their boss push, so it's the anchor the keep defenders hold
+Position const IC_KEEP_DEFENSE_POS_HORDE = {1284.76f, -705.668f, 48.9163f, 0.0f};
+Position const IC_KEEP_DEFENSE_POS_ALLIANCE = {299.153f, -784.589f, 48.9162f, 0.0f};
 
 Position const IC_CANNON_POS_HORDE1 = {1140.938f, -838.685f, 88.124f, 2.30f};
 Position const IC_CANNON_POS_HORDE2 = {1139.695f, -686.574f, 88.173f, 3.95f};
@@ -1423,12 +1423,6 @@ static std::unordered_map<uint32, Position> EY_NodePositions = {
     {POINT_MAGE_TOWER, Position(2284.720f, 1728.457f, 1189.153f)}
 };
 
-static std::pair<uint32, uint32> IC_AttackObjectives[] = {
-    {NODE_TYPE_WORKSHOP, BG_IC_GO_WORKSHOP_BANNER},
-    {NODE_TYPE_DOCKS, BG_IC_GO_DOCKS_BANNER},
-    {NODE_TYPE_HANGAR, BG_IC_GO_HANGAR_BANNER},
-};
-
 // useful commands for fixing BG bugs and checking waypoints/paths
 bool BGTactics::HandleConsoleCommand(ChatHandler* handler, char const* args)
 {
@@ -1939,32 +1933,25 @@ bool BGTactics::saVehicleShoot()
 }
 
 // Nearest unmanned, alive Isle of Conquest siege vehicle owned by the bot's team.
-// Sharded by bg role so the whole raid doesn't converge on one free vehicle: the
-// docks group (role < 3) crews the glaive throwers, the workshop/side-base group
-// (role >= 6) crews the demolishers and the siege engine, the hangar group stays
-// on foot. Catapults are deliberately absent — they launch the passenger, which
-// bots can't use (same exclusion as EnterVehicleAction).
+// Every attacker may pilot any vehicle — an empty vehicle rotting at its spawn is
+// worth more than one more foot soldier, and duplicate walkers resolve themselves
+// (first one boards, the rest re-select next tick). Catapults are deliberately
+// absent — they launch the passenger, which bots can't use (same exclusion as
+// EnterVehicleAction).
 Creature* BGTactics::icFreeSiegeVehicle()
 {
     Battleground* bg = bot->GetBattleground();
     if (!bg)
         return nullptr;
 
-    uint32 const role = context->GetValue<uint32>("bg role")->Get();
     bool const horde = bot->GetTeamId() == TEAM_HORDE;
 
     std::vector<uint32> slots;
-    if (role < 3)
-    {
-        for (uint32 i = 0; i < 2; ++i)
-            slots.push_back((horde ? BG_IC_NPC_GLAIVE_THROWER_1_H : BG_IC_NPC_GLAIVE_THROWER_1_A) + i);
-    }
-    else if (role >= 6)
-    {
-        slots.push_back(horde ? BG_IC_NPC_SIEGE_ENGINE_H : BG_IC_NPC_SIEGE_ENGINE_A);
-        for (uint32 i = 0; i < 4; ++i)
-            slots.push_back((horde ? BG_IC_NPC_DEMOLISHER_1_H : BG_IC_NPC_DEMOLISHER_1_A) + i);
-    }
+    slots.push_back(horde ? BG_IC_NPC_SIEGE_ENGINE_H : BG_IC_NPC_SIEGE_ENGINE_A);
+    for (uint32 i = 0; i < 4; ++i)
+        slots.push_back((horde ? BG_IC_NPC_DEMOLISHER_1_H : BG_IC_NPC_DEMOLISHER_1_A) + i);
+    for (uint32 i = 0; i < 2; ++i)
+        slots.push_back((horde ? BG_IC_NPC_GLAIVE_THROWER_1_H : BG_IC_NPC_GLAIVE_THROWER_1_A) + i);
 
     Creature* best = nullptr;
     float bestDist = FLT_MAX;
@@ -2342,36 +2329,19 @@ bool BGTactics::moveToStart(bool force)
     else if (bgType == BATTLEGROUND_IC)
     {
         uint32 role = context->GetValue<uint32>("bg role")->Get();
+        bool const horde = bot->GetTeamId() == TEAM_HORDE;
 
-        if (bot->GetTeamId() == TEAM_HORDE)
+        if (role < 2)  // keep defenders take post at their keep's graveyard banner
         {
-            if (role == 9)  // refinery
-                MoveTo(bg->GetMapId(), IC_WEST_WAITING_POS_HORDE.GetPositionX() + frand(-5.0f, 5.0f),
-                       IC_WEST_WAITING_POS_HORDE.GetPositionY() + frand(-5.0f, 5.0f),
-                       IC_WEST_WAITING_POS_HORDE.GetPositionZ());
-            else if (role >= 3 && role < 6)  // hanger
-                MoveTo(bg->GetMapId(), IC_EAST_WAITING_POS_HORDE.GetPositionX() + frand(-5.0f, 5.0f),
-                       IC_EAST_WAITING_POS_HORDE.GetPositionY() + frand(-5.0f, 5.0f),
-                       IC_EAST_WAITING_POS_HORDE.GetPositionZ());
-            else  // everything else
-                MoveTo(bg->GetMapId(), IC_WAITING_POS_HORDE.GetPositionX() + frand(-5.0f, 5.0f),
-                       IC_WAITING_POS_HORDE.GetPositionY() + frand(-5.0f, 5.0f), IC_WAITING_POS_HORDE.GetPositionZ());
+            Position const& anchor = horde ? IC_KEEP_DEFENSE_POS_HORDE : IC_KEEP_DEFENSE_POS_ALLIANCE;
+            MoveTo(bg->GetMapId(), anchor.GetPositionX() + frand(-6.0f, 6.0f),
+                   anchor.GetPositionY() + frand(-6.0f, 6.0f), anchor.GetPositionZ());
         }
-        else
+        else  // everyone else masses at the front gate for the workshop rush
         {
-            if (role < 3)  // docks
-                MoveTo(
-                    bg->GetMapId(), IC_WAITING_POS_ALLIANCE.GetPositionX() + frand(-5.0f, 5.0f),
-                    IC_WAITING_POS_ALLIANCE.GetPositionY() + frand(-5.0f, 5.0f),
-                    IC_WAITING_POS_ALLIANCE.GetPositionZ());  // dont bother using west, there's no paths to use anyway
-            else if (role == 9 || (role >= 3 && role < 6))    // quarry and hanger
-                MoveTo(bg->GetMapId(), IC_EAST_WAITING_POS_ALLIANCE.GetPositionX() + frand(-5.0f, 5.0f),
-                       IC_EAST_WAITING_POS_ALLIANCE.GetPositionY() + frand(-5.0f, 5.0f),
-                       IC_EAST_WAITING_POS_ALLIANCE.GetPositionZ());
-            else  // everything else
-                MoveTo(bg->GetMapId(), IC_WAITING_POS_ALLIANCE.GetPositionX() + frand(-5.0f, 5.0f),
-                       IC_WAITING_POS_ALLIANCE.GetPositionY() + frand(-5.0f, 5.0f),
-                       IC_WAITING_POS_ALLIANCE.GetPositionZ());
+            Position const& gatePos = horde ? IC_WAITING_POS_HORDE : IC_WAITING_POS_ALLIANCE;
+            MoveTo(bg->GetMapId(), gatePos.GetPositionX() + frand(-5.0f, 5.0f),
+                   gatePos.GetPositionY() + frand(-5.0f, 5.0f), gatePos.GetPositionZ());
         }
     }
     else if (bgType == BATTLEGROUND_SA)
@@ -3400,6 +3370,31 @@ bool BGTactics::selectObjective(bool reset)
             if (inVehicle && !controlsVehicle)
                 return false;
 
+            // roles 0-1 (~20%): keep defenders. They hold our keep's graveyard
+            // banner — the enemy has to flip it before their boss push, so a
+            // standing guard there is what "defend our fort" actually means.
+            // Everyone else plays offense: workshop/nodes -> siege vehicle ->
+            // enemy gate -> boss.
+            if (role < 2 && !inVehicle)
+            {
+                Position const& anchor =
+                    bot->GetTeamId() == TEAM_HORDE ? IC_KEEP_DEFENSE_POS_HORDE : IC_KEEP_DEFENSE_POS_ALLIANCE;
+                if (bot->GetDistance(anchor) < 10.0f)
+                    pos.Set(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), bot->GetMapId());
+                else
+                {
+                    // log the assignment once, not on every few-second re-evaluation
+                    float const dx = pos.x - anchor.GetPositionX();
+                    float const dy = pos.y - anchor.GetPositionY();
+                    if ((!pos.isSet() || (dx * dx + dy * dy) > 20.0f * 20.0f) && bot->GetDistance(anchor) > 25.0f)
+                        LOG_INFO("playerbots", "[IC] {} falls back to defend the keep banner", bot->GetName());
+                    pos.Set(anchor.GetPositionX() + frand(-6.0f, +6.0f), anchor.GetPositionY() + frand(-6.0f, +6.0f),
+                            anchor.GetPositionZ(), bot->GetMapId());
+                }
+                posMap["bg objective"] = pos;
+                return true;
+            }
+
             /* TACTICS */
             if (bot->GetTeamId() == TEAM_HORDE)  // HORDE
             {
@@ -3486,72 +3481,35 @@ bool BGTactics::selectObjective(bool reset)
                     }
                 }
 
-                // If gates arent down and not in vehicle, split tasks
-                if (!BgObjective && !controlsVehicle && role == 9)  // Capture Side base
+                // Gates still up, on foot: the main effort (roles 2-6) takes and
+                // holds the Workshop — it spawns the demolishers and siege engine
+                // that actually break the gate — while roles 7/8/9 spread to the
+                // side nodes so the team doesn't march as one blob. Nobody parks
+                // on already-owned nodes: with nothing to capture they fall
+                // through to escorting the siege at the gate.
+                if (!BgObjective && !controlsVehicle && role <= 6)  // Capture + hold Workshop
                 {
-                    // Capture Refinery
-                    ICNodePoint const& nodePoint = isleOfConquestBG->GetICNodePoint(NODE_TYPE_REFINERY);
-                    if (nodePoint.nodeState != NODE_STATE_CONFLICT_H && nodePoint.nodeState != NODE_STATE_CONTROLLED_H)
-                    {
-                        BgObjective = bg->GetBGObject(BG_IC_GO_REFINERY_BANNER);
-                        // LOG_INFO("playerbots", "bot={} attack refinery", bot->GetName());
-                    }
+                    ICNodePoint const& nodePoint = isleOfConquestBG->GetICNodePoint(NODE_TYPE_WORKSHOP);
+                    if (nodePoint.nodeState != NODE_STATE_CONTROLLED_H)  // guard it through the capture timer too
+                        BgObjective = bg->GetBGObject(BG_IC_GO_WORKSHOP_BANNER);
                 }
-
-                if (!BgObjective && !controlsVehicle && role < 3)  // Capture Docks
+                if (!BgObjective && !controlsVehicle && role == 7)  // Capture Docks
                 {
                     ICNodePoint const& nodePoint = isleOfConquestBG->GetICNodePoint(NODE_TYPE_DOCKS);
                     if (nodePoint.nodeState != NODE_STATE_CONFLICT_H && nodePoint.nodeState != NODE_STATE_CONTROLLED_H)
-                    {
-                        if (GameObject* pGO = bg->GetBGObject(BG_IC_GO_DOCKS_BANNER))
-                        {
-                            BgObjective = pGO;
-                            // LOG_INFO("playerbots", "bot={} attack docks", bot->GetName());
-                        }
-                    }
+                        BgObjective = bg->GetBGObject(BG_IC_GO_DOCKS_BANNER);
                 }
-                if (!BgObjective && !controlsVehicle && role < 6)  // Capture Hangar
+                if (!BgObjective && !controlsVehicle && role == 8)  // Capture Hangar
                 {
                     ICNodePoint const& nodePoint = isleOfConquestBG->GetICNodePoint(NODE_TYPE_HANGAR);
                     if (nodePoint.nodeState != NODE_STATE_CONFLICT_H && nodePoint.nodeState != NODE_STATE_CONTROLLED_H)
-                    {
-                        if (GameObject* pGO = bg->GetBGObject(BG_IC_GO_HANGAR_BANNER))
-                        {
-                            BgObjective = pGO;
-                            // LOG_INFO("playerbots", "bot={} attack hangar", bot->GetName());
-                        }
-                    }
+                        BgObjective = bg->GetBGObject(BG_IC_GO_HANGAR_BANNER);
                 }
-                if (!BgObjective && !controlsVehicle)  // Capture Workshop
+                if (!BgObjective && !controlsVehicle && role == 9)  // Capture Refinery
                 {
-                    ICNodePoint const& nodePoint = isleOfConquestBG->GetICNodePoint(NODE_TYPE_WORKSHOP);
+                    ICNodePoint const& nodePoint = isleOfConquestBG->GetICNodePoint(NODE_TYPE_REFINERY);
                     if (nodePoint.nodeState != NODE_STATE_CONFLICT_H && nodePoint.nodeState != NODE_STATE_CONTROLLED_H)
-                    {
-                        if (GameObject* pGO = bg->GetBGObject(BG_IC_GO_WORKSHOP_BANNER))
-                        {
-                            BgObjective = pGO;
-                            // LOG_INFO("playerbots", "bot={} attack workshop", bot->GetName());
-                        }
-                    }
-                }
-                if (!BgObjective)  // Guard point that's not fully capped (also gets them in place to board vehicle)
-                {
-                    uint32 len = end(IC_AttackObjectives) - begin(IC_AttackObjectives);
-                    for (uint32 i = 0; i < len; i++)
-                    {
-                        auto const& objective =
-                            IC_AttackObjectives[(i + role) %
-                                                len];  // use role to determine which objective checked first
-                        if (isleOfConquestBG->GetICNodePoint(objective.first).nodeState != NODE_STATE_CONTROLLED_H)
-                        {
-                            if (GameObject* pGO = bg->GetBGObject(objective.second))
-                            {
-                                BgObjective = pGO;
-                                // LOG_INFO("playerbots", "bot={} guard point while it captures", bot->GetName());
-                                break;
-                            }
-                        }
-                    }
+                        BgObjective = bg->GetBGObject(BG_IC_GO_REFINERY_BANNER);
                 }
                 if (!BgObjective)  // guard vehicles as they seige
                 {
@@ -3655,75 +3613,32 @@ bool BGTactics::selectObjective(bool reset)
                     }
                 }
 
-                // If gates arent down and not in vehicle, split tasks
-                if (!BgObjective && !controlsVehicle && role == 9)  // Capture Side base
+                // Gates still up, on foot: same split as the horde block — main
+                // effort (roles 2-6) on the Workshop, roles 7/8/9 spread to the
+                // side nodes, nobody parks on already-owned nodes.
+                if (!BgObjective && !controlsVehicle && role <= 6)  // Capture + hold Workshop
                 {
-                    // Capture Refinery
-                    ICNodePoint const& nodePoint = isleOfConquestBG->GetICNodePoint(NODE_TYPE_QUARRY);
-                    if (nodePoint.nodeState != NODE_STATE_CONFLICT_A && nodePoint.nodeState != NODE_STATE_CONTROLLED_A)
-                    {
-                        BgObjective = bg->GetBGObject(BG_IC_GO_QUARRY_BANNER);
-                        // LOG_INFO("playerbots", "bot={} attack quarry", bot->GetName());
-                    }
+                    ICNodePoint const& nodePoint = isleOfConquestBG->GetICNodePoint(NODE_TYPE_WORKSHOP);
+                    if (nodePoint.nodeState != NODE_STATE_CONTROLLED_A)  // guard it through the capture timer too
+                        BgObjective = bg->GetBGObject(BG_IC_GO_WORKSHOP_BANNER);
                 }
-
-                if (!BgObjective && !controlsVehicle && role < 3)  // Capture Docks
+                if (!BgObjective && !controlsVehicle && role == 7)  // Capture Docks
                 {
                     ICNodePoint const& nodePoint = isleOfConquestBG->GetICNodePoint(NODE_TYPE_DOCKS);
                     if (nodePoint.nodeState != NODE_STATE_CONFLICT_A && nodePoint.nodeState != NODE_STATE_CONTROLLED_A)
-                    {
-                        if (GameObject* pGO = bg->GetBGObject(BG_IC_GO_DOCKS_BANNER))
-                        {
-                            BgObjective = pGO;
-                            // LOG_INFO("playerbots", "bot={} attack docks", bot->GetName());
-                        }
-                    }
+                        BgObjective = bg->GetBGObject(BG_IC_GO_DOCKS_BANNER);
                 }
-                if (!BgObjective && !controlsVehicle && role < 6)  // Capture Hangar
+                if (!BgObjective && !controlsVehicle && role == 8)  // Capture Hangar
                 {
                     ICNodePoint const& nodePoint = isleOfConquestBG->GetICNodePoint(NODE_TYPE_HANGAR);
                     if (nodePoint.nodeState != NODE_STATE_CONFLICT_A && nodePoint.nodeState != NODE_STATE_CONTROLLED_A)
-                    {
-                        if (GameObject* pGO = bg->GetBGObject(BG_IC_GO_HANGAR_BANNER))
-                        {
-                            BgObjective = pGO;
-                            // LOG_INFO("playerbots", "bot={} attack hangar", bot->GetName());
-                        }
-                    }
+                        BgObjective = bg->GetBGObject(BG_IC_GO_HANGAR_BANNER);
                 }
-                if (!BgObjective && !controlsVehicle)  // Capture Workshop
+                if (!BgObjective && !controlsVehicle && role == 9)  // Capture Quarry
                 {
-                    ICNodePoint const& nodePoint = isleOfConquestBG->GetICNodePoint(NODE_TYPE_WORKSHOP);
+                    ICNodePoint const& nodePoint = isleOfConquestBG->GetICNodePoint(NODE_TYPE_QUARRY);
                     if (nodePoint.nodeState != NODE_STATE_CONFLICT_A && nodePoint.nodeState != NODE_STATE_CONTROLLED_A)
-                    {
-                        if (GameObject* pGO = bg->GetBGObject(BG_IC_GO_WORKSHOP_BANNER))
-                        {
-                            BgObjective = pGO;
-                            // LOG_INFO("playerbots", "bot={} attack workshop", bot->GetName());
-                        }
-                    }
-                }
-                if (!BgObjective)  // Guard point that's not fully capped (also gets them in place to board vehicle)
-                {
-                    uint32 len = end(IC_AttackObjectives) - begin(IC_AttackObjectives);
-                    for (uint32 i = 0; i < len; i++)
-                    {
-                        auto const& objective =
-                            IC_AttackObjectives[(i + role) %
-                                                len];  // use role to determine which objective checked first
-                        // "not fully capped" means not OURS: for alliance that's CONTROLLED_A
-                        // (this was a copy of the horde block's CONTROLLED_H check, which parked
-                        // alliance bots on their own captured nodes forever)
-                        if (isleOfConquestBG->GetICNodePoint(objective.first).nodeState != NODE_STATE_CONTROLLED_A)
-                        {
-                            if (GameObject* pGO = bg->GetBGObject(objective.second))
-                            {
-                                BgObjective = pGO;
-                                // LOG_INFO("playerbots", "bot={} guard point while it captures", bot->GetName());
-                                break;
-                            }
-                        }
-                    }
+                        BgObjective = bg->GetBGObject(BG_IC_GO_QUARRY_BANNER);
                 }
                 if (!BgObjective)  // guard vehicles as they seige
                 {
@@ -3743,6 +3658,15 @@ bool BGTactics::selectObjective(bool reset)
 
             if (BgObjective)
             {
+                // banners and gates only — vehicle/boss picks log at their own
+                // sites. Objective re-evaluates every few seconds while the pick
+                // usually stays the same, so only an actual target change logs.
+                float const dx = pos.x - BgObjective->GetPositionX();
+                float const dy = pos.y - BgObjective->GetPositionY();
+                bool const newTarget = !pos.isSet() || (dx * dx + dy * dy) > 20.0f * 20.0f;
+                if (newTarget && BgObjective->GetTypeId() == TYPEID_GAMEOBJECT && bot->GetDistance(BgObjective) > 25.0f)
+                    LOG_INFO("playerbots", "[IC] {} heads for {} ({:.0f}yd away)", bot->GetName(),
+                             BgObjective->GetName(), bot->GetDistance(BgObjective));
                 pos.Set(BgObjective->GetPositionX(), BgObjective->GetPositionY(), BgObjective->GetPositionZ(),
                         bot->GetMapId());
                 posMap["bg objective"] = pos;
@@ -4169,9 +4093,14 @@ bool BGTactics::resetObjective()
 
     if (bgType == BATTLEGROUND_WS)
         oddsToChangeRole = 2;
-    else if (bgType == BATTLEGROUND_EY || bgType == BATTLEGROUND_IC || bgType == BATTLEGROUND_AB)
+    else if (bgType == BATTLEGROUND_EY || bgType == BATTLEGROUND_AB)
         oddsToChangeRole = 1;
     else if (bgType == BATTLEGROUND_AV)
+        oddsToChangeRole = 0;
+    else if (bgType == BATTLEGROUND_IC)
+        // role is a standing assignment here (keep defender vs workshop/side-node
+        // attacker, like SA's gate flank): a mid-match re-roll turns a bot deep in
+        // the enemy push into a "defender" that abandons the siege to march home
         oddsToChangeRole = 0;
     else if (bgType == BATTLEGROUND_SA)
         // SA roles pick a gate flank on both sides; a re-roll mid-round makes
@@ -4969,6 +4898,11 @@ bool BGTactics::IsLockedInsideKeep()
         bgType = bg->GetBgTypeID(true);
 
     if (bgType != BATTLEGROUND_IC)
+        return false;
+
+    // keep defenders (roles 0-1) live inside the keep on purpose — don't usher
+    // them out through the teleporters
+    if (context->GetValue<uint32>("bg role")->Get() < 2 && !botAI->IsInVehicle())
         return false;
 
     bool isInside = false;
