@@ -7897,9 +7897,25 @@ namespace WowPsParty
         if (RoleForGuid(bot->GetGUID()) == "tank" && TankAntiFlankNudge(bot))
             return;
         int const fi = FormationIndexFor(bot->GetGUID(), GetLeaderFor(bot->GetGUID()));
-        float const chaseAngle = float(fi) * (2.0f * float(M_PI) / 5.0f);
+        // ChaseAngle is FACING-relative (0 = the mob's front, pi = its back), so a
+        // fi*72-degree fan parks slots 0/1/4 INSIDE the frontal arc — non-tank melee
+        // stood in boss cleaves (Marrowgar), and a move_behind rule LOST the tug-of-
+        // war: its dodge leaves POINT motion, this branch re-installs the chase, and
+        // the pinned front slot dragged the bot straight back in. Fan non-tanks
+        // across the REAR arc only (>= ~111 degrees off the facing, ~34 apart); the
+        // pin being facing-relative means the chase itself keeps them behind as the
+        // mob turns. The tank keeps the legacy fan — the mob turns to face the tank,
+        // so its slot self-resolves and a rear pin would make it orbit.
+        static constexpr float REAR_FAN[5] = { 0.0f, 0.6f, -0.6f, 1.2f, -1.2f };
+        float const chaseAngle = role == "tank"
+            ? float(fi) * (2.0f * float(M_PI) / 5.0f)
+            : float(M_PI) + REAR_FAN[fi % 5];
         if (newVictim || mg != CHASE_MOTION_TYPE)
+        {
             bot->GetMotionMaster()->MoveChase(desired, {}, ChaseAngle(chaseAngle));
+            if (role != "tank")
+                AssistLog(gLow, "melee: chasing to a rear-arc slot (never the frontal arc)");
+        }
         else if (!bot->HasInArc(float(M_PI), desired))
             bot->SetFacingToObject(desired);
     }
