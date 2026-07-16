@@ -31,6 +31,7 @@
 #include "Playerbots.h"
 #include "PositionValue.h"
 #include "PvpTriggers.h"
+#include "PvpValues.h"
 #include "ServerFacade.h"
 #include "Vehicle.h"
 
@@ -1409,6 +1410,25 @@ static uint32 AB_AttackObjectives[] = {
     BG_AB_NODE_GOLD_MINE
 };
 
+static char const* AB_NodeName(uint32 nodeId)
+{
+    switch (nodeId)
+    {
+        case BG_AB_NODE_STABLES:
+            return "Stables";
+        case BG_AB_NODE_BLACKSMITH:
+            return "Blacksmith";
+        case BG_AB_NODE_FARM:
+            return "Farm";
+        case BG_AB_NODE_LUMBER_MILL:
+            return "Lumber Mill";
+        case BG_AB_NODE_GOLD_MINE:
+            return "Gold Mine";
+        default:
+            return "unknown node";
+    }
+}
+
 static std::tuple<uint32, uint32, uint32> EY_AttackObjectives[] = {
     {POINT_FEL_REAVER, BG_EY_OBJECT_FLAG_FEL_REAVER, AT_FEL_REAVER_POINT},
     {POINT_BLOOD_ELF, BG_EY_OBJECT_FLAG_BLOOD_ELF, AT_BLOOD_ELF_POINT},
@@ -2149,6 +2169,10 @@ bool BGTactics::Execute(Event /*event*/)
 
         if (!isCarryingFlag)
         {
+            // death releases an AB capture commitment — the respawned bot re-decides
+            if (bgType == BATTLEGROUND_AB)
+                context->GetValue<uint32>("ab committed node")->Set(AB_COMMITTED_NODE_NONE);
+
             bot->StopMoving();
             bot->GetMotionMaster()->Clear();
             return resetObjective();  // Reset objective to not use "old" data
@@ -2854,8 +2878,40 @@ bool BGTactics::selectObjective(bool reset)
 
             BgObjective = nullptr;
 
+            // a node the bot's team could still assault: neutral, enemy-held, or enemy mid-capture
+            auto isCapturable = [&](uint32 nodeId)
+            {
+                uint8 state = ab->GetCapturePointInfo(nodeId)._state;
+                return state == BG_AB_NODE_STATE_NEUTRAL ||
+                       (team == TEAM_ALLIANCE &&
+                        (state == BG_AB_NODE_STATE_HORDE_OCCUPIED || state == BG_AB_NODE_STATE_HORDE_CONTESTED)) ||
+                       (team == TEAM_HORDE &&
+                        (state == BG_AB_NODE_STATE_ALLY_OCCUPIED || state == BG_AB_NODE_STATE_ALLY_CONTESTED));
+            };
+
+            // --- COMMITTED NODE: once a bot picks a node to capture it sticks with it
+            // until the node flips to its team or the bot dies (death clears the value
+            // via "reset objective force"). Without this, the periodic objective reset
+            // re-rolls the whole selection and bots ping-pong between nodes mid-route.
+            bool committed = false;
+            uint32 committedNode = context->GetValue<uint32>("ab committed node")->Get();
+            if (committedNode != AB_COMMITTED_NODE_NONE)
+            {
+                if (isCapturable(committedNode))
+                    BgObjective = bg->GetBGObject(committedNode * BG_AB_OBJECTS_PER_NODE);
+
+                if (BgObjective)
+                    committed = true;
+                else
+                {
+                    context->GetValue<uint32>("ab committed node")->Set(AB_COMMITTED_NODE_NONE);
+                    LOG_INFO("playerbots", "[AB] {} releases {} (no longer capturable)", bot->GetName(),
+                             AB_NodeName(committedNode));
+                }
+            }
+
             // --- PRIORITY 1: Nearby enemy (rare aggressive impulse)
-            if (urand(0, 99) < 5)
+            if (!committed && urand(0, 99) < 5)
             {
                 if (Unit* enemy = AI_VALUE(Unit*, "enemy player target"))
                 {
@@ -2869,50 +2925,49 @@ bool BGTactics::selectObjective(bool reset)
             }
 
             // --- PRIORITY 2: No valid nodes? Camp or attack visible enemy
-            bool hasValidTarget = false;
-            for (uint32 nodeId : AB_AttackObjectives)
+            if (!committed)
             {
-                uint8 state = ab->GetCapturePointInfo(nodeId)._state;
-                if (state == BG_AB_NODE_STATE_NEUTRAL ||
-                    (team == TEAM_ALLIANCE &&
-                     (state == BG_AB_NODE_STATE_HORDE_OCCUPIED || state == BG_AB_NODE_STATE_HORDE_CONTESTED)) ||
-                    (team == TEAM_HORDE &&
-                     (state == BG_AB_NODE_STATE_ALLY_OCCUPIED || state == BG_AB_NODE_STATE_ALLY_CONTESTED)))
+                bool hasValidTarget = false;
+                for (uint32 nodeId : AB_AttackObjectives)
                 {
-                    hasValidTarget = true;
-                    break;
-                }
-            }
-
-            if (!hasValidTarget)
-            {
-                if (Unit* enemy = AI_VALUE(Unit*, "enemy player target"))
-                {
-                    if (bot->GetDistance(enemy) < 500.0f)
+                    if (isCapturable(nodeId))
                     {
-                        pos.Set(enemy->GetPositionX(), enemy->GetPositionY(), enemy->GetPositionZ(), bot->GetMapId());
-                        posMap["bg objective"] = pos;
+                        hasValidTarget = true;
                         break;
                     }
                 }
 
-                // Camp enemy GY fallback
-                Position camp = (team == TEAM_ALLIANCE) ? AB_GY_CAMPING_HORDE : AB_GY_CAMPING_ALLIANCE;
-                float rx, ry, rz;
-                bot->GetRandomPoint(camp, 10.0f, rx, ry, rz);
-                if (Map* map = bot->GetMap())
+                if (!hasValidTarget)
                 {
-                    float groundZ = map->GetHeight(rx, ry, rz);
-                    if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
-                        rz = groundZ;
+                    if (Unit* enemy = AI_VALUE(Unit*, "enemy player target"))
+                    {
+                        if (bot->GetDistance(enemy) < 500.0f)
+                        {
+                            pos.Set(enemy->GetPositionX(), enemy->GetPositionY(), enemy->GetPositionZ(),
+                                    bot->GetMapId());
+                            posMap["bg objective"] = pos;
+                            break;
+                        }
+                    }
+
+                    // Camp enemy GY fallback
+                    Position camp = (team == TEAM_ALLIANCE) ? AB_GY_CAMPING_HORDE : AB_GY_CAMPING_ALLIANCE;
+                    float rx, ry, rz;
+                    bot->GetRandomPoint(camp, 10.0f, rx, ry, rz);
+                    if (Map* map = bot->GetMap())
+                    {
+                        float groundZ = map->GetHeight(rx, ry, rz);
+                        if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
+                            rz = groundZ;
+                    }
+                    pos.Set(rx, ry, rz, bot->GetMapId());
+                    posMap["bg objective"] = pos;
+                    break;
                 }
-                pos.Set(rx, ry, rz, bot->GetMapId());
-                posMap["bg objective"] = pos;
-                break;
             }
 
             // --- PRIORITY 3: Defender logic ---
-            if (isDefender && urand(0, 99) < 85)
+            if (!committed && isDefender && urand(0, 99) < 85)
             {
                 float closestDist = FLT_MAX;
                 for (uint32 nodeId : AB_AttackObjectives)
@@ -2943,11 +2998,12 @@ bool BGTactics::selectObjective(bool reset)
             // --- PRIORITY 4: Attack objectives ---
             if (!BgObjective)
             {
-                std::vector<GameObject*> objectivePool;
+                std::vector<std::pair<uint32, GameObject*>> objectivePool;
 
                 for (uint8 i = 0; i < 3; ++i)
                 {
                     float bestDist = isSilly ? 0.0f : FLT_MAX;
+                    uint32 chosenNode = AB_COMMITTED_NODE_NONE;
                     GameObject* chosen = nullptr;
 
                     for (uint32 nodeId : AB_AttackObjectives)
@@ -2965,23 +3021,39 @@ bool BGTactics::selectObjective(bool reset)
                             continue;
 
                         GameObject* go = bg->GetBGObject(nodeId * BG_AB_OBJECTS_PER_NODE);
-                        if (!go || std::find(objectivePool.begin(), objectivePool.end(), go) != objectivePool.end())
+                        if (!go || std::find_if(objectivePool.begin(), objectivePool.end(),
+                                                [go](auto const& entry) { return entry.second == go; }) !=
+                                       objectivePool.end())
                             continue;
 
                         float dist = bot->GetDistance(go);
                         if ((isSilly && dist > bestDist) || (!isSilly && dist < bestDist))
                         {
                             bestDist = dist;
+                            chosenNode = nodeId;
                             chosen = go;
                         }
                     }
 
                     if (chosen)
-                        objectivePool.push_back(chosen);
+                        objectivePool.push_back({chosenNode, chosen});
                 }
 
                 if (!objectivePool.empty())
-                    BgObjective = objectivePool[urand(0, objectivePool.size() - 1)];
+                {
+                    auto const& [pickedNode, pickedGo] = objectivePool[urand(0, objectivePool.size() - 1)];
+                    BgObjective = pickedGo;
+
+                    // friendly-contested picks are guard duty, not a capture run — only
+                    // commit to nodes the bot can still assault
+                    if (isCapturable(pickedNode))
+                    {
+                        context->GetValue<uint32>("ab committed node")->Set(pickedNode);
+                        committed = true;
+                        LOG_INFO("playerbots", "[AB] {} commits to capturing {}", bot->GetName(),
+                                 AB_NodeName(pickedNode));
+                    }
+                }
             }
 
             // --- Final move ---
@@ -2989,7 +3061,9 @@ bool BGTactics::selectObjective(bool reset)
             {
                 float rx, ry, rz;
                 Position objPos = BgObjective->GetPosition();
-                bot->GetRandomPoint(objPos, frand(5.0f, 15.0f), rx, ry, rz);
+                // a committed bot heads straight into banner-click range; the wide
+                // radius is for defenders spreading out around a held node
+                bot->GetRandomPoint(objPos, committed ? frand(1.0f, 4.0f) : frand(5.0f, 15.0f), rx, ry, rz);
 
                 if (Map* map = bot->GetMap())
                 {

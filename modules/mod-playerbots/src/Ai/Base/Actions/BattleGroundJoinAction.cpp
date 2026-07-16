@@ -13,6 +13,7 @@
 #include "PlayerbotAI.h"
 #include "Playerbots.h"
 #include "PositionValue.h"
+#include "PvpValues.h"
 
 bool BGJoinAction::Execute(Event /*event*/)
 {
@@ -684,6 +685,7 @@ bool BGLeaveAction::Execute(Event /*event*/)
     botAI->GetAiObjectContext()->GetValue<uint32>("bg type")->Set(0);
     botAI->GetAiObjectContext()->GetValue<uint32>("bg role")->Set(0);
     botAI->GetAiObjectContext()->GetValue<uint32>("arena type")->Set(0);
+    botAI->GetAiObjectContext()->GetValue<uint32>("ab committed node")->Set(AB_COMMITTED_NODE_NONE);
 
     return true;
 }
@@ -729,6 +731,7 @@ bool BGStatusAction::LeaveBG(PlayerbotAI* botAI)
     botAI->GetAiObjectContext()->GetValue<uint32>("bg type")->Set(0);
     botAI->GetAiObjectContext()->GetValue<uint32>("bg role")->Set(0);
     botAI->GetAiObjectContext()->GetValue<uint32>("arena type")->Set(0);
+    botAI->GetAiObjectContext()->GetValue<uint32>("ab committed node")->Set(AB_COMMITTED_NODE_NONE);
     PositionMap& posMap = botAI->GetAiObjectContext()->GetValue<PositionMap&>("position")->Get();
     PositionInfo pos = botAI->GetAiObjectContext()->GetValue<PositionMap&>("position")->Get()["bg objective"];
     pos.Reset();
@@ -914,6 +917,7 @@ bool BGStatusAction::Execute(Event event)
                         botAI->ChangeStrategy("+bg", BOT_STATE_NON_COMBAT);
                     }
                     context->GetValue<uint32>("bg role")->Set(urand(0, 9));
+                    context->GetValue<uint32>("ab committed node")->Set(AB_COMMITTED_NODE_NONE);
                     PositionMap& posMap = context->GetValue<PositionMap&>("position")->Get();
                     PositionInfo pos = context->GetValue<PositionMap&>("position")->Get()["bg objective"];
                     pos.Reset();
@@ -965,6 +969,7 @@ bool BGStatusAction::Execute(Event event)
             botAI->GetAiObjectContext()->GetValue<uint32>("bg type")->Set(0);
             botAI->GetAiObjectContext()->GetValue<uint32>("bg role")->Set(0);
             botAI->GetAiObjectContext()->GetValue<uint32>("arena type")->Set(0);
+            botAI->GetAiObjectContext()->GetValue<uint32>("ab committed node")->Set(AB_COMMITTED_NODE_NONE);
 
             return true;
         }
@@ -1036,6 +1041,7 @@ bool BGStatusAction::Execute(Event event)
             botAI->ChangeStrategy("+bg", BOT_STATE_NON_COMBAT);
         }
         context->GetValue<uint32>("bg role")->Set(urand(0, 9));
+        context->GetValue<uint32>("ab committed node")->Set(AB_COMMITTED_NODE_NONE);
         PositionMap& posMap = context->GetValue<PositionMap&>("position")->Get();
         PositionInfo pos = context->GetValue<PositionMap&>("position")->Get()["bg objective"];
         PositionInfo pos2 = context->GetValue<PositionMap&>("position")->Get()["bg siege"];

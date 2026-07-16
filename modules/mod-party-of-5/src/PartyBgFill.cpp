@@ -76,6 +76,7 @@
 #include "WorldSession.h"
 
 #include "AiObjectContext.h"    // "bg role" roll for fill bots (BGTactics job split)
+#include "PvpValues.h"          // AB_COMMITTED_NODE_NONE — entry-clear of "ab committed node"
 #include "PlayerbotAI.h"
 #include "PlayerbotAIConfig.h"  // sPlayerbotAIConfig.randomBotJoinBG (the "bg" strategy gate)
 #include "PlayerbotFactory.h"   // re-level a pool fill bot to the BG bracket on spawn
@@ -1187,6 +1188,10 @@ public:
                             // via AcceptBgInvite and would all stay role 0 — same objective,
                             // no flank split — without this roll.
                             ai->GetAiObjectContext()->GetValue<uint32>("bg role")->Set(urand(0, 9));
+                            // fill bots / party heroes never run BGStatusAction's join path,
+                            // so a node commitment from a previous AB match would survive
+                            // into this one — clear it on entry like that path does
+                            ai->GetAiObjectContext()->GetValue<uint32>("ab committed node")->Set(AB_COMMITTED_NODE_NONE);
                         }
                 // Remember it made it in, so when the match ENDS (below) we retire it from
                 // HERE — never from the BG-removal hook, where a synchronous LogoutPlayer

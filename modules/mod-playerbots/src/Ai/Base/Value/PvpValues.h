@@ -31,6 +31,20 @@ public:
     BgRoleValue(PlayerbotAI* botAI) : ManualSetValue<uint32>(botAI, 0, "bg role") {}
 };
 
+// Arathi Basin node (BG_AB_NODE_*) the bot has committed to capturing, or
+// AB_COMMITTED_NODE_NONE while free to pick. Kept until the node flips to the
+// bot's team or the bot dies, so re-selection can't ping-pong it between nodes.
+constexpr uint32 AB_COMMITTED_NODE_NONE = 0xFFFFFFFF;
+
+class ABCommittedNodeValue : public ManualSetValue<uint32>
+{
+public:
+    ABCommittedNodeValue(PlayerbotAI* botAI)
+        : ManualSetValue<uint32>(botAI, AB_COMMITTED_NODE_NONE, "ab committed node")
+    {
+    }
+};
+
 class BgMastersValue : public SingleCalculatedValue<std::vector<CreatureData const*>>, public Qualified
 {
 public:
