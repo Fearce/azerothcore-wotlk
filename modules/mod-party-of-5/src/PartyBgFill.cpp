@@ -528,8 +528,21 @@ namespace
                 sBattlegroundMgr->GetBattleground(ginfo.IsInvitedToBGInstanceGUID, BATTLEGROUND_TYPE_NONE);
             BattlegroundTypeId const bgTypeId = invBg ? invBg->GetBgTypeID() : BattlegroundMgr::BGTemplateId(qt);
             if (arenaType != 0)
-                LOG_INFO("module", "[WowPsParty BGFill] arena-port {} -> inst={} realBg={} (queued qt={})",
-                         bot->GetName(), ginfo.IsInvitedToBGInstanceGUID, uint32(bgTypeId), uint32(qt));
+                LOG_INFO("module",
+                         "[WowPsParty BGFill] arena-port {} -> inst={} realBg={} (queued qt={}) combat={} charm={} vehicle={} frozen={}",
+                         bot->GetName(), ginfo.IsInvitedToBGInstanceGUID, uint32(bgTypeId), uint32(qt),
+                         bot->IsInCombat(), !bot->GetCharmGUID().IsEmpty(), !!bot->GetVehicle(), bot->HasAura(9454));
+            // HandleBattleFieldPortOpcode REJECTS the accept — at LOG_DEBUG, invisibly —
+            // while the player is charmed, in combat, or GM-frozen (aura 9454). A bot
+            // parked inside an ACTIVE Wintergrasp battle got auto-enrolled in the war on
+            // login, was re-flagged into combat every tick, and burned its whole 60s
+            // invite window on rejected ports: the enemy "5v5" team entered 3- or
+            // 4-strong. These are all managed bots, so strip every blocker before the
+            // accept (logged raw above, so residual causes stay visible).
+            if (bot->GetVehicle()) bot->ExitVehicle();
+            if (bot->GetCharmGUID()) bot->RemoveCharmAuras();
+            if (bot->HasAura(9454)) bot->RemoveAura(9454);
+            if (bot->IsInCombat()) bot->CombatStop(true);
             // DEFER the port: QUEUE the CMSG_BATTLEFIELD_PORT so the core processes it
             // in the bot's normal session update — do NOT call HandleBattleFieldPortOpcode
             // synchronously here. This runs inside the world OnUpdate tick, and porting a
@@ -640,6 +653,18 @@ namespace
     };
     std::unordered_map<uint32, ArenaFillSession> g_arenaFills;   // leaderLow -> session
 
+    // Dalaran fountain — sanctuary staging for a queued bot arena team. Pool chars log
+    // in wherever they last stood; several were parked inside Wintergrasp, where an
+    // active war means non-stop combat and a combat-flagged player can never accept the
+    // arena port (see AcceptBgInvite). A sanctuary makes combat impossible while the
+    // team waits out the pop, and post-match the arena exit returns them here (their
+    // entry point), so a staged team can't re-poison itself.
+    constexpr uint32 ARENA_STAGING_MAP = 571;
+    constexpr float  ARENA_STAGING_X = 5807.98f;
+    constexpr float  ARENA_STAGING_Y = 588.49f;
+    constexpr float  ARENA_STAGING_Z = 660.94f;
+    constexpr float  ARENA_STAGING_O = 1.67f;
+
     void RetireArenaFill(uint32 leaderLow)
     {
         ArenaFillSession s;
@@ -700,6 +725,18 @@ namespace
             if (m->GetGroup()) m->RemoveFromGroup();
             grp->AddMember(m);
         }
+        // NEVER field a short team: a failed AddMember (or a member evaporating between
+        // the all-online check and here) would queue a 4-man "5v5" and the core happily
+        // starts the rated match under-manned. Retire instead — the human just re-queues.
+        if (grp->GetMembersCount() < uint32(s.members.size()))
+        {
+            LOG_INFO("module",
+                "[WowPsParty ArenaFill] bot team {} grouped only {}/{} members — retiring, not queueing short",
+                s.botTeamId, grp->GetMembersCount(), uint32(s.members.size()));
+            grp->Disband(true);
+            RetireArenaFill(leaderLow);
+            return;
+        }
 
         Battleground* bgt = sBattlegroundMgr->GetBattlegroundTemplate(BATTLEGROUND_AA);
         if (!bgt) { RetireArenaFill(leaderLow); return; }
@@ -717,9 +754,17 @@ namespace
         bgt->SetRated(true);
         q.AddGroup(captain, grp, BATTLEGROUND_AA, bracket, arenatype, /*isRated=*/true, /*isPremade=*/false,
                    rating, mmr, at->GetId(), at->GetPreviousOpponents());
+        uint32 staged = 0;
         for (GroupReference* itr = grp->GetFirstMember(); itr; itr = itr->next())
             if (Player* mm = itr->GetSource())
+            {
                 mm->AddBattlegroundQueueId(qt);
+                // Stage in the Dalaran sanctuary while the pop lands (see the constants
+                // above for why); small offset so the team doesn't stack on one spot.
+                mm->TeleportTo(ARENA_STAGING_MAP, ARENA_STAGING_X + 2.0f * staged,
+                               ARENA_STAGING_Y, ARENA_STAGING_Z, ARENA_STAGING_O);
+                ++staged;
+            }
         sBattlegroundMgr->ScheduleQueueUpdate(mmr, arenatype, qt, BATTLEGROUND_AA, bracket->GetBracketId());
 
         { std::lock_guard<std::mutex> lk(g_mutex);
