@@ -4496,33 +4496,16 @@ static void HandleCharterSign(Player* owner, Item* charter, Petition const* peti
     WowPsParty::SendInventoryTo(owner);
 }
 
-// USE\t<srcPartySlot>\t<srcItemGuidLow> — use a bag item. CONSUMABLES (food/
+// Core of USE / USEBYID — use a resolved bag item. CONSUMABLES (food/
 // potions) fire their on-use on the requester and lose a charge from the owner.
 // NON-consumables (recipes to learn, essences/shards that CONVERT via reagents,
 // clickies, clams) are pulled onto the requester and used through the engine's
 // real item-use path, so the input is consumed exactly as a normal use — a bare
 // triggered CastSpell skips reagent/charge/recipe consumption, which let you
 // create the output without destroying the input (the infinite-dupe bug).
-static void HandleUse(Player* requester, std::string_view payload)
+static void UseOwnedItemInstance(Player* requester, Player* srcChar, Item* srcItem)
 {
-    if (!requester || !requester->GetSession()) return;
-    auto tab = payload.find('\t');
-    if (tab == std::string_view::npos) return;
-    uint32 const srcSlot = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
-    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
-    if (!srcItemGuidLow) return;
-
-    uint32 const account = requester->GetSession()->GetAccountId();
-    QueryResult q = CharacterDatabase.Query(
-        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, srcSlot);
-    if (!q) return;
-    uint32 const srcCharGuid = q->Fetch()[0].Get<uint32>();
-    Player* srcChar = ObjectAccessor::FindConnectedPlayer(
-        ObjectGuid::Create<HighGuid::Player>(srcCharGuid));
-    if (!srcChar) return;
-
-    Item* srcItem = SafeGetItemByGuid(srcChar, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
-    if (!srcItem) return;
+    if (!requester || !requester->GetSession() || !srcChar || !srcItem) return;
     ItemTemplate const* t = srcItem->GetTemplate();
     if (!t) return;
 
@@ -4668,6 +4651,127 @@ static void HandleUse(Player* requester, std::string_view payload)
     }
     WowPsParty::SendInventoryTo(requester);
     if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
+}
+
+// USE\t<srcPartySlot>\t<srcItemGuidLow> — use a specific bag item instance
+// (the shared-inventory grid's right-click). Resolves owner + item, then the
+// shared core above does the work.
+static void HandleUse(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    auto tab = payload.find('\t');
+    if (tab == std::string_view::npos) return;
+    uint32 const srcSlot = std::strtoul(std::string(payload.substr(0, tab)).c_str(), nullptr, 10);
+    uint32 const srcItemGuidLow = std::strtoul(std::string(payload.substr(tab + 1)).c_str(), nullptr, 10);
+    if (!srcItemGuidLow) return;
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    QueryResult q = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {} AND `slot` = {}", account, srcSlot);
+    if (!q) return;
+    uint32 const srcCharGuid = q->Fetch()[0].Get<uint32>();
+    Player* srcChar = ObjectAccessor::FindConnectedPlayer(
+        ObjectGuid::Create<HighGuid::Player>(srcCharGuid));
+    if (!srcChar) return;
+
+    Item* srcItem = SafeGetItemByGuid(srcChar, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow));
+    if (!srcItem) return;
+    UseOwnedItemInstance(requester, srcChar, srcItem);
+}
+
+// USEBYID\t<itemId> — the consumables action bar's use path: use ANY instance
+// of <itemId> from the party's shared bags. The requester's own stacks drain
+// first, then party-slot order, so a hero doesn't burn a mate's last potion
+// while sitting on a full stack. Delegates to the same core as USE.
+static void HandleUseById(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    uint32 const itemId = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+    if (!itemId) return;
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    Player* srcChar = nullptr;
+    Item*   srcItem = nullptr;
+    auto tryMember = [&](Player* p)
+    {
+        if (srcItem || WowPsParty::MemberStorageUnstable(p)) return;
+        if (Item* it = p->GetItemByEntry(itemId)) { srcChar = p; srcItem = it; }
+    };
+    tryMember(requester);
+    for (uint8 slot = 0; slot < WowPsParty::PARTY_SIZE && !srcItem; ++slot)
+    {
+        uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+        if (!guid) continue;
+        ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
+        Player* p = ObjectAccessor::FindConnectedPlayer(og);
+        if (!p) p = ObjectAccessor::FindPlayer(og);
+        if (!p || p == requester) continue;
+        tryMember(p);
+    }
+    if (!srcItem)
+    {
+        ItemTemplate const* t = sObjectMgr->GetItemTemplate(itemId);
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r No |cffffffff{}|r left in the party's bags.",
+            t ? t->Name1 : "such item");
+        return;
+    }
+    LOG_INFO("module", "[WowPsParty Bar] {} uses entry={} '{}' owned by {} (guidLow={})",
+        requester->GetName(), itemId, srcItem->GetTemplate() ? srcItem->GetTemplate()->Name1 : "?",
+        srcChar->GetName(), srcItem->GetGUID().GetCounter());
+    UseOwnedItemInstance(requester, srcChar, srcItem);
+}
+
+// BARCOUNT\t<id1>,<id2>,... — party-wide bag counts for the consumables action
+// bar. Replies BARCOUNT\t<id>:<count>;... chunked under the 3.3.5a addon-message
+// size cap; every requested id is echoed (0 when none) so an emptied stack greys
+// its button out. The addon re-requests on INV_DIRTY / INV_END, so this stays a
+// tiny targeted reply instead of the full INVENTORY stream.
+static void HandleBarCounts(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    uint32 const account = requester->GetSession()->GetAccountId();
+
+    std::vector<Player*> members;
+    for (uint8 slot = 0; slot < WowPsParty::PARTY_SIZE; ++slot)
+    {
+        uint32 const guid = WowPsParty::GuidForAccountSlot(account, slot);
+        if (!guid) continue;
+        ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
+        Player* p = ObjectAccessor::FindConnectedPlayer(og);
+        if (!p) p = ObjectAccessor::FindPlayer(og);
+        if (!WowPsParty::MemberStorageUnstable(p)) members.push_back(p);
+    }
+    // Not enrolled (solo, no account_party rows) → count the requester alone.
+    if (std::find(members.begin(), members.end(), requester) == members.end())
+        members.push_back(requester);
+
+    std::string chunk;
+    auto flush = [&]()
+    {
+        if (!chunk.empty()) { SendWPSP(requester, "BARCOUNT\t" + chunk); chunk.clear(); }
+    };
+    constexpr size_t MAX_PAYLOAD = 200;
+    std::string const ids(payload);
+    size_t pos = 0;
+    while (pos < ids.size())
+    {
+        size_t const comma = ids.find(',', pos);
+        uint32 const id = std::strtoul(ids.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos).c_str(), nullptr, 10);
+        pos = comma == std::string::npos ? ids.size() : comma + 1;
+        if (!id) continue;
+        uint32 count = 0;
+        for (Player* p : members)
+            count += p->GetItemCount(id, false);
+        std::string const rec = std::to_string(id) + ':' + std::to_string(count);
+        if (!chunk.empty() && chunk.size() + 1 + rec.size() > MAX_PAYLOAD)
+            flush();
+        if (!chunk.empty()) chunk += ';';
+        chunk += rec;
+    }
+    flush();
+    LOG_DEBUG("module", "[WowPsParty Bar] BARCOUNT for {}: {} member(s), ids='{}'",
+        requester->GetName(), members.size(), ids);
 }
 
 // SPLIT\t<srcPartySlot>\t<srcItemGuidLow>\t<count> — split `count` off a stack
@@ -6046,6 +6150,14 @@ public:
         else if (command == "USE")
         {
             HandleUse(player, payload);
+        }
+        else if (command == "USEBYID")
+        {
+            HandleUseById(player, payload);
+        }
+        else if (command == "BARCOUNT")
+        {
+            HandleBarCounts(player, payload);
         }
         else if (command == "SPLIT")
         {
