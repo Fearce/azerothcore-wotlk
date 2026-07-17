@@ -5354,7 +5354,7 @@ namespace WowPsParty
                 || verb == "charge"                   // leaps to a far enemy (away from the leader)
                 || verb == "reposition_random" || verb == "walk_away_from_source"
                 || verb == "dodge_frontals"   || verb == "face_away"
-                || verb == "stand_on_side"))
+                || verb == "stand_on_side"    || verb == "face_away_from_party"))
             return false;
 
         // "cast_on_swing:<spell>" — arm a NEXT-MELEE-SWING attack (Rune Strike,
@@ -6848,6 +6848,87 @@ namespace WowPsParty
                                         fx, fy, fz))
                     return false;
                 bot->GetMotionMaster()->MovePoint(0, fx, fy, fz, FORCED_MOVEMENT_NONE,
+                                                  0.0f, 0.0f, /*generatePath=*/true,
+                                                  /*forceDestination=*/false);
+            }
+            return true;
+        }
+
+        // "face_away_from_party:N" — TANK anchor: hold the spot on the target's FAR
+        // side from the rest of the party, N yards out (blank/0 = melee reach). The
+        // boss always turns back to face its threat target, so parking the tank
+        // opposite everyone else points the frontal cleave (Marrowgar's Saber Lash)
+        // permanently AWAY from the party. The anchor is PARTY-relative, never
+        // facing-relative: when the boss spins to shoot a Bone Spike at a member,
+        // the anchor doesn't move, so the tank STANDS STILL instead of chasing the
+        // momentary facing around the boss — the facing-relative chase pin did
+        // exactly that, and the boss re-facing the relocated tank swept the party.
+        // HoldFollower's every tick so AssistTarget's chase pin never fights the
+        // anchor; yields (returns false) while in position so casts/swings fire.
+        // Put it on the tank's rotation (or gate with "I am the tank" in Common).
+        if (verb == "face_away_from_party")
+        {
+            Unit* v = bot->GetVictim();
+            if (!v || !v->IsAlive()) return false;
+            // Centroid of the OTHER living members near the fight — with nobody to
+            // protect (solo / everyone far away) there is no far side to hold.
+            std::vector<Player*> party;
+            GatherPartyPlayers(bot, party, /*includeDead=*/false);
+            float cx = 0.0f, cy = 0.0f;
+            uint32 nearby = 0;
+            for (Player* m : party)
+                if (m != bot && m->GetDistance(v) < 80.0f)
+                {
+                    cx += m->GetPositionX();
+                    cy += m->GetPositionY();
+                    ++nearby;
+                }
+            if (!nearby) return false;
+            cx /= float(nearby); cy /= float(nearby);
+            float const dx = v->GetPositionX() - cx;
+            float const dy = v->GetPositionY() - cy;
+            if (dx * dx + dy * dy < 1.0f) return false;   // party stacked ON the boss — no far side
+            float const away = std::atan2(dy, dx);        // centroid→boss bearing, extended past it
+            float want = float(std::atof(arg.c_str()));
+            if (want <= 0.0f) want = std::max(v->GetCombatReach() + 1.0f, 2.0f);
+            WowPsParty::HoldFollower(bot->GetGUID(), 1500);
+            // Bearing hysteresis: settled when within ~55° of the exact far point AND
+            // at range. The boss faces US, so the party clears its front well before
+            // the exact spot, and the slack keeps ordinary party drift (the healer
+            // stepping a few yards) from ping-ponging the anchor.
+            float rel = v->GetAngle(bot) - away;
+            while (rel >  float(M_PI)) rel -= 2.0f * float(M_PI);
+            while (rel < -float(M_PI)) rel += 2.0f * float(M_PI);
+            constexpr float SETTLED = 0.96f;   // ~55°
+            if (std::fabs(rel) <= SETTLED && bot->GetDistance(v) <= want + 2.0f)
+                return false;
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE
+                && bot->isMoving())
+                return true;                   // let the in-flight anchor move finish
+            float ax, ay, az;
+            if (!PickSafeDestAround(bot, v, v, want, away, ax, ay, az))
+                return false;                  // whole far side in damage — fight from here
+            if (!NavReachable(bot, ax, ay, az, want))
+            {
+                if (HazardLogThrottled(bot->GetGUID().GetCounter()))
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation] {} face_away_from_party: far side of {} "
+                        "unreachable - holding position",
+                        bot->GetName(), v->GetName());
+                return false;
+            }
+            static thread_local std::unordered_map<uint32, uint32> lastAnchorMs;
+            uint32 const now = getMSTime();
+            uint32& last = lastAnchorMs[bot->GetGUID().GetCounter()];
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE
+                || now - last > 400)
+            {
+                last = now;
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] {} face_away_from_party: anchoring {:.1f}y on "
+                    "{}'s far side from the party (bearing {:.2f}, off by {:.2f} rad)",
+                    bot->GetName(), want, v->GetName(), away, rel);
+                bot->GetMotionMaster()->MovePoint(0, ax, ay, az, FORCED_MOVEMENT_NONE,
                                                   0.0f, 0.0f, /*generatePath=*/true,
                                                   /*forceDestination=*/false);
             }
