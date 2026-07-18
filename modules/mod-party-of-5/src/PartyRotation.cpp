@@ -8152,6 +8152,25 @@ namespace WowPsParty
             || verb == "wand";
     }
 
+    // The "suppression" verbs — they don't perform an action for the tick, they
+    // arm a hold that gates OTHER rules: stop_hold_cast (cast hold, holds hard-
+    // casts), stop_attacking (offensive hold), stop_cleansing (cleanse hold). Each
+    // returns false from ExecAction so the tick still falls through, which means it
+    // only takes effect for rules the priority loop reaches AFTER it. But the loop
+    // returns on the first rule that COMMITS, so a suppression rule placed BELOW the
+    // rules it means to gate is never reached (a heal/nuke commits first) and its
+    // hold never arms — the "healers keep casting through Loatheb's Necrotic Aura
+    // even with a stop_hold_cast rule at the bottom" report. TickRotation's pre-pass
+    // arms these up front so their position in the list doesn't matter; ExecAction is
+    // idempotent for them (re-arms the same hold), so a re-hit in the main loop is a
+    // harmless no-op.
+    static bool IsHoldSuppressVerb(std::string const& verb)
+    {
+        return verb == "stop_hold_cast"
+            || verb == "stop_attacking"
+            || verb == "stop_cleansing";
+    }
+
     // When a rule's ACTION targets a FRIENDLY unit (a heal/HoT/buff on the
     // lowest party member, the tank, or self), that friendly unit — not the
     // bot's enemy victim — is what its target_* conditions should evaluate
@@ -8708,6 +8727,27 @@ namespace WowPsParty
         // refs). While true, the healer holds its HEALS. Non-healers return false.
         // (offenseHold for all classes is computed earlier, before the auto-attack.)
         bool const healerHold = WowPsParty::HealerShouldHoldHeal(bot);
+
+        // Suppression pre-pass (see IsHoldSuppressVerb): arm the stop_* holds BEFORE
+        // the priority loop so they gate the rest of the rotation no matter where the
+        // user placed them. Without this a stop_hold_cast rule below the heal rules
+        // never fires — a heal commits first and the loop returns before reaching it,
+        // so the cast hold never arms and the healer keeps hard-casting through a
+        // healing-block aura (Loatheb's Necrotic Aura). These verbs don't commit
+        // (ExecAction returns false), so this cannot "use up" the tick; it only arms.
+        for (RotationRule const& r : rules)
+        {
+            if (CsvContains(Lower(r.flags), "disabled")) continue;
+            std::string const verb = r.action.substr(0, r.action.find(':'));
+            if (!IsHoldSuppressVerb(verb)) continue;
+            Unit* const condTarget = FriendlyActionTarget(bot, r.action);
+            if (!EvalCondition(r.condition, bot, condTarget)) continue;
+            if (trace)
+                LOG_INFO("module",
+                    "[WowPsParty Rotation]   prepass prio={} cond=[{}] act=[{}] -> ARM_HOLD",
+                    r.priority, r.condition, r.action);
+            ExecAction(r.action, bot, r.flags, r.condition);
+        }
 
         for (RotationRule const& r : rules)
         {
