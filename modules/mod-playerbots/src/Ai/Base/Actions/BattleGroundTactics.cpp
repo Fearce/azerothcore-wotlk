@@ -1998,6 +1998,50 @@ Creature* BGTactics::icFreeSiegeVehicle()
     return best;
 }
 
+// How far an on-foot attacker will detour to crew a demolisher. Generous enough to
+// sweep the whole beach wave from the single landing spot (the farthest beach hull
+// is ~206yd out) and the factory hulls that spawn beside a freshly-taken graveyard,
+// but short of a cross-map backtrack (beach->yellow gate is 500yd+).
+static constexpr float SA_DEMOLISHER_SEEK_RANGE = 250.0f;
+
+// Nearest empty, alive Strand of the Ancients demolisher within seek range — the four
+// beach hulls (BG_SA_DEMOLISHER_1..4, spawned at round start) plus the four factory
+// hulls (BG_SA_DEMOLISHER_5..8, spawned as graveyards fall). Only truly-free hulls are
+// returned: an in-use demolisher already has a driver, and EnterVehicleAction refuses
+// to board an in-use vehicle, so the seek self-caps concurrent drivers at the hull
+// count and the surplus falls through to the graveyard/gate objectives on foot.
+Creature* BGTactics::saFreeDemolisher()
+{
+    Battleground* bg = bot->GetBattleground();
+    if (!bg)
+        return nullptr;
+
+    Creature* best = nullptr;
+    // seed at the cap, not FLT_MAX, so the same compare rejects out-of-range hulls
+    float bestDist = SA_DEMOLISHER_SEEK_RANGE;
+    for (uint32 slot = BG_SA_DEMOLISHER_1; slot <= BG_SA_DEMOLISHER_8; ++slot)
+    {
+        // read the slot directly — GetBGCreature() error-logs an unspawned vehicle,
+        // which factory demolishers are until their graveyard is captured
+        Creature* demolisher = bg->GetBgMap()->GetCreature(bg->BgCreatures[slot]);
+        if (!demolisher || !demolisher->IsAlive() || demolisher->HasUnitFlag(UNIT_FLAG_NOT_SELECTABLE))
+            continue;
+
+        Vehicle* kit = demolisher->GetVehicleKit();
+        if (!kit || kit->IsVehicleInUse() || !kit->GetAvailableSeatCount())
+            continue;
+
+        float const d = bot->GetDistance(demolisher);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            best = demolisher;
+        }
+    }
+
+    return best;
+}
+
 // A parked Isle of Conquest siege vehicle shells the enemy keep's front gate for as
 // long as it stands — the gate is what wins the game, enemy players are only the
 // strategy-level fallback shot. Fired from the move-to-objective tick like the SA
@@ -3833,6 +3877,22 @@ bool BGTactics::selectObjective(bool reset)
                 {
                     if (GameObject* relic = bg->GetBGObject(BG_SA_TITAN_RELIC))
                         BgObjective = relic;
+                }
+
+                // demolishers are the ONLY thing that breaks a gate, so grabbing a free
+                // one beats walking up on foot: head for the nearest empty hull and the
+                // enter-vehicle timer boards it (as driver — EnterVehicleAction skips
+                // in-use hulls) once in range. Placed ahead of the graveyard/gate escort
+                // so a spare demolisher always outranks another foot soldier; the in-use
+                // filter caps drivers at the hull count and the rest fall through below.
+                if (!BgObjective && targetGate != BG_SA_TITAN_RELIC)
+                {
+                    if (Creature* demolisher = saFreeDemolisher())
+                    {
+                        BgObjective = demolisher;
+                        LOG_INFO("playerbots", "[SA] {} heads for a free demolisher ({:.0f}yd away)",
+                                 bot->GetName(), bot->GetDistance(demolisher));
+                    }
                 }
 
                 // graveyard runners: taking a flag moves our spawn up AND spawns fresh

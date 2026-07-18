@@ -129,6 +129,7 @@ private:
     bool saVehicleShoot();
     bool icVehicleShoot();
     Creature* icFreeSiegeVehicle();
+    Creature* saFreeDemolisher();
     bool atFlag(std::vector<BattleBotPath*> const& vPaths, std::vector<uint32> const& vFlagIds);
     bool flagTaken();
     bool teamFlagTaken();
