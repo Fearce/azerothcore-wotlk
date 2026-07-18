@@ -877,6 +877,47 @@ namespace
     // tick independent of any ArenaFill session (that session retires when the ENEMY
     // team clears, which can be before our henchmen are out). Skips mid-port bots and
     // never touches an IN_PROGRESS match, so a live arena is never disturbed.
+    // A managed party bot that has fully left a match must not keep *reporting* itself
+    // battleground-bound. LFGMgr::Join checks every group member — plrg->InBattleground()
+    // || plrg->InBattlegroundQueue() — and rejects the WHOLE party with
+    // LFG_JOIN_USING_BG_SYSTEM ("you cannot queue for a dungeon while using battlegrounds
+    // or arenas") if any member still looks BG-bound. So one lingering bit on a henchman
+    // blocks the HUMAN from queueing a dungeon until they leave the party or relog. Two
+    // strays can survive a finished match:
+    //   * a bgData instance id pointing at a battleground that no longer exists, and
+    //   * a queue slot the BattlegroundQueue itself no longer tracks (InBattlegroundQueue
+    //     reads only the Player-object slots, so a phantom slot lies forever).
+    // Clear either; both are provably invalid — a live match is resolved by
+    // GetBattleground() and a real queue entry is found by GetPlayerGroupInfoData(), so
+    // neither is ever touched.
+    static void ClearStaleBgState(Player* pb)
+    {
+        if (pb->InBattleground() && !pb->GetBattleground())
+        {
+            LOG_INFO("module",
+                "[WowPsParty ArenaFill] clearing stale battleground id on {} — "
+                "instance no longer exists; was blocking party LFG join", pb->GetName());
+            pb->SetBattlegroundId(0, BATTLEGROUND_TYPE_NONE,
+                PLAYER_MAX_BATTLEGROUND_QUEUES, false, false, TEAM_NEUTRAL);
+        }
+
+        if (pb->InBattleground()) return;   // genuinely in a live match — hands off
+
+        for (uint8 i = 0; i < PLAYER_MAX_BATTLEGROUND_QUEUES; ++i)
+        {
+            BattlegroundQueueTypeId const qt = pb->GetBattlegroundQueueTypeId(i);
+            if (qt == BATTLEGROUND_QUEUE_NONE) continue;
+            GroupQueueInfo gi;
+            if (sBattlegroundMgr->GetBattlegroundQueue(qt).GetPlayerGroupInfoData(pb->GetGUID(), &gi))
+                continue;   // really queued — leave it alone
+            LOG_INFO("module",
+                "[WowPsParty ArenaFill] clearing phantom BG queue slot (type {}) on {} — "
+                "queue has no record of it; was blocking party LFG join",
+                uint32(qt), pb->GetName());
+            pb->RemoveBattlegroundQueueId(qt);
+        }
+    }
+
     void RecoverOrphanedPartyBots()
     {
         std::vector<ObjectGuid> followers;
@@ -887,11 +928,15 @@ namespace
             if (!pb || !pb->IsInWorld() || pb->IsBeingTeleported()) continue;
             if (!sPlayerbotsMgr.GetPlayerbotAI(pb)) continue;   // managed bot only
             Battleground* bg = pb->GetBattleground();
-            if (!bg || bg->GetStatus() != STATUS_WAIT_LEAVE) continue;
-            LOG_INFO("module",
-                "[WowPsParty ArenaFill] match over — leaving {} out of finished {} (status WAIT_LEAVE)",
-                pb->GetName(), bg->isArena() ? "arena" : "battleground");
-            pb->LeaveBattleground(bg);
+            if (bg && bg->GetStatus() == STATUS_WAIT_LEAVE)
+            {
+                LOG_INFO("module",
+                    "[WowPsParty ArenaFill] match over — leaving {} out of finished {} (status WAIT_LEAVE)",
+                    pb->GetName(), bg->isArena() ? "arena" : "battleground");
+                pb->LeaveBattleground(bg);
+                continue;
+            }
+            ClearStaleBgState(pb);
         }
     }
 
