@@ -1834,6 +1834,30 @@ namespace WowPsParty
         return best ? best->GetGUID() : ObjectGuid::Empty;
     }
 
+    // Maps an "am_<class>" condition to the WotLK class id it gates on, or 0
+    // for anything else. Lets a shared rule list fan out by CLASS the same way
+    // am_dps fans out by role — e.g. one mixed-caster rule where only "I am a
+    // Mage" bots Blizzard while the warlocks Rain of Fire. Death Knight is the
+    // one two-word class ("am_deathknight", no space). Monk/DH don't exist in
+    // 3.3.5a so the table stops at Druid.
+    static uint8 ClassForConditionName(std::string const& cond)
+    {
+        static std::unordered_map<std::string, uint8> const kByCond = {
+            { "am_warrior",     CLASS_WARRIOR      },
+            { "am_paladin",     CLASS_PALADIN      },
+            { "am_hunter",      CLASS_HUNTER       },
+            { "am_rogue",       CLASS_ROGUE        },
+            { "am_priest",      CLASS_PRIEST       },
+            { "am_deathknight", CLASS_DEATH_KNIGHT },
+            { "am_shaman",      CLASS_SHAMAN       },
+            { "am_mage",        CLASS_MAGE         },
+            { "am_warlock",     CLASS_WARLOCK      },
+            { "am_druid",       CLASS_DRUID        },
+        };
+        auto const it = kByCond.find(cond);
+        return it != kByCond.end() ? it->second : 0;
+    }
+
     // ----- condition evaluator ------------------------------------------------
 
     // Returns true on parse + match. Conditions of the form name<N or name>N
@@ -3239,6 +3263,11 @@ namespace WowPsParty
             std::string const r = WowPsParty::RoleForGuid(bot->GetGUID());
             return r != "tank" && r != "healer";
         }
+        // Class of the BOT running this rule — "I am a Mage". Orthogonal to the
+        // role checks above (a Druid can be tank OR healer OR dps), so combine
+        // them: "am_druid & am_healer" targets only resto druids in a raid.
+        if (uint8 const wantClass = ClassForConditionName(cond))
+            return bot->getClass() == wantClass;
         // Raid main/off-tank split. In a two-tank fight the main and off tank do
         // different jobs (main holds the boss, off-tank grabs adds / a second
         // boss), so a rotation gates rules on which one this bot is. Assignment is
