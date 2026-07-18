@@ -1797,6 +1797,43 @@ namespace WowPsParty
         return nullptr;
     }
 
+    // Which tank in the bot's raid/party is the MAIN tank? Returns its GUID
+    // (empty if no live tank is present). Assignment is automatic so a rotation
+    // can split tank jobs (main taunts the boss, off-tank grabs adds):
+    //   - a HUMAN tank always outranks an AI tank (Kevin's own toon leads),
+    //   - among the same kind the deepest health pool wins — GetMaxHealth, a
+    //     stable gear-based measure that won't flip mid-fight the way current HP
+    //     would, with the lower GUID breaking exact ties for determinism,
+    //   - a lone tank is trivially the main tank.
+    // Scope is the full same-map roster (GatherPartyPlayers folds in the WoW raid
+    // group) so an off-tank sitting in another sub-party is still ranked here.
+    static ObjectGuid DetermineMainTankGuid(Player* bot)
+    {
+        if (!bot) return ObjectGuid::Empty;
+        std::vector<Player*> party;
+        GatherPartyPlayers(bot, party, /*includeDead=*/false);
+
+        Player* best = nullptr;
+        bool bestHuman = false;
+        for (Player* m : party)
+        {
+            if (!m) continue;
+            if (WowPsParty::RoleForGuid(m->GetGUID()) != "tank") continue;
+            bool const human = sPlayerbotsMgr.GetPlayerbotAI(m) == nullptr;
+            if (!best) { best = m; bestHuman = human; continue; }
+            if (human != bestHuman)
+            {
+                if (human) { best = m; bestHuman = true; }   // human beats bot
+                continue;
+            }
+            uint32 const hp = m->GetMaxHealth();
+            uint32 const bestHp = best->GetMaxHealth();
+            if (hp > bestHp || (hp == bestHp && m->GetGUID() < best->GetGUID()))
+                best = m;
+        }
+        return best ? best->GetGUID() : ObjectGuid::Empty;
+    }
+
     // ----- condition evaluator ------------------------------------------------
 
     // Returns true on parse + match. Conditions of the form name<N or name>N
@@ -3201,6 +3238,34 @@ namespace WowPsParty
         {
             std::string const r = WowPsParty::RoleForGuid(bot->GetGUID());
             return r != "tank" && r != "healer";
+        }
+        // Raid main/off-tank split. In a two-tank fight the main and off tank do
+        // different jobs (main holds the boss, off-tank grabs adds / a second
+        // boss), so a rotation gates rules on which one this bot is. Assignment is
+        // automatic (DetermineMainTankGuid): a human tank if present, else the AI
+        // tank with the deepest health pool; a lone tank is always the main tank.
+        // is_off_tank is true ONLY for a tank that isn't the main one — a healer
+        // or dps bot is neither.
+        if (cond == "is_main_tank" || cond == "is_off_tank")
+        {
+            if (WowPsParty::RoleForGuid(bot->GetGUID()) != "tank") return false;
+            ObjectGuid const mainTank = DetermineMainTankGuid(bot);
+            bool const isMain = mainTank.IsEmpty() || mainTank == bot->GetGUID();
+
+            // Diagnostic: tank-job assignment is easy to get wrong to eyeball
+            // in-raid, so log who this bot resolved the main tank to be — but only
+            // when it CHANGES (the assignment is stable in steady state, so a
+            // heartbeat would just spam the log).
+            static thread_local std::unordered_map<uint32, uint32> lastMainTank;
+            uint32& prevMt = lastMainTank[bot->GetGUID().GetCounter()];
+            if (prevMt != mainTank.GetCounter())
+            {
+                prevMt = mainTank.GetCounter();
+                LOG_INFO("module",
+                    "[WowPsParty Rotation] {} main-tank resolved to guid {} (isMain={})",
+                    bot->GetName(), mainTank.GetCounter(), isMain);
+            }
+            return cond == "is_main_tank" ? isMain : !isMain;
         }
         // True when this bot's party has a live tank-role member — a ranged shaman uses it to
         // pick Water Shield (mana, it's safe behind the tank) over Lightning Shield.
