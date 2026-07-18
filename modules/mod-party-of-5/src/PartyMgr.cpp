@@ -3515,6 +3515,34 @@ namespace WowPsParty
             DismissHiredAlt(requester, gg.GetCounter());
     }
 
+    // Is this own-account character genuinely in a live session right now?
+    //
+    // The `characters.online` column is NOT a reliable answer: a crash or an
+    // unclean logout leaves it stuck at 1 with no session behind it, and the
+    // world only resets it on startup — on a long-lived server that stale flag
+    // persists for days. Trusting it would hide a perfectly hireable offline alt
+    // from the Hire-Alts window forever (it still shows in the roster, which
+    // doesn't filter online — the Nissedaza symptom). The authoritative signal
+    // is whether a WorldSession is actually connected. Reconcile the two: if the
+    // DB claims online but nobody's connected, the flag is stale — clear it so
+    // every consumer (this window, HireAlt, anything else) recovers.
+    static bool AltHasLiveSession(uint32 guid, bool dbOnline)
+    {
+        ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
+        if (ObjectAccessor::FindConnectedPlayer(og))
+            return true;
+        if (dbOnline)
+        {
+            CharacterDatabase.Execute(
+                "UPDATE `characters` SET `online` = 0 "
+                "WHERE `guid` = {} AND `online` <> 0", guid);
+            LOG_INFO("module",
+                "[WowPsParty Alts] cleared stale online flag for guid={} "
+                "(DB said online but no session is connected)", guid);
+        }
+        return false;
+    }
+
     // Every non-enrolled own-account character (minus the active session char),
     // flagged whether it's currently hired. Offline un-hired rows are hireable;
     // a hired row (online as a bot) is shown so it can be dismissed.
@@ -3539,13 +3567,14 @@ namespace WowPsParty
             uint32 const guid = f[0].Get<uint32>();
             if (guid == activeGuid) continue;   // can't hire the character you're playing
             uint8 const cls    = f[2].Get<uint8>();
-            bool  const online = f[4].Get<uint8>() != 0;
+            bool  const dbOnline = f[4].Get<uint8>() != 0;
             ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
             bool const hired   = WowPsParty::IsHiredAlt(og);
-            // Hireable rows are offline; a currently-hired alt is online (as a bot)
-            // and listed so it can be dismissed. Skip an online char that isn't our
-            // hired alt (shouldn't happen on a single-session account — defensive).
-            if (online && !hired) continue;
+            // Hireable rows have no live session; a currently-hired alt does (as a
+            // bot) and is listed so it can be dismissed. Skip a genuinely-connected
+            // char that isn't our hired alt (shouldn't happen on a single-session
+            // account — defensive). Uses the real session, not the stale DB flag.
+            if (AltHasLiveSession(guid, dbOnline) && !hired) continue;
 
             AltCandidate c;
             c.guid  = guid;
@@ -3576,13 +3605,16 @@ namespace WowPsParty
         if (!q) { outMsg = "Character not found."; return false; }
         Field* f = q->Fetch();
         uint8 const level        = f[0].Get<uint8>();
-        bool  const online       = f[1].Get<uint8>() != 0;
+        bool  const dbOnline     = f[1].Get<uint8>() != 0;
         uint32 const charAccount = f[2].Get<uint32>();
         uint8 const cls          = f[3].Get<uint8>();
         bool  const enrolled     = f[4].Get<uint32>() != 0;
         if (charAccount != account) { outMsg = "That isn't one of your characters."; return false; }
         if (enrolled) { outMsg = "That character is already in your party."; return false; }
-        if (online)   { outMsg = "That character is busy — log it out first."; return false; }
+        // Real session, not the DB flag — a stale characters.online must not block
+        // a hire (it clears the flag as a side effect, self-healing the row).
+        if (AltHasLiveSession(altGuid, dbOnline))
+        { outMsg = "That character is busy — log it out first."; return false; }
 
         // Party-space cap. Hired alts, henchmen and enrolled heroes all count as
         // followers toward the leader+4 / raid-of-40 cap (same gate as HireHenchman).
