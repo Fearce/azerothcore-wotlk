@@ -8188,6 +8188,87 @@ namespace WowPsParty
         bot->SendMovementFlagUpdate();   // heartbeat -> onlookers update; no spline, no channel clip
     }
 
+    // Cancel a HARD-CAST single-target heal the instant the ally it's aimed at has
+    // been topped up by ANOTHER source mid-cast — a second healer's heal landing, a
+    // HoT tick, a potion. Five Holy Paladins that all open Holy Light on the same
+    // tank otherwise every one lands, and four are pure overheal that spent a chunk
+    // of mana for nothing. Mana is only paid when the cast COMPLETES, so interrupting
+    // a doomed-to-overheal cast refunds it in full.
+    //
+    // We act ONLY when the target's health ROSE since we began the cast: that rise is
+    // the "gained health another way" signal. A cast whose target is merely healthy
+    // from the start is the ROTATION's call — its party_lowest_health gate already
+    // decided the heal was wanted — and is left alone, so a lone healer topping the
+    // tank is never second-guessed. Restricted to the GENERIC slot (direct heals:
+    // Holy/Flash of Light, Greater/Flash Heal, Healing Touch, Nourish); channels
+    // (Tranquility, Penance) are multi-target / multi-tick and must not be cut for
+    // one ally's HP.
+    struct HealCastWatch { ObjectGuid target; uint32 spellId; uint64 startHealth; };
+
+    // Keep the cast only while at least this fraction of it would be effective
+    // healing; below it the remainder is overheal an ally already covered.
+    static constexpr float HEAL_KEEP_FRACTION = 0.5f;
+
+    static void CancelOverhealingCast(Player* bot)
+    {
+        // Self-cleaning: only a bot mid-heal keeps an entry; everyone else is erased
+        // each tick, so this never grows past the count of currently-casting healers.
+        static thread_local std::unordered_map<uint32, HealCastWatch> watch;
+        uint32 const key = bot->GetGUID().GetCounter();
+
+        Spell* const spell = bot->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+        SpellInfo const* const si = spell ? spell->GetSpellInfo() : nullptr;
+        Unit* const target = spell ? spell->m_targets.GetUnitTarget() : nullptr;
+
+        bool eligible = si && target && target->IsAlive()
+                     && si->IsPositive() && si->CalcCastTime() > 0
+                     && bot->IsFriendlyTo(target);
+        int32 healEff = -1;
+        if (eligible)
+        {
+            for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                if (si->Effects[i].Effect == SPELL_EFFECT_HEAL) { healEff = int32(i); break; }
+            if (healEff < 0) eligible = false;   // HoT-only / non-direct heal — nothing to refund
+        }
+        if (!eligible)
+        {
+            watch.erase(key);
+            return;
+        }
+
+        // First tick we observe THIS cast: latch the pre-heal health so a later rise
+        // can be attributed to an outside source, then wait for the next tick.
+        auto it = watch.find(key);
+        if (it == watch.end() || it->second.target != target->GetGUID()
+            || it->second.spellId != si->Id)
+        {
+            watch[key] = HealCastWatch{ target->GetGUID(), si->Id, target->GetHealth() };
+            return;
+        }
+
+        // Health hasn't risen: our own cast is still the one that will top them —
+        // let it finish (a tank steadily dropping never trips this).
+        if (target->GetHealth() <= it->second.startHealth) return;
+
+        int32 const base = si->Effects[uint8(healEff)].CalcValue(bot);
+        uint32 projected = bot->SpellHealingBonusDone(
+            target, si, base > 0 ? uint32(base) : 0, HEAL, uint8(healEff));
+        if (projected == 0) projected = base > 0 ? uint32(base) : 0;
+        if (projected == 0) return;   // can't project — don't cancel blindly
+
+        uint64 const missing = target->GetMaxHealth() > target->GetHealth()
+            ? target->GetMaxHealth() - target->GetHealth() : 0;
+        if (double(missing) >= double(projected) * HEAL_KEEP_FRACTION) return;
+
+        bot->InterruptSpell(CURRENT_GENERIC_SPELL, false);
+        watch.erase(key);
+        LOG_INFO("module",
+            "[WowPsParty Heal] {} cancelled {} on {} - topped by another source "
+            "(deficit {} < {}% of projected {})",
+            bot->GetName(), si->SpellName[0] ? si->SpellName[0] : "heal",
+            target->GetName(), missing, int(HEAL_KEEP_FRACTION * 100.0f), projected);
+    }
+
     bool TickRotation(Player* bot)
     {
         if (!bot) return false;
@@ -8265,6 +8346,13 @@ namespace WowPsParty
         // ground-AoE channel's patch). Runs every tick here — BEFORE the channel-commit
         // gate below stands the rotation down — so it also corrects a Blizzard channel.
         FaceTargetCosmetic(bot);
+
+        // Refund a healer's mana when the ally it's hard-casting a direct heal on has
+        // already been topped up by another source mid-cast (see CancelOverhealingCast).
+        // Runs BEFORE the rule loop so a cancelled cast's healer can redirect to a
+        // genuinely-injured member the same tick. Must run even while mid-cast — it IS
+        // the mid-cast handler — so it sits ahead of the offense-hold / leash gates.
+        CancelOverhealingCast(bot);
 
         // Keep ammo/poisons topped up (self-throttled). Runs before the rotation
         // so a freshly-spawned hunter has arrows on its first idle tick and a
