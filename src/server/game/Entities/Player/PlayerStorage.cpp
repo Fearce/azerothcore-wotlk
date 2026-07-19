@@ -4506,7 +4506,20 @@ void Player::ApplyEnchantment(Item* item, EnchantmentSlot slot, bool apply, bool
     if (pEnchant->requiredLevel > GetLevel())
         return;
 
-    if (pEnchant->requiredSkill > 0 && pEnchant->requiredSkillValue > GetSkillValue(pEnchant->requiredSkill))
+    // [WowPsParty PATCH] Profession-restricted enchants (LW Fur Lining, Enchanting
+    // ring enchants, BS prismatic sockets, …) can be applied to a party member's gear
+    // through the Party UI, but this skill gate then grants NO stats to a wearer who
+    // lacks the profession — the enchant shows on the item yet does nothing, on every
+    // equip/relog. Exempt managed party members so cross-profession enchants work;
+    // everyone else keeps the normal requirement. Membership is read live, so this
+    // gate stays symmetric across an item's equipped life (both the apply and the
+    // remove pass see the same answer) as long as membership doesn't change under a
+    // worn enchant — the same benign asymmetry vanilla already tolerates for a
+    // profession learned/dropped while gear is equipped.
+    extern bool WowPsParty_ShouldBypassEnchantSkillReq(Player*);
+    bool const partyBypassEnchantReq = WowPsParty_ShouldBypassEnchantSkillReq(this);
+
+    if (!partyBypassEnchantReq && pEnchant->requiredSkill > 0 && pEnchant->requiredSkillValue > GetSkillValue(pEnchant->requiredSkill))
         return;
 
     if (!sScriptMgr->OnPlayerCanApplyEnchantment(this, item, slot, apply, apply_dur, ignore_condition))
@@ -4519,7 +4532,10 @@ void Player::ApplyEnchantment(Item* item, EnchantmentSlot slot, bool apply, bool
     {
         // Check if the requirements for the prismatic socket are met before applying the gem stats
         SpellItemEnchantmentEntry const* pPrismaticEnchant = sSpellItemEnchantmentStore.LookupEntry(item->GetEnchantmentId(PRISMATIC_ENCHANTMENT_SLOT));
-        if (!pPrismaticEnchant || (pPrismaticEnchant->requiredSkill > 0 && pPrismaticEnchant->requiredSkillValue > GetSkillValue(pPrismaticEnchant->requiredSkill)))
+        // [WowPsParty PATCH] Same party-member exemption as the perm enchant above: a
+        // Blacksmithing prismatic socket shouldn't withhold its gem's stats from a
+        // party member who lacks Blacksmithing.
+        if (!pPrismaticEnchant || (!partyBypassEnchantReq && pPrismaticEnchant->requiredSkill > 0 && pPrismaticEnchant->requiredSkillValue > GetSkillValue(pPrismaticEnchant->requiredSkill)))
             return;
     }
 

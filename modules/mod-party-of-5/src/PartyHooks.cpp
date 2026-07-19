@@ -1491,6 +1491,22 @@ bool WowPsParty_ShouldBypassTotemReq(Player* caster)
     return sPartyMgr.GetSlotForGuid(caster->GetGUID().GetCounter()).has_value();
 }
 
+// Trampoline called from the [WowPsParty PATCH] in PlayerStorage.cpp::ApplyEnchantment.
+// Profession-restricted enchants (Leatherworking Fur Lining, Enchanting ring enchants,
+// Blacksmithing prismatic sockets, …) can be applied to any party member's gear through
+// the Party UI, but the core skill gate then grants NO stats to a wearer who lacks the
+// profession — so the enchant shows on the item yet does nothing. Exempt managed party
+// members from that skill requirement so cross-profession enchants actually work: an
+// enrolled hero (GetSlotForGuid, includes the active/leader char) or any follower
+// henchman (BotHasActiveFollowDirective, includes henchmen with no party_slot). Random-
+// pool / AH bots and unrelated players keep the normal requirement.
+bool WowPsParty_ShouldBypassEnchantSkillReq(Player* player)
+{
+    if (!player || !WowPsParty::IsEnabled()) return false;
+    if (WowPsParty::BotHasActiveFollowDirective(player->GetGUID())) return true;
+    return sPartyMgr.GetSlotForGuid(player->GetGUID().GetCounter()).has_value();
+}
+
 // Trampoline called from the [WowPsParty PATCH] in Spell.cpp::CheckCast for
 // SPELL_EFFECT_SKINNING. The engine refuses to skin a beast whose NORMAL loot
 // isn't fully gone (UNIT_FLAG_SKINNABLE unset and/or loot not looted). In a
