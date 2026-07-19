@@ -4698,28 +4698,62 @@ static void UseOwnedItemInstance(Player* requester, Player* srcChar, Item* srcIt
         return;
     }
 
-    // A RECIPE (learns a spell) must be used by the REQUESTER so THEY learn it: pull
-    // it over (recipes are count-1, so no stack merge) and use it via the real
-    // item-use pipeline, which consumes the recipe. Everything else (essence/shard
-    // CONVERSIONS, clams, clickies) is used by its OWNER through the same pipeline —
-    // no cross-character pull — and the engine consumes the input (reagents / the
-    // item) exactly as a normal use. The old bare triggered cast skipped that
+    // Two on-use item kinds MUST be cast by the (never-a-bot) REQUESTER, not the
+    // owning party member — so pull the item over (like a recipe) and use it via
+    // the real item-use pipeline on the requester:
+    //   * A RECIPE (learns a spell): the requester must be the one who LEARNS it.
+    //   * A REAGENT-CONSUMING CONVERSION (essence/shard "combine 3 -> 1", mote
+    //     combines, …): Spell::TakeReagents gives ANY bot caster its reagents for
+    //     FREE (the autonomous-rotation rule, WowPsParty_PlayerHasBotAI). Casting
+    //     such a combine as the owning hero-alt/henchman therefore consumed only
+    //     the single cast item while still creating the output — the infinite-
+    //     essence dupe. Casting as the human requester makes the engine take the
+    //     full reagent cost from the shared party inventory. (The reverse split,
+    //     greater -> 3 lesser, has no reagent and is consumed via the cast item, so
+    //     it stays on the owner-cast path below and never duped.)
+    // Everything else (clams, clickies) is used by its OWNER through the same
+    // pipeline — no cross-character pull — and the engine consumes the input
+    // exactly as a normal use. The old bare triggered cast skipped that
     // consumption, creating the output while leaving the input = the infinite dupe.
     bool isLearn = false;
+    bool hasReagent = false;
     if (SpellInfo const* si2 = sSpellMgr->GetSpellInfo(useSpell))
+    {
         for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
             if (si2->Effects[i].Effect == SPELL_EFFECT_LEARN_SPELL) { isLearn = true; break; }
+        for (uint8 i = 0; i < MAX_SPELL_REAGENTS; ++i)
+            if (si2->Reagent[i] > 0 && si2->ReagentCount[i] > 0) { hasReagent = true; break; }
+    }
+    bool const castByRequester = isLearn || hasReagent;
 
     SpellCastTargets targets;   // default-constructed = self-cast
-    if (isLearn && srcChar != requester)
+    if (castByRequester && srcChar != requester)
     {
+        uint32 const    entry   = srcItem->GetEntry();
+        ObjectGuid const srcGuid = srcItem->GetGUID();
         Item* pulled = PullItemToRequester(requester, srcChar, srcItem);
         if (!pulled)
         {
-            ChatHandler(requester->GetSession()).PSendSysMessage(
-                "|cffff5555[WowPsParty]|r Your bags are full — free a slot to learn |cffffffff{}|r.", t->Name1);
-            return;
+            // A stackable reagent (a recipe is count-1, but an essence stacks) can
+            // MERGE into a stack the requester already holds: the moved instance is
+            // consumed by the merge so its guid is gone, yet the reagent now sits in
+            // the requester's bags. Distinguish that from a genuine no-room bounce-
+            // back — where PullItemToRequester leaves the stack on its owner — so a
+            // merge still combines and only a real full-bags case aborts.
+            if (SafeGetItemByGuid(srcChar, srcGuid))
+            {
+                ChatHandler(requester->GetSession()).PSendSysMessage(
+                    "|cffff5555[WowPsParty]|r Your bags are full — free a slot to use |cffffffff{}|r.", t->Name1);
+                return;
+            }
+            // Any same-entry stack is an acceptable cast source: the on-use spell
+            // and its reagent cost are item-entry-keyed, not instance-keyed.
+            pulled = requester->GetItemByEntry(entry);
+            if (!pulled) return;   // merged in but unfindable — bail rather than mis-cast
         }
+        LOG_INFO("module",
+            "[WowPsParty Use] {} converts entry={} '{}' (reagent={} learn={}) as the human caster; owner was {}.",
+            requester->GetName(), entry, t->Name1, hasReagent, isLearn, srcChar->GetName());
         requester->CastItemUseSpell(pulled, targets, 0, 0);
     }
     else
