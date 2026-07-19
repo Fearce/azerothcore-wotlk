@@ -433,7 +433,7 @@ namespace WowPsParty
     }
 
     // Display fields read off an Item for the inventory/gear panels.
-    struct PartyItemFields { uint32 entry; uint32 count; uint32 guidLow; int32 randProp; uint32 suffix; uint32 enchant; bool soulbound; };
+    struct PartyItemFields { uint32 entry; uint32 count; uint32 guidLow; int32 randProp; uint32 suffix; uint32 enchant; uint32 gem[MAX_GEM_SOCKETS]; bool soulbound; };
 
     // Defensive read of an item's display fields. A bag/equip slot can transiently
     // hold an Item whose value-array is invalid — a partially-initialised / dangling
@@ -456,6 +456,8 @@ namespace WowPsParty
             out.randProp = item->GetItemRandomPropertyId();
             out.suffix   = item->GetItemSuffixFactor();
             out.enchant  = item->GetEnchantmentId(PERM_ENCHANTMENT_SLOT);   // perm enchant, for the tooltip
+            for (uint32 g = 0; g < MAX_GEM_SOCKETS; ++g)                    // socket gem enchant ids, so the tooltip shows socketed gems (value-array reads → inside the SEH guard)
+                out.gem[g] = item->GetEnchantmentId(EnchantmentSlot(SOCK_ENCHANTMENT_SLOT + g));
             out.soulbound = item->IsSoulBound();                            // instance bind state (value-array read → inside the SEH guard)
             return true;
 #ifdef _WIN32
@@ -499,10 +501,12 @@ namespace WowPsParty
         return sObjectMgr->GetItemTemplate(entry);
     }
 
-    // GEAR\t<slot>\t<eqSlot>:<itemId>:<itemGuidLow>:<randProp>:<suffixFactor>;...
+    // GEAR\t<slot>\t<eqSlot>:<itemId>:<itemGuidLow>:<randProp>:<suffixFactor>:<enchant>:<gem0>:<gem1>:<gem2>;...
     // (19 equipment slots). randProp/suffixFactor appended so the gear tooltip
     // renders a randomized item (e.g. "of the Bear") with its real stats, exactly
-    // like the bag inventory does — see SendInventoryTo::emitItem.
+    // like the bag inventory does — see SendInventoryTo::emitItem. enchant + the 3
+    // socket gem enchant ids let the client rebuild a link that shows the applied
+    // enchant and socketed gems instead of empty sockets.
     void SendGearTo(Player* requester, uint32 slot)
     {
         if (!requester || !requester->GetSession()) return;
@@ -544,7 +548,11 @@ namespace WowPsParty
             if (!first) out << ';';
             first = false;
             out << uint32(i) << ':' << f.entry << ':' << f.guidLow
-                << ':' << f.randProp << ':' << f.suffix << ':' << f.enchant;
+                << ':' << f.randProp << ':' << f.suffix << ':' << f.enchant
+                // Socket gem enchant ids, so the gear tooltip renders socketed gems
+                // (empty sockets otherwise). Appended, so an older addon that only
+                // reads the first 6 fields still parses fine.
+                << ':' << f.gem[0] << ':' << f.gem[1] << ':' << f.gem[2];
         }
         SendWPSP(requester, out.str());
     }
