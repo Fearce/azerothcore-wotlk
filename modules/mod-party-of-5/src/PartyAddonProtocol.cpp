@@ -1992,18 +1992,28 @@ static void HandleBuyback(Player* requester, std::string_view payload)
     SendBuybackTo(requester);
 }
 
-// Stream the REQUESTER's BANK contents — the 28 main bank slots AND the items inside
-// every bank bag — so the panel's Bank view can SHOW (and let the user withdraw) what
-// was deposited. Without this, banking was a one-way trip: you could deposit but never
-// see or retrieve it. The bank is the requester's own (used as shared storage), so there
-// is no party loop / partySlot. Mirrors SendBuybackTo's chunked, AV-safe stream. The bag
-// CONTAINERS themselves aren't emitted here (those live in the BANKBAG strip); this is
-// strictly their contents + the loose bank items.
-static void SendBankTo(Player* requester)
+// One BANKVIEW record. ownerGuidLow/ownerName tag WHICH of the account's characters
+// physically holds the item, so the account-wide Bank view can label "Stored on <char>"
+// and cluster each alt's reserves. 3.3.5a character names never contain ':' or ';', so
+// they append raw into the ':'-delimited, ';'-separated record stream without escaping.
+static std::string MakeBankRecord(WowPsParty::PartyItemFields const& f,
+                                  uint32 ownerGuidLow, std::string const& ownerName)
 {
-    if (!requester || !requester->GetSession()) return;
+    std::ostringstream r;
+    r << f.entry << ':' << f.count << ':' << f.guidLow << ':'
+      << f.randProp << ':' << f.suffix << ':' << f.enchant
+      << ':' << (f.soulbound ? 1 : 0)          // instance bind state (see SendInventoryTo)
+      << ':' << ownerGuidLow << ':' << ownerName;
+    return r.str();
+}
 
-    std::vector<std::string> records;
+// Append the REQUESTER's own LIVE bank (28 main slots + every bank-bag's contents) as
+// records tagged with the requester as owner. The bag CONTAINERS themselves aren't
+// emitted (those live in the BANKBAG strip); strictly their contents + loose bank items.
+static void AppendLiveBankRecords(Player* requester, std::vector<std::string>& records)
+{
+    std::string const selfName = requester->GetName();
+    uint32 const selfGuid = requester->GetGUID().GetCounter();
     auto emit = [&](Item* it)
     {
         if (!it) return;
@@ -2011,22 +2021,128 @@ static void SendBankTo(Player* requester)
         if (!WowPsParty::SafeReadItemFields(it, f))
         {
             LOG_ERROR("module", "[WowPsParty] SendBankTo: SKIPPED a bad item ptr=0x{:x} owner={}",
-                reinterpret_cast<uintptr_t>(it), requester->GetGUID().GetCounter());
+                reinterpret_cast<uintptr_t>(it), selfGuid);
             return;
         }
-        std::ostringstream r;
-        r << f.entry << ':' << f.count << ':' << f.guidLow << ':'
-          << f.randProp << ':' << f.suffix << ':' << f.enchant
-          << ':' << (f.soulbound ? 1 : 0);   // instance bind state (see SendInventoryTo)
-        records.push_back(r.str());
+        records.push_back(MakeBankRecord(f, selfGuid, selfName));
     };
-
     for (uint8 s = BANK_SLOT_ITEM_START; s < BANK_SLOT_ITEM_END; ++s)
         emit(requester->GetItemByPos(INVENTORY_SLOT_BAG_0, s));
     for (uint8 b = BANK_SLOT_BAG_START; b < BANK_SLOT_BAG_END; ++b)
         if (Bag* bag = requester->GetBagByPos(b))
             for (uint32 j = 0; j < bag->GetBagSize(); ++j)
                 emit(requester->GetItemByPos(b, j));
+}
+
+// Classify one character_inventory row (bag/slot + item guid) as a BANK item. Rows are
+// read bag-ASC, so the bag==0 rows — which include the bank-bag CONTAINERS in slots
+// 67-73 — are always visited before any in-bag content rows; thus `bankBagGuids` is
+// fully populated by the time a bag-contained row (bag == a container guid) is judged.
+static bool ClassifyOfflineBankRow(uint32 bag, uint8 slot, uint32 itemGuid,
+                                   std::unordered_set<uint32>& bankBagGuids)
+{
+    if (bag == 0)
+    {
+        if (slot >= BANK_SLOT_BAG_START && slot < BANK_SLOT_BAG_END)
+        {
+            bankBagGuids.insert(itemGuid);   // a bank-bag container (not itself a bank item)
+            return false;
+        }
+        return slot >= BANK_SLOT_ITEM_START && slot < BANK_SLOT_ITEM_END;
+    }
+    return bankBagGuids.count(bag) != 0;     // an item sitting inside a bank bag
+}
+
+// One character's full inventory joined to item_instance, columns 0-10 laid out to match
+// Item::LoadFromDB (see CHAR_SEL_CHARACTER_INVENTORY) plus ci.bag/ci.slot/ci.item/entry.
+// Shared by the account-bank read and the cross-char withdraw so the bank-position rules
+// stay identical. Synchronous (user-initiated, infrequent — panel open / a withdraw).
+static QueryResult QueryCharInventoryForBank(uint32 ownerGuidLow)
+{
+    return CharacterDatabase.Query(
+        "SELECT ii.creatorGuid, ii.giftCreatorGuid, ii.count, ii.duration, ii.charges, "
+        "ii.flags, ii.enchantments, ii.randomPropertyId, ii.durability, ii.playedTime, "
+        "ii.text, ci.bag, ci.slot, ci.item, ii.itemEntry "
+        "FROM character_inventory ci JOIN item_instance ii ON ci.item = ii.guid "
+        "WHERE ci.guid = {} ORDER BY ci.bag ASC, ci.slot ASC",
+        ownerGuidLow);
+}
+
+// Append the bank contents of every OTHER (offline) character on the requester's account,
+// making the Bank view account-wide — one place to see & retrieve reserve items no matter
+// which alt banked them. Only one char per account is online at a time, so every account
+// char except the requester is offline and read from the DB. A SINGLE query over the whole
+// account (ordered by owner, then bag/slot) keeps this to one world-thread round-trip; the
+// per-owner container set resets whenever ci.guid changes. Each bank item is briefly loaded
+// into a throwaway Item* so the same SafeReadItemFields extraction as the live path is
+// reused (no item_instance blob parsing), then freed.
+static void AppendAccountBankRecords(Player* requester, std::vector<std::string>& records)
+{
+    uint32 const account  = requester->GetSession()->GetAccountId();
+    uint32 const selfGuid = requester->GetGUID().GetCounter();
+    QueryResult q = CharacterDatabase.Query(
+        "SELECT ii.creatorGuid, ii.giftCreatorGuid, ii.count, ii.duration, ii.charges, "
+        "ii.flags, ii.enchantments, ii.randomPropertyId, ii.durability, ii.playedTime, "
+        "ii.text, ci.bag, ci.slot, ci.item, ii.itemEntry, ci.guid, c.name "
+        "FROM characters c "
+        "JOIN character_inventory ci ON ci.guid = c.guid "
+        "JOIN item_instance ii ON ci.item = ii.guid "
+        "WHERE c.account = {} AND c.guid <> {} "
+        "AND (c.deleteInfos_Account IS NULL OR c.deleteInfos_Account = 0) "
+        "ORDER BY ci.guid ASC, ci.bag ASC, ci.slot ASC",
+        account, selfGuid);
+    if (!q) return;
+
+    uint32 curOwner = 0;
+    bool ownerOnline = false;
+    std::string ownerName;
+    std::unordered_set<uint32> bankBagGuids;
+    do
+    {
+        Field* fields = q->Fetch();
+        uint32 const owner = fields[15].Get<uint32>();
+        if (owner != curOwner)                       // reached a new character — reset per-owner state
+        {
+            curOwner = owner;
+            ownerName = fields[16].Get<std::string>();
+            bankBagGuids.clear();
+            // Never DB-read a char that's actually in memory (defensive: 1 online/acct).
+            ownerOnline = ObjectAccessor::FindConnectedPlayer(
+                              ObjectGuid::Create<HighGuid::Player>(owner)) != nullptr;
+        }
+        if (ownerOnline) continue;
+
+        uint32 const bag      = fields[11].Get<uint32>();
+        uint8  const slot     = fields[12].Get<uint8>();
+        uint32 const itemGuid = fields[13].Get<uint32>();
+        uint32 const entry    = fields[14].Get<uint32>();
+        if (!ClassifyOfflineBankRow(bag, slot, itemGuid, bankBagGuids))
+            continue;
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(entry);
+        if (!proto) continue;
+        Item* it = NewItemOrBag(proto);
+        if (!it->LoadFromDB(itemGuid, ObjectGuid::Empty, fields, entry)) { delete it; continue; }
+        WowPsParty::PartyItemFields f;
+        if (WowPsParty::SafeReadItemFields(it, f))
+            records.push_back(MakeBankRecord(f, owner, ownerName));
+        delete it;
+    } while (q->NextRow());
+}
+
+// Stream the account-wide BANK contents — the requester's own live bank PLUS every other
+// account character's banked items — so the panel's Bank view can SHOW (and withdraw)
+// reserve items across ALL the account's characters. Without this the bank was per-char.
+// Mirrors SendBuybackTo's chunked, AV-safe stream.
+static void SendBankTo(Player* requester)
+{
+    if (!requester || !requester->GetSession()) return;
+
+    std::vector<std::string> records;
+    AppendLiveBankRecords(requester, records);
+    size_t const liveCount = records.size();
+    AppendAccountBankRecords(requester, records);
+    LOG_DEBUG("module", "[WowPsParty] SendBankTo: {} bank item(s) for account of {} ({} own live, {} from offline alts)",
+        records.size(), requester->GetName(), liveCount, records.size() - liveCount);
 
     SendWPSP(requester, "BANK_BEGIN");
     constexpr size_t MAX_PAYLOAD = 220;
@@ -2045,10 +2161,131 @@ static void SendBankTo(Player* requester)
     SendWPSP(requester, "BANK_END");
 }
 
-// WITHDRAW\t<bankItemGuidLow> — pull one item OUT of the requester's bank back into their
-// own bags. The mirror of HandleBankDeposit: canonical same-player move (RemoveItem from
-// the bank slot, then StoreItem into the bags). Validates the item is actually in a bank
-// slot so this can't be used to teleport a worn/bagged item.
+// Withdraw a banked item that lives on ANOTHER (offline) character of the requester's
+// account into the requester's OWN bags — the account-wide half of WITHDRAW. The item is
+// loaded from the DB and, in ONE transaction, the source character's inventory row is
+// deleted while the item is re-owned + stored to the requester (mirrors MailHandler's
+// HandleMailTakeItem: MoveItemToInventory + SaveInventoryAndGoldToDB). Atomic, so there is
+// no dupe and no orphan; bags-full is checked BEFORE the delete so a failed withdraw
+// leaves the source bank untouched. Returns true if it OWNED the request (did the move or
+// deliberately rejected it), false to let the caller fall through to its own error path.
+static bool HandleOfflineBankWithdraw(Player* requester, uint32 itemGuidLow)
+{
+    // The guid comes from the client, so never trust it: resolve the real owner and
+    // confirm the item belongs to THIS account before touching anything.
+    QueryResult og = CharacterDatabase.Query(
+        "SELECT owner_guid FROM item_instance WHERE guid = {}", itemGuidLow);
+    if (!og) return false;
+    uint32 const ownerGuidLow = og->Fetch()[0].Get<uint32>();
+    if (!ownerGuidLow || ownerGuidLow == requester->GetGUID().GetCounter())
+        return false;   // no owner, or the requester's own item (the live path's job)
+
+    ObjectGuid const ownerGuid = ObjectGuid::Create<HighGuid::Player>(ownerGuidLow);
+    if (sCharacterCache->GetCharacterAccountIdByGuid(ownerGuid) != requester->GetSession()->GetAccountId())
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r That item isn't on one of your characters.");
+        return true;
+    }
+    if (ObjectAccessor::FindConnectedPlayer(ownerGuid))
+        return false;   // owner is in memory (shouldn't happen: 1 online/acct) — not our path
+
+    // Load the item, but ONLY if it is genuinely a BANK item of that character (so this
+    // can't be used to strip an offline alt's equipped or bagged gear).
+    QueryResult q = QueryCharInventoryForBank(ownerGuidLow);
+    if (!q)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r That item is no longer in the bank.");
+        SendBankTo(requester);
+        return true;
+    }
+    std::unordered_set<uint32> bankBagGuids;
+    Item* loaded = nullptr;
+    do
+    {
+        Field* fields = q->Fetch();
+        uint32 const bag     = fields[11].Get<uint32>();
+        uint8  const slot    = fields[12].Get<uint8>();
+        uint32 const rowGuid = fields[13].Get<uint32>();
+        uint32 const entry   = fields[14].Get<uint32>();
+        bool const isBank = ClassifyOfflineBankRow(bag, slot, rowGuid, bankBagGuids);
+        if (rowGuid != itemGuidLow)
+            continue;
+        if (isBank)
+            if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(entry))
+            {
+                Item* it = NewItemOrBag(proto);
+                if (it->LoadFromDB(itemGuidLow, ObjectGuid::Empty, fields, entry))
+                    loaded = it;
+                else
+                    delete it;
+            }
+        break;   // found the target row (bank or not) — stop scanning
+    } while (q->NextRow());
+
+    if (!loaded)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r That item is no longer in the bank.");
+        SendBankTo(requester);
+        return true;
+    }
+
+    // A bag can only be a bank-BAG container (excluded by ClassifyOfflineBankRow), never a
+    // bank ITEM — so a Bag reaching here means corrupt data. Refuse rather than move a
+    // container and strand its contents' rows (which point at the moved bag guid).
+    if (loaded->IsBag())
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r That item can't be withdrawn from the bank.");
+        delete loaded;
+        return true;
+    }
+
+    ItemTemplate const* t = loaded->GetTemplate();
+    std::string const itemName = t ? t->Name1 : "item";
+
+    ItemPosCountVec dest;
+    if (requester->CanStoreItem(NULL_BAG, NULL_SLOT, dest, loaded, false) != EQUIP_ERR_OK)
+    {
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Your bags are full — couldn't withdraw |cffffffff{}|r.", itemName);
+        delete loaded;
+        return true;
+    }
+
+    std::string ownerName;
+    sCharacterCache->GetCharacterNameByGuid(ownerGuid, ownerName);
+
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+    CharacterDatabasePreparedStatement* del =
+        CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHAR_INVENTORY_BY_ITEM);
+    del->SetData(0, itemGuidLow);
+    trans->Append(del);   // detach from the source character's bank
+
+    loaded->SetState(ITEM_UNCHANGED);                     // clean slate before store (as HandleMailTakeItem)
+    requester->MoveItemToInventory(dest, loaded, true);   // ITEM_NEW → new char_inventory row + owner=requester
+    requester->SaveInventoryAndGoldToDB(trans);           // persist both sides in the SAME transaction
+    CharacterDatabase.CommitTransaction(trans);
+
+    LOG_INFO("module", "[WowPsParty] Account-bank withdraw: {} pulled item {} ({}) from offline char {} ({})",
+        requester->GetName(), itemGuidLow, itemName, ownerName.empty() ? "?" : ownerName, ownerGuidLow);
+
+    ChatHandler(requester->GetSession()).PSendSysMessage(
+        "|cff66ccff[WowPsParty]|r Withdrew |cffffffff{}|r from {}'s bank.",
+        itemName, ownerName.empty() ? "another character" : ownerName);
+
+    WowPsParty::SendInventoryTo(requester);
+    SendBankTo(requester);
+    return true;
+}
+
+// WITHDRAW\t<bankItemGuidLow> — pull one item OUT of the bank back into the requester's own
+// bags. If the item is in the requester's OWN live bank this is the canonical same-player
+// move (RemoveItem then StoreItem); otherwise it belongs to another (offline) account
+// character and HandleOfflineBankWithdraw does the cross-char DB move (account-wide bank).
+// Validates the item is actually in a bank slot so this can't teleport a worn/bagged item.
 static void HandleWithdraw(Player* requester, std::string_view payload)
 {
     if (!requester || !requester->GetSession()) return;
@@ -2058,6 +2295,10 @@ static void HandleWithdraw(Player* requester, std::string_view payload)
     Item* item = SafeGetItemByGuid(requester, ObjectGuid::Create<HighGuid::Item>(itemGuidLow));
     if (!item || !Player::IsBankPos(item->GetPos()))
     {
+        // Not in the requester's own live bank — it may be banked on another (offline)
+        // character on the account. Route there before reporting it gone.
+        if (HandleOfflineBankWithdraw(requester, itemGuidLow))
+            return;
         ChatHandler(requester->GetSession()).PSendSysMessage(
             "|cffff5555[WowPsParty]|r That item is no longer in your bank.");
         WowPsParty::SendInventoryTo(requester);
