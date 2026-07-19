@@ -33,6 +33,8 @@
 #include "GroupScript.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "Spell.h"                    // Spell::GetSpellInfo — record the mount a human just rode
+#include "CheckMountStateAction.h"    // CheckMountStateAction::RecordManualMount
 #include "StringFormat.h"
 #include "Trainer.h"
 #include "WorldSession.h"
@@ -422,8 +424,30 @@ public:
         PLAYERHOOK_ON_MAP_CHANGED,
         PLAYERHOOK_ON_REMOVE_FROM_BATTLEGROUND,
         PLAYERHOOK_CAN_PLAYER_USE_PRIVATE_CHAT,
-        PLAYERHOOK_ON_BEFORE_SEND_CHAT_MESSAGE
+        PLAYERHOOK_ON_BEFORE_SEND_CHAT_MESSAGE,
+        PLAYERHOOK_ON_SPELL_CAST
     }) { }
+
+    // Remember the last mount a human rode manually on a hero char, so that character
+    // prefers the same mount when it's later AI-driven — "ride Winterspring Frostsaber
+    // once and your henchman keeps riding it." Ground and flying mounts are tracked
+    // independently; a char never ridden manually keeps the default auto-mount behavior.
+    // Fires on every human spell cast, so reject non-mounts before any lookup. Only real
+    // (human-controlled) casts count: an AI bot has a PlayerbotAI and is skipped, so a
+    // bot's random fallback mount can never overwrite the stored preference.
+    void OnPlayerSpellCast(Player* player, Spell* spell, bool /*skipCheck*/) override
+    {
+        if (!WowPsParty::IsEnabled() || !player || !spell)
+            return;
+        SpellInfo const* info = spell->GetSpellInfo();
+        if (!info || info->Effects[0].ApplyAuraName != SPELL_AURA_MOUNTED)
+            return;
+        if (sPlayerbotsMgr.GetPlayerbotAI(player))                       // AI auto-mount, not manual
+            return;
+        if (!sPartyMgr.GetSlotForGuid(player->GetGUID().GetCounter()))   // enrolled hero only
+            return;
+        CheckMountStateAction::RecordManualMount(player, info);
+    }
 
     // On-demand "Cast <spell>" party command: a human leader typing e.g.
     // "Cast Portal: Ironforge" or "Cast Heroism" in party/raid chat makes whichever

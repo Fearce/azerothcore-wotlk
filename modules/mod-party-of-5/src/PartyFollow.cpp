@@ -67,6 +67,7 @@
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 #include "RandomPlayerbotMgr.h"
+#include "CheckMountStateAction.h"   // honour the human's last manually-ridden mount per char
 
 #include "WorldSession.h"
 #include "WorldSessionMgr.h"
@@ -617,6 +618,13 @@ namespace WowPsParty
         bool canFly = leaderFlying && level >= 60;
         if (canFly && bot->GetMapId() == 571 /*Northrend*/ && !bot->HasSpell(54197 /*Cold Weather Flying*/))
             canFly = false;
+
+        // The mount the human last rode MANUALLY on this exact character wins — that's
+        // how the player picks which mount a henchman uses, ground and flying tracked
+        // separately. Only when nothing was recorded do we fall back to a racial pick.
+        // The char owns the spell (it rode it), so the caller's triggered cast applies.
+        if (uint32 preferred = CheckMountStateAction::GetPreferredMount(bot->GetGUID().GetCounter(), canFly ? 1 : 0))
+            return preferred;
 
         std::vector<uint32> const& tier =
             canFly ? (level >= 70 ? ffast : fslow)

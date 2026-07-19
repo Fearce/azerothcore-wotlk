@@ -315,55 +315,67 @@ bool CheckMountStateAction::TryForms(Player* master, int32 masterMountType, int3
     return false;
 }
 
+void CheckMountStateAction::EnsurePreferredMountCache()
+{
+    if (preferredMountTableChecked)
+        return;
+
+    preferredMountTableChecked = true;
+
+    // Verify the preferred-mounts table exists in the database
+    QueryResult checkTable = PlayerbotsDatabase.Query(
+        "SELECT EXISTS(SELECT * FROM information_schema.tables WHERE table_schema = 'acore_playerbots' AND table_name = 'playerbots_preferred_mounts')");
+
+    if (!checkTable || checkTable->Fetch()[0].Get<uint32>() != 1)
+    {
+        LOG_DEBUG("playerbots", "Preferred mounts SQL table playerbots_preferred_mounts does not exist!");
+        return;
+    }
+
+    // Cache all mounts of both types, ordered so the newest row per guid wins.
+    QueryResult result =
+        PlayerbotsDatabase.Query("SELECT guid, spellid, type FROM playerbots_preferred_mounts ORDER BY id");
+    if (!result)
+        return;
+
+    uint32 totalResults = 0;
+    do
+    {
+        Field* row = result->Fetch();
+        uint32 guid = row[0].Get<uint32>();
+        uint32 spellId = row[1].Get<uint32>();
+        uint32 mountType = row[2].Get<uint32>();
+
+        if (mountType == 0)
+            mountCache[guid].groundMounts.push_back(spellId);
+        else if (mountType == 1)
+            mountCache[guid].flightMounts.push_back(spellId);
+
+        totalResults++;
+    } while (result->NextRow());
+
+    LOG_INFO("playerbots", "Preferred mounts initialized | Total records: {}", totalResults);
+}
+
+uint32 CheckMountStateAction::GetPreferredMount(uint32 guid, uint32 type)
+{
+    EnsurePreferredMountCache();
+
+    auto it = mountCache.find(guid);
+    if (it == mountCache.end())
+        return 0;
+
+    std::vector<uint32> const& list = (type == 1) ? it->second.flightMounts : it->second.groundMounts;
+    // RecordManualMount keeps a single latest row per guid+type; ORDER BY id means the
+    // last cached entry is the newest even if legacy data left more than one behind.
+    return list.empty() ? 0 : list.back();
+}
+
 bool CheckMountStateAction::TryPreferredMount(Player* master) const
 {
     uint32 botGUID = bot->GetGUID().GetRawValue();
 
-    // Build cache (only once)
-    if (!preferredMountTableChecked)
-    {
-        // Verify preferred mounts table existance in the database
-        QueryResult checkTable = PlayerbotsDatabase.Query(
-            "SELECT EXISTS(SELECT * FROM information_schema.tables WHERE table_schema = 'acore_playerbots' AND table_name = 'playerbots_preferred_mounts')");
-
-        if (checkTable && checkTable->Fetch()[0].Get<uint32>() == 1)
-        {
-            preferredMountTableChecked = true;
-
-            // Cache all mounts of both types globally, for all entries
-            QueryResult result = PlayerbotsDatabase.Query("SELECT guid, spellid, type FROM playerbots_preferred_mounts");
-
-            if (result)
-            {
-                uint32 totalResults = 0;
-                while (auto row = result->Fetch())
-                {
-                    uint32 guid = row[0].Get<uint32>();
-                    uint32 spellId = row[1].Get<uint32>();
-                    uint32 mountType = row[2].Get<uint32>();
-
-                    if (mountType == 0)
-                        mountCache[guid].groundMounts.push_back(spellId);
-
-                    else if (mountType == 1)
-                        mountCache[guid].flightMounts.push_back(spellId);
-
-                    totalResults++;
-
-                    result->NextRow();
-                }
-                LOG_INFO("playerbots", "Preferred mounts initialized | Total records: {}", totalResults);
-            }
-        }
-        else // If the SQL table is missing, log an error and return false
-        {
-            preferredMountTableChecked = true;
-
-            LOG_DEBUG("playerbots", "Preferred mounts SQL table playerbots_preferred_mounts does not exist!");
-
-            return false;
-        }
-    }
+    EnsurePreferredMountCache();
 
     // Pick a random preferred mount from the selection, if available
     uint32 chosenMountId = 0;
@@ -404,6 +416,51 @@ bool CheckMountStateAction::TryPreferredMount(Player* master) const
 
     LOG_DEBUG("playerbots", "Preferred mount failed! | Bot Guid: {}", botGUID);
     return false;
+}
+
+int32 CheckMountStateAction::ClassifyMountSpell(SpellInfo const* spellInfo)
+{
+    if (!spellInfo || spellInfo->Effects[0].ApplyAuraName != SPELL_AURA_MOUNTED || spellInfo->IsPassive())
+        return -1;
+
+    bool const flying =
+        spellInfo->Effects[1].ApplyAuraName == SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED ||
+        spellInfo->Effects[2].ApplyAuraName == SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED ||
+        spellInfo->Id == 54729;  // Winged Steed of the Ebon Blade (autoscaling flyer)
+    return flying ? 1 : 0;
+}
+
+void CheckMountStateAction::RecordManualMount(Player* player, SpellInfo const* spellInfo)
+{
+    if (!player)
+        return;
+
+    int32 const type = ClassifyMountSpell(spellInfo);
+    if (type < 0)
+        return;
+
+    uint32 const guid = player->GetGUID().GetCounter();
+    uint32 const spellId = spellInfo->Id;
+
+    // Persist as the single latest preference for this character + mount type.
+    PlayerbotsDatabase.Execute(
+        "DELETE FROM playerbots_preferred_mounts WHERE guid = {} AND type = {}", guid, type);
+    PlayerbotsDatabase.Execute(
+        "INSERT INTO playerbots_preferred_mounts (guid, type, spellid) VALUES ({}, {}, {})",
+        guid, type, spellId);
+
+    // Keep the in-memory cache coherent so the next auto-mount picks it up immediately.
+    // If the cache hasn't been built yet, leave it — the first read rebuilds from the DB
+    // (which now holds this row), so touching it here would only add a duplicate entry.
+    if (preferredMountTableChecked)
+    {
+        PreferredMountCache& entry = mountCache[guid];
+        std::vector<uint32>& list = (type == 1) ? entry.flightMounts : entry.groundMounts;
+        list.assign(1, spellId);
+    }
+
+    LOG_INFO("playerbots", "Preferred mount recorded | Guid: {} | Type: {} | Spell: {}",
+        guid, type, spellId);
 }
 
 bool CheckMountStateAction::TryRandomMountFiltered(const std::map<int32, std::vector<uint32>>& spells, int32 masterSpeed) const

@@ -31,6 +31,7 @@ struct PreferredMountCache
 };
 
 class PlayerbotAI;
+class SpellInfo;
 
 class CheckMountStateAction : public UseItemAction
 {
@@ -44,10 +45,32 @@ public:
 
     static void CompleteDismount(Player* bot);
 
+    // Remember the mount a human just rode manually so that this character prefers the
+    // same one when it is later AI-driven (a party henchman/hero). Ground and flying are
+    // tracked independently. No-op unless spellInfo is a usable mount. Persists one row
+    // per character + type in playerbots_preferred_mounts and refreshes the in-memory
+    // preferred-mount cache so it applies on the next mount without a relog.
+    static void RecordManualMount(Player* player, SpellInfo const* spellInfo);
+
+    // The spell of the mount a human last rode manually on this character for the given
+    // type (0 = ground, 1 = flying), or 0 if none was recorded. Lets other mount pickers
+    // (e.g. the party-of-5 follow mount) honour the same preference.
+    static uint32 GetPreferredMount(uint32 guid, uint32 type);
+
 private:
+    // 0 = ground, 1 = flying, -1 = not a usable mount spell.
+    static int32 ClassifyMountSpell(SpellInfo const* spellInfo);
+
+    // Lazily load playerbots_preferred_mounts into mountCache once per run.
+    static void EnsurePreferredMountCache();
+
     Player* master;
     ShapeshiftForm masterInShapeshiftForm;
     ShapeshiftForm botInShapeshiftForm;
+    // World-thread-only, no lock: written by RecordManualMount (Spell::_cast) and read by
+    // GetPreferredMount / TryPreferredMount (bot AI update), all on the world thread. Any
+    // future off-thread caller must add synchronization — a concurrent rehash on write
+    // would corrupt an in-flight read.
     static std::unordered_map<uint32, PreferredMountCache> mountCache;
     static bool preferredMountTableChecked;
     float CalculateDismountDistance() const;
