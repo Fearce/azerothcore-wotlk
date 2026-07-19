@@ -16,6 +16,8 @@
  */
 
 #include "CreatureScript.h"
+#include "Log.h"
+#include "Map.h"
 #include "Player.h"
 #include "ScriptedCreature.h"
 #include "culling_of_stratholme.h"
@@ -26,6 +28,16 @@ enum Spells
     SPELL_MIND_BLAST                            = 52722,
     SPELL_SLEEP                                 = 52721,
     SPELL_VAMPIRIC_TOUCH                        = 52723,
+
+    // Cast on defeat: this is the ENCOUNTER_CREDIT_CAST_SPELL for the CoS
+    // encounter (instance_encounters 296/300), so casting it completes the
+    // dungeon -> loot lockout + LFG reward (Emblems of Frost).
+    SPELL_MALGANIS_KILL_CREDIT                  = 58630,
+};
+
+enum Misc
+{
+    NPC_MALGANIS_KC_BUNNY                       = 31006, // "A Royal Escort" quest credit
 };
 
 enum Events
@@ -90,8 +102,21 @@ public:
             events.ScheduleEvent(EVENT_SPELL_VAMPIRIC_TOUCH, 15s);
         }
 
-        void JustDied(Unit* /*killer*/) override
+        void JustDied(Unit* killer) override
         {
+            // Mal'Ganis is meant to survive the killing blow: DamageTaken
+            // absorbs it and plays the escape event. On a high-burst group the
+            // lethal hit can still slip past that absorb (an overkill batch, or
+            // a DoT ticking after he is already low), leaving him simply dead.
+            // When that happens his credit spell is never cast, so the encounter
+            // never completes: no loot chest, no "A Royal Escort" credit and no
+            // Emblems of Frost. Run the same completion from the death so the
+            // reward is never lost. Gate on the final act so bursting the
+            // city-intro copy of Mal'Ganis can't credit the dungeon early.
+            if (!finished)
+                if (InstanceScript* instance = me->GetInstanceScript())
+                    if (instance->GetData(DATA_ARTHAS_EVENT) >= COS_PROGRESS_BEFORE_MALGANIS)
+                        FinishEncounter(killer, false);
         }
 
         void KilledUnit(Unit*  /*victim*/) override
@@ -107,28 +132,47 @@ public:
             if (!finished && damage >= me->GetHealth())
             {
                 damage = 0;
-                finished = true;
                 me->SetRegeneratingHealth(false);
                 me->SetImmuneToAll(true);
                 me->SetUnitFlag(UNIT_FLAG_NON_ATTACKABLE);
                 me->SetReactState(REACT_PASSIVE);
-                if (InstanceScript* instance = me->GetInstanceScript())
-                {
-                    if (Creature* cr = ObjectAccessor::GetCreature(*me, instance->GetGuidData(DATA_ARTHAS)))
-                        cr->AI()->DoAction(ACTION_KILLED_MALGANIS);
-
-                    // give credit to players
-                    me->CastSpell(me, 58630, true);
-                    instance->instance->SummonGameObject(DUNGEON_MODE(GO_MALGANIS_CHEST_N, GO_MALGANIS_CHEST_H), 2288.35f, 1498.73f, 128.414f, -0.994837f, 0, 0, 0, 0, 7 * DAY * IN_MILLISECONDS);
-                }
-
-                // quest completion
-                if (who)
-                    if (Player* player = who->GetCharmerOrOwnerPlayerOrPlayerItself())
-                        player->RewardPlayerAndGroupAtEvent(31006, player); // Royal Escort quest, Mal'ganis bunny
-
+                FinishEncounter(who, true);
                 EnterEvadeMode();
             }
+        }
+
+        // Grants everything tied to Mal'Ganis' defeat exactly once: the dungeon
+        // encounter credit (loot lockout + LFG reward / Emblems of Frost), the
+        // loot chest, Arthas' outro, and the "A Royal Escort" quest credit.
+        // alive == true when he survives the blow and casts the credit spell
+        // himself; alive == false is the death fail-safe, where a corpse can't
+        // cast so the encounter state is updated directly instead.
+        void FinishEncounter(Unit* who, bool alive)
+        {
+            if (finished)
+                return;
+
+            finished = true;
+
+            if (InstanceScript* instance = me->GetInstanceScript())
+            {
+                if (Creature* arthas = ObjectAccessor::GetCreature(*me, instance->GetGuidData(DATA_ARTHAS)))
+                    arthas->AI()->DoAction(ACTION_KILLED_MALGANIS);
+
+                if (alive)
+                    me->CastSpell(me, SPELL_MALGANIS_KILL_CREDIT, true);
+                else
+                    instance->instance->UpdateEncounterState(ENCOUNTER_CREDIT_CAST_SPELL, SPELL_MALGANIS_KILL_CREDIT, me);
+
+                instance->instance->SummonGameObject(DUNGEON_MODE(GO_MALGANIS_CHEST_N, GO_MALGANIS_CHEST_H), 2288.35f, 1498.73f, 128.414f, -0.994837f, 0, 0, 0, 0, 7 * DAY * IN_MILLISECONDS);
+            }
+
+            if (who)
+                if (Player* player = who->GetCharmerOrOwnerPlayerOrPlayerItself())
+                    player->RewardPlayerAndGroupAtEvent(NPC_MALGANIS_KC_BUNNY, player);
+
+            LOG_INFO("scripts.cos", "[CoS] Mal'Ganis defeated via {} path; encounter credit + chest + quest granted.",
+                alive ? "escape" : "death-failsafe");
         }
 
         void UpdateAI(uint32 diff) override
