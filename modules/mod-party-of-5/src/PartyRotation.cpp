@@ -4412,7 +4412,7 @@ namespace WowPsParty
     // named spell's aura. classCsv is comma-separated lowercase class
     // keywords ("priest,mage,warlock,druid").
     static Player* FindClassFilteredMissing(Player* bot,
-        std::string const& classCsv, uint32 spellId)
+        std::string const& classCsv, uint32 spellId, std::string const& cond)
     {
         if (!bot || !spellId) return nullptr;
         std::string const csv = Lower(classCsv);
@@ -4425,6 +4425,7 @@ namespace WowPsParty
             if (!CsvContains(csv, kw)) continue;
             if (BlocksFriendlySpells(m)) continue;   // buff blocked by Ice Block/Cyclone/etc.
             if (HasAuraFromSpell(m, spellId)) continue;
+            if (!EvalCondition(cond, bot, m)) continue;   // rule's target_* clauses vs THIS recipient
             return m;
         }
         return nullptr;
@@ -4433,7 +4434,7 @@ namespace WowPsParty
     // Find first party member matching a role filter and missing the named
     // spell's aura. roleFilter is "tank" / "healer" / "dps" / "!tank" etc.
     static Player* FindRoleFilteredMissing(Player* bot,
-        std::string const& roleFilter, uint32 spellId)
+        std::string const& roleFilter, uint32 spellId, std::string const& cond)
     {
         if (!bot || !spellId) return nullptr;
         bool const negate = !roleFilter.empty() && roleFilter[0] == '!';
@@ -4482,6 +4483,7 @@ namespace WowPsParty
             if (negate ? matches : !matches) continue;
             if (BlocksFriendlySpells(m)) continue;   // buff blocked by Ice Block/Cyclone/etc.
             if (HasAuraFromSpell(m, spellId)) continue;
+            if (!EvalCondition(cond, bot, m)) continue;   // rule's target_* clauses vs THIS recipient
             return m;   // GatherPartyPlayers already filtered to alive / in-world / same map
         }
         return nullptr;
@@ -4489,13 +4491,16 @@ namespace WowPsParty
 
     // Walk the bot's group looking for the first member missing the named
     // spell's aura. Returns nullptr if every member already has it.
-    static Player* FindPartyMemberMissingAura(Player* bot, uint32 spellId)
+    static Player* FindPartyMemberMissingAura(Player* bot, uint32 spellId,
+        std::string const& cond)
     {
         if (!bot || !spellId) return nullptr;
         std::vector<Player*> party;
         GatherPartyPlayers(bot, party, /*includeDead=*/false);
         for (Player* m : party)
-            if (!BlocksFriendlySpells(m) && !HasAuraFromSpell(m, spellId)) return m;
+            if (!BlocksFriendlySpells(m) && !HasAuraFromSpell(m, spellId)
+                && EvalCondition(cond, bot, m))   // rule's target_* clauses vs THIS recipient
+                return m;
         return nullptr;
     }
 
@@ -5872,7 +5877,7 @@ namespace WowPsParty
             std::string const spellNm  = arg.substr(inner + 1);
             uint32 const spellId = FindKnownSpellByName(bot, spellNm);
             if (!spellId) return false;
-            Player* target = FindClassFilteredMissing(bot, classes, spellId);
+            Player* target = FindClassFilteredMissing(bot, classes, spellId, cond);
             if (!target) return false;
             return castOrApproach(target, spellId, /*friendlyApproach=*/true);
         }
@@ -5888,7 +5893,7 @@ namespace WowPsParty
             std::string const spellNm    = arg.substr(inner + 1);
             uint32 const spellId = FindKnownSpellByName(bot, spellNm);
             if (!spellId) return false;
-            Player* target = FindRoleFilteredMissing(bot, roleFilter, spellId);
+            Player* target = FindRoleFilteredMissing(bot, roleFilter, spellId, cond);
             if (!target) return false;
             return castOrApproach(target, spellId, /*friendlyApproach=*/true);
         }
@@ -5897,7 +5902,7 @@ namespace WowPsParty
         {
             uint32 const spellId = FindKnownSpellByName(bot, arg);
             if (!spellId) return false;
-            Player* target = FindPartyMemberMissingAura(bot, spellId);
+            Player* target = FindPartyMemberMissingAura(bot, spellId, cond);
             if (!target) return false;
             if (TryDropFormForBuff(bot, spellId)) return true;   // druid: drop form to cast it (e.g. Mark of the Wild)
             return castOrApproach(target, spellId, /*friendlyApproach=*/true);
@@ -8817,12 +8822,23 @@ namespace WowPsParty
                                || r.action.rfind("cast_scan", 0) == 0
                                || r.action == "cc"                              // scans + re-checks target_* per mob
                                || r.action.rfind("interrupt_caster", 0) == 0;   // covers _melee too
-            // For a friendly-target action, evaluate target_* conditions against
-            // the unit we'll actually heal/buff (the heal target), not the enemy
-            // victim — so "target_missing_my_aura:Rejuvenation" gates on the
-            // member we're about to Rejuv. nullptr keeps the victim (offensive).
-            Unit* const condTarget = isSpread ? nullptr : FriendlyActionTarget(bot, r.action);
-            bool const condOk = EvalCondition(r.condition, bot, condTarget, isSpread);
+            // The scan-style FRIENDLY buffs pick their recipient by walking the
+            // party, so — like a spread — their target_* clauses can't be resolved
+            // at rule level (there's no single recipient yet). Defer them: the
+            // finder re-checks each clause against every candidate ally and only
+            // returns one that passes (so target_has_aura:Water Shield scopes to
+            // the buffed ally, not the enemy victim). Without this the clause fell
+            // back to BotTarget — false out of combat, so the whole rule never fired.
+            bool const isFriendlyScan = r.action.rfind("cast_role_missing", 0) == 0
+                                     || r.action.rfind("cast_class_missing", 0) == 0
+                                     || r.action.rfind("cast_party_missing", 0) == 0;
+            bool const deferTarget = isSpread || isFriendlyScan;
+            // For a single-recipient friendly action (cast_party_lowest / cast_tank),
+            // evaluate target_* against the unit we'll actually heal/buff — so
+            // "target_missing_my_aura:Rejuvenation" gates on the member we're about
+            // to Rejuv. nullptr keeps the victim (offensive) or defers (scan/spread).
+            Unit* const condTarget = deferTarget ? nullptr : FriendlyActionTarget(bot, r.action);
+            bool const condOk = EvalCondition(r.condition, bot, condTarget, deferTarget);
             if (!condOk)
             {
                 if (trace)
