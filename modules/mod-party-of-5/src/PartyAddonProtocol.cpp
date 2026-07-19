@@ -3888,6 +3888,62 @@ static void HandleDestroy(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// Build quality-coloured, clickable chat links for each DISTINCT item pulled from
+// a container ("2x [Netherweave Cloth]"), so opening a bag tells the player exactly
+// what landed in their bags instead of a bare "+N item(s)" count. The link format
+// mirrors the party loot feed in PartyHooks.cpp.
+static std::vector<std::string> BuildLootedItemLinks(
+    std::vector<std::pair<uint32, uint32>> const& idCounts)
+{
+    std::vector<std::string> links;
+    links.reserve(idCounts.size());
+    for (auto const& [itemId, count] : idCounts)
+    {
+        ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(itemId);
+        std::string const name = tmpl ? tmpl->Name1 : "Unknown Item";
+        uint32 quality = tmpl ? tmpl->Quality : uint32(ITEM_QUALITY_NORMAL);
+        if (quality >= MAX_ITEM_QUALITY) quality = ITEM_QUALITY_NORMAL;   // guard a custom OOB quality
+        uint32 const color = ItemQualityColors[quality];
+        links.push_back(Acore::StringFormat(
+            "{}x |c{:08x}|Hitem:{}::::::::1::::|h[{}]|h|r", count, color, itemId, name));
+    }
+    return links;
+}
+
+// Chat-report a container open, naming what dropped. A single line when the drop is
+// small, otherwise a header + one line per item — a 3.3.5a SMSG_MESSAGECHAT truncates
+// around ~255 bytes and item links are long, so a fat satchel would otherwise lose
+// its tail. Gold (if any) leads the list.
+static void AnnounceContainerOpen(Player* player, std::string const& satchelName,
+                                  std::string const& ownerName,
+                                  std::vector<std::string> const& itemLinks,
+                                  std::string const& goldText)
+{
+    ChatHandler handler(player->GetSession());
+    std::string const header = Acore::StringFormat(
+        "|cff66ccff[WowPsParty]|r Opened |cffffffff{}|r on {}", satchelName, ownerName);
+
+    std::string tail = goldText;
+    for (std::string const& link : itemLinks)
+    {
+        if (!tail.empty()) tail += ", ";
+        tail += link;
+    }
+    if (tail.empty())
+        tail = "nothing";
+
+    if (itemLinks.size() <= 2 && header.size() + tail.size() + 2 < 240)
+    {
+        handler.PSendSysMessage("{}: {}", header, tail);
+        return;
+    }
+    handler.PSendSysMessage("{}:", header);
+    if (!goldText.empty())
+        handler.PSendSysMessage("  |cff66ccff+|r {}", goldText);
+    for (std::string const& link : itemLinks)
+        handler.PSendSysMessage("  |cff66ccff+|r {}", link);
+}
+
 // Open a LOOTABLE container (Satchel of Helpful Goods, the random-dungeon reward
 // bag, lootable pouches, …) ON ITS OWNER. These are BoP/unique and bound to the
 // char that earned them, so they can't be moved to the requester (that fails the
@@ -3953,6 +4009,7 @@ static bool OpenLootableContainer(Player* requester, Player* srcChar, Item* srcI
     // dupe. Gold is credited only on full success. (CanStoreNewItem is checked
     // immediately before each store, so slots consumed by earlier items count.)
     std::vector<Item*> created;
+    std::vector<std::pair<uint32, uint32>> lootedSummary;   // (itemId, total count), in drop order
     bool allStored = true;
     for (LootItem& li : loot.items)
     {
@@ -3964,6 +4021,13 @@ static bool OpenLootableContainer(Player* requester, Player* srcChar, Item* srcI
         if (!it) { allStored = false; break; }
         li.is_looted = true;
         created.push_back(it);
+
+        auto summary = std::find_if(lootedSummary.begin(), lootedSummary.end(),
+            [&](auto const& e) { return e.first == li.itemid; });
+        if (summary != lootedSummary.end())
+            summary->second += li.count;
+        else
+            lootedSummary.push_back({ li.itemid, li.count });   // li.count is a bitfield — read by value
     }
     if (!allStored)
     {
@@ -3976,14 +4040,19 @@ static bool OpenLootableContainer(Player* requester, Player* srcChar, Item* srcI
         WowPsParty::SendInventoryTo(requester);
         return true;
     }
+    uint32 const lootedGold = loot.gold;
     if (loot.gold) { srcChar->ModifyMoney(int32(loot.gold)); loot.gold = 0; }
     srcChar->SendLootRelease(srcItem->GetGUID());
     // Fully looted -> the container is consumed on open, so it can never be
     // re-opened to dupe its contents.
     srcChar->DestroyItem(srcItem->GetBagSlot(), srcItem->GetSlot(), true);
-    ChatHandler(requester->GetSession()).PSendSysMessage(
-        "|cff66ccff[WowPsParty]|r Opened |cffffffff{}|r on {} (+{} item(s)).",
-        satchelName, ownerName, uint32(created.size()));
+
+    std::string goldText;
+    if (lootedGold)
+        goldText = Acore::StringFormat("{}g {}s {}c",
+            lootedGold / 10000, (lootedGold % 10000) / 100, lootedGold % 100);
+    AnnounceContainerOpen(requester, satchelName, ownerName,
+        BuildLootedItemLinks(lootedSummary), goldText);
     WowPsParty::SendInventoryTo(requester);
     return true;
 }
