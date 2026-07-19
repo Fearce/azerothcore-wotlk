@@ -3976,8 +3976,10 @@ namespace WowPsParty
                 return;
             }
             // Load the account's COMMON shared rotation once (it's account-wide, not
-            // per-bot) — prepended to every bot's rules in TickRotation.
+            // per-bot) — prepended to every bot's rules in TickRotation. The per-mob
+            // boss sections load alongside it (same account scope, gated at eval time).
             WowPsParty::SharedRotationRefreshFromDB(account);
+            WowPsParty::MobRotationRefreshFromDB(account);
 
             // WoW party is capped at 5 members. Active player counts as 1,
             // so spawn at most 4 bots. Extra enrolled chars beyond that just

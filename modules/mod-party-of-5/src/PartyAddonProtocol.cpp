@@ -1676,6 +1676,16 @@ namespace {
         return m;
     }
 
+    // Pending per-mob COMMON section mid-save, keyed by ACCOUNT. Sections commit one at a
+    // time (BEGIN sets the name + clears, RULE lines append, COMMIT flushes), so a single
+    // in-progress section per account is enough — the name comes from BEGIN, not each RULE.
+    struct PendingMobSection { std::string name; std::vector<WowPsParty::RotationRule> rules; };
+    std::unordered_map<uint32, PendingMobSection>& PendingMobRotationMap()
+    {
+        static std::unordered_map<uint32, PendingMobSection> m;
+        return m;
+    }
+
     // -------- Oversized-message (WPSP_FRAG) reassembly -----------------------
     // 3.3.5a's SendAddonMessage silently DROPS any single message whose wire form
     // exceeds ~255 bytes. Each rotation rule is sent as its own ROTATION_RULE /
@@ -6881,6 +6891,155 @@ public:
             // WoW escape prefix it can't read). Same conversion REQ_ROTATION does.
             std::replace(dsl.begin(), dsl.end(), '|', '~');
             SendWPSP(player, "SHARED_ROTATION\t" + dsl);
+        }
+        // ---------- per-mob COMMON sections (account-wide, chunked like above) ------
+        // A named bucket of Common rules per boss. Stored raw in party_mob_rotation +
+        // the g_mobRotation cache; gated with target_name:<mob> only at eval time. The
+        // RULE payload matches SHARED_ROTATION_RULE (no name) — the section name comes
+        // from the preceding BEGIN, so one section commits per BEGIN/COMMIT pair.
+        else if (command == "BEGIN_MOB_ROTATION")
+        {
+            std::string const name = WowPsParty::SanitizeMobName(std::string(payload));
+            auto& sec = PendingMobRotationMap()[player->GetSession()->GetAccountId()];
+            sec.name = name;
+            sec.rules.clear();
+        }
+        else if (command == "MOB_ROTATION_RULE")
+        {
+            // payload = "<condition>\t<action>\t<priority>[\t<flags>]"
+            std::string s(payload);
+            std::vector<std::string> f;
+            size_t p = 0;
+            while (p <= s.size())
+            {
+                size_t t = s.find('\t', p);
+                if (t == std::string::npos) { f.push_back(s.substr(p)); break; }
+                f.push_back(s.substr(p, t - p));
+                p = t + 1;
+            }
+            if (f.size() < 3) return;
+            WowPsParty::RotationRule r;
+            r.condition = f[0];
+            r.action    = f[1];
+            r.priority  = std::atoi(f[2].c_str());
+            r.flags     = f.size() >= 4 ? f[3] : "";
+            PendingMobRotationMap()[player->GetSession()->GetAccountId()].rules.push_back(std::move(r));
+        }
+        else if (command == "COMMIT_MOB_ROTATION")
+        {
+            uint32 const account = player->GetSession()->GetAccountId();
+            std::string name = WowPsParty::SanitizeMobName(std::string(payload));
+            auto& pending = PendingMobRotationMap();
+            auto it = pending.find(account);
+            std::vector<WowPsParty::RotationRule> rules;
+            if (it != pending.end())
+            {
+                if (name.empty()) name = it->second.name;   // fall back to BEGIN's name
+                rules = std::move(it->second.rules);
+                pending.erase(it);
+            }
+            if (name.empty()) return;
+            std::stable_sort(rules.begin(), rules.end(),
+                [](WowPsParty::RotationRule const& a, WowPsParty::RotationRule const& b)
+                { return a.priority > b.priority; });
+            std::string escName = name;
+            CharacterDatabase.EscapeString(escName);
+            CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
+            if (rules.empty())
+            {
+                // An emptied section is dropped entirely (matches the Common tab, where an
+                // empty commit clears the rotation) so it doesn't linger in the dropdown.
+                tx->Append("DELETE FROM `party_mob_rotation` WHERE `account` = {} AND `mob_name` = '{}'",
+                           account, escName);
+            }
+            else
+            {
+                std::string stored = WowPsParty::SerialiseRotationRules(rules);
+                CharacterDatabase.EscapeString(stored);
+                tx->Append(
+                    "INSERT INTO `party_mob_rotation` (`account`, `mob_name`, `priority_actions_json`) "
+                    "VALUES ({}, '{}', '{}') "
+                    "ON DUPLICATE KEY UPDATE `priority_actions_json` = VALUES(`priority_actions_json`)",
+                    account, escName, stored);
+            }
+            CharacterDatabase.CommitTransaction(tx);
+            WowPsParty::SharedRotationCacheSetMob(account, name, rules);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Saved {} rule(s) for \"{}\" — runs on the whole party vs that mob.",
+                uint32(rules.size()), name);
+        }
+        // DELETE_MOB_ROTATION\t<name>  — remove a whole section (dropdown entry + rules).
+        else if (command == "DELETE_MOB_ROTATION")
+        {
+            uint32 const account = player->GetSession()->GetAccountId();
+            std::string const name = WowPsParty::SanitizeMobName(std::string(payload));
+            if (name.empty()) return;
+            std::string escName = name;
+            CharacterDatabase.EscapeString(escName);
+            CharacterDatabase.Execute(
+                "DELETE FROM `party_mob_rotation` WHERE `account` = {} AND `mob_name` = '{}'",
+                account, escName);
+            WowPsParty::DeleteMobRotation(account, name);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff66ccff[WowPsParty]|r Removed the \"{}\" mob rules.", name);
+        }
+        // REQ_MOB_ROTATIONS  ->  MOB_LIST_BEGIN / MOB_LIST_ITEM\t<name>[\t<name>...] / MOB_LIST_END
+        // Chunked (like the inventory stream): with 200 sections scripted, a single
+        // tab-joined message would blow past the ~255-byte addon-message cap and drop, so
+        // names are batched into lines kept well under it. BEGIN resets the client's list,
+        // each ITEM appends, END rebuilds the dropdown.
+        else if (command == "REQ_MOB_ROTATIONS")
+        {
+            uint32 const account = player->GetSession()->GetAccountId();
+            // Read straight from the DB (authoritative) so a just-logged-in editor sees
+            // sections even before any bot-login refresh populated the cache.
+            QueryResult q = CharacterDatabase.Query(
+                "SELECT `mob_name` FROM `party_mob_rotation` WHERE `account` = {} ORDER BY `mob_name`",
+                account);
+            SendWPSP(player, "MOB_LIST_BEGIN");
+            std::string line = "MOB_LIST_ITEM";
+            if (q)
+            {
+                do
+                {
+                    std::string const name = q->Fetch()[0].Get<std::string>();
+                    if (line.size() + 1 + name.size() > 200 && line != "MOB_LIST_ITEM")
+                    {
+                        SendWPSP(player, line);
+                        line = "MOB_LIST_ITEM";
+                    }
+                    line += "\t" + name;
+                } while (q->NextRow());
+            }
+            if (line != "MOB_LIST_ITEM") SendWPSP(player, line);
+            SendWPSP(player, "MOB_LIST_END");
+        }
+        // REQ_MOB_ROTATION\t<name>  ->  MOB_ROT_BEGIN / MOB_ROT_CHUNK / MOB_ROT_END
+        // A fully-scripted boss's DSL can be long, so the reply is CHUNKED (unlike the
+        // single-message REQ_SHARED_ROTATION): if a big section's DSL overflowed the
+        // ~255-byte addon-message cap it would arrive EMPTY, and re-saving that section
+        // would then clear its stored rules. Splitting the raw DSL into <=200-byte pieces
+        // (the client concatenates them verbatim before parsing) removes that footgun.
+        else if (command == "REQ_MOB_ROTATION")
+        {
+            uint32 const account = player->GetSession()->GetAccountId();
+            std::string const name = WowPsParty::SanitizeMobName(std::string(payload));
+            if (name.empty()) return;
+            std::string escName = name;
+            CharacterDatabase.EscapeString(escName);
+            QueryResult q = CharacterDatabase.Query(
+                "SELECT `priority_actions_json` FROM `party_mob_rotation` "
+                "WHERE `account` = {} AND `mob_name` = '{}'", account, escName);
+            std::string dsl = q ? q->Fetch()[0].Get<std::string>() : std::string();
+            // DB stores '|'-delimited fields; the editor's parser wants '~' ('|' is a
+            // WoW escape prefix). Same conversion REQ_SHARED_ROTATION does. The DSL uses
+            // no tabs, so chunking on raw byte offsets is safe — the client just
+            // reassembles the exact string. Name is on BEGIN/END only (not each chunk).
+            std::replace(dsl.begin(), dsl.end(), '|', '~');
+            SendWPSP(player, "MOB_ROT_BEGIN\t" + name);
+            for (size_t i = 0; i < dsl.size(); i += 200)
+                SendWPSP(player, "MOB_ROT_CHUNK\t" + dsl.substr(i, 200));
+            SendWPSP(player, "MOB_ROT_END\t" + name);
         }
         else if (command == "SET_ROTATION")
         {

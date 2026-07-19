@@ -203,6 +203,25 @@ namespace WowPsParty
     std::vector<RotationRule> GetSharedRotation(uint32 account);
     void SharedRotationRefreshFromDB(uint32 account);
 
+    // Per-mob COMMON rule sections (per ACCOUNT, keyed by mob name). Organisational
+    // split of the Common rotation: one named bucket of rules per boss, gated by that
+    // mob's name. Cache Set stores/erases one section; GetMobRotation returns a section's
+    // RAW rules (for the editor round-trip); GetMobRotationNames lists the sections;
+    // GetSharedAndMobRotation returns the general Common rules PLUS every section's rules
+    // with `target_name:<mob>&` prepended (the eval view). RefreshFromDB reloads all of
+    // an account's sections. DeleteMobRotation drops one section entirely.
+    // Strip the delimiters that would break the DSL or the target_name gate, trim, and
+    // cap to the DB column width — mirrors the addon's NormalizeMobName so a name can
+    // never corrupt the eval gate regardless of what the client sends.
+    std::string SanitizeMobName(std::string const& raw);
+    void SharedRotationCacheSetMob(uint32 account, std::string const& mobName,
+                                   std::vector<RotationRule> rules);
+    std::vector<RotationRule> GetMobRotation(uint32 account, std::string const& mobName);
+    std::vector<std::string> GetMobRotationNames(uint32 account);
+    std::vector<RotationRule> GetSharedAndMobRotation(uint32 account);
+    void MobRotationRefreshFromDB(uint32 account);
+    void DeleteMobRotation(uint32 account, std::string const& mobName);
+
     // True when the bot is CURRENTLY kiting: it has an enabled keep_distance_* /
     // close_to_enemy rule whose CONDITION holds right now (evaluated against `bot`
     // and the `target` AssistTarget is about to engage). A rule gated behind

@@ -207,7 +207,7 @@ namespace WowPsParty
             if (it != g_rotationCache.end()) collect(it->second);
         }
         if (uint32 const acct = SharedAccountFor(guid))   // COMMON tab (lock released above)
-            collect(GetSharedRotation(acct));
+            collect(GetSharedAndMobRotation(acct));       // incl. per-mob sections (gated)
         if (kiteConds.empty()) return false;
         // CONDITION-AWARE handoff: a kite rule gated behind target_name (or any
         // condition) owns the feet ONLY while its condition actually holds right now.
@@ -269,9 +269,10 @@ namespace WowPsParty
             if (it != g_rotationCache.end()) scan(it->second);
         }
         // The COMMON shared rotation (leader's account) — so a rule in the Common tab works
-        // for heroes AND henchmen, not just one in the bot's own tab.
+        // for heroes AND henchmen, not just one in the bot's own tab. Includes per-mob
+        // sections so a focus:/keep_distance rule scripted under a boss is still seen.
         if (uint32 const acct = SharedAccountFor(guid))
-            scan(GetSharedRotation(acct));
+            scan(GetSharedAndMobRotation(acct));
     }
 
     void BotFocusNames(ObjectGuid guid, std::vector<std::string>& out)
@@ -450,6 +451,139 @@ namespace WowPsParty
             "SELECT `priority_actions_json` FROM `party_shared_rotation` WHERE `account` = {}", account);
         std::string const dsl = q ? q->Fetch()[0].Get<std::string>() : std::string();
         SharedRotationCacheSet(account, ParseRotationString(dsl));
+    }
+
+    // ---- per-mob COMMON rule sections (per ACCOUNT) ------------------------
+    // Organisational split of the Common rotation so scripting one boss at a time
+    // doesn't bloat a single list. Each section holds that mob's rules RAW (no gate);
+    // GetSharedAndMobRotation injects `target_name:<mob>&` at eval time.
+    struct MobSection { std::string name; std::vector<RotationRule> rules; };
+    // account -> (lowercased mob name -> section). Lowercase key dedups casing; the
+    // section keeps the original-cased name for the target_name gate + the editor.
+    static std::unordered_map<uint32, std::unordered_map<std::string, MobSection>> g_mobRotation;
+    static std::mutex g_mobRotationMutex;
+
+    std::string SanitizeMobName(std::string const& raw)
+    {
+        std::string s = Trim(raw);
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s)
+            if (c != '\t' && c != '|' && c != '~' && c != '&' && c != ',') out.push_back(c);
+        out = Trim(out);
+        if (out.size() > 100) out.resize(100);
+        return out;
+    }
+
+    void SharedRotationCacheSetMob(uint32 account, std::string const& mobName,
+                                   std::vector<RotationRule> rules)
+    {
+        std::string const disp = SanitizeMobName(mobName);
+        std::string const key  = Lower(disp);
+        if (key.empty()) return;
+        std::lock_guard<std::mutex> lock(g_mobRotationMutex);
+        if (rules.empty())
+        {
+            auto acctIt = g_mobRotation.find(account);
+            if (acctIt != g_mobRotation.end())
+            {
+                acctIt->second.erase(key);
+                if (acctIt->second.empty()) g_mobRotation.erase(acctIt);
+            }
+            return;
+        }
+        MobSection& sec = g_mobRotation[account][key];
+        sec.name  = disp;
+        sec.rules = std::move(rules);
+    }
+
+    std::vector<RotationRule> GetMobRotation(uint32 account, std::string const& mobName)
+    {
+        std::string const key = Lower(SanitizeMobName(mobName));
+        std::lock_guard<std::mutex> lock(g_mobRotationMutex);
+        auto acctIt = g_mobRotation.find(account);
+        if (acctIt == g_mobRotation.end()) return {};
+        auto secIt = acctIt->second.find(key);
+        return secIt == acctIt->second.end() ? std::vector<RotationRule>{} : secIt->second.rules;
+    }
+
+    std::vector<std::string> GetMobRotationNames(uint32 account)
+    {
+        std::vector<std::string> out;
+        std::lock_guard<std::mutex> lock(g_mobRotationMutex);
+        auto acctIt = g_mobRotation.find(account);
+        if (acctIt == g_mobRotation.end()) return out;
+        out.reserve(acctIt->second.size());
+        for (auto const& kv : acctIt->second) out.push_back(kv.second.name);
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
+    void DeleteMobRotation(uint32 account, std::string const& mobName)
+    {
+        SharedRotationCacheSetMob(account, mobName, {});   // empty rules -> erase section
+    }
+
+    // The eval view: general Common rules FIRST-priority? No — mob sections are the
+    // MOST specific, so they run ahead of the general Common list (a boss section can
+    // override a generic Common rule while that boss is the target). Each section rule's
+    // condition gets `target_name:<mob>&` prepended so it only fires against that mob,
+    // reusing the existing target_name condition (no new eval logic). Order:
+    // mob-gated rules, then the general Common rules.
+    std::vector<RotationRule> GetSharedAndMobRotation(uint32 account)
+    {
+        std::vector<RotationRule> out;
+        {
+            std::lock_guard<std::mutex> lock(g_mobRotationMutex);
+            auto acctIt = g_mobRotation.find(account);
+            if (acctIt != g_mobRotation.end())
+            {
+                // Deterministic order across sections (name-sorted) so ties resolve
+                // the same way every tick; within a section the rules keep their
+                // stored priority order.
+                std::vector<std::string> keys;
+                keys.reserve(acctIt->second.size());
+                for (auto const& kv : acctIt->second) keys.push_back(kv.first);
+                std::sort(keys.begin(), keys.end());
+                for (std::string const& k : keys)
+                {
+                    MobSection const& sec = acctIt->second.at(k);
+                    for (RotationRule r : sec.rules)   // copy — we rewrite the condition
+                    {
+                        std::string gate = "target_name:" + sec.name;
+                        r.condition = r.condition.empty() ? gate : (gate + "&" + r.condition);
+                        out.push_back(std::move(r));
+                    }
+                }
+            }
+        }
+        std::vector<RotationRule> general = GetSharedRotation(account);
+        out.reserve(out.size() + general.size());
+        for (auto& r : general) out.push_back(std::move(r));
+        return out;
+    }
+
+    void MobRotationRefreshFromDB(uint32 account)
+    {
+        std::unordered_map<std::string, MobSection> sections;
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `mob_name`, `priority_actions_json` FROM `party_mob_rotation` WHERE `account` = {}",
+            account);
+        if (q)
+        {
+            do
+            {
+                Field* f = q->Fetch();
+                std::string const name = SanitizeMobName(f[0].Get<std::string>());
+                if (name.empty()) continue;
+                std::vector<RotationRule> rules = ParseRotationString(f[1].Get<std::string>());
+                if (rules.empty()) continue;
+                sections[Lower(name)] = MobSection{ name, std::move(rules) };
+            } while (q->NextRow());
+        }
+        std::lock_guard<std::mutex> lock(g_mobRotationMutex);
+        if (sections.empty()) g_mobRotation.erase(account);
+        else                  g_mobRotation[account] = std::move(sections);
     }
 
     bool HasRotation(uint32 guid)
@@ -8199,8 +8333,9 @@ namespace WowPsParty
         return t;
     }
 
-    // Merge the account's COMMON shared rotation (runs FIRST, as a pre-rotation) with the
-    // bot's own cached rules, both priority-sorted. Keyed off the LEADER's account so a
+    // Merge the account's COMMON shared rotation (runs FIRST, as a pre-rotation) — general
+    // Common rules AND per-mob boss sections (each auto-gated with target_name:<mob>) — with
+    // the bot's own cached rules, both priority-sorted. Keyed off the LEADER's account so a
     // henchman on a different account still gets Common (matches TickRotation's own keying).
     static std::vector<RotationRule> GatherMergedRules(Player* bot)
     {
@@ -8215,7 +8350,7 @@ namespace WowPsParty
             if (Player* leaderShared = ObjectAccessor::FindConnectedPlayer(lgShared))
                 if (leaderShared->GetSession())
                     sharedAccount = leaderShared->GetSession()->GetAccountId();
-        std::vector<RotationRule> rules = GetSharedRotation(sharedAccount);
+        std::vector<RotationRule> rules = GetSharedAndMobRotation(sharedAccount);
         rules.reserve(rules.size() + ownRules.size());
         for (auto& r : ownRules) rules.push_back(std::move(r));
         return rules;
