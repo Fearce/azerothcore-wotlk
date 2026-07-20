@@ -360,6 +360,38 @@ namespace
         return count;
     }
 
+    // Whether member `p` holds a TOOL matching totem-category `cat` (blacksmith
+    // hammer, mining pick, arclight spanner, runed rod, ...). Mirrors
+    // Player::HasItemTotemCategory (equipment + keyring + bags) but SEH-guards
+    // every slot read with WowPsItemReadable: the shared-inventory item mover can
+    // leave a freed Item* in a party-mate's bag slot, and the vanilla method would
+    // dereference it (the recurring dangling-item bag UAF that crashes the world
+    // thread). Same guard discipline as UsableReagentCount above — use this, not
+    // the vanilla method, for any read of a PEER's bags.
+    static bool UsableToolCategory(Player* p, uint32 cat)
+    {
+        if (!p) return false;
+        for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            if (Item* it = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                if (WowPsParty::WowPsItemReadable(it) && p->IsTotemCategoryCompatiableWith(it->GetTemplate(), cat))
+                    return true;
+        for (uint8 i = KEYRING_SLOT_START; i < CURRENCYTOKEN_SLOT_END; ++i)
+            if (Item* it = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                if (WowPsParty::WowPsItemReadable(it) && p->IsTotemCategoryCompatiableWith(it->GetTemplate(), cat))
+                    return true;
+        for (uint8 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_END; ++i)
+            if (Bag* bag = p->GetBagByPos(i))
+            {
+                if (!WowPsParty::WowPsItemReadable(bag))   // a freed bag in the slot would crash GetBagSize()
+                    continue;
+                for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                    if (Item* it = bag->GetItemByPos(j))
+                        if (WowPsParty::WowPsItemReadable(it) && p->IsTotemCategoryCompatiableWith(it->GetTemplate(), cat))
+                            return true;
+            }
+        return false;
+    }
+
     // Finish a quest turn-in on a hero WITHOUT granting the reward item: consume
     // the required/dropped quest items, free the log slot, and mark it rewarded.
     // Used when the hero's bags are too full for the reward (CanRewardQuest
@@ -1407,12 +1439,12 @@ bool WowPsParty_PartyHasTotemCategory(Player* crafter, uint32 totemCategory)
         // update contexts.
         if (p->GetMap() != crafter->GetMap())
         {
-            if (p->HasItemTotemCategory(totemCategory))
+            if (UsableToolCategory(p, totemCategory))
                 LOG_DEBUG("module", "[WowPsParty Tool] tool category {} held by party-mate {} is on another map ({} vs {}); not counted for {}'s craft.",
                           totemCategory, p->GetName(), p->GetMapId(), crafter->GetMapId(), crafter->GetName());
             continue;
         }
-        if (p->HasItemTotemCategory(totemCategory))
+        if (UsableToolCategory(p, totemCategory))
         {
             LOG_INFO("module", "[WowPsParty Tool] {}'s craft satisfies tool category {} from party-mate {}'s bags (shared inventory).",
                      crafter->GetName(), totemCategory, p->GetName());
