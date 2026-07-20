@@ -41,6 +41,7 @@
 #include <fstream>
 #include <vector>
 #include <unordered_map>
+#include <chrono>
 
 namespace WowPsParty
 {
@@ -228,6 +229,7 @@ namespace WowPsParty
     // ====== Driver ========================================================
 
     static constexpr uint32 TEST_BOT_GUIDS[3] = { 1, 2, 3 };
+    static uint8 s_retargetMapSyncAttempts = 0;
 
     static Player* FindBot(uint32 guidLow)
     {
@@ -237,6 +239,34 @@ namespace WowPsParty
 
     static void RunTestsNow()
     {
+        // Cross-map TeleportTo completes on a later world tick. Do not assert
+        // the follow move against the old map in the same handler invocation.
+        Player* preflightMaster = FindBot(TEST_BOT_GUIDS[0]);
+        Player* preflightMover = FindBot(TEST_BOT_GUIDS[2]);
+        if (preflightMaster && preflightMover
+            && preflightMaster->GetMapId() != preflightMover->GetMapId()
+            && s_retargetMapSyncAttempts < 8)
+        {
+            ++s_retargetMapSyncAttempts;
+            LOG_INFO("module",
+                "[WowPsParty TEST] RetargetBotFollow map sync attempt {}: mover {} map {} -> master {} map {}",
+                uint32(s_retargetMapSyncAttempts), preflightMover->GetName(),
+                preflightMover->GetMapId(), preflightMaster->GetName(), preflightMaster->GetMapId());
+            if (!preflightMover->IsBeingTeleported())
+                preflightMover->TeleportTo(preflightMaster->GetMapId(),
+                    preflightMaster->GetPositionX(), preflightMaster->GetPositionY(),
+                    preflightMaster->GetPositionZ(), preflightMaster->GetOrientation());
+
+            ObjectGuid const masterGuid = preflightMaster->GetGUID();
+            preflightMaster->m_Events.AddEventAtOffset([masterGuid]()
+            {
+                if (ObjectAccessor::FindConnectedPlayer(masterGuid))
+                    RunTestsNow();
+            }, std::chrono::milliseconds(500));
+            return;
+        }
+        s_retargetMapSyncAttempts = 0;
+
         TestResults r;
 
         Player* a = FindBot(TEST_BOT_GUIDS[0]);
@@ -250,13 +280,6 @@ namespace WowPsParty
         if (!c) r.Fail("BotSpawn[guid=3]", "not in world");
         else    r.Pass("BotSpawn[guid=3]  " + std::string(c->GetName()));
 
-        // Co-locate b on a for the possess test (if both present)
-        if (a && b)
-        {
-            b->TeleportTo(a->GetMapId(), a->GetPositionX(),
-                          a->GetPositionY(), a->GetPositionZ(), 0.0f);
-        }
-
         if (a) Test_SpellbookDedupe(a, r);
         if (b) Test_SpellbookDedupe(b, r);
         if (c) Test_SpellbookDedupe(c, r);
@@ -266,12 +289,6 @@ namespace WowPsParty
         // RetargetBotFollow — bot c re-follows a (different master)
         if (a && c)
         {
-            // Ensure c is on the same map as a
-            if (c->GetMapId() != a->GetMapId())
-            {
-                c->TeleportTo(a->GetMapId(), a->GetPositionX(),
-                              a->GetPositionY(), a->GetPositionZ(), 0.0f);
-            }
             Test_RetargetBotFollow(c, a, r);
         }
 
