@@ -6448,6 +6448,26 @@ namespace WowPsParty
         return true;
     }
 
+    // Town-service NPCs a henchman must NEVER turn on while they aren't genuinely
+    // hostile — flight masters, vendors, trainers, bankers, innkeepers, quest
+    // givers, guards, civilians. In a NEUTRAL town (Booty Bay) these read yellow:
+    // IsValidAttackTarget() is TRUE and their reaction stays NEUTRAL even after the
+    // owner provokes them, so the assist / self-defense path (gated only on
+    // IsValidAttackTarget) would pile the whole party onto a guard or the flight
+    // master. Enemy-CITY guards are hostile-by-reaction (IsHostileTo true) and stay
+    // fair game for world PvP; only the not-hostile town NPCs are shielded here.
+    // Mirrors the `!IsHostileTo` neutral guard the pull paths already carry.
+    static bool IsShieldedTownNpc(Player* bot, Unit* u)
+    {
+        Creature* c = u ? u->ToCreature() : nullptr;
+        if (!c) return false;   // players / their pets are handled by the friendly-fire guard
+        bool const townRole = u->IsServiceProvider()   // vendor/trainer/flightmaster/banker/innkeeper/spirit/auctioneer/…
+                           || u->IsQuestGiver()
+                           || c->IsGuard()
+                           || c->IsCivilian();
+        return townRole && !u->IsHostileTo(bot);
+    }
+
     void AssistTarget(Player* bot)
     {
         if (!bot || !bot->IsAlive() || !bot->IsInWorld()) return;
@@ -6983,10 +7003,12 @@ namespace WowPsParty
                         uint32 const sdNow = getMSTime();
                         Unit* ripped = (desired && desired->IsAlive()
                                         && desired->GetVictim() == bot) ? desired : nullptr;
+                        if (ripped && IsShieldedTownNpc(bot, ripped)) ripped = nullptr;   // never drag/kill a town guard
                         if (!ripped)
                             for (Unit* a : bot->getAttackers())
                                 if (a && a->IsAlive() && a->GetVictim() == bot
-                                    && bot->IsValidAttackTarget(a)) { ripped = a; break; }
+                                    && bot->IsValidAttackTarget(a)
+                                    && !IsShieldedTownNpc(bot, a)) { ripped = a; break; }
 
                         if (ripped && throttleTank && throttleTank != bot)
                         {
@@ -7189,6 +7211,21 @@ namespace WowPsParty
             }
             else
                 AssistLog(gLow, "target under transform CC, no alternative -> burst it (last enemy)");
+        }
+
+        // Town-NPC shield (final gate). Never let the assist/defense path settle on a
+        // neutral-town service NPC or guard — flight master, vendor, guard, quest
+        // giver, civilian. In Booty Bay these are IsValidAttackTarget-attackable and
+        // stay neutral even once the owner provokes them, so without this the party
+        // retaliated onto the flight master / guards. Placed here — past every picker,
+        // the leader-assist, party-defense, the tank peel and PartyMainCombatTarget —
+        // so a single check covers them all; nulling `desired` drops us into the
+        // stand-down block below (AttackStop + idle). Enemy-city guards are hostile-by-
+        // reaction and passed IsShieldedTownNpc's `!IsHostileTo`, so PvP is untouched.
+        if (desired && IsShieldedTownNpc(bot, desired))
+        {
+            AssistLog(gLow, "skip: shielded town NPC (flight master/guard/vendor) — never attack a neutral-town NPC");
+            desired = nullptr;
         }
 
         if (!desired)
