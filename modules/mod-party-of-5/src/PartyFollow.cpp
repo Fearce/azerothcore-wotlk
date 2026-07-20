@@ -8496,6 +8496,24 @@ namespace WowPsParty
 
                 if (uint32 const mountSpell = ChooseBotMountSpell(follower, leaderFlying))
                 {
+                    // A druid in Bear/Tree/Moonkin form can't mount: Spell::CheckCast
+                    // rejects the mount aura with SPELL_FAILED_NOT_SHAPESHIFT for any
+                    // IsInDisallowedMountForm() caster, and that gate has NO triggered
+                    // bypass — so even this triggered cast fails and the henchman trails
+                    // the party on foot in form (Kevin/Viv: druids "just stay in their
+                    // tree and bear form"). Drop the form first, exactly as the client
+                    // does when a player mounts out of a form. Travel/Flight forms are
+                    // allowed mount forms, so they're left alone. Once mounted, the
+                    // rotation's reform rule (a normal faceAndCast) fails NOT_MOUNTED,
+                    // so there's no drop/reform flap.
+                    if (follower->IsInDisallowedMountForm())
+                    {
+                        follower->RemoveAurasByType(SPELL_AURA_MOD_SHAPESHIFT);
+                        if (IsLogVerbose())
+                            LOG_INFO("module",
+                                "[WowPsParty Follow] {} dropped shapeshift form to mount",
+                                follower->GetName());
+                    }
                     // Self-heal a stuck state: a lingering SPELL_AURA_MOUNTED while
                     // NOT mounted (a desync from an old Dismount-only path) makes the
                     // cast just refresh the aura without mounting. Strip it first so
