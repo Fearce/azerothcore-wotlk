@@ -7396,7 +7396,13 @@ SpellCastResult Spell::CheckItems(uint32* param1, uint32* param2)
             {
                 if (m_spellInfo->TotemCategory[i] != 0)
                 {
-                    if (player->HasItemTotemCategory(m_spellInfo->TotemCategory[i]))
+                    // [WowPsParty PATCH] Satisfy the profession tool requirement
+                    // (blacksmith hammer, mining pick, arclight spanner, ...) from
+                    // the shared Party Inventory too — the tool may sit in a
+                    // party-mate's bags, not the crafter's. Solo casters fall back
+                    // to the crafter's own bags == vanilla HasItemTotemCategory.
+                    extern bool WowPsParty_PartyHasTotemCategory(Player*, uint32);
+                    if (WowPsParty_PartyHasTotemCategory(player, m_spellInfo->TotemCategory[i]))
                     {
                         TotemCategory -= 1;
                         continue;

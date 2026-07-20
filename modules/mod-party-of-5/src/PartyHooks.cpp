@@ -1380,6 +1380,48 @@ uint32 WowPsParty_PartyReagentCount(Player* crafter, uint32 itemId)
     return total;
 }
 
+// Trampoline called from the [WowPsParty PATCH] in Spell.cpp::CheckItems.
+// A profession recipe can require a category TOOL in the crafter's bags — a
+// blacksmith hammer, mining pick, arclight spanner, runed rod, etc. (spell
+// TotemCategory, surfaced client-side as "Requires Blacksmith Hammer"). In the
+// shared-inventory party that tool may sit in a party-mate's bags instead; the
+// merged Party Inventory already shows it as "yours", so demanding it on the
+// crafter specifically is the friction this removes. TRUE if the crafter OR any
+// loaded same-map party peer holds a matching tool. A tool is never consumed, so
+// unlike the reagent pool there is no consume counterpart to keep symmetric.
+// Solo / shared-inventory-off falls back to the crafter's own bags == the vanilla
+// Player::HasItemTotemCategory predicate it augments.
+bool WowPsParty_PartyHasTotemCategory(Player* crafter, uint32 totemCategory)
+{
+    if (!crafter) return false;
+    if (crafter->HasItemTotemCategory(totemCategory))
+        return true;
+    if (!WowPsParty::IsEnabled() || !WowPsParty::InventoryShared(crafter))
+        return false;   // solo: own bags only == vanilla predicate
+    for (Player* p : LoadedPartyPeers(crafter->GetSession()->GetAccountId(), crafter))
+    {
+        // Same-Map* peers only. HasItemTotemCategory walks the peer's bags, and an
+        // off-map peer updates on another MapUpdater thread — reading a bag it is
+        // concurrently saving can dereference a freed Item* (the dangling-item bag
+        // UAF). Compare Map* not map id: two instances of one map are distinct
+        // update contexts.
+        if (p->GetMap() != crafter->GetMap())
+        {
+            if (p->HasItemTotemCategory(totemCategory))
+                LOG_DEBUG("module", "[WowPsParty Tool] tool category {} held by party-mate {} is on another map ({} vs {}); not counted for {}'s craft.",
+                          totemCategory, p->GetName(), p->GetMapId(), crafter->GetMapId(), crafter->GetName());
+            continue;
+        }
+        if (p->HasItemTotemCategory(totemCategory))
+        {
+            LOG_INFO("module", "[WowPsParty Tool] {}'s craft satisfies tool category {} from party-mate {}'s bags (shared inventory).",
+                     crafter->GetName(), totemCategory, p->GetName());
+            return true;
+        }
+    }
+    return false;
+}
+
 // Trampoline called from the [WowPsParty PATCH] in Spell.cpp::TakeReagents.
 // Consume `count` of reagent `itemId`: the crafter's own bags first, then loaded
 // party members for the shortfall (the counterpart to the count above). For a
