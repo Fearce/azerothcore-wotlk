@@ -8137,6 +8137,58 @@ namespace WowPsParty
                 && TickBotVehicleMovement(follower, leader))
                 return true;
 
+            // ---- Sunwell: Kalecgos Spectral Realm sync ---------------------
+            // In the Kalecgos fight the human clicks a Spectral Rift portal
+            // (GO 187055) to phase into the Spectral Realm and fight Sathrovarr:
+            // the portal casts 44811 -> 46019 (Teleport: Spectral Realm) which,
+            // via spell_linked_spell 46019->46021, drops them at Sathrovarr's
+            // realm (Z~-74) with the "Spectral Realm" aura 46021 (the invis /
+            // detect phasing that lets them see + hit Sathrovarr). Henchmen have
+            // no client to click the portal, so they'd be stranded up in the
+            // dragon realm and can't help kill him (Kevin: "none of my bots get
+            // the debuff, so i cant kill the dude in the shadow realm"). Mirror
+            // the leader's realm membership, keyed purely on the 46021 aura so
+            // it only ever fires in this one encounter, and BEFORE the position
+            // teleports below — a raw snap onto the leader's XYZ would land the
+            // bot in the realm physically but UNPHASED (no 46021), unable to
+            // touch Sathrovarr.
+            if (follower->IsAlive() && !follower->IsBeingTeleported())
+            {
+                static constexpr uint32 SPELL_SPECTRAL_REALM      = 46021;
+                static constexpr uint32 SPELL_TELEPORT_SPECTRAL   = 46019;
+                static constexpr uint32 SPELL_SPECTRAL_EXHAUSTION = 44867;
+                bool const leaderInRealm = leader->HasAura(SPELL_SPECTRAL_REALM);
+                bool const botInRealm    = follower->HasAura(SPELL_SPECTRAL_REALM);
+                if (leaderInRealm && !botInRealm)
+                {
+                    // Send the bot in with the SAME spell the portal uses. Strip
+                    // any lingering Spectral Exhaustion first (it only blocks a
+                    // portal re-click, not this direct triggered cast, but a
+                    // clean state guarantees the re-entry after a prior stint in
+                    // the realm always takes).
+                    if (follower->HasAura(SPELL_SPECTRAL_EXHAUSTION))
+                        follower->RemoveAurasDueToSpell(SPELL_SPECTRAL_EXHAUSTION);
+                    follower->CastSpell(follower, SPELL_TELEPORT_SPECTRAL, true);
+                    LOG_INFO("module",
+                        "[WowPsParty Follow] {} entered the Spectral Realm with leader {}",
+                        follower->GetName(), leader->GetName());
+                    return true;
+                }
+                if (botInRealm && !leaderInRealm)
+                {
+                    // Leader left the realm (aura expired / boss done). Drop the
+                    // bot's 46021; its AfterEffectRemove (in the boss script)
+                    // casts Spectral Exhaustion + Teleport: Normal Realm (46020),
+                    // bringing it back up beside the leader — the same exit path
+                    // the human takes.
+                    follower->RemoveAurasDueToSpell(SPELL_SPECTRAL_REALM);
+                    LOG_INFO("module",
+                        "[WowPsParty Follow] {} left the Spectral Realm (leader {} exited)",
+                        follower->GetName(), leader->GetName());
+                    return true;
+                }
+            }
+
             // Re-form the party if an enrolled member got dropped from the leader's group.
             // Exiting Wintergrasp/LFG, OR the human accidentally clicking "Leave Party",
             // disbands or reshuffles the group — the member stays enrolled but ungrouped, and
