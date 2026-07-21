@@ -5586,6 +5586,7 @@ namespace WowPsParty
                 || verb == "interrupt_caster_melee"   // travels to a far caster
                 || verb == "charge"                   // leaps to a far enemy (away from the leader)
                 || verb == "reposition_random" || verb == "walk_away_from_source"
+                || verb == "spread_from_aura"
                 || verb == "dodge_frontals"   || verb == "face_away"
                 || verb == "stand_on_side"    || verb == "face_away_from_party"))
             return false;
@@ -7576,6 +7577,144 @@ namespace WowPsParty
             return true;
         }
 
+        // "spread_from_aura:<AuraName>[,<AuraName>…][:<radius>]" — SPREAD FROM
+        // AFFLICTED ALLIES: step away from EVERY party member carrying one of the
+        // named auras, until we're past <radius> yards of all of them. For a debuff
+        // that burns everyone standing NEAR a marked player — Saviana Ragefire's
+        // Conflagration (Ruby Sanctum): the boss beacons up to THREE players at
+        // once (spell 74452 applies the 74453 "Flame Beacon" aura to each), and
+        // every beacon pulses fire onto all players within 8y, so type the aura the
+        // mark leaves: "spread_from_aura:Flame Beacon". Unlike keep_distance_party
+        // (which flees the NEAREST ally, healthy or not, and can step you TOWARD a
+        // marked one) this homes on the MARKED players specifically and, with
+        // several beacons out, flees their COMBINED repulsion vector. It never flees
+        // the bot from ITSELF: a marked henchman skips itself (the mark is self-
+        // centred — moving can't shed its own tick, so it sits and eats it while the
+        // rest scatter) — put the rule on every henchman. A comma list matches ANY
+        // of the names. Default <radius> 12y (a safe margin past the 8y burst).
+        // Reactive: it breaks an in-flight cast to escape, like walk_away_from_source.
+        // Small per-tick steps (re-evaluated each tick) so it never overshoots into
+        // another beacon.
+        if (verb == "spread_from_aura")
+        {
+            if (arg.empty()) return false;
+            std::string names = arg;
+            float radius = 12.0f;
+            // Optional trailing ":<radius>". Aura names carry no ':', so a purely
+            // numeric tail after the last ':' is unambiguously the radius; anything
+            // else (or no ':') means the whole arg is the name list, default radius.
+            if (auto const sep = arg.rfind(':'); sep != std::string::npos)
+            {
+                std::string const tail = arg.substr(sep + 1);
+                if (!tail.empty()
+                    && tail.find_first_not_of("0123456789.") == std::string::npos)
+                {
+                    float const r = float(std::atof(tail.c_str()));
+                    if (r > 0.0f) { radius = r; names = arg.substr(0, sep); }
+                }
+            }
+            std::vector<std::string> const auraNames = Split(names, ',');
+            auto holdsBeacon = [&](Player* m) -> bool
+            {
+                for (std::string const& n : auraNames)
+                    if (!n.empty() && TargetHasNamedAura(m, n)) return true;   // any caster
+                return false;
+            };
+
+            std::vector<Player*> party;
+            GatherPartyPlayers(bot, party, /*includeDead=*/false);
+            std::vector<HazardPoint> beacons;
+            float nearest = radius;
+            for (Player* m : party)
+            {
+                if (!m || m == bot) continue;         // never flee ourselves
+                if (!holdsBeacon(m)) continue;
+                beacons.push_back({ m->GetPositionX(), m->GetPositionY() });
+                nearest = std::min(nearest, bot->GetDistance(m));
+            }
+            if (beacons.empty() || nearest >= radius) return false;   // clear / none marked
+
+            // Mid-step? let the (small) step finish before re-evaluating — no per-
+            // tick stutter, at most one STEP of residual movement.
+            if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE
+                && bot->isMoving())
+                return true;
+
+            WowPsParty::HoldFollower(bot->GetGUID(), 1200);   // yield follow during the hop
+
+            auto minBeaconDist = [&beacons](float x, float y) -> float
+            {
+                float best2 = 1.0e18f;
+                for (HazardPoint const& p : beacons)
+                {
+                    float const hx = x - p.x, hy = y - p.y;
+                    best2 = std::min(best2, hx * hx + hy * hy);
+                }
+                return std::sqrt(best2);
+            };
+            float const curDist = minBeaconDist(bot->GetPositionX(), bot->GetPositionY());
+
+            // Combined repulsion bearing: each beacon pushes AWAY, weighted by how
+            // close it is (one at the radius edge barely pushes; one on top of us
+            // shoves hard). Straddling two beacons the vector can cancel — fall back
+            // to a random bearing then, and the fan below still finds the spot that
+            // maximises clearance.
+            float sx = 0.0f, sy = 0.0f;
+            for (HazardPoint const& p : beacons)
+            {
+                float const dx = bot->GetPositionX() - p.x;
+                float const dy = bot->GetPositionY() - p.y;
+                float const d  = std::sqrt(dx * dx + dy * dy);
+                if (d < 0.1f) continue;
+                float const w = std::max(0.15f, (radius - std::min(d, radius)) / radius);
+                sx += dx / d * w; sy += dy / d * w;
+            }
+            float const awayAng = (std::fabs(sx) + std::fabs(sy) > 0.01f)
+                                ? std::atan2(sy, sx)
+                                : frand(0.0f, 2.0f * 3.14159265f);
+
+            // Fan STEP-yard candidate hops from the away bearing (0, ±22.5°, …);
+            // keep only those that gain clearance from the nearest beacon, land clear
+            // of any ground hazard, in LoS and navmesh-reachable; take the one
+            // farthest from the nearest beacon (mirrors walk_away_from_source).
+            std::vector<Unit*> clouds;
+            GatherDamagingClouds(bot, 45.0f, clouds);
+            constexpr float STEP = 4.0f;
+            constexpr int   N    = 16;
+            float bestX = 0.0f, bestY = 0.0f, bestZ = 0.0f, bestScore = 0.0f;
+            bool  haveBest = false;
+            for (int i = 0; i < N; ++i)
+            {
+                int const   notch = (i + 1) / 2;
+                float const side  = (i % 2) ? 1.0f : -1.0f;
+                float const ang   = awayAng + side * float(notch) * (3.14159265f / 8.0f);
+                float const x = bot->GetPositionX() + std::cos(ang) * STEP;
+                float const y = bot->GetPositionY() + std::sin(ang) * STEP;
+                float const d = minBeaconDist(x, y);
+                if (d <= curDist + 0.5f) continue;             // must gain clearance
+                if (PointInClouds(clouds, x, y)) continue;     // never hop into the bad
+                float const score = d - 0.15f * float(notch);  // farthest-out first
+                if (haveBest && score <= bestScore) continue;
+                float z = bot->GetPositionZ();
+                bot->UpdateAllowedPositionZ(x, y, z);
+                if (!bot->IsWithinLOS(x, y, z)) continue;      // don't aim through a wall
+                if (!NavReachable(bot, x, y, z, STEP)) continue;
+                haveBest = true; bestScore = score; bestX = x; bestY = y; bestZ = z;
+            }
+            if (!haveBest)
+                return false;   // boxed in — fight in place rather than freeze
+
+            LOG_INFO("module",
+                "[WowPsParty Rotation] {} spread_from_aura [{}]: {} beacon(s), "
+                "nearest {:.1f}y -> hop ({:.1f},{:.1f}) newDist {:.1f} r={:.0f}",
+                bot->GetName(), names, uint32(beacons.size()), nearest,
+                bestX, bestY, minBeaconDist(bestX, bestY), radius);
+            bot->GetMotionMaster()->MovePoint(0, bestX, bestY, bestZ, FORCED_MOVEMENT_NONE,
+                                              0.0f, 0.0f, /*generatePath=*/true,
+                                              /*forceDestination=*/false);
+            return true;
+        }
+
         // "close_to_enemy:N" — advance to within N yards of the bot's current
         // victim (the enemy AssistTarget picked: leader's target / tank's / party-
         // defense / the gap-close fallback), then stand and cast. The inverse of
@@ -8258,6 +8397,7 @@ namespace WowPsParty
     {
         return verb == "reposition_random"
             || verb == "walk_away_from_source"
+            || verb == "spread_from_aura"  // scatter off a marked ally NOW, even mid-cast
             || verb == "move_out_of_los"
             || verb == "dodge_frontals"   // get out of the cone NOW, even mid-cast
             || verb == "stand_on_side"    // slip to the flank NOW (breath+tail), even mid-cast
