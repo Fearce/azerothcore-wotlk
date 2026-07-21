@@ -30,6 +30,11 @@
 #include "Timer.h"
 #include "TravelMgr.h"
 
+// Party-of-5 keeps player-owned characters as follower bots.  Their quests are
+// real player progression, not disposable random-bot work; keep the RPG quest
+// organizer from issuing CMSG_QUESTLOG_REMOVE_QUEST for them.
+extern bool WowPsParty_BotHasActiveFollowDirective_Trampoline(ObjectGuid guid);
+
 bool NewRpgBaseAction::MoveFarTo(WorldPosition dest)
 {
     if (dest == WorldPosition())
@@ -569,6 +574,13 @@ bool NewRpgBaseAction::IsQuestCapableDoing(Quest const* quest)
 
 bool NewRpgBaseAction::OrganizeQuestLog()
 {
+    if (WowPsParty_BotHasActiveFollowDirective_Trampoline(bot->GetGUID()))
+    {
+        LOG_INFO("module", "[WowPsParty QuestGuard] blocked RPG quest cleanup for managed bot {}",
+                 bot->GetName());
+        return false;
+    }
+
     int32 freeSlotNum = 0;
 
     for (uint16 i = 0; i < MAX_QUEST_LOG_SIZE; ++i)

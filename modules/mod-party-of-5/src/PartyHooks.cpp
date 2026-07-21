@@ -620,6 +620,18 @@ public:
         using namespace WowPsParty;
         if (g_propagatingQuest) return;
         if (!IsEnabled() || !player || !player->GetSession() || !questId) return;
+
+        // A playerbot can invoke the normal abandon handler while cleaning its
+        // own quest log. That is not a player's shared-progression decision and
+        // must never fan out to the other real characters on the account.
+        // (The managed-bot quest guards stop the originating removal too; this
+        // is the containment layer for any future playerbot abandon path.)
+        if (sPlayerbotsMgr.GetPlayerbotAI(player))
+        {
+            LOG_INFO("module", "[WowPsParty QuestGuard] ignored bot abandon: {} quest={}",
+                     player->GetName(), questId);
+            return;
+        }
         if (!ProgressionShared(player)) return;   // solo: don't mirror quests
         if (!sPartyMgr.GetSlotForGuid(player->GetGUID().GetCounter()))
             return;  // abandoner isn't one of this account's party characters

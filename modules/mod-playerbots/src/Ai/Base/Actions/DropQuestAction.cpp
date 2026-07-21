@@ -9,8 +9,32 @@
 #include "Event.h"
 #include "Playerbots.h"
 
+// Party-of-5 followers are real player characters.  Never let a playerbot
+// command or automated quest-log maintenance discard their progression.
+extern bool WowPsParty_BotHasActiveFollowDirective_Trampoline(ObjectGuid guid);
+
+namespace
+{
+    bool IsWowPsManagedFollower(Player const* player)
+    {
+        return player && WowPsParty_BotHasActiveFollowDirective_Trampoline(player->GetGUID());
+    }
+
+    void LogBlockedQuestCleanup(Player const* player, char const* operation)
+    {
+        LOG_INFO("module", "[WowPsParty QuestGuard] blocked {} for managed bot {}",
+                 operation, player->GetName());
+    }
+}
+
 bool DropQuestAction::Execute(Event event)
 {
+    if (IsWowPsManagedFollower(bot))
+    {
+        LogBlockedQuestCleanup(bot, "playerbot quest drop");
+        return false;
+    }
+
     std::string const link = event.getParam();
 
     Player* master = GetMaster();
@@ -60,6 +84,12 @@ bool DropQuestAction::Execute(Event event)
 
 bool CleanQuestLogAction::Execute(Event event)
 {
+    if (IsWowPsManagedFollower(bot))
+    {
+        LogBlockedQuestCleanup(bot, "playerbot quest-log cleanup");
+        return false;
+    }
+
     Player* requester = event.getOwner() ? event.getOwner() : GetMaster();
     if (!requester)
         return false;
