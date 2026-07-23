@@ -16,6 +16,7 @@
 #include "DBCStores.h"   // sLockStore — identify "key" items that open world objects
 #include "Group.h"
 #include "GroupMgr.h"
+#include "GameTime.h"
 #include "LFGMgr.h"      // clear a stale group LFG state after a BG (dungeon-finder unblock)
 #include "Bag.h"
 #include "Item.h"
@@ -44,6 +45,7 @@
 
 #include <algorithm>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #ifdef _WIN32
 #include <excpt.h>   // __try/__except — guard reagent scans against freed item pointers
@@ -99,6 +101,50 @@ namespace WowPsParty
     {
         if (!p || !p->GetSession()) return false;
         return GetAccountSettings(p->GetSession()->GetAccountId()).sharedInventory;
+    }
+
+    // Return a real person in `killer`'s group other than the person directing
+    // that killer's own companion party. A playerbot may land the killing blow,
+    // so simply finding any real player in the group would also find its own
+    // captain and incorrectly disable solo party auto-loot.
+    static Player* GetExternalHumanGroupMember(Player* killer)
+    {
+        if (!killer) return nullptr;
+        Group* group = killer->GetGroup();
+        if (!group) return nullptr;
+
+        ObjectGuid const captain = GetLeaderFor(killer->GetGUID());
+        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+        {
+            Player* member = itr->GetSource();
+            if (!member || member == killer || !member->GetSession()) continue;
+            if (captain && member->GetGUID() == captain) continue;
+
+            PlayerbotAI* memberAI = sPlayerbotsMgr.GetPlayerbotAI(member);
+            if (!memberAI || memberAI->IsRealPlayer()) return member;
+        }
+        return nullptr;
+    }
+
+    // The co-op bypass can run once per creature, so keep the diagnostic useful
+    // without turning a trash pull into a wall of identical log entries.
+    static void LogExternalHumanLootHandoff(Player* killer, Player* human,
+                                            Creature* killed, Group* group)
+    {
+        if (!killer || !human || !killed || !group) return;
+
+        static thread_local std::unordered_map<uint32, uint32> lastLogAt;
+        uint32 const killerGuid = killer->GetGUID().GetCounter();
+        uint32 const now = static_cast<uint32>(GameTime::GetGameTime().count());
+        auto const previous = lastLogAt.find(killerGuid);
+        if (previous != lastLogAt.end() && now - previous->second < 5) return;
+        lastLogAt[killerGuid] = now;
+
+        LOG_INFO("module",
+            "[WowPsParty Loot] {} leaves corpse {} to group loot: external human "
+            "{} present method={}",
+            killer->GetName(), killed->GetGUID().GetCounter(), human->GetName(),
+            static_cast<uint32>(group->GetLootMethod()));
     }
 
     // ---- Party-wide KEY sharing ---------------------------------------------
@@ -862,6 +908,19 @@ public:
         uint32 const account = killer->GetSession()->GetAccountId();
         auto const party = sPartyMgr.GetParty(account);
         if (party.empty()) return;
+
+        // Our shared-inventory shortcut is for a single human and their own
+        // companions. Once another person joins the group/raid it must not
+        // preempt the core's loot method: Group Loot and Need Before Greed need
+        // the corpse intact to create their roll windows, while other methods
+        // retain their normal Blizzard semantics. A bot can land the kill, so
+        // GetExternalHumanGroupMember excludes that bot's own captain.
+        if (Player* externalHuman = WowPsParty::GetExternalHumanGroupMember(killer))
+        {
+            WowPsParty::LogExternalHumanLootHandoff(killer, externalHuman, killed,
+                                                     killer->GetGroup());
+            return;
+        }
 
         Loot* loot = &killed->loot;
         if (loot->isLooted()) return;
