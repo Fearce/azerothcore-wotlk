@@ -113,6 +113,23 @@ namespace
                                      full, /*chatTag=*/0);
         target->GetSession()->SendPacket(&data);
     }
+
+    // Stream a rotation DSL to the client as a chunked BEGIN / CHUNK / END group so a
+    // large rotation can't overflow the ~255-byte addon-message cap and arrive empty
+    // (what made a fully-scripted Common list vanish from the editor). Mirrors the
+    // per-mob MOB_ROT_* framing: `beginMsg`/`endMsg` carry any key/token, each CHUNK is
+    // a <=200-byte raw DSL fragment the client concatenates verbatim before parsing. The
+    // '|' field separator is converted to '~' for the editor's import parser first.
+    static void SendChunkedRotation(Player* target, std::string const& beginMsg,
+                                    char const* chunkCmd, std::string dsl,
+                                    std::string const& endMsg)
+    {
+        std::replace(dsl.begin(), dsl.end(), '|', '~');
+        SendWPSP(target, beginMsg);
+        for (size_t i = 0; i < dsl.size(); i += 200)
+            SendWPSP(target, std::string(chunkCmd) + "\t" + dsl.substr(i, 200));
+        SendWPSP(target, endMsg);
+    }
 }
 
 namespace WowPsParty
@@ -6067,11 +6084,13 @@ public:
             out << "LEADDUNGEON\t" << token << '\t' << (on ? 1 : 0);
             SendWPSP(player, out.str());
         }
-        // REQ_ROTATION\t<token>  →  ROTATION\t<token>\t<dsl>
+        // REQ_ROTATION\t<token>  ->  ROT_BEGIN\t<token> / ROT_CHUNK\t<frag> / ROT_END\t<token>
         // The editor pulls the SAVED rotation from party_loadout (guid-keyed,
         // authoritative) so a reshuffled party slot never shows the previous
-        // occupant's rotation out of the slot-keyed client cache. '|' field sep
-        // → '~' for the editor's import parser (which avoids '|', a WoW escape).
+        // occupant's rotation out of the slot-keyed client cache. Chunked (the DSL
+        // can exceed the ~255-byte addon-message cap and would otherwise arrive
+        // EMPTY — the same footgun that hid the Common list); the '|' field sep
+        // becomes '~' inside the helper for the editor's import parser.
         else if (command == "REQ_ROTATION")
         {
             std::string const token(payload);
@@ -6084,10 +6103,8 @@ public:
                     "WHERE `guid` = {}", guid);
                 if (q) dsl = q->Fetch()[0].Get<std::string>();
             }
-            std::replace(dsl.begin(), dsl.end(), '|', '~');
-            std::ostringstream out;
-            out << "ROTATION\t" << token << '\t' << dsl;
-            SendWPSP(player, out.str());
+            SendChunkedRotation(player, "ROT_BEGIN\t" + token, "ROT_CHUNK",
+                                dsl, "ROT_END\t" + token);
         }
         // SET_LEADDUNGEON\t<token>\t<0|1>
         else if (command == "SET_LEADDUNGEON")
@@ -6880,17 +6897,19 @@ public:
                 "|cff66ccff[WowPsParty]|r Saved {} common rule(s) — runs on the whole party.",
                 uint32(rules.size()));
         }
-        // REQ_SHARED_ROTATION  ->  SHARED_ROTATION\t<dsl>
+        // REQ_SHARED_ROTATION  ->  SHARED_ROT_BEGIN / SHARED_ROT_CHUNK\t<frag> / SHARED_ROT_END
+        // Chunked (the account-wide Common list can be large — a fully-scripted one
+        // overflowed the ~255-byte addon-message cap and arrived EMPTY, so the editor
+        // showed no Common rules at all). The helper converts the '|' field separator
+        // to '~' for the editor's import parser, exactly as the single-message send did.
         else if (command == "REQ_SHARED_ROTATION")
         {
             uint32 const account = player->GetSession()->GetAccountId();
             QueryResult q = CharacterDatabase.Query(
                 "SELECT `priority_actions_json` FROM `party_shared_rotation` WHERE `account` = {}", account);
             std::string dsl = q ? q->Fetch()[0].Get<std::string>() : std::string();
-            // DB stores '|'-delimited fields; the editor's parser wants '~' ('|' is a
-            // WoW escape prefix it can't read). Same conversion REQ_ROTATION does.
-            std::replace(dsl.begin(), dsl.end(), '|', '~');
-            SendWPSP(player, "SHARED_ROTATION\t" + dsl);
+            SendChunkedRotation(player, "SHARED_ROT_BEGIN", "SHARED_ROT_CHUNK",
+                                dsl, "SHARED_ROT_END");
         }
         // ---------- per-mob COMMON sections (account-wide, chunked like above) ------
         // A named bucket of Common rules per boss. Stored raw in party_mob_rotation +
