@@ -22,6 +22,7 @@
 #include "LFG.h"                // lfg::LFGDungeonData
 #include "SpellMgr.h"           // henchman down-level spell sanitize
 #include "SpellInfo.h"          // SpellLevel / LEARN_SPELL effect inspection
+#include "Reputation/ReputationMgr.h"  // sync a henchman's faction standings to its leader
 #include "Bag.h"                // henchman inventory clear (GetBagByPos/GetBagSize)
 #include "Unit.h"
 #include "WorldSession.h"
@@ -2521,6 +2522,50 @@ namespace WowPsParty
     // Run the sanitize at most once per (guid, level): on the first sighting of a
     // henchman this session (heals an already-bloated pool bot) and again whenever
     // its level changes (a fresh down-level). Cheap no-op otherwise.
+    // A henchman is a random-pool character with its OWN accumulated faction
+    // standings, which can sit at Hostile/Hated with factions the leader is only
+    // Neutral with — most visibly the shared "neutral hub" reputations (Aldor vs
+    // Scryers, Cenarion Expedition, the goblin towns). A creature reacting to a
+    // player reads THAT player's own reputation rank (Unit::GetFactionReactionTo,
+    // CvP branch), so such a henchman gets jumped by quest/city NPCs that leave the
+    // leader alone the instant it spawns near them.
+    //
+    // Fix: mirror the leader's standing onto the henchman for any faction where the
+    // henchman is currently below Neutral. We only ever RAISE (leaderTotal > henTotal),
+    // so the henchman is never made MORE hostile than it already is — an enemy-team
+    // city the leader is also Hated with stays hostile to both (leaderTotal is just as
+    // negative, so no change), while a neutral-hub faction the leader is fine with is
+    // lifted out of the attack range. (The "at war" flag is deliberately ignored: it
+    // only ever caps a reaction DOWN to Neutral, which never triggers an attack.)
+    static void SyncHenchmanReputationToLeader(Player* hen, Player* leader)
+    {
+        if (!hen || !leader || !hen->IsInWorld()) return;
+        if (!WowPsParty::IsHenchman(hen->GetGUID())) return;   // never touch a player's own alt
+
+        ReputationMgr&       hm = hen->GetReputationMgr();
+        ReputationMgr const& lm = leader->GetReputationMgr();
+
+        // Snapshot the faction ids first — SetOneFactionReputation mutates the state
+        // map's values (not its structure), but iterating a copy keeps this obviously safe.
+        std::vector<uint32> factionIds;
+        factionIds.reserve(hm.GetStateList().size());
+        for (auto const& kv : hm.GetStateList())
+            factionIds.push_back(kv.second.ID);
+
+        for (uint32 id : factionIds)
+        {
+            FactionEntry const* fe = sFactionStore.LookupEntry(id);
+            if (!fe || !fe->CanHaveReputation()) continue;
+            if (hm.GetRank(fe) >= REP_NEUTRAL) continue;   // already at least neutral -> not attacked
+
+            int32 const henTotal    = hm.GetReputation(fe);
+            int32 const leaderTotal = lm.GetReputation(fe);
+            if (leaderTotal <= henTotal) continue;         // never lower the henchman toward the leader
+
+            hm.SetOneFactionReputation(fe, float(leaderTotal), /*incremental=*/false);
+        }
+    }
+
     static void SanitizeHenchmanSpellsIfNeeded(Player* bot)
     {
         if (!bot || !bot->IsInWorld()) return;
@@ -2564,6 +2609,13 @@ namespace WowPsParty
         // Strip any over-level / orphaned-talent spells a down-leveled henchman
         // kept from a former higher level (once per guid+level; no-op once clean).
         SanitizeHenchmanSpellsIfNeeded(bot);
+
+        // Re-mirror the leader's faction standings. Reputation GAINS are already
+        // mirrored live (OnPlayerGiveReputation), but a henchman can still LOSE
+        // standing on its own — grinding mobs in a neutral hub drops it below the
+        // leader again — so re-sync on this throttled tick to self-heal.
+        if (Player* leader = ObjectAccessor::FindConnectedPlayer(WowPsParty::GetLeaderFor(bot->GetGUID())))
+            SyncHenchmanReputationToLeader(bot, leader);
 
         uint8 const cls = bot->getClass();
         if (cls == CLASS_ROGUE)   MaintainPoisons(bot);
@@ -3041,6 +3093,11 @@ namespace WowPsParty
             hen->SetFullHealth();
             if (hen->getPowerType() == POWER_MANA)
                 hen->SetPower(POWER_MANA, hen->GetMaxPower(POWER_MANA));
+
+            // Mirror the leader's faction standings so a henchman drawn from the
+            // random pool with a soured "neutral hub" reputation isn't jumped by
+            // quest/city NPCs that leave the leader alone (see the helper's comment).
+            SyncHenchmanReputationToLeader(hen, lead);
 
             Group* g = lead->GetGroup();
             if (!g)
