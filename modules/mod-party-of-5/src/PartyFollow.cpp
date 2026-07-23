@@ -4953,6 +4953,154 @@ namespace WowPsParty
         }
     }
 
+    // ----- Summoning-ritual portal clicking --------------------------------
+    // A warlock's Ritual of Summoning (portal GO 194108, channel spell 698) and
+    // a Meeting/Summoning Stone summon (portal GO 179944, channel spell 59782)
+    // both spawn a GAMEOBJECT_TYPE_SUMMONING_RITUAL portal owned by the player
+    // who started it; that summoner CHANNELS the whole time the portal is up,
+    // and the summon only completes once enough OTHER group members click the
+    // portal (2 unique users total for a stone, 3 for a warlock). Managed party
+    // bots have no client, so they never clicked one — the human had to drag a
+    // second warm body to the stone. This walks any idle party bot to a portal
+    // a GROUP-MATE is currently channeling and clicks it through the exact
+    // GameObject::Use path a player's right-click takes, so the party can summon
+    // by itself. Applies to hired henchmen AND enrolled alts.
+    static constexpr float SUMMON_RITUAL_SCAN_RANGE = 40.0f;  // portal sits at a party-mate — well within the follow leash
+    static constexpr float SUMMON_RITUAL_REACH      = 5.0f;   // < INTERACTION_DISTANCE (5.5) so Use() is in range
+
+    static void SummonRitualLog(uint32 guidLow, std::string const& reason)
+    {
+        static thread_local std::unordered_map<uint64, uint32> lastMs;
+        uint64 key = (uint64(guidLow) << 32) ^ std::hash<std::string>{}(reason);
+        uint32 nowMs = getMSTime();
+        uint32& last = lastMs[key];
+        if (nowMs - last < 4000) return;
+        last = nowMs;
+        LOG_INFO("module", "[WowPsParty Summon] guid={} {}", guidLow, reason);
+    }
+
+    // Is `go` a live summoning-ritual portal that a GROUP-MATE of `bot` is
+    // currently channeling, still needs more clickers, and that this bot hasn't
+    // already contributed to? Mirrors the eligibility GameObject::Use enforces
+    // for an owned ritual, so a pass here means the click below actually counts.
+    static bool EligibleSummonPortal(Player* bot, GameObject* go)
+    {
+        if (!go || !go->isSpawned()) return false;
+        if (go->GetGoType() != GAMEOBJECT_TYPE_SUMMONING_RITUAL) return false;
+        GameObjectTemplate const* info = go->GetGOInfo();
+        if (!info) return false;
+
+        // The summoner (portal owner). Both our summon paths set an owner GUID;
+        // require it, and never our own portal (a bot can't be summoning here).
+        ObjectGuid const ownerGuid = go->GetOwnerGUID();
+        if (!ownerGuid || ownerGuid == bot->GetGUID()) return false;
+
+        // Only ever help a member of the bot's OWN group summon — never a
+        // stranger's portal that merely spawned within scan range.
+        Group* grp = bot->GetGroup();
+        if (!grp || !grp->IsMember(ownerGuid)) return false;
+
+        Player* owner = ObjectAccessor::FindConnectedPlayer(ownerGuid);
+        if (!owner || !owner->IsInWorld() || owner->GetMapId() != bot->GetMapId()) return false;
+
+        // The portal is only "live" while the summoner is mid-channel — exactly
+        // what GameObject::Use requires for an owned ritual. Once the channel
+        // ends (cancelled / summon done) the portal is dead; don't walk to it.
+        if (!owner->GetCurrentSpell(CURRENT_CHANNELED_SPELL)) return false;
+
+        // castersGrouped portals demand the clicker share the summoner's raid;
+        // our party bots do, but honour the flag so we never approach one we're
+        // not allowed to use.
+        if (info->summoningRitual.castersGrouped && !bot->IsInSameRaidWith(owner)) return false;
+
+        // Enough unique clickers already → the completing click despawns it; done.
+        if (go->GetUniqueUseCount() >= info->summoningRitual.reqParticipants) return false;
+
+        // We already clicked this portal — don't re-click (it would just re-fire
+        // the ritual anim on us and never advance the count past our one use).
+        if (go->IsRitualParticipant(bot->GetGUID())) return false;
+
+        return true;
+    }
+
+    // Cheap pre-gate for the per-tick portal scan: is any OTHER member of the
+    // bot's group currently channeling within scan range on the same map? A
+    // ritual portal only exists while its summoner channels, so when nobody is,
+    // skip the grid visit entirely (the overwhelmingly common case). A false
+    // positive (a group-mate channeling something unrelated) just falls through
+    // to the scan below, which then finds no eligible portal and returns.
+    static bool AnyGroupMateChannelingNearby(Player* bot)
+    {
+        Group* grp = bot->GetGroup();
+        if (!grp) return false;
+        for (GroupReference* itr = grp->GetFirstMember(); itr != nullptr; itr = itr->next())
+        {
+            Player* m = itr->GetSource();
+            if (!m || m == bot) continue;
+            if (m->GetMapId() != bot->GetMapId()) continue;
+            if (!m->IsWithinDist(bot, SUMMON_RITUAL_SCAN_RANGE)) continue;
+            if (m->GetCurrentSpell(CURRENT_CHANNELED_SPELL)) return true;
+        }
+        return false;
+    }
+
+    void TickSummoningRitual(Player* bot)
+    {
+        if (!bot || !bot->IsAlive() || !bot->IsInWorld() || !bot->GetSession()) return;
+        if (bot->HasUnitFlag(UNIT_FLAG_POSSESSED)) return;          // the controlled body
+        if (bot->IsInCombat()) return;                              // fight first; summoning is an OOC activity
+        if (bot->IsNonMeleeSpellCast(false, false, true)) return;   // don't interrupt a real (non-autorepeat) cast
+        if (IsTankLeading(bot->GetGUID())) return;                  // busy running the dungeon
+
+        // Cheap pre-gate before the grid scan: only look for a portal when a
+        // group-mate is actually channeling nearby (a summon in progress).
+        if (!AnyGroupMateChannelingNearby(bot)) return;
+
+        uint32 const gLow = bot->GetGUID().GetCounter();
+
+        // Nearest eligible party-mate summoning portal within scan range.
+        GameObject* portal = nullptr;
+        {
+            std::list<GameObject*> gos;
+            NearbySpawnedGOCheck check(bot, SUMMON_RITUAL_SCAN_RANGE);
+            Acore::GameObjectListSearcher<NearbySpawnedGOCheck> searcher(bot, gos, check);
+            Cell::VisitObjects(bot, searcher, SUMMON_RITUAL_SCAN_RANGE);
+            float best = SUMMON_RITUAL_SCAN_RANGE + 1.0f;
+            for (GameObject* go : gos)
+            {
+                if (!EligibleSummonPortal(bot, go)) continue;
+                float const d = bot->GetDistance(go);
+                if (d < best) { best = d; portal = go; }
+            }
+        }
+        if (!portal) return;
+
+        // In reach → face and click it exactly like a player's right-click. The
+        // engine adds us to the ritual's unique users and, on the last needed
+        // click, completes the summon and despawns the portal.
+        if (bot->IsWithinDist(portal, SUMMON_RITUAL_REACH))
+        {
+            HoldFollower(bot->GetGUID(), 2000);
+            bot->SetFacingToObject(portal);
+            portal->Use(bot);
+            SummonRitualLog(gLow, "clicked a party summoning portal to help complete the summon");
+            return;
+        }
+
+        // Walk to the portal. Hold the follow systems off so they don't reel the
+        // bot back to the leader mid-approach; re-issue MovePoint only when not
+        // already heading there (avoids restarting the spline every tick).
+        HoldFollower(bot->GetGUID(), 2000);
+        if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE
+            || !bot->isMoving())
+        {
+            bot->SetFacingToObject(portal);
+            bot->GetMotionMaster()->MovePoint(0xA1A,
+                portal->GetPositionX(), portal->GetPositionY(), portal->GetPositionZ());
+            SummonRitualLog(gLow, "walking to a party summoning portal");
+        }
+    }
+
     // ----- Henchman corpse looting -----------------------------------------
     // Hired henchmen never ran the default playerbot loot AI (managed bots
     // hard-return from UpdateAI), so party-killed corpses just sat there — "they
@@ -9680,6 +9828,15 @@ void WowPsParty_TickHenchmanLoot_Trampoline(Player* bot)
 void WowPsParty_TickRibbonPole_Trampoline(Player* bot)
 {
     WowPsParty::TickRibbonPole(bot);
+}
+
+// Summoning-portal trampoline — out-of-combat, alts AND henchmen. Walks a party
+// bot to a warlock Ritual of Summoning / meeting-stone portal a group-mate is
+// channeling and clicks it, so the party can complete a summon without a second
+// human. Self-gates on a live, group-owned, not-yet-full ritual portal nearby.
+void WowPsParty_TickSummoningRitual_Trampoline(Player* bot)
+{
+    WowPsParty::TickSummoningRitual(bot);
 }
 
 // Battleground-invite auto-accept trampoline — ports a managed party bot into a

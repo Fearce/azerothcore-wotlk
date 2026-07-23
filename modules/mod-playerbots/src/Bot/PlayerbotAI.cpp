@@ -289,6 +289,7 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
     extern void WowPsParty_TickGathering_Trampoline(Player* bot);
     extern void WowPsParty_TickHenchmanLoot_Trampoline(Player* bot);
     extern void WowPsParty_TickRibbonPole_Trampoline(Player* bot);
+    extern void WowPsParty_TickSummoningRitual_Trampoline(Player* bot);
     extern void WowPsParty_TickAcceptBgInvite_Trampoline(Player* bot);
     extern void WowPsParty_TickTankPullMore_Trampoline(Player* bot);
     bool const isPartyOfFiveBot = WowPsParty_BotHasActiveFollowDirective_Trampoline(bot->GetGUID());
@@ -319,6 +320,11 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
         // bonfire's Ribbon Pole the leader is parked at to pick up the XP buff
         // (alts AND henchmen). Self-gates off the holiday + pole proximity.
         WowPsParty_TickRibbonPole_Trampoline(bot);
+        // Out-of-combat only: click a party summoning portal (warlock Ritual of
+        // Summoning / meeting-stone) a group-mate is channeling, so the party can
+        // complete a summon without a second human clicker. Self-gates on a live,
+        // group-owned ritual portal being nearby; no-op otherwise.
+        WowPsParty_TickSummoningRitual_Trampoline(bot);
         // Manual "pull one more" (keybind) — dispatched LAST so its MoveChase
         // overrides the rotation/AssistTarget combat-chase while armed, walking the
         // lead tank onto the next pack mid-fight. No-op unless armed for this tank.

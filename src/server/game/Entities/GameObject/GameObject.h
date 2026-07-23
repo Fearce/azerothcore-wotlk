@@ -240,6 +240,7 @@ public:
 
     [[nodiscard]] uint32 GetUseCount() const { return m_usetimes; }
     [[nodiscard]] uint32 GetUniqueUseCount() const { return m_unique_users.size(); }
+    [[nodiscard]] bool IsRitualParticipant(ObjectGuid guid) const { return m_unique_users.find(guid) != m_unique_users.end(); }
 
     void SaveRespawnTime() override { SaveRespawnTime(0); }
     void SaveRespawnTime(uint32 forceDelay);
