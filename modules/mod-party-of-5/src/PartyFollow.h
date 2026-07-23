@@ -249,6 +249,13 @@ namespace WowPsParty
     void HoldFollower(ObjectGuid followerGuid, uint32 durationMs);
     bool IsFollowerHeld(ObjectGuid followerGuid);
 
+    // A damage-escape hold is distinct from an ordinary stationary hold: while
+    // active, AssistTarget must not apply its no-victim stale-hold recovery,
+    // because that recovery would cancel the escape MovePoint and send a bot
+    // back into the hazard it just fled.
+    void HoldFollowerForDamageEscape(ObjectGuid followerGuid, uint32 durationMs);
+    bool IsFollowerDamageEscaping(ObjectGuid followerGuid);
+
     // Force a freshly-revived / stuck bot back into a movable state. A bot has
     // no game client to round-trip the unroot, so a movement-blocking unit-
     // state (UNIT_STATE_NOT_MOVE bits / MOVEMENTFLAG_ROOT) can survive a revive

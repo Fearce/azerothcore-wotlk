@@ -7773,19 +7773,16 @@ namespace WowPsParty
             if (!RecentDamageSource(bot->GetGUID().GetCounter(), arg, sx, sy, sz, &ageMs))
                 return false;   // no known source to flee — let a lower rule act
 
-            // The escape has to own the bot's feet for the ENTIRE recent-hit
-            // window, not just the first little hop. AssistTarget runs straight
-            // after TickRotation and otherwise re-installs its chase/follow as
-            // soon as the old 800 ms hold expires — often while the bot is still
-            // on this MovePoint spline. That cancelled the escape and walked the
-            // bot right back into persistent ground damage (Darkness, Coldflame,
-            // Defile) before its next periodic tick could tell us to leave again.
-            // Refresh this even while the spline is active, then keep the bot
-            // still for the short remainder after the last hit. A continuing
-            // periodic effect refreshes the hit and makes the next outward hop;
-            // a cleared effect simply hands movement back after this window.
+            // The escape owns the bot's feet for the entire recent-hit window,
+            // not just the first little hop. AssistTarget runs immediately after
+            // TickRotation and otherwise re-installs its chase/follow while this
+            // MovePoint spline is active, walking the bot back into persistent
+            // ground damage before its next periodic tick can trigger another hop.
+            // Refresh this even while the spline is active. A continuing periodic
+            // effect makes the next outward hop; a cleared effect returns movement
+            // after this brief safety window.
             constexpr uint32 ESCAPE_HOLD_MS = RECENT_DMG_WINDOW_MS;
-            WowPsParty::HoldFollower(bot->GetGUID(), ESCAPE_HOLD_MS);
+            WowPsParty::HoldFollowerForDamageEscape(bot->GetGUID(), ESCAPE_HOLD_MS);
 
             // Already mid-step? let the (small) step finish before re-evaluating — no
             // per-tick stutter, and the residual movement is at most one STEP.

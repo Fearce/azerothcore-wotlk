@@ -252,6 +252,12 @@ namespace WowPsParty
         // bot is intentionally stationary (drinking, holding for healer, etc).
         static std::unordered_map<uint32, uint32> g_holdUntilMs;
 
+        // followerGuidLow -> expiry for a reactive escape from spell damage.
+        // Kept separate from the general hold so AssistTarget can distinguish a
+        // deliberate safety move from a stale cast/drink hold while no victim
+        // has been acquired yet.
+        static std::unordered_map<uint32, uint32> g_damageEscapeUntilMs;
+
         // followerGuidLow -> getMSTime() at which a "Come Hither" recall ends. Read
         // ONLY by TickRotation, to PAUSE the rotation during the recall so a ranged
         // DPS runs to the leader instead of hard-casting in place (faceAndCast would
@@ -745,6 +751,15 @@ namespace WowPsParty
         g_holdUntilMs[followerGuid.GetCounter()] = getMSTime() + durationMs;
     }
 
+    void HoldFollowerForDamageEscape(ObjectGuid followerGuid, uint32 durationMs)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        uint32 const until = getMSTime() + durationMs;
+        uint32 const guidLow = followerGuid.GetCounter();
+        g_holdUntilMs[guidLow] = until;
+        g_damageEscapeUntilMs[guidLow] = until;
+    }
+
     bool IsFollowerHeld(ObjectGuid followerGuid)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -753,6 +768,19 @@ namespace WowPsParty
         if (getMSTime() >= it->second)
         {
             g_holdUntilMs.erase(it);
+            return false;
+        }
+        return true;
+    }
+
+    bool IsFollowerDamageEscaping(ObjectGuid followerGuid)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_damageEscapeUntilMs.find(followerGuid.GetCounter());
+        if (it == g_damageEscapeUntilMs.end()) return false;
+        if (getMSTime() >= it->second)
+        {
+            g_damageEscapeUntilMs.erase(it);
             return false;
         }
         return true;
@@ -6646,6 +6674,14 @@ namespace WowPsParty
         // returned at "skip: casting" above; a bot planting a cast still HAS a victim; a
         // DPS that genuinely must wait for the tank's pull is still held by the threat-gate
         // below (not this). Tanks keep their gather/lead holds untouched.
+        // Check this before the general hold: a later lower-priority action can
+        // replace g_holdUntilMs with a shorter hold, but it must never make a
+        // live damage escape eligible for stale-hold recovery.
+        if (IsFollowerDamageEscaping(bot->GetGUID()))
+        {
+            AssistLog(gLow, "skip: active damage escape");
+            return;
+        }
         if (IsFollowerHeld(bot->GetGUID()))
         {
             bool const staleHold = bot->IsInCombat() && !bot->GetVictim()

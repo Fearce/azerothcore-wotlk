@@ -29,6 +29,7 @@ target_link_libraries(
         gtest_main
         gmock_main
         game-interface
+        acore-compile-option-interface
 )
 
 # Add module test sources if any modules registered tests
@@ -55,5 +56,22 @@ add_test(
         NAME
         unit
         COMMAND
-        ${CMAKE_BINARY_DIR}/src/test/unit_tests
+        $<TARGET_FILE:unit_tests>
 )
+
+# The Windows test executable links the locally supplied MySQL and OpenSSL
+# DLLs. Place those runtime dependencies next to the test executable so CTest
+# can run it directly from a fresh build tree.
+if(WIN32)
+    get_filename_component(MYSQL_LIBRARY_DIR "${MYSQL_LIBRARY}" DIRECTORY)
+    add_custom_command(TARGET unit_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${OPENSSL_ROOT_DIR}/bin/libcrypto-3-x64.dll"
+            "$<TARGET_FILE_DIR:unit_tests>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${OPENSSL_ROOT_DIR}/bin/libssl-3-x64.dll"
+            "$<TARGET_FILE_DIR:unit_tests>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${MYSQL_LIBRARY_DIR}/../bin/libmysql.dll"
+            "$<TARGET_FILE_DIR:unit_tests>")
+endif()
