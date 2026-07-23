@@ -7773,6 +7773,20 @@ namespace WowPsParty
             if (!RecentDamageSource(bot->GetGUID().GetCounter(), arg, sx, sy, sz, &ageMs))
                 return false;   // no known source to flee — let a lower rule act
 
+            // The escape has to own the bot's feet for the ENTIRE recent-hit
+            // window, not just the first little hop. AssistTarget runs straight
+            // after TickRotation and otherwise re-installs its chase/follow as
+            // soon as the old 800 ms hold expires — often while the bot is still
+            // on this MovePoint spline. That cancelled the escape and walked the
+            // bot right back into persistent ground damage (Darkness, Coldflame,
+            // Defile) before its next periodic tick could tell us to leave again.
+            // Refresh this even while the spline is active, then keep the bot
+            // still for the short remainder after the last hit. A continuing
+            // periodic effect refreshes the hit and makes the next outward hop;
+            // a cleared effect simply hands movement back after this window.
+            constexpr uint32 ESCAPE_HOLD_MS = RECENT_DMG_WINDOW_MS;
+            WowPsParty::HoldFollower(bot->GetGUID(), ESCAPE_HOLD_MS);
+
             // Already mid-step? let the (small) step finish before re-evaluating — no
             // per-tick stutter, and the residual movement is at most one STEP.
             if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE
@@ -7788,13 +7802,6 @@ namespace WowPsParty
             // ~under a patch-tick we've cleared the edge: yield so casts resume.
             constexpr uint32 STILL_IN_IT_MS = 600;
             if (ageMs > STILL_IN_IT_MS) return false;
-
-            // Keep AssistTarget off our feet for THIS step — a HEALER gets re-planted
-            // straight back into the fire by AssistTarget's "hold near party" the instant
-            // it moves, so it never actually leaves (Kevin: healer stood in Coldflame).
-            // Short hold (one step), not the whole window, so positioning hands the feet
-            // back the moment we've cleared and start casting again.
-            WowPsParty::HoldFollower(bot->GetGUID(), 800);
 
             // JUST BARELY step out, like a real player — a small hop, then re-check next
             // tick and hop again only if STILL standing in it. A big fixed step overshot
