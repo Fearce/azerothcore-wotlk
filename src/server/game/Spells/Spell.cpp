@@ -7378,7 +7378,13 @@ SpellCastResult Spell::CheckItems(uint32* param1, uint32* param2)
             {
                 if (m_spellInfo->Totem[i] != 0)
                 {
-                    if (player->HasItemCount(m_spellInfo->Totem[i]))
+                    // [WowPsParty PATCH] Satisfy a recipe's SPECIFIC required tool
+                    // item (Simple Grinder, runed rod, philosopher's stone, ...)
+                    // from the shared Party Inventory too — it may sit in a
+                    // party-mate's bags, not the crafter's. Solo casters fall back
+                    // to the crafter's own bags == vanilla HasItemCount.
+                    extern bool WowPsParty_PartyHasTotemItem(Player*, uint32);
+                    if (WowPsParty_PartyHasTotemItem(player, m_spellInfo->Totem[i]))
                     {
                         totems -= 1;
                         continue;
