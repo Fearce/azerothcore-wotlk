@@ -88,6 +88,15 @@
 #define WOWPS_HAS_AHBOT 1
 #endif
 
+// mod-transmog is likewise a gitignored clone that may be absent on a fresh
+// checkout. TransmogPop's REQ_XMOG / XMOG_APPLY bridge only compiles in when the
+// module's header is present; without it the opcodes reply "unavailable" so the
+// tree still builds on a box that has no mod-transmog.
+#if __has_include("../../mod-transmog/src/Transmogrification.h")
+#include "../../mod-transmog/src/Transmogrification.h"
+#define WOWPS_HAS_TRANSMOG 1
+#endif
+
 namespace WowPsParty
 {
     bool IsEnabled();     // PartyBootstrap.cpp
@@ -129,6 +138,143 @@ namespace
         for (size_t i = 0; i < dsl.size(); i += 200)
             SendWPSP(target, std::string(chunkCmd) + "\t" + dsl.substr(i, 200));
         SendWPSP(target, endMsg);
+    }
+
+    // --- TransmogPop bridge (Path B) --------------------------------------
+    // The transmog NPC's own gossip/vendor flow can't drive a multi-slot custom
+    // window (the client drops the gossip the moment the fake vendor opens), so
+    // TransmogPop talks to us instead: REQ_XMOG streams the account's COLLECTED
+    // appearances that are valid for each equipped slot; XMOG_APPLY commits one
+    // pick through mod-transmog. We never involve the NPC.
+
+    // Slots mod-transmog can reskin, ascending EQUIPMENT_SLOT_* (server, 0-based;
+    // the addon maps these back to its rail as invSlot = serverSlot + 1).
+    static uint8 const kXmogSlots[] = {
+        EQUIPMENT_SLOT_HEAD, EQUIPMENT_SLOT_SHOULDERS, EQUIPMENT_SLOT_BODY,
+        EQUIPMENT_SLOT_CHEST, EQUIPMENT_SLOT_WAIST, EQUIPMENT_SLOT_LEGS,
+        EQUIPMENT_SLOT_FEET, EQUIPMENT_SLOT_WRISTS, EQUIPMENT_SLOT_HANDS,
+        EQUIPMENT_SLOT_BACK, EQUIPMENT_SLOT_MAINHAND, EQUIPMENT_SLOT_OFFHAND,
+        EQUIPMENT_SLOT_RANGED, EQUIPMENT_SLOT_TABARD
+    };
+
+    static void SendXmogCollectionTo(Player* player)
+    {
+        if (!player || !player->GetSession())
+            return;
+#ifndef WOWPS_HAS_TRANSMOG
+        SendWPSP(player, "XMOG_UNAVAIL\tmodule");
+#else
+        if (!sTransmogrification->GetUseCollectionSystem())
+        {
+            SendWPSP(player, "XMOG_UNAVAIL\tcollection");
+            return;
+        }
+
+        uint32 const accountId = player->GetSession()->GetAccountId();
+        auto const it = sTransmogrification->collectionCache.find(accountId);
+
+        // Which transmoggable slots the player actually has an item equipped in
+        // (so the addon shows a slot even when it has no collected appearance).
+        std::string slotsCsv;
+        for (uint8 slot : kXmogSlots)
+        {
+            Item* equipped = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (equipped && equipped->GetTemplate())
+            {
+                if (!slotsCsv.empty())
+                    slotsCsv += ',';
+                slotsCsv += std::to_string(uint32(slot));
+            }
+        }
+
+        SendWPSP(player, "XMOG_BEGIN");
+        SendWPSP(player, "XMOG_SLOTS\t" + slotsCsv);
+
+        std::string chunk;
+        chunk.reserve(240);
+        auto flush = [&]()
+        {
+            if (!chunk.empty())
+            {
+                SendWPSP(player, "XMOG\t" + chunk);
+                chunk.clear();
+            }
+        };
+
+        if (it != sTransmogrification->collectionCache.end())
+        {
+            for (uint8 slot : kXmogSlots)
+            {
+                Item* equipped = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+                if (!equipped)
+                    continue;
+                ItemTemplate const* dst = equipped->GetTemplate();
+                if (!dst)
+                    continue;
+                for (uint32 itemId : it->second)
+                {
+                    ItemTemplate const* src = sObjectMgr->GetItemTemplate(itemId);
+                    if (!src)
+                        continue;
+                    if (!sTransmogrification->SuitableForTransmogrification(player, src))
+                        continue;
+                    if (!sTransmogrification->CanTransmogrifyItemWithItem(player, dst, src))
+                        continue;
+                    std::string rec = std::to_string(uint32(slot)) + ":" + std::to_string(itemId);
+                    if (!chunk.empty() && chunk.size() + 1 + rec.size() > 220)
+                        flush();
+                    if (!chunk.empty())
+                        chunk += ';';
+                    chunk += rec;
+                }
+            }
+        }
+        flush();
+        SendWPSP(player, "XMOG_END");
+#endif
+    }
+
+    // payload: "<serverSlot> <itemId>"  (itemId 0 == remove the slot's transmog).
+    static void HandleXmogApply(Player* player, std::string_view payload)
+    {
+        if (!player || !player->GetSession())
+            return;
+#ifndef WOWPS_HAS_TRANSMOG
+        SendWPSP(player, "XMOG_RESULT\t255\t0");
+#else
+        uint32 slot = 255, itemId = 0;
+        {
+            std::string p(payload);
+            std::istringstream ss(p);
+            ss >> slot >> itemId;
+        }
+
+        std::string res = "0";
+        if (slot < EQUIPMENT_SLOT_END)
+        {
+            if (Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, uint8(slot)))
+            {
+                if (itemId == 0)
+                {
+                    sTransmogrification->DeleteFakeEntry(player, uint8(slot), item);
+                    res = "1";
+                }
+                else
+                {
+                    // The uint32-entry Transmogrify overload does NOT verify the
+                    // appearance is collected, so gate it here before applying.
+                    uint32 const accountId = player->GetSession()->GetAccountId();
+                    auto const it = sTransmogrification->collectionCache.find(accountId);
+                    bool const collected = it != sTransmogrification->collectionCache.end()
+                                        && it->second.count(itemId) > 0;
+                    if (collected
+                        && sTransmogrification->Transmogrify(player, itemId, uint8(slot), /*no_cost=*/false) == LANG_TRANSMOG_OK)
+                        res = "1";
+                }
+            }
+        }
+        SendWPSP(player, "XMOG_RESULT\t" + std::to_string(slot) + "\t" + res);
+#endif
     }
 }
 
@@ -7389,6 +7535,14 @@ public:
                                          player->GetGUID(), player->GetGUID(),
                                          std::string("WPSP\tPONG"), /*chatTag=*/0);
             player->GetSession()->SendPacket(&data);
+        }
+        else if (command == "REQ_XMOG")
+        {
+            SendXmogCollectionTo(player);
+        }
+        else if (command == "XMOG_APPLY")
+        {
+            HandleXmogApply(player, payload);
         }
         else
         {
