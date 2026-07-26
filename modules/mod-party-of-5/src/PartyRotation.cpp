@@ -6973,10 +6973,12 @@ namespace WowPsParty
             float const side = (rel >= 0.0f) ? 1.0f : -1.0f;         // exit toward the side we're on
             constexpr float EDGE = float(M_PI) * 0.5f + 0.30f;       // just past the 90° cone edge
 
-            WowPsParty::HoldFollower(bot->GetGUID(), 1200);
             if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE
                 && bot->isMoving())
+            {
+                WowPsParty::HoldFollower(bot->GetGUID(), 1200);
                 return true;                                         // let the in-flight sidestep finish
+            }
             std::vector<Unit*> clouds;
             GatherDamagingClouds(bot, 45.0f, clouds);
             for (float s : { side, -side })   // preferred side first, then the other if blocked/hazardous
@@ -6985,6 +6987,7 @@ namespace WowPsParty
                 enemy->GetNearPoint(bot, x, y, z, 0.0f, gap, facing + s * EDGE);
                 if (DestInDamage(bot, clouds, x, y, enemy, std::string())) continue;
                 if (!NavReachable(bot, x, y, z, gap)) continue;
+                WowPsParty::HoldFollower(bot->GetGUID(), 1200);
                 bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
                                                   0.0f, 0.0f, /*generatePath=*/true,
                                                   /*forceDestination=*/false);
@@ -6993,9 +6996,9 @@ namespace WowPsParty
             if (HazardLogThrottled(bot->GetGUID().GetCounter()))
                 LOG_INFO("module",
                     "[WowPsParty Rotation] {} dodge_frontals: both cone-edge exits around {} "
-                    "hazardous/unreachable - holding",
+                    "hazardous/unreachable - yielding to spell rotation",
                     bot->GetName(), enemy->GetName());
-            return true;   // boxed both sides — hold rather than walk deeper into the cone
+            return false;  // boxed both sides — retain position and continue normal rotation
         }
 
         // "stand_on_side" — hold the target's FLANK (~90° off its facing), clear of BOTH the
