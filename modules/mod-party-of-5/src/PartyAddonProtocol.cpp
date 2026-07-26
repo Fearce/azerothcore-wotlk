@@ -4179,6 +4179,129 @@ static void HandleAhSell(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// Forward declaration: PULL_TOOLS uses the same preserve-or-bounce transfer
+// primitive as the later inventory actions.
+static Item* PullItemToRequester(Player* requester, Player* srcChar, Item* item);
+
+// Return one loose bag item owned by `owner` that fulfils either a specific
+// profession-tool item requirement or a profession-tool category. The caller
+// has already confirmed both players share a Map*, so their inventories are
+// serialized by the same MapUpdater worker. Banked/equipped tools deliberately
+// do not qualify: native profession windows only see the crafter's bags.
+static Item* FindPullableProfessionTool(Player* owner, uint32 itemId, uint32 totemCategory)
+{
+    if (!owner) return nullptr;
+    auto matches = [owner, itemId, totemCategory](Item* item)
+    {
+        if (!item || item->IsEquipped() || item->IsNotEmptyBag()) return false;
+        ItemTemplate const* proto = WowPsParty::SafeItemTemplate(item);
+        if (!proto) return false;
+        return (itemId && proto->ItemId == itemId)
+            || (totemCategory && owner->IsTotemCategoryCompatiableWith(proto, totemCategory));
+    };
+
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        if (Item* item = owner->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            if (matches(item)) return item;
+
+    for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        if (Bag* bag = owner->GetBagByPos(bagSlot))
+            for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+                if (Item* item = bag->GetItemByPos(slot))
+                    if (matches(item)) return item;
+
+    return nullptr;
+}
+
+// Pull one tool that satisfies `itemId` or `totemCategory` from a loaded,
+// same-map hero. Unlike the server spell trampoline, this deliberately moves
+// the tool so the native client profession UI can observe it and enable Create.
+static bool PullProfessionTool(Player* requester, uint32 account, uint32 itemId, uint32 totemCategory)
+{
+    QueryResult members = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {}", account);
+    if (!members) return false;
+
+    do
+    {
+        uint32 const memberGuid = members->Fetch()[0].Get<uint32>();
+        if (memberGuid == requester->GetGUID().GetCounter()) continue;
+        Player* owner = ObjectAccessor::FindConnectedPlayer(
+            ObjectGuid::Create<HighGuid::Player>(memberGuid));
+        if (!owner || WowPsParty::MemberStorageUnstable(owner)) continue;
+        if (owner->GetMap() != requester->GetMap())
+        {
+            LOG_INFO("module", "[WowPsParty PullTools] requester={} requirement={}{} holder={} result=skipped reason=other-map",
+                     requester->GetName(), itemId ? "item=" : "category=",
+                     itemId ? itemId : totemCategory, owner->GetName());
+            continue;
+        }
+
+        Item* tool = FindPullableProfessionTool(owner, itemId, totemCategory);
+        if (!tool) continue;
+        ItemTemplate const* proto = WowPsParty::SafeItemTemplate(tool);
+        std::string const toolName = proto ? proto->Name1 : "tool";
+        if (!PullItemToRequester(requester, owner, tool))
+        {
+            LOG_WARN("module", "[WowPsParty PullTools] requester={} requirement={}{} holder={} result=failed reason=crafter-bags-full",
+                     requester->GetName(), itemId ? "item=" : "category=",
+                     itemId ? itemId : totemCategory, owner->GetName());
+            return false;
+        }
+
+        LOG_INFO("module", "[WowPsParty PullTools] requester={} requirement={}{} holder={} tool='{}' result=pulled",
+                 requester->GetName(), itemId ? "item=" : "category=",
+                 itemId ? itemId : totemCategory, owner->GetName(), toolName);
+        return true;
+    } while (members->NextRow());
+
+    LOG_INFO("module", "[WowPsParty PullTools] requester={} requirement={}{} result=not-found scope=loaded-same-map-bags",
+             requester->GetName(), itemId ? "item=" : "category=", itemId ? itemId : totemCategory);
+    return false;
+}
+
+// PULL_TOOLS\t<recipeSpellId>
+//   Recipe tools are not exposed by the 3.3.5 client as item links — only as a
+//   display string — so the addon sends the selected recipe spell and the server
+//   resolves its Totem[] (specific tool) and TotemCategory[] requirements. Pull
+//   one matching tool for each missing requirement into the crafter's bags; this
+//   is what makes the native "Requires <tool>" line and Create button update.
+static void HandlePullTools(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+    uint32 const spellId = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+    if (!spellId || !requester->HasSpell(spellId))
+    {
+        LOG_INFO("module", "[WowPsParty PullTools] requester={} recipe={} result=rejected reason=unknown-spell",
+                 requester->GetName(), spellId);
+        return;
+    }
+    SpellInfo const* spell = sSpellMgr->GetSpellInfo(spellId);
+    if (!spell || !spell->HasAttribute(SPELL_ATTR0_IS_TRADESKILL))
+    {
+        LOG_INFO("module", "[WowPsParty PullTools] requester={} recipe={} result=rejected reason=not-tradeskill",
+                 requester->GetName(), spellId);
+        return;
+    }
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    if (!WowPsParty::GetAccountSettings(account).sharedInventory)
+    {
+        LOG_INFO("module", "[WowPsParty PullTools] requester={} recipe={} result=skipped reason=shared-inventory-disabled",
+                 requester->GetName(), spellId);
+        return;
+    }
+
+    for (uint32 itemId : spell->Totem)
+        if (itemId && !requester->HasItemCount(itemId))
+            PullProfessionTool(requester, account, itemId, 0);
+    for (uint32 totemCategory : spell->TotemCategory)
+        if (totemCategory && !requester->HasItemTotemCategory(totemCategory))
+            PullProfessionTool(requester, account, 0, totemCategory);
+
+    WowPsParty::SendInventoryTo(requester);
+}
+
 // PULL_REAGENT\t<itemId>
 //   Consolidate every copy of <itemId> from the OTHER party members' bags into
 //   the requester's (the crafting character's) own bags. The native tradeskill
@@ -6667,6 +6790,10 @@ public:
         else if (command == "PULL_REAGENT")
         {
             HandlePullReagent(player, payload);
+        }
+        else if (command == "PULL_TOOLS")
+        {
+            HandlePullTools(player, payload);
         }
         else if (command == "DESTROY")
         {

@@ -45,6 +45,7 @@
 
 #include <algorithm>
 #include <mutex>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #ifdef _WIN32
@@ -417,13 +418,22 @@ namespace
     static bool UsableToolCategory(Player* p, uint32 cat)
     {
         if (!p) return false;
+        auto matches = [p, cat](Item* it)
+        {
+            if (!WowPsParty::WowPsItemReadable(it)) return false;
+            // A freed-but-still-mapped bag slot can yield a plausible Item pointer
+            // with a garbage entry. Never pass a null template to
+            // IsTotemCategoryCompatiableWith: that helper dereferences it.
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(it->GetEntry());
+            return proto && p->IsTotemCategoryCompatiableWith(proto, cat);
+        };
         for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_ITEM_END; ++i)
             if (Item* it = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
-                if (WowPsParty::WowPsItemReadable(it) && p->IsTotemCategoryCompatiableWith(it->GetTemplate(), cat))
+                if (matches(it))
                     return true;
         for (uint8 i = KEYRING_SLOT_START; i < CURRENCYTOKEN_SLOT_END; ++i)
             if (Item* it = p->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
-                if (WowPsParty::WowPsItemReadable(it) && p->IsTotemCategoryCompatiableWith(it->GetTemplate(), cat))
+                if (matches(it))
                     return true;
         for (uint8 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_END; ++i)
             if (Bag* bag = p->GetBagByPos(i))
@@ -432,7 +442,7 @@ namespace
                     continue;
                 for (uint32 j = 0; j < bag->GetBagSize(); ++j)
                     if (Item* it = bag->GetItemByPos(j))
-                        if (WowPsParty::WowPsItemReadable(it) && p->IsTotemCategoryCompatiableWith(it->GetTemplate(), cat))
+                        if (matches(it))
                             return true;
             }
         return false;
@@ -1489,31 +1499,46 @@ uint32 WowPsParty_PartyReagentCount(Player* crafter, uint32 itemId)
 // TotemCategory, surfaced client-side as "Requires Blacksmith Hammer"). In the
 // shared-inventory party that tool may sit in a party-mate's bags instead; the
 // merged Party Inventory already shows it as "yours", so demanding it on the
-// crafter specifically is the friction this removes. TRUE if the crafter OR any
-// loaded party peer holds a matching tool. A tool is never consumed, so it is
-// safe to satisfy this read-only requirement from a peer on another map; unlike
-// the reagent pool there is no cross-map inventory mutation to keep symmetric.
-// Solo / shared-inventory-off falls back to the crafter's own bags == the vanilla
-// Player::HasItemTotemCategory predicate it augments.
+// crafter specifically is the friction this removes. TRUE if the crafter OR a
+// loaded SAME-MAP party peer holds a matching tool. The same-map boundary is
+// required even for this read: a peer on another MapUpdater thread can mutate or
+// save its bags while this check walks them. Solo / shared-inventory-off falls
+// back to the crafter's own bags == the vanilla Player::HasItemTotemCategory
+// predicate it augments.
 bool WowPsParty_PartyHasTotemCategory(Player* crafter, uint32 totemCategory)
 {
     if (!crafter) return false;
     if (crafter->HasItemTotemCategory(totemCategory))
         return true;
     if (!WowPsParty::IsEnabled() || !WowPsParty::InventoryShared(crafter))
+    {
+        LOG_INFO("module", "[WowPsParty Tool] {} craft tool-category={} result=missing reason=shared-inventory-disabled",
+                 crafter->GetName(), totemCategory);
         return false;   // solo: own bags only == vanilla predicate
+    }
+
+    std::ostringstream peers;
+    bool first = true;
     for (Player* p : LoadedPartyPeers(crafter->GetSession()->GetAccountId(), crafter))
     {
-        // UsableToolCategory SEH-guards every inventory read, including peers on
-        // other MapUpdater threads. A tool is never consumed, so accepting that
-        // guarded read cannot race a cross-map mutation like reagent consumption.
+        if (!first) peers << ',';
+        first = false;
+        peers << p->GetName() << ':';
+        if (p->GetMap() != crafter->GetMap())
+        {
+            peers << "other-map(" << p->GetMapId() << ')';
+            continue;
+        }
         if (UsableToolCategory(p, totemCategory))
         {
             LOG_INFO("module", "[WowPsParty Tool] {} craft tool-category={} holder={} holderMap={} crafterMap={} source=party-inventory",
                      crafter->GetName(), totemCategory, p->GetName(), p->GetMapId(), crafter->GetMapId());
             return true;
         }
+        peers << "missing";
     }
+    LOG_INFO("module", "[WowPsParty Tool] {} craft tool-category={} result=missing peers=[{}] reason=no-same-map-holder",
+             crafter->GetName(), totemCategory, peers.str());
     return false;
 }
 
@@ -1526,10 +1551,10 @@ bool WowPsParty_PartyHasTotemCategory(Player* crafter, uint32 totemCategory)
 // from WowPsParty_PartyHasTotemCategory above. In the shared-inventory party the
 // tool may sit in a party-mate's bags instead of the crafter's — the merged Party
 // Inventory already shows it as "yours", so demanding it on the crafter is the
-// friction this removes. TRUE if the crafter OR any loaded party peer holds the
-// item. A tool is never consumed, so it can safely be checked in a party-mate's
-// bags on another map; unlike the reagent pool there is no cross-map mutation.
-// Solo / shared-inventory-off falls back to the crafter's own bags == the vanilla
+// friction this removes. TRUE if the crafter OR a loaded SAME-MAP party peer
+// holds the item. An off-map peer's bag storage can mutate on another MapUpdater
+// thread while this check reads it, so it is deliberately not inspected. Solo /
+// shared-inventory-off falls back to the crafter's own bags == the vanilla
 // Player::HasItemCount predicate.
 bool WowPsParty_PartyHasTotemItem(Player* crafter, uint32 itemId)
 {
@@ -1537,19 +1562,34 @@ bool WowPsParty_PartyHasTotemItem(Player* crafter, uint32 itemId)
     if (crafter->HasItemCount(itemId))
         return true;
     if (!WowPsParty::IsEnabled() || !WowPsParty::InventoryShared(crafter))
+    {
+        LOG_INFO("module", "[WowPsParty Tool] {} craft tool-item={} result=missing reason=shared-inventory-disabled",
+                 crafter->GetName(), itemId);
         return false;   // solo: own bags only == vanilla predicate
+    }
+
+    std::ostringstream peers;
+    bool first = true;
     for (Player* p : LoadedPartyPeers(crafter->GetSession()->GetAccountId(), crafter))
     {
-        // UsableReagentCount is the SEH-guarded, non-mutating inventory probe
-        // used for peer bags. Unlike a reagent, a required tool is never removed,
-        // so it remains safe to use this guarded result across MapUpdater threads.
+        if (!first) peers << ',';
+        first = false;
+        peers << p->GetName() << ':';
+        if (p->GetMap() != crafter->GetMap())
+        {
+            peers << "other-map(" << p->GetMapId() << ')';
+            continue;
+        }
         if (UsableReagentCount(p, itemId))
         {
             LOG_INFO("module", "[WowPsParty Tool] {} craft tool-item={} holder={} holderMap={} crafterMap={} source=party-inventory",
                      crafter->GetName(), itemId, p->GetName(), p->GetMapId(), crafter->GetMapId());
             return true;
         }
+        peers << "missing";
     }
+    LOG_INFO("module", "[WowPsParty Tool] {} craft tool-item={} result=missing peers=[{}] reason=no-same-map-holder",
+             crafter->GetName(), itemId, peers.str());
     return false;
 }
 
