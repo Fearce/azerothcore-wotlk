@@ -7074,7 +7074,7 @@ namespace WowPsParty
         if (bot->IsInCombat())
         {
             std::vector<std::string> focusNames;
-            WowPsParty::BotFocusNames(bot->GetGUID(), focusNames);
+            WowPsParty::BotFocusNames(bot->GetGUID(), focusNames, bot);
             if (!focusNames.empty())
                 focusMob = FindNearestFocusEnemy(bot, focusNames, FOCUS_SCAN_RANGE, /*engagedOnly=*/false);
             // focus_engaged:<names> — same override but ONLY onto a match the party is
@@ -7082,7 +7082,7 @@ namespace WowPsParty
             if (!focusMob)
             {
                 std::vector<std::string> focusEngagedNames;
-                WowPsParty::BotFocusEngagedNames(bot->GetGUID(), focusEngagedNames);
+                WowPsParty::BotFocusEngagedNames(bot->GetGUID(), focusEngagedNames, bot);
                 if (!focusEngagedNames.empty())
                     focusMob = FindNearestFocusEnemy(bot, focusEngagedNames, FOCUS_SCAN_RANGE, /*engagedOnly=*/true);
             }

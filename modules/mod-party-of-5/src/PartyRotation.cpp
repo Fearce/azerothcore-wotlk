@@ -224,41 +224,105 @@ namespace WowPsParty
         return false;
     }
 
-    // Collect the comma-separated names from every enabled "focus:<a>,<b>,…" rule the
-    // bot runs. These are must-kill adds (Chaos Rift on Anomalus, Frost Tomb in Utgarde
-    // Keep) the party should switch to on sight; AssistTarget overrides target selection
-    // onto the nearest match. Scans BOTH the bot's OWN rotation AND the account's COMMON
-    // (shared) rotation — keyed off the LEADER's account exactly like TickRotation — so a
-    // focus: rule placed in the Common tab works (heroes AND henchmen). Before this, the
-    // accessor read ONLY the per-bot cache, so a focus rule moved from a DPS's own tab
-    // into Common was silently ignored: the party kept hitting the boss and ignored the
-    // Frost Tomb (Kevin's report).
-    // Shared collector: gather the comma-separated names from every enabled rule whose
-    // action starts with `prefix` ("focus:" or "focus_engaged:"), across the bot's OWN and
-    // the account's COMMON (shared) rotation (leader-keyed, like TickRotation).
-    static void CollectFocusList(ObjectGuid guid, std::string const& prefix, std::vector<std::string>& out)
+    // Strip the clauses that read the bot's CURRENT VICTIM, returning the rest of the
+    // AND-chain. Only the focus harvest uses this: focus: exists to CHOOSE the victim, so
+    // gating it on the victim we have not picked yet is circular — and it would break the
+    // documented "is_immune | focus:X" / "target_name:X | focus:Y" peel rules, which must
+    // keep harvesting exactly as they did before conditions were honoured at all.
+    // Deliberately NOT folded into EvalCondition's skipTargetClauses: cast_spread/cast_scan
+    // share that flag and re-check only the `target_` prefix per candidate, so widening it
+    // there would drop is_immune from spread gating entirely instead of deferring it.
+    static std::string WithoutVictimClauses(std::string const& cond)
+    {
+        auto victimScoped = [](std::string c)
+        {
+            if (!c.empty() && c[0] == '!') c.erase(0, 1);
+            return c.rfind("target_", 0) == 0
+                || c == "is_immune" || c.rfind("is_immune:", 0) == 0
+                || c == "has_target" || c == "no_target";
+        };
+        std::string kept;
+        size_t p = 0;
+        while (p <= cond.size())
+        {
+            size_t const amp = cond.find('&', p);
+            std::string clause = (amp == std::string::npos)
+                ? cond.substr(p) : cond.substr(p, amp - p);
+            if (!clause.empty() && !victimScoped(clause))
+            {
+                if (!kept.empty()) kept += '&';
+                kept += clause;
+            }
+            if (amp == std::string::npos) break;
+            p = amp + 1;
+        }
+        return kept;   // all clauses victim-scoped -> empty -> EvalCondition passes
+    }
+
+    // Report a bot's RESOLVED focus set the first time it is seen and on every change.
+    // Now that conditions gate the harvest, the set is dynamic (a my_name:/role-scoped
+    // assignment, a rule that arms only in combat), and "which henchman is actually on
+    // which boss" is the first thing to check when a raid split misbehaves. Emitted only
+    // on CHANGE and at most once per bot+prefix per FOCUS_LOG_COOLDOWN_MS: the gating
+    // condition can flap (ally_aura_stacks crossing its threshold, enemies_within), and
+    // this is called twice per bot per assist tick, so change-detection alone would let a
+    // flapping gate flood Server.log through a raid pull.
+    // thread_local: a bot is only ever updated on its map's thread.
+    static constexpr uint32 FOCUS_LOG_COOLDOWN_MS = 4000;
+    static void LogFocusSetChange(ObjectGuid guid, Player* bot,
+                                  std::string const& prefix,
+                                  std::vector<std::string> const& names)
+    {
+        struct FocusLogState { std::string names; uint32 atMs; };
+        static thread_local std::unordered_map<std::string, FocusLogState> lastSeen;
+        std::string joined;
+        for (std::string const& n : names)
+        {
+            if (!joined.empty()) joined += ", ";
+            joined += n;
+        }
+        std::string const key = std::to_string(guid.GetCounter()) + prefix;
+        uint32 const now = getMSTime();
+        auto const it = lastSeen.find(key);
+        if (it != lastSeen.end()
+            && (it->second.names == joined
+                || now - it->second.atMs < FOCUS_LOG_COOLDOWN_MS))
+            return;
+        lastSeen[key] = { joined, now };
+        LOG_INFO("module", "[WowPsParty Focus] {} {} -> [{}]",
+                 bot ? bot->GetName() : std::to_string(guid.GetCounter()),
+                 prefix, joined.empty() ? "none" : joined);
+    }
+
+    // Gather the comma-separated names from every enabled rule whose action starts with
+    // `prefix` ("focus:" or "focus_engaged:") and whose condition currently holds. These
+    // are must-kill adds (Chaos Rift on Anomalus, Frost Tomb in Utgarde Keep) the party
+    // should switch to on sight; AssistTarget overrides target selection onto the nearest
+    // match. Scans BOTH the bot's OWN rotation AND the account's COMMON (shared) rotation
+    // — keyed off the LEADER's account exactly like TickRotation — so a focus: rule placed
+    // in the Common tab works for heroes AND henchmen. (Before that it read only the
+    // per-bot cache, so a focus rule moved from a DPS's own tab into Common was silently
+    // ignored: the party kept hitting the boss and left the Frost Tomb up — Kevin's report.)
+    static void CollectFocusList(ObjectGuid guid, std::string const& prefix,
+                                 std::vector<std::string>& out, Player* bot)
     {
         out.clear();
         size_t const plen = prefix.size();
+
+        // Gather (condition, name-list) pairs FIRST and evaluate afterwards — never with
+        // g_rotationCacheMutex held. Evaluating in place would run a condition (which can
+        // reach GatherPartyPlayers -> PartyFollow's g_mutex, and 45-60y grid scans for
+        // enemies_within / enemy_has_aura) under a lock every map thread shares, and would
+        // create a g_rotationCacheMutex -> g_mutex ordering edge this file otherwise never
+        // takes. BotIsKiting copies out under the lock for exactly this reason.
+        std::vector<std::pair<std::string, std::string>> candidates;   // condition, list
         auto scan = [&](std::vector<RotationRule> const& rules)
         {
             for (RotationRule const& r : rules)
             {
                 if (r.action.rfind(prefix, 0) != 0) continue;
                 if (CsvContains(Lower(r.flags), "disabled")) continue;
-                std::string const list = r.action.substr(plen);   // after the prefix
-                size_t start = 0;
-                while (start <= list.size())
-                {
-                    size_t const comma = list.find(',', start);
-                    std::string token = list.substr(
-                        start, comma == std::string::npos ? std::string::npos : comma - start);
-                    size_t const a = token.find_first_not_of(" \t");
-                    size_t const b = token.find_last_not_of(" \t");
-                    if (a != std::string::npos) out.push_back(token.substr(a, b - a + 1));
-                    if (comma == std::string::npos) break;
-                    start = comma + 1;
-                }
+                candidates.emplace_back(r.condition, r.action.substr(plen));
             }
         };
 
@@ -273,16 +337,44 @@ namespace WowPsParty
         // sections so a focus:/keep_distance rule scripted under a boss is still seen.
         if (uint32 const acct = SharedAccountFor(guid))
             scan(GetSharedAndMobRotation(acct));
+
+        for (auto const& c : candidates)
+        {
+            // A focus rule's CONDITION gates it, exactly like every other rule —
+            // harvesting on action presence alone made per-bot assignment impossible:
+            // "my_name:Zoe|focus:Lady Blaumeux" in the COMMON tab handed Blaumeux to
+            // the WHOLE party, so a raid could not split its henchmen across targets
+            // (and only the first 5 members get a per-member tab to scope it in).
+            if (bot && !EvalCondition(WithoutVictimClauses(c.first), bot, nullptr, false))
+                continue;
+            std::string const& list = c.second;
+            size_t start = 0;
+            while (start <= list.size())
+            {
+                size_t const comma = list.find(',', start);
+                std::string token = list.substr(
+                    start, comma == std::string::npos ? std::string::npos : comma - start);
+                size_t const a = token.find_first_not_of(" \t");
+                size_t const b = token.find_last_not_of(" \t");
+                if (a != std::string::npos) out.push_back(token.substr(a, b - a + 1));
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+        }
+
+        LogFocusSetChange(guid, bot, prefix, out);
     }
 
-    void BotFocusNames(ObjectGuid guid, std::vector<std::string>& out)
-    { CollectFocusList(guid, "focus:", out); }
+    // `bot` (when supplied) gates each rule on its CONDITION; without it the harvest
+    // falls back to presence, so a caller that has no Player* still sees every name.
+    void BotFocusNames(ObjectGuid guid, std::vector<std::string>& out, Player* bot)
+    { CollectFocusList(guid, "focus:", out, bot); }
 
     // Like focus:, but AssistTarget only switches onto a match the PARTY is ALREADY in
     // combat with — the bot won't run off to a same-named mob that hasn't been pulled yet
     // (Kevin: a focus that doesn't go aggro stray mobs that merely share the name).
-    void BotFocusEngagedNames(ObjectGuid guid, std::vector<std::string>& out)
-    { CollectFocusList(guid, "focus_engaged:", out); }
+    void BotFocusEngagedNames(ObjectGuid guid, std::vector<std::string>& out, Player* bot)
+    { CollectFocusList(guid, "focus_engaged:", out, bot); }
 
     // ---- per-tank multi-pull count (pull_count) ----------------------------
     // First-class per-bot setting (party_loadout.pull_count), set from the rotation
@@ -3071,6 +3163,38 @@ namespace WowPsParty
                 Unit* u = (cname == "self_aura_stacks") ? bot : theTarget();
                 int const stacks = u ? int(NamedAuraStacks(u, n, auraCaster)) : 0;
                 return op == '<' ? (stacks < want) : (stacks > want);
+            }
+            // ally_aura_stacks:<spell><op>N — the HIGHEST stack count of the named aura
+            // on any OTHER party member (excludes self, like allies_within). This is the
+            // cross-bot HANDOFF primitive: self_aura_stacks only ever sees the bot's own
+            // debuff, so two bots sharing one duty could not see each other saturate and
+            // stepped out together. The canonical case is Naxxramas' Four Horsemen: a body
+            // must stay inside Blaumeux/Zeliek's 45y range at all times (leaving it makes
+            // them cast a 200y, ~5.6k Unyielding Pain / Condemnation on the whole raid) yet
+            // nobody may reach 5 stacks of that horseman's Mark (12.5k on application). The
+            // relief bot arms on
+            //   "ally_aura_stacks:Mark of Blaumeux>2&!self_aura_stacks:Mark of Blaumeux>2"
+            // so it moves in exactly as its partner saturates, and back out once its own
+            // stacks climb — the pair self-alternates with no timer and no gap.
+            // Nobody else holding it reads 0, so ">N" is false and "<N" is true: a bot left
+            // on its own behaves as though its partner were fresh, never as though it were
+            // covered. Dead members are skipped (a corpse can't hold the spot).
+            // SCOPE: "ally" is every OTHER same-map member GatherPartyPlayers can see —
+            // which folds in the whole WoW group, so in a raid that is all 9 others, not
+            // just a nominated partner. Pair it with an aura only the duty-holders can
+            // carry (a per-horseman Mark, a stacking debuff from one boss); against a
+            // raid-wide aura it degrades to "is anyone at all stacked".
+            if (cname == "ally_aura_stacks")
+            {
+                std::string n; char op; int want;
+                if (!unpackNameOpVal(n, op, want)) return false;
+                std::vector<Player*> party;
+                GatherPartyPlayers(bot, party, /*includeDead=*/false);
+                int most = 0;
+                for (Player* m : party)
+                    if (m && m != bot)
+                        most = std::max(most, int(NamedAuraStacks(m, n, auraCaster)));
+                return op == '<' ? (most < want) : (most > want);
             }
             // party_aura_clustered:<spell><op>R — for a debuff that EXPLODES on cleanse and
             // hits nearby allies (Grobbulus's Mutating Injection, 20y). For a party member

@@ -129,6 +129,11 @@ compile_commands.json
 !/modules/mod-ale/
 !/modules/mod-ale/**
 /modules/mod-ale/MythicPlus/Data/Client/
+# The blanket un-ignore above also re-includes build output dropped inside the
+# vendored tree, so a `git add -A` would commit compiler debug databases.
+/modules/mod-ale/**/*.pdb
+/modules/mod-ale/**/*.obj
+/modules/mod-ale/**/*.ilk
 
 # WowPs: vendor mod-playerbots (our patched fork) into the server repo.
 !/modules/mod-playerbots/

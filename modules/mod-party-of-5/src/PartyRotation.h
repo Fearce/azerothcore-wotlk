@@ -233,10 +233,16 @@ namespace WowPsParty
     // Names listed in the bot's rotation "focus:" rule(s) — adds the party must
     // kill on sight (e.g. "Chaos Rift", "Frost Tomb"). Empty when none configured.
     // AssistTarget reads this to override target selection onto a matching enemy.
-    void BotFocusNames(ObjectGuid guid, std::vector<std::string>& out);
+    // `bot` gates each rule on its CONDITION (victim-scoped clauses excepted — the victim
+    // is what we're picking): that is what lets ONE Common-tab rule per bot
+    // ("my_name:Zoe|focus:Lady Blaumeux") split a raid's henchmen across targets,
+    // including the members past the 5th who have no per-member tab. Required rather
+    // than defaulted — a nullptr silently reverts to the old ungated harvest, so it must
+    // be a deliberate choice at the call site, not an omission.
+    void BotFocusNames(ObjectGuid guid, std::vector<std::string>& out, Player* bot);
     // Like BotFocusNames but for "focus_engaged:" rules — the override only fires on a
     // match the PARTY is already in combat with (won't chase an un-pulled same-named mob).
-    void BotFocusEngagedNames(ObjectGuid guid, std::vector<std::string>& out);
+    void BotFocusEngagedNames(ObjectGuid guid, std::vector<std::string>& out, Player* bot);
 
     // A lead tank's configured INITIAL-pull target size. Default 3, clamped [1,8];
     // 1 = the classic single-mob pull. TankLeadEngagement reads this to body-pull a
