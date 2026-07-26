@@ -6998,7 +6998,7 @@ namespace WowPsParty
                     "[WowPsParty Rotation] {} dodge_frontals: both cone-edge exits around {} "
                     "hazardous/unreachable - yielding to spell rotation",
                     bot->GetName(), enemy->GetName());
-            return false;  // boxed both sides — retain position and continue normal rotation
+            return false;  // boxed both sides: yield to normal spell rotation
         }
 
         // "stand_on_side" — hold the target's FLANK (~90° off its facing), clear of BOTH the
@@ -7037,10 +7037,12 @@ namespace WowPsParty
             float const side = (rel >= 0.0f) ? 1.0f : -1.0f;      // slide to the arc we're on
             constexpr float FLANK = float(M_PI) * 0.5f;           // 90° — the true side
 
-            WowPsParty::HoldFollower(bot->GetGUID(), 1200);
             if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE
                 && bot->isMoving())
+            {
+                WowPsParty::HoldFollower(bot->GetGUID(), 1200);
                 return true;                                      // let the in-flight sidestep finish
+            }
             std::vector<Unit*> clouds;
             GatherDamagingClouds(bot, 45.0f, clouds);
             for (float s : { side, -side })   // preferred side first, other if blocked/hazardous
@@ -7049,6 +7051,7 @@ namespace WowPsParty
                 enemy->GetNearPoint(bot, x, y, z, 0.0f, gap, facing + s * FLANK);
                 if (DestInDamage(bot, clouds, x, y, enemy, std::string())) continue;
                 if (!NavReachable(bot, x, y, z, gap)) continue;
+                WowPsParty::HoldFollower(bot->GetGUID(), 1200);
                 bot->GetMotionMaster()->MovePoint(0, x, y, z, FORCED_MOVEMENT_NONE,
                                                   0.0f, 0.0f, /*generatePath=*/true,
                                                   /*forceDestination=*/false);
@@ -7057,9 +7060,9 @@ namespace WowPsParty
             if (HazardLogThrottled(bot->GetGUID().GetCounter()))
                 LOG_INFO("module",
                     "[WowPsParty Rotation] {} stand_on_side: both flanks of {} "
-                    "hazardous/unreachable - holding",
+                    "hazardous/unreachable - yielding to spell rotation",
                     bot->GetName(), enemy->GetName());
-            return true;   // boxed both sides — hold rather than walk into a danger arc
+            return false;  // boxed both sides: yield rather than walk into a danger arc
         }
 
         // "stay_in_front:N" — hold the target's FRONTAL arc, N yards out (the direction it
