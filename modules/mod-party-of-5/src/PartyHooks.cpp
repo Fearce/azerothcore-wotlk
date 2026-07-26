@@ -1490,8 +1490,9 @@ uint32 WowPsParty_PartyReagentCount(Player* crafter, uint32 itemId)
 // shared-inventory party that tool may sit in a party-mate's bags instead; the
 // merged Party Inventory already shows it as "yours", so demanding it on the
 // crafter specifically is the friction this removes. TRUE if the crafter OR any
-// loaded same-map party peer holds a matching tool. A tool is never consumed, so
-// unlike the reagent pool there is no consume counterpart to keep symmetric.
+// loaded party peer holds a matching tool. A tool is never consumed, so it is
+// safe to satisfy this read-only requirement from a peer on another map; unlike
+// the reagent pool there is no cross-map inventory mutation to keep symmetric.
 // Solo / shared-inventory-off falls back to the crafter's own bags == the vanilla
 // Player::HasItemTotemCategory predicate it augments.
 bool WowPsParty_PartyHasTotemCategory(Player* crafter, uint32 totemCategory)
@@ -1503,22 +1504,13 @@ bool WowPsParty_PartyHasTotemCategory(Player* crafter, uint32 totemCategory)
         return false;   // solo: own bags only == vanilla predicate
     for (Player* p : LoadedPartyPeers(crafter->GetSession()->GetAccountId(), crafter))
     {
-        // Same-Map* peers only. HasItemTotemCategory walks the peer's bags, and an
-        // off-map peer updates on another MapUpdater thread — reading a bag it is
-        // concurrently saving can dereference a freed Item* (the dangling-item bag
-        // UAF). Compare Map* not map id: two instances of one map are distinct
-        // update contexts.
-        if (p->GetMap() != crafter->GetMap())
-        {
-            if (UsableToolCategory(p, totemCategory))
-                LOG_DEBUG("module", "[WowPsParty Tool] tool category {} held by party-mate {} is on another map ({} vs {}); not counted for {}'s craft.",
-                          totemCategory, p->GetName(), p->GetMapId(), crafter->GetMapId(), crafter->GetName());
-            continue;
-        }
+        // UsableToolCategory SEH-guards every inventory read, including peers on
+        // other MapUpdater threads. A tool is never consumed, so accepting that
+        // guarded read cannot race a cross-map mutation like reagent consumption.
         if (UsableToolCategory(p, totemCategory))
         {
-            LOG_INFO("module", "[WowPsParty Tool] {}'s craft satisfies tool category {} from party-mate {}'s bags (shared inventory).",
-                     crafter->GetName(), totemCategory, p->GetName());
+            LOG_INFO("module", "[WowPsParty Tool] {} craft tool-category={} holder={} holderMap={} crafterMap={} source=party-inventory",
+                     crafter->GetName(), totemCategory, p->GetName(), p->GetMapId(), crafter->GetMapId());
             return true;
         }
     }
@@ -1534,10 +1526,11 @@ bool WowPsParty_PartyHasTotemCategory(Player* crafter, uint32 totemCategory)
 // from WowPsParty_PartyHasTotemCategory above. In the shared-inventory party the
 // tool may sit in a party-mate's bags instead of the crafter's — the merged Party
 // Inventory already shows it as "yours", so demanding it on the crafter is the
-// friction this removes. TRUE if the crafter OR any loaded same-map party peer
-// holds the item. A tool is never consumed, so unlike the reagent pool there is
-// no consume counterpart to keep symmetric. Solo / shared-inventory-off falls
-// back to the crafter's own bags == the vanilla Player::HasItemCount predicate.
+// friction this removes. TRUE if the crafter OR any loaded party peer holds the
+// item. A tool is never consumed, so it can safely be checked in a party-mate's
+// bags on another map; unlike the reagent pool there is no cross-map mutation.
+// Solo / shared-inventory-off falls back to the crafter's own bags == the vanilla
+// Player::HasItemCount predicate.
 bool WowPsParty_PartyHasTotemItem(Player* crafter, uint32 itemId)
 {
     if (!crafter) return false;
@@ -1547,22 +1540,13 @@ bool WowPsParty_PartyHasTotemItem(Player* crafter, uint32 itemId)
         return false;   // solo: own bags only == vanilla predicate
     for (Player* p : LoadedPartyPeers(crafter->GetSession()->GetAccountId(), crafter))
     {
-        // Same-Map* peers only. Reading an off-map peer's bags (it updates on
-        // another MapUpdater thread) can dereference a freed Item* — the recurring
-        // dangling-item bag UAF. UsableReagentCount SEH-guards every slot read, so
-        // it is the safe presence probe for a PEER's bags. Compare Map* not map id:
-        // two instances of one map are distinct update contexts.
-        if (p->GetMap() != crafter->GetMap())
-        {
-            if (UsableReagentCount(p, itemId))
-                LOG_DEBUG("module", "[WowPsParty Tool] required tool item {} held by party-mate {} is on another map ({} vs {}); not counted for {}'s craft.",
-                          itemId, p->GetName(), p->GetMapId(), crafter->GetMapId(), crafter->GetName());
-            continue;
-        }
+        // UsableReagentCount is the SEH-guarded, non-mutating inventory probe
+        // used for peer bags. Unlike a reagent, a required tool is never removed,
+        // so it remains safe to use this guarded result across MapUpdater threads.
         if (UsableReagentCount(p, itemId))
         {
-            LOG_INFO("module", "[WowPsParty Tool] {}'s craft satisfies required tool item {} from party-mate {}'s bags (shared inventory).",
-                     crafter->GetName(), itemId, p->GetName());
+            LOG_INFO("module", "[WowPsParty Tool] {} craft tool-item={} holder={} holderMap={} crafterMap={} source=party-inventory",
+                     crafter->GetName(), itemId, p->GetName(), p->GetMapId(), crafter->GetMapId());
             return true;
         }
     }
