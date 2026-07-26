@@ -137,6 +137,17 @@ namespace WowPsParty
     // mirror the controlled body's target onto the rest of the party.
     ObjectGuid GetLeaderFor(ObjectGuid followerGuid);
 
+    // Distance from its owner past which a follower breaks off and rejoins: 70y on a
+    // RAID map, 50y everywhere else. Raid encounters spread the party far wider than
+    // the 5-man corridors the original figure was tuned for. Every leash check — the
+    // follow ticker, AssistTarget's yield and TickRotation's — must read this so they
+    // agree; a mismatch leaves a bot that is allowed to stand somewhere but refuses to
+    // cast there. The separate >100y emergency teleport is NOT scaled by this.
+    float PartyLeashRadius(Player const* follower);
+    // How far to look for a "focus:<name>" target. Tracks the leash, since anything
+    // beyond it would be walked back before the bot arrived.
+    float PartyFocusScanRange(Player const* bot);
+
     // Minimal "auto-attack the leader's victim + chase" assist used
     // when the user has NOT defined a rotation rule that matched on
     // this tick. We deliberately do NOT run mod-playerbots' default

@@ -1219,6 +1219,30 @@ namespace WowPsParty
         return true;
     }
 
+    // How far a follower may get from its OWNER before it stops fighting and rejoins.
+    // 50y is tuned for 5-man corridors. A raid room is far bigger: Naxxramas' Four
+    // Horsemen park 60-121y apart and must ALL be held at once (leaving Blaumeux or
+    // Zeliek unattended casts a 200y, ~5.6k raid-wide punish), yet every corner sits
+    // 57-62y from the room centre — just outside 50y. So the whole raid went inert in
+    // the corners it was sent to (Kevin: "they didn't go to their respective corners
+    // ... so we still wiped"). Raid MAPS get 70y, which covers every corner from the
+    // centre; a 5-man keeps 50y even when the group is flagged raid to fit >4 henchmen.
+    // The >100y emergency teleport is deliberately unchanged and still recovers a bot
+    // that genuinely strands.
+    float PartyLeashRadius(Player const* follower)
+    {
+        Map const* map = follower ? follower->FindMap() : nullptr;
+        return (map && map->IsRaid()) ? 70.0f : 50.0f;
+    }
+
+    // A focus: target further away than the leash is unreachable — the follower would be
+    // walked back before it arrived — so the scan tracks the leash instead of carrying its
+    // own number. At 50y in a raid a bot could not even SEE the horseman it was assigned.
+    float PartyFocusScanRange(Player const* bot)
+    {
+        return PartyLeashRadius(bot);
+    }
+
     ObjectGuid GetLeaderFor(ObjectGuid followerGuid)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -5586,7 +5610,7 @@ namespace WowPsParty
         };
 
         // EVERY member's victim — NO range cap, so an idle bot gap-closes to a
-        // groupmate fighting OUT of range (the >50y leader leash still bounds how
+        // groupmate fighting OUT of range (the party leash still bounds how
         // far it strays). The tank's victim is flagged so the party focus-fires
         // the tank's kill when there is one.
         for (Player* m : members)
@@ -5594,7 +5618,7 @@ namespace WowPsParty
 
         // Grid search: every nearby enemy actually engaged with the party —
         // melee OR ranged. Bounded to 45y so we don't grab a fight across the
-        // zone; the >50y party leash above caps the wander further.
+        // zone; the party leash above caps the wander further.
         std::list<Unit*> units;
         Acore::AnyUnfriendlyUnitInObjectRangeCheck check(bot, bot, 45.0f);
         Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck>
@@ -6472,8 +6496,6 @@ namespace WowPsParty
         return true;
     }
 
-    static constexpr float FOCUS_SCAN_RANGE = 50.0f;   // how far to look for a "focus:" add
-
     // True if any party member (or their non-totem pet) is in combat with `mob`. Mirrors
     // the engagedWithParty check used by the loose-enemy picker — IsInCombatWith catches a
     // RANGED attacker that getAttackers() (melee only) misses.
@@ -6746,14 +6768,20 @@ namespace WowPsParty
             return;
         }
 
-        // Party leash: once the leader is >50y away, stop engaging and let the
-        // follow ticker bring us back (it walks at 50y, teleports past 100y).
+        // Party leash: once the leader is beyond PartyLeashRadius, stop engaging and let
+        // the follow ticker bring us back (it walks at the leash, teleports past 100y).
         // Yielding here stops the AI tick from re-acquiring a target between
         // the 1Hz follow ticks.
-        if (bot->GetDistance(leader) > 50.0f)
+        float const leashYd = PartyLeashRadius(bot);
+        if (bot->GetDistance(leader) > leashYd)
         {
             if (bot->GetVictim()) bot->AttackStop();
-            AssistLog(gLow, "skip: beyond party leash (>50y) — rejoining leader");
+            // Literals, not a formatted string: AssistTarget runs ~100x/s per bot and the
+            // 4s throttle gates the LOG, not the formatting — building a std::string every
+            // tick just to throw it away is pure waste. Two messages, two throttle slots.
+            AssistLog(gLow, leashYd > 50.0f
+                ? "skip: beyond party leash (>70y) — rejoining leader"
+                : "skip: beyond party leash (>50y) — rejoining leader");
             return;
         }
 
@@ -7076,7 +7104,7 @@ namespace WowPsParty
             std::vector<std::string> focusNames;
             WowPsParty::BotFocusNames(bot->GetGUID(), focusNames, bot);
             if (!focusNames.empty())
-                focusMob = FindNearestFocusEnemy(bot, focusNames, FOCUS_SCAN_RANGE, /*engagedOnly=*/false);
+                focusMob = FindNearestFocusEnemy(bot, focusNames, PartyFocusScanRange(bot), /*engagedOnly=*/false);
             // focus_engaged:<names> — same override but ONLY onto a match the party is
             // already fighting (won't pull a stray same-named mob).
             if (!focusMob)
@@ -7084,7 +7112,7 @@ namespace WowPsParty
                 std::vector<std::string> focusEngagedNames;
                 WowPsParty::BotFocusEngagedNames(bot->GetGUID(), focusEngagedNames, bot);
                 if (!focusEngagedNames.empty())
-                    focusMob = FindNearestFocusEnemy(bot, focusEngagedNames, FOCUS_SCAN_RANGE, /*engagedOnly=*/true);
+                    focusMob = FindNearestFocusEnemy(bot, focusEngagedNames, PartyFocusScanRange(bot), /*engagedOnly=*/true);
             }
         }
 
@@ -8902,11 +8930,12 @@ namespace WowPsParty
 
             // ---- Party leash ----------------------------------------------
             // If the controlled char has run off, the bot abandons whatever
-            // it's doing (combat, drinking, holding) and rejoins. >50y: break
-            // off and walk back. >100y: snap directly to the leader. Runs
+            // it's doing (combat, drinking, holding) and rejoins. Past
+            // PartyLeashRadius (50y, 70y on a raid map): break off and walk
+            // back. >100y: snap directly to the leader. Runs
             // BEFORE the combat / hold / cast early-returns so it overrides
-            // them. AssistTarget + TickRotation also yield past 50y so the AI
-            // tick doesn't re-engage between these 1Hz follow ticks.
+            // them. AssistTarget + TickRotation yield past the same radius so
+            // the AI tick doesn't re-engage between these 1Hz follow ticks.
             {
                 float const leaderDist = follower->GetDistance(leader);
                 if (leaderDist > 100.0f)
@@ -8934,7 +8963,7 @@ namespace WowPsParty
                 // keeps the node until it's harvested, so the only thing that ever
                 // interrupts the approach is the >100y hard teleport above (which
                 // clears the node). A gather can never strand a bot.
-                if (leaderDist > 50.0f
+                if (leaderDist > PartyLeashRadius(follower)
                     && !BotIsApproachingGatherNode(d.followerGuid.GetCounter()))
                 {
                     if (follower->GetVictim()) follower->AttackStop();
@@ -9102,13 +9131,17 @@ namespace WowPsParty
             // leader is WALKING and the tank isn't keeping up, that's a genuine stall — let
             // the detector recover it (this closes the "dead follow path within 60y freezes
             // forever" hole: the moment the leader moves, a frozen tank is re-armed).
+            // Leash + 10y: the slack must track PartyLeashRadius, not a constant derived
+            // from the old flat 50. On a raid map a lead tank may legitimately hold a spot
+            // up to 70y out, and a hardcoded 60 here would score it "idle" and eventually
+            // teleport it off a position it was allowed to take.
             bool const leadTankExempt =
                 IsLeadTank(d.followerGuid) && GetLeadInDungeon(d.followerGuid.GetCounter())
-                && dist < 60.0f && !leader->isMoving();
+                && dist < PartyLeashRadius(follower) + 10.0f && !leader->isMoving();
             if (dist > 8.0f && movedSelf < 1.0f && !leadTankExempt) ++s.idle;
             else { s.idle = 0; s.unstickAttempts = 0; }   // moved / caught up / leading = recovered
-            // Genuine long-distance gaps are already handled above (the >50y
-            // leash re-walks, >100y snaps), so by here dist <= 50: a "stuck" bot
+            // Genuine long-distance gaps are already handled above (the leash re-walks,
+            // >100y snaps), so by here dist is within PartyLeashRadius: a "stuck" bot
             // is idle-frozen, NOT far. Two distinct causes, two remedies:
             //   1. A movement-BLOCKING state the bot's missing client never cleared
             //      (post-revive root/stun/death). ForceMovableState + re-asserting

@@ -8919,13 +8919,16 @@ namespace WowPsParty
         std::vector<RotationRule> rules = GatherMergedRules(bot);
         if (rules.empty()) return false;
 
-        // Party leash: if the controlled char has run >50y away, don't cast
-        // or drink — yield so the follow ticker rejoins the leader (it walks
-        // back at 50y, teleports past 100y). Matches AssistTarget's leash.
+        // Party leash: if the controlled char has run past PartyLeashRadius (50y, 70y on
+        // a raid map), don't cast or drink — yield so the follow ticker rejoins the
+        // leader (it walks back at the same radius, teleports past 100y). MUST read the
+        // same helper as AssistTarget and the follow ticker: if this one stayed at a flat
+        // 50y while they allowed 70y, a raid bot standing where it was told to stand
+        // would silently refuse to cast there.
         if (ObjectGuid const lg = GetLeaderFor(bot->GetGUID()))
             if (Player* leader = ObjectAccessor::FindConnectedPlayer(lg))
                 if (leader->IsInWorld() && leader->GetMapId() == bot->GetMapId()
-                    && bot->GetDistance(leader) > 50.0f)
+                    && bot->GetDistance(leader) > PartyLeashRadius(bot))
                     return false;
 
         // PRIORITY peel (runs BEFORE the normal rotation): a non-tank DPS slows/stuns a
