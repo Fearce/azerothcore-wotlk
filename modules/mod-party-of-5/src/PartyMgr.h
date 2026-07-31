@@ -6,8 +6,10 @@
  *   plus `characters.party_slot` (denormalized for fast login-time lookup).
  * - On active login: looks up the rest of the account's party and asks mod-playerbots
  *   to spawn each remaining member as a server-controlled bot in the active player's
- *   party. The bots inherit mod-playerbots' default AI (follow, combat, loot) — no
- *   per-member loadout yet (that's Phase 3).
+ *   party, and loads each member's saved `party_loadout` row (rotation + behaviour
+ *   toggles) into the runtime caches via RefreshMemberLoadoutCaches. The follow and
+ *   rotation engines read ONLY those caches, so the hire and roster-invite paths run
+ *   the same load — a member spawned without it fights with no rules.
  * - On active logout: mod-playerbots handles cascade cleanup when the master goes
  *   away (PlayerbotMgr is destructed with its owning Player), so we deliberately
  *   don't double-free.
@@ -93,6 +95,13 @@ namespace WowPsParty
     void AccountSettingsRefreshFromDB(uint32 account);
     void EnsureSettingsTable();   // CREATE TABLE IF NOT EXISTS — call on startup
     void EnsureRosterOrderColumn();  // ADD characters.roster_order if missing — call on startup
+
+    // Load one party member's persisted `party_loadout` row (rotation + every
+    // behaviour toggle) into the runtime caches. Combat reads ONLY those caches,
+    // so every path that brings a saved member into an active party — login
+    // spawn, alt hire, roster invite — has to run this or the member fights with
+    // no rules at all while its rules sit safely on disk.
+    void RefreshMemberLoadoutCaches(uint32 guidLow);
 
     // ----- Henchmen --------------------------------------------------------
     // GW1-style hireable bot companions, drawn from the random-bot pool. They

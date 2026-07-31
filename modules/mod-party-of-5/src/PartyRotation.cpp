@@ -502,6 +502,9 @@ namespace WowPsParty
         return DEFAULT_ENGAGE;
     }
 
+    // Logs the outcome unconditionally: "this member has no rules" is invisible in
+    // combat (the bot just auto-attacks), so a missed load is only ever diagnosed
+    // from a Server.log line saying which guid loaded how many rules, and when.
     void RotationCacheRefreshFromDB(uint32 guid)
     {
         QueryResult q = CharacterDatabase.Query(
@@ -509,10 +512,14 @@ namespace WowPsParty
         if (!q)
         {
             RotationCacheClear(guid);
+            LOG_INFO("module",
+                "[WowPsParty Rotation] load guid={}: no party_loadout row — no rules", guid);
             return;
         }
         std::string const dsl = q->Fetch()[0].Get<std::string>();
         auto rules = ParseRotationString(dsl);
+        LOG_INFO("module", "[WowPsParty Rotation] load guid={}: {} rule(s) from party_loadout",
+                 guid, uint32(rules.size()));
         RotationCacheSet(guid, std::move(rules));
     }
 
@@ -542,7 +549,10 @@ namespace WowPsParty
         QueryResult q = CharacterDatabase.Query(
             "SELECT `priority_actions_json` FROM `party_shared_rotation` WHERE `account` = {}", account);
         std::string const dsl = q ? q->Fetch()[0].Get<std::string>() : std::string();
-        SharedRotationCacheSet(account, ParseRotationString(dsl));
+        auto rules = ParseRotationString(dsl);
+        LOG_INFO("module", "[WowPsParty Rotation] load COMMON account={}: {} rule(s)",
+                 account, uint32(rules.size()));
+        SharedRotationCacheSet(account, std::move(rules));
     }
 
     // ---- per-mob COMMON rule sections (per ACCOUNT) ------------------------
@@ -673,6 +683,8 @@ namespace WowPsParty
                 sections[Lower(name)] = MobSection{ name, std::move(rules) };
             } while (q->NextRow());
         }
+        LOG_INFO("module", "[WowPsParty Rotation] load COMMON account={}: {} mob section(s)",
+                 account, uint32(sections.size()));
         std::lock_guard<std::mutex> lock(g_mobRotationMutex);
         if (sections.empty()) g_mobRotation.erase(account);
         else                  g_mobRotation[account] = std::move(sections);

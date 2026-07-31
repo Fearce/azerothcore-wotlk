@@ -6331,7 +6331,11 @@ public:
                 "`gear_lock_json`, `priority_actions_json`) VALUES ({}, '{}', '', '', '', '') "
                 "ON DUPLICATE KEY UPDATE `strategies_csv` = VALUES(`strategies_csv`)",
                 guid, mode);
-            CharacterDatabase.CommitTransaction(tx);
+            // SYNCHRONOUS commit, like every party_loadout write below it: hiring or
+            // inviting this character re-reads the row into the runtime caches, so a
+            // write still queued in the DB worker would hand the refresh the OLD
+            // value and silently revert the toggle the player just set.
+            CharacterDatabase.DirectCommitTransaction(tx);
             WowPsParty::TargetModeCacheSet(guid, mode);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Target mode set to '{}'.", mode);
@@ -6389,7 +6393,7 @@ public:
                 "`gear_lock_json`, `priority_actions_json`) VALUES ({}, '', '', '{}', '', '') "
                 "ON DUPLICATE KEY UPDATE `glyphs_csv` = VALUES(`glyphs_csv`)",
                 guid, on ? "1" : "0");
-            CharacterDatabase.CommitTransaction(tx);
+            CharacterDatabase.DirectCommitTransaction(tx);   // sync — a later hire/invite re-reads this row
             WowPsParty::LeadDungeonCacheSet(guid, on);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Lead-in-dungeons: {}.", on ? "ON" : "OFF");
@@ -6437,7 +6441,7 @@ public:
                 "VALUES ({}, '', '', '', '', '', '{}') "
                 "ON DUPLICATE KEY UPDATE `wait_tank_threat` = VALUES(`wait_tank_threat`)",
                 guid, on ? "1" : "0");
-            CharacterDatabase.CommitTransaction(tx);
+            CharacterDatabase.DirectCommitTransaction(tx);   // sync — a later hire/invite re-reads this row
             WowPsParty::WaitTankThreatCacheSet(guid, on ? 1 : 0);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Wait for tank threat: {}.", on ? "ON" : "OFF");
@@ -6481,7 +6485,7 @@ public:
                 "VALUES ({}, '', '', '', '', '', '{}') "
                 "ON DUPLICATE KEY UPDATE `safe_pull` = VALUES(`safe_pull`)",
                 guid, on ? "1" : "0");
-            CharacterDatabase.CommitTransaction(tx);
+            CharacterDatabase.DirectCommitTransaction(tx);   // sync — a later hire/invite re-reads this row
             WowPsParty::SafePullCacheSet(guid, on ? 1 : 0);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Safe pull: {}.", on ? "ON" : "OFF");
@@ -6521,7 +6525,7 @@ public:
                 "VALUES ({}, '', '', '', '', '', '{}') "
                 "ON DUPLICATE KEY UPDATE `follow_path` = VALUES(`follow_path`)",
                 guid, on ? "1" : "0");
-            CharacterDatabase.CommitTransaction(tx);
+            CharacterDatabase.DirectCommitTransaction(tx);   // sync — a later hire/invite re-reads this row
             WowPsParty::FollowPathCacheSet(guid, on ? 1 : 0);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Follow recorded path: {}.", on ? "ON" : "OFF");
@@ -6561,7 +6565,7 @@ public:
                 "VALUES ({}, '', '', '', '', '', '{}') "
                 "ON DUPLICATE KEY UPDATE `pull_grays` = VALUES(`pull_grays`)",
                 guid, on ? "1" : "0");
-            CharacterDatabase.CommitTransaction(tx);
+            CharacterDatabase.DirectCommitTransaction(tx);   // sync — a later hire/invite re-reads this row
             WowPsParty::PullGraysCacheSet(guid, on ? 1 : 0);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Pull gray mobs: {}.", on ? "ON" : "OFF");
@@ -6602,7 +6606,7 @@ public:
                 "VALUES ({}, '', '', '', '', '', '{}') "
                 "ON DUPLICATE KEY UPDATE `anchor_tank` = VALUES(`anchor_tank`)",
                 guid, on ? "1" : "0");
-            CharacterDatabase.CommitTransaction(tx);
+            CharacterDatabase.DirectCommitTransaction(tx);   // sync — a later hire/invite re-reads this row
             WowPsParty::AnchorTankCacheSet(guid, on ? 1 : 0);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Anchor on tank: {}.", on ? "ON" : "OFF");
@@ -6643,7 +6647,7 @@ public:
                 "VALUES ({}, '', '', '', '', '', '{}') "
                 "ON DUPLICATE KEY UPDATE `pull_count` = VALUES(`pull_count`)",
                 guid, n);
-            CharacterDatabase.CommitTransaction(tx);
+            CharacterDatabase.DirectCommitTransaction(tx);   // sync — a later hire/invite re-reads this row
             WowPsParty::PullCountCacheSet(guid, n);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Multi-pull count: {}.", n);
@@ -6686,7 +6690,7 @@ public:
                 "VALUES ({}, '', '', '', '', '', '{}') "
                 "ON DUPLICATE KEY UPDATE `lead_distance` = VALUES(`lead_distance`)",
                 guid, n);
-            CharacterDatabase.CommitTransaction(tx);
+            CharacterDatabase.DirectCommitTransaction(tx);   // sync — a later hire/invite re-reads this row
             WowPsParty::LeadDistCacheSet(guid, n);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Lead distance: {} yds.", n);
@@ -6728,7 +6732,7 @@ public:
                 "VALUES ({}, '', '', '', '', '', '{}') "
                 "ON DUPLICATE KEY UPDATE `engage_range` = VALUES(`engage_range`)",
                 guid, n);
-            CharacterDatabase.CommitTransaction(tx);
+            CharacterDatabase.DirectCommitTransaction(tx);   // sync — a later hire/invite re-reads this row
             WowPsParty::EngageRangeCacheSet(guid, n);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff66ccff[WowPsParty]|r Engage range: {} yds.", n);
@@ -7089,7 +7093,11 @@ public:
                 "`gear_lock_json`, `priority_actions_json`) VALUES ({}, '', '', '', '', '{}') "
                 "ON DUPLICATE KEY UPDATE `priority_actions_json` = VALUES(`priority_actions_json`)",
                 guid, stored);
-            CharacterDatabase.CommitTransaction(tx);
+            // SYNCHRONOUS commit: a save immediately followed by a roster invite of
+            // the SAME character makes Enroll re-read party_loadout into the cache,
+            // and an async write still in the worker queue would hand it the
+            // pre-save rules — quietly undoing the save that just reported success.
+            CharacterDatabase.DirectCommitTransaction(tx);
 
             // A HENCHMAN never keeps a custom rotation (it's wiped on enroll), so an
             // EMPTY save must not leave it ruleless — that gutted its combat (Kevin:
@@ -7364,7 +7372,7 @@ public:
                 "`gear_lock_json`, `priority_actions_json`) VALUES ({}, '', '', '', '', '{}') "
                 "ON DUPLICATE KEY UPDATE `priority_actions_json` = VALUES(`priority_actions_json`)",
                 guid, stored);
-            CharacterDatabase.CommitTransaction(tx);
+            CharacterDatabase.DirectCommitTransaction(tx);   // sync — a later hire/invite re-reads this row
 
             WowPsParty::RotationCacheSet(guid, rules);
             ChatHandler(player->GetSession()).PSendSysMessage(
@@ -7545,7 +7553,12 @@ public:
             tx->Append("DELETE FROM `account_party` WHERE `account` = {} AND `slot` = {}",
                        accountId, slot);
             tx->Append("UPDATE `characters` SET `party_slot` = NULL WHERE `guid` = {}", kickedGuid);
-            CharacterDatabase.CommitTransaction(tx);
+            // SYNCHRONOUS commit: SetActiveFollowers below — and any MGMT_INVITE the
+            // player fires straight after — re-query account_party. With an async
+            // commit the deleted row could still be visible, so the follow-up invite
+            // saw a full roster and failed with "Party is full (5/5)". Same race
+            // Leave / MGMT_ROLE / MGMT_MOVE were already fixed for.
+            CharacterDatabase.DirectCommitTransaction(tx);
 
             // Rebuild alt directives (kicked alt is gone from account_party so
             // it won't return). SetActiveFollowers preserves henchmen; do NOT
@@ -7628,7 +7641,7 @@ public:
             CharacterDatabaseTransaction tx = CharacterDatabase.BeginTransaction();
             tx->Append(
                 "UPDATE `party_loadout` SET `priority_actions_json` = '' WHERE `guid` = {}", guid);
-            CharacterDatabase.CommitTransaction(tx);
+            CharacterDatabase.DirectCommitTransaction(tx);   // sync — a later hire/invite re-reads this row
 
             // The editor sends CLEAR_ROTATION (not an empty COMMIT) whenever the
             // saved rule list is empty. A HENCHMAN must never be left ruleless —

@@ -71,6 +71,27 @@ namespace WowPsParty
         return instance;
     }
 
+    // Every per-character cache fed by the member's `party_loadout` row, in one
+    // place. The caches are the ONLY thing combat and the follow ticker read —
+    // the DB row is just where they persist — so a member brought into the party
+    // without this call runs ruleless and with every toggle at its default until
+    // the editor happens to push a save. Adding a new per-member loadout cache?
+    // Add its RefreshFromDB here too.
+    void RefreshMemberLoadoutCaches(uint32 guidLow)
+    {
+        RotationCacheRefreshFromDB(guidLow);
+        TargetModeRefreshFromDB(guidLow);
+        LeadDungeonRefreshFromDB(guidLow);
+        WaitTankThreatRefreshFromDB(guidLow);
+        SafePullRefreshFromDB(guidLow);
+        PullCountRefreshFromDB(guidLow);
+        LeadDistRefreshFromDB(guidLow);
+        EngageRangeRefreshFromDB(guidLow);
+        AnchorTankRefreshFromDB(guidLow);
+        FollowPathRefreshFromDB(guidLow);
+        PullGraysRefreshFromDB(guidLow);
+    }
+
     // ----- per-account feature toggles ---------------------------------------
     static std::unordered_map<uint32, PartySettings> g_accountSettings;
     static std::mutex                                g_settingsMutex;
@@ -1725,6 +1746,20 @@ namespace WowPsParty
         return out;
     }
 
+    // A henchman never loads a saved rotation — every hire, re-level and forced
+    // re-spec rebuilds the class default — so it bypasses the load diagnostic in
+    // RotationCacheRefreshFromDB. Route all four of those rebuilds through here so
+    // a grep for "[WowPsParty Rotation]" still accounts for the whole party.
+    static void SetHenchmanDefaultRotation(uint32 guidLow, uint8 cls,
+                                           std::string const& role, int tree)
+    {
+        auto rules = ParseRotationString(DefaultRotationForClass(cls, role, tree));
+        LOG_INFO("module",
+            "[WowPsParty Rotation] henchman guid={}: {} default rule(s) (role={})",
+            guidLow, uint32(rules.size()), role);
+        RotationCacheSet(guidLow, std::move(rules));
+    }
+
     std::vector<HenchmanCandidate> BuildHenchmanCandidates(Player* requester)
     {
         std::vector<HenchmanCandidate> out;
@@ -2701,9 +2736,8 @@ namespace WowPsParty
         // rotation/targetmode so a scaled pick never keeps a stale rotation.
         std::string const freshRole = InferHenchmanRoleLive(hen, ClassDefaultRole(cls));
         WowPsParty::SetHenchmanRole(hen->GetGUID(), freshRole);
-        WowPsParty::RotationCacheSet(hen->GetGUID().GetCounter(),
-            WowPsParty::ParseRotationString(
-                DefaultRotationForClass(cls, freshRole, DominantTalentTabLive(hen))));
+        SetHenchmanDefaultRotation(hen->GetGUID().GetCounter(), cls, freshRole,
+                                   DominantTalentTabLive(hen));
         WowPsParty::TargetModeCacheSet(hen->GetGUID().GetCounter(),
             freshRole == "tank" ? "loose" : "master");
 
@@ -2889,9 +2923,8 @@ namespace WowPsParty
 
             // Always the class default rotation (identical to "Generate"); never the
             // saved one. Then wipe any persisted rotation so it can't survive the run.
-            WowPsParty::RotationCacheSet(candidateGuid,
-                WowPsParty::ParseRotationString(
-                    DefaultRotationForClass(cls, useRole, DominantTalentTabDB(candidateGuid))));
+            SetHenchmanDefaultRotation(candidateGuid, cls, useRole,
+                                       DominantTalentTabDB(candidateGuid));
             CharacterDatabase.Execute(
                 "UPDATE `party_loadout` SET `priority_actions_json` = '' WHERE `guid` = {}", candidateGuid);
 
@@ -2920,6 +2953,15 @@ namespace WowPsParty
             // pull_grays: '1' = explicit on, '0' = explicit off, '' = default OFF.
             WowPsParty::PullGraysCacheSet(candidateGuid,
                 savedPullGrays == "1" ? 1 : (savedPullGrays == "0" ? 0 : -1));
+
+            // The last two loadout caches. Both are process-global and guid-keyed,
+            // so without this a pool char hired by one player kept the PREVIOUS
+            // hirer's lead distance / anchor-tank setting. Refreshers rather than
+            // more columns on the SELECT above: they own the clamping, and a
+            // dismissed henchman's row is deleted, so "no row" correctly means
+            // "back to the default".
+            LeadDistRefreshFromDB(candidateGuid);
+            AnchorTankRefreshFromDB(candidateGuid);
         }
 
         mgr->AddPlayerBot(henchGuid, account);
@@ -3011,9 +3053,8 @@ namespace WowPsParty
                     WowPsParty::SetHenchmanRole(henchGuid, freshRole);
                     if (!hadCustomRotation)
                     {
-                        WowPsParty::RotationCacheSet(guidLow,
-                            WowPsParty::ParseRotationString(
-                                DefaultRotationForClass(cls, freshRole, DominantTalentTabLive(hen))));
+                        SetHenchmanDefaultRotation(guidLow, cls, freshRole,
+                                                   DominantTalentTabLive(hen));
                         WowPsParty::TargetModeCacheSet(guidLow,
                             freshRole == "tank" ? "loose" : "master");
                     }
@@ -3058,9 +3099,8 @@ namespace WowPsParty
                     PlayerbotFactory(hen, hen->GetLevel()).InitEquipment(false, false);
                     hen->SaveToDB(false, false);
                     WowPsParty::SetHenchmanRole(henchGuid, useRole);
-                    WowPsParty::RotationCacheSet(henchGuid.GetCounter(),
-                        WowPsParty::ParseRotationString(
-                            DefaultRotationForClass(cls, useRole, DominantTalentTabLive(hen))));
+                    SetHenchmanDefaultRotation(henchGuid.GetCounter(), cls, useRole,
+                                               DominantTalentTabLive(hen));
                     WowPsParty::TargetModeCacheSet(henchGuid.GetCounter(),
                         useRole == "tank" ? "loose" : "master");
                     LOG_INFO("module",
@@ -3704,17 +3744,7 @@ namespace WowPsParty
         // reset to a class default (the henchman hire path does): the alt runs the
         // exact rotation/toggles the player saved for it before. The COMMON shared
         // rotation is account-wide (already loaded at login) and applies on top.
-        RotationCacheRefreshFromDB(altGuid);
-        TargetModeRefreshFromDB(altGuid);
-        LeadDungeonRefreshFromDB(altGuid);
-        WaitTankThreatRefreshFromDB(altGuid);
-        SafePullRefreshFromDB(altGuid);
-        PullCountRefreshFromDB(altGuid);
-        LeadDistRefreshFromDB(altGuid);
-        EngageRangeRefreshFromDB(altGuid);
-        AnchorTankRefreshFromDB(altGuid);
-        FollowPathRefreshFromDB(altGuid);
-        PullGraysRefreshFromDB(altGuid);
+        RefreshMemberLoadoutCaches(altGuid);
 
         mgr->AddPlayerBot(altObjGuid, account);
 
@@ -3899,6 +3929,14 @@ namespace WowPsParty
         // (e.g. a priest self-casting Power Word: Shield) instead of its rotation.
         CharacterDatabase.DirectCommitTransaction(tx);
 
+        // An invite mid-session spawns this hero straight away, and only the
+        // LOGIN path used to fill its loadout caches — so a hero invited after
+        // login (the "kick the roster, swap character, invite five others" flow)
+        // fought with an empty rotation until the editor saved again, even though
+        // its rules were never lost from `party_loadout`. Re-read them now, before
+        // the caller spawns the bot.
+        RefreshMemberLoadoutCaches(targetGuid);
+
         LOG_INFO("module",
                  "[WowPsParty] enroll: account={} guid={} name={} slot={}",
                  requestorAccount, targetGuid, targetName, nextSlot);
@@ -3996,6 +4034,15 @@ namespace WowPsParty
         uint32 const account = active->GetSession()->GetAccountId();
         uint32 const activeGuid = active->GetGUID().GetCounter();
 
+        // The account's COMMON shared rotation (and its per-mob boss sections) is
+        // prepended to EVERY party bot's rules, henchmen included, so it has to be
+        // cached before any companion can exist — not only when a roster already
+        // does. Loading it below the early-returns meant logging in with an empty
+        // roster, then hiring or inviting, ran the whole session with no Common
+        // rules until the editor saved them again.
+        WowPsParty::SharedRotationRefreshFromDB(account);
+        WowPsParty::MobRotationRefreshFromDB(account);
+
         // Load this account's feature toggles up front (cached). Solo mode
         // (companions off) keeps the enrolled roster + rotations/talents on
         // disk — we just don't spawn the bots or form the party group.
@@ -4032,11 +4079,6 @@ namespace WowPsParty
                          "members will NOT spawn. Re-login should fix.", activeGuid);
                 return;
             }
-            // Load the account's COMMON shared rotation once (it's account-wide, not
-            // per-bot) — prepended to every bot's rules in TickRotation. The per-mob
-            // boss sections load alongside it (same account scope, gated at eval time).
-            WowPsParty::SharedRotationRefreshFromDB(account);
-            WowPsParty::MobRotationRefreshFromDB(account);
 
             // WoW party is capped at 5 members. Active player counts as 1,
             // so spawn at most 4 bots. Extra enrolled chars beyond that just
@@ -4045,17 +4087,7 @@ namespace WowPsParty
             for (auto const& row : rows)
             {
                 uint32 const guid = row.second;
-                RotationCacheRefreshFromDB(guid);
-                TargetModeRefreshFromDB(guid);
-                LeadDungeonRefreshFromDB(guid);
-                WaitTankThreatRefreshFromDB(guid);
-                SafePullRefreshFromDB(guid);
-                PullCountRefreshFromDB(guid);
-                LeadDistRefreshFromDB(guid);
-                EngageRangeRefreshFromDB(guid);
-                AnchorTankRefreshFromDB(guid);
-                FollowPathRefreshFromDB(guid);
-                PullGraysRefreshFromDB(guid);
+                RefreshMemberLoadoutCaches(guid);
                 if (guid == activeGuid) continue;
                 if (spawned >= 4) break;
                 ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(guid);
