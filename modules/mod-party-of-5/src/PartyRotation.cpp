@@ -3929,7 +3929,7 @@ namespace WowPsParty
             if (nowMs - last > 5000)
             {
                 last = nowMs;
-                LOG_INFO("module",
+                LOG_DEBUG("module",
                     "[WowPsParty Rotation] {} self_mana eval: powerType={} mana={}/{} pct={} cmp_op={} threshold={}",
                     bot->GetName(), uint32(bot->getPowerType()),
                     bot->GetPower(POWER_MANA), bot->GetMaxPower(POWER_MANA),
@@ -4920,7 +4920,7 @@ namespace WowPsParty
                 if (now - last > 3000)
                 {
                     last = now;
-                    LOG_INFO("module",
+                    LOG_DEBUG("module",
                         "[WowPsParty Rotation]     canFire spell={} on guid={}: REJECT ({})",
                         spellId, bot->GetGUID().GetCounter(), why);
                 }
@@ -4962,7 +4962,7 @@ namespace WowPsParty
                 if (fnow - flast > 3000)
                 {
                     flast = fnow;
-                    LOG_INFO("module",
+                    LOG_DEBUG("module",
                         "[WowPsParty Rotation]     spell={} stance-block: curForm={} Stances={:#x} StancesNot={:#x}",
                         spellId, uint32(bot->GetShapeshiftForm()),
                         info->Stances, info->StancesNot);
@@ -5157,7 +5157,7 @@ namespace WowPsParty
                 if (dn - dl > 3000)
                 {
                     dl = dn;
-                    LOG_INFO("module",
+                    LOG_DEBUG("module",
                         "[WowPsParty Rotation] faceAndCast: defer {} on guid={} — spline live "
                         "(isMoving={} finalized={})", spellId, bot->GetGUID().GetCounter(),
                         bot->isMoving() ? 1 : 0, bot->movespline->Finalized() ? 1 : 0);
@@ -5228,7 +5228,7 @@ namespace WowPsParty
                 if (fn - fl > 5000)
                 {
                     fl = fn;
-                    LOG_INFO("module",
+                    LOG_DEBUG("module",
                         "[WowPsParty Rotation] cast {} failed on guid={} result={}",
                         spellId, bot->GetGUID().GetCounter(), uint32(r));
                 }
@@ -5367,7 +5367,7 @@ namespace WowPsParty
                 if (fn - fl > 5000)
                 {
                     fl = fn;
-                    LOG_INFO("module",
+                    LOG_DEBUG("module",
                         "[WowPsParty Rotation] ground-cast {} failed on guid={} result={}",
                         spellId, bot->GetGUID().GetCounter(), uint32(r));
                 }
@@ -5639,7 +5639,7 @@ namespace WowPsParty
             uint32& last = lastMs[key];
             if (now - last <= 3000) return;
             last = now;
-            LOG_INFO("module",
+            LOG_DEBUG("module",
                 "[WowPsParty Rotation] {} friendly-cast spell={} target={} dist={:.1f}: {} (result={})",
                 bot->GetName(), spellId,
                 target ? target->GetGUID().GetCounter() : 0u,
@@ -8958,10 +8958,10 @@ namespace WowPsParty
         // not casting) where the actual root cause needed full visibility
         // into the rotation loop. Log one summary block per bot every
         // ~3 s: rule-by-rule, condition pass/fail, and what ExecAction
-        // returned. Off-by-default tuning would mean retrofitting logs
-        // every time something misbehaves, which the project rule
-        // ("Diagnostic logging in everything from the start") explicitly
-        // forbids.
+        // returned. Keep the full diagnostic in the hot path, but at debug
+        // level: normal production logging must not format and write every
+        // rule result. Raise Logger.module to debug when investigating a
+        // rotation issue; no code change is needed to restore the trace.
         static thread_local std::unordered_map<uint32, uint32> lastTraceMs;
         uint32 const nowMs = getMSTime();
         uint32& last = lastTraceMs[bot->GetGUID().GetCounter()];
@@ -8996,7 +8996,7 @@ namespace WowPsParty
         if (trace)
         {
             Unit* victim = bot->GetVictim();
-            LOG_INFO("module",
+            LOG_DEBUG("module",
                 "[WowPsParty Rotation] {} TICK rules={} rage={}/{} mana={}/{} target={} hp={}%",
                 bot->GetName(), uint32(rules.size()),
                 bot->GetPower(POWER_RAGE), bot->GetMaxPower(POWER_RAGE),
@@ -9027,7 +9027,7 @@ namespace WowPsParty
         {
             SustainConsume(bot);
             if (trace)
-                LOG_INFO("module",
+                LOG_DEBUG("module",
                     "[WowPsParty Rotation] {} consuming — holding until full/done "
                     "(hp={}/{} mana={}/{})",
                     bot->GetName(), bot->GetHealth(), bot->GetMaxHealth(),
@@ -9172,7 +9172,7 @@ namespace WowPsParty
             Unit* const condTarget = FriendlyActionTarget(bot, r.action);
             if (!EvalCondition(r.condition, bot, condTarget)) continue;
             if (trace)
-                LOG_INFO("module",
+                LOG_DEBUG("module",
                     "[WowPsParty Rotation]   prepass prio={} cond=[{}] act=[{}] -> ARM_HOLD",
                     r.priority, r.condition, r.action);
             ExecAction(r.action, bot, r.flags, r.condition);
@@ -9186,7 +9186,7 @@ namespace WowPsParty
             if (CsvContains(Lower(r.flags), "disabled"))
             {
                 if (trace)
-                    LOG_INFO("module",
+                    LOG_DEBUG("module",
                         "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> DISABLED",
                         r.priority, r.condition, r.action);
                 continue;
@@ -9205,7 +9205,7 @@ namespace WowPsParty
                 && !CsvContains(Lower(r.flags), "clip"))
             {
                 if (trace)
-                    LOG_INFO("module",
+                    LOG_DEBUG("module",
                         "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> CHANNELING",
                         r.priority, r.condition, r.action);
                 continue;
@@ -9231,7 +9231,7 @@ namespace WowPsParty
                 && !CsvContains(Lower(r.flags), "clip"))
             {
                 if (trace)
-                    LOG_INFO("module",
+                    LOG_DEBUG("module",
                         "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> CASTING",
                         r.priority, r.condition, r.action);
                 continue;
@@ -9266,7 +9266,7 @@ namespace WowPsParty
             if (!condOk)
             {
                 if (trace)
-                    LOG_INFO("module",
+                    LOG_DEBUG("module",
                         "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> NO_MATCH",
                         r.priority, r.condition, r.action);
                 continue;
@@ -9287,7 +9287,7 @@ namespace WowPsParty
                 if (skip)
                 {
                     if (trace)
-                        LOG_INFO("module",
+                        LOG_DEBUG("module",
                             "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> TANK_THREAT_HOLD",
                             r.priority, r.condition, r.action);
                     continue;
@@ -9319,7 +9319,7 @@ namespace WowPsParty
                 && bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE)
                 bot->InterruptNonMeleeSpells(false);
             if (trace)
-                LOG_INFO("module",
+                LOG_DEBUG("module",
                     "[WowPsParty Rotation]   prio={} cond=[{}] act=[{}] -> {}",
                     r.priority, r.condition, r.action,
                     execOk ? "FIRED" : "exec_failed_falling_through");
