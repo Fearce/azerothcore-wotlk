@@ -115,10 +115,10 @@ namespace
                             // can be online, so fills must claim DISTINCT accounts
     };
 
-    // Grace before retiring a fill bot that read !InBattleground after entering. A real
-    // match-end stays out; a transient clear of bgInstanceID (an intra-BG teleport / a tick
-    // where the flag flickers) comes back within this window — without it an active bot got
-    // logged out mid-match ("a bot just left in the middle of a battleground").
+    // Grace before recovering a fill bot that reads !InBattleground after entering. A
+    // transient clear of bgInstanceID (an intra-BG teleport / a tick where the flag flickers)
+    // can settle on its own; a persistent clear is requeued into the leader's live match
+    // rather than logged out and replaced by the top-up loop.
     constexpr uint32 BG_OUT_GRACE_MS = 8000;
 
     // A fill bot that never finishes its async login is retired after this so it
@@ -144,6 +144,37 @@ namespace
     BattlegroundQueueTypeId QueueTypeFor(uint32 bgTypeId)
     {
         return BattlegroundMgr::BGQueueTypeId(BattlegroundTypeId(bgTypeId), 0);
+    }
+
+    // A player can be invited while its Player queue slot is between states. The queue's
+    // group info is authoritative during that STATUS_WAIT_JOIN transition.
+    bool HasPendingBgInvite(Player* player, uint32 bgTypeId)
+    {
+        if (!player) return false;
+
+        BattlegroundQueue& queue = sBattlegroundMgr->GetBattlegroundQueue(QueueTypeFor(bgTypeId));
+        GroupQueueInfo invite;
+        return queue.GetPlayerGroupInfoData(player->GetGUID(), &invite)
+            && invite.IsInvitedToBGInstanceGUID && invite.RemoveInviteTime;
+    }
+
+    bool LeaderStillInBgFlow(Player* leader, uint32 bgTypeId)
+    {
+        return leader && leader->IsInWorld()
+            && (leader->InBattleground()
+                || leader->InBattlegroundQueueForBattlegroundQueueType(QueueTypeFor(bgTypeId))
+                || HasPendingBgInvite(leader, bgTypeId));
+    }
+
+    // WAIT_LEAVE is a finished match; only a pre-gate or in-progress match should recover
+    // a detached fill bot.
+    Battleground* GetLiveLeaderBattleground(Player* leader)
+    {
+        if (!leader || !leader->InBattleground()) return nullptr;
+
+        Battleground* bg = leader->GetBattleground();
+        if (!bg || bg->isArena()) return nullptr;
+        return bg->GetStatus() == STATUS_WAIT_JOIN || bg->GetStatus() == STATUS_IN_PROGRESS ? bg : nullptr;
     }
 
     // CSV of RNDBOT account ids (the same parked pool the henchman hire draws from).
@@ -1184,13 +1215,6 @@ public:
             leaders.assign(g_activeLeaders.begin(), g_activeLeaders.end());
         }
 
-        auto leaderStillIn = [](Player* leader, uint32 bgTypeId) -> bool
-        {
-            return leader && leader->IsInWorld()
-                && (leader->InBattleground()
-                    || leader->InBattlegroundQueueForBattlegroundQueueType(QueueTypeFor(bgTypeId)));
-        };
-
         // 1) Drive each fill bot: re-level (if needed) -> queue -> accept -> retire. Only
         //    one heavy re-level runs per tick so a 40v40 spin-up never stalls the world.
         bool releveledThisTick = false;
@@ -1265,13 +1289,34 @@ public:
                     continue;   // start the grace; re-check next tick
                 }
                 if (now - fe.outSinceMs < BG_OUT_GRACE_MS) continue;   // still settling — wait
+                Player* leader = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(fe.leaderLow));
+                if (Battleground* liveBg = GetLiveLeaderBattleground(leader))
+                {
+                    // A live leader proves this is not the match ending. Keep the pool bot
+                    // tracked, then requeue it for that live BG instead of replacing it.
+                    {
+                        std::lock_guard<std::mutex> lk(g_mutex);
+                        auto it = g_fillBots.find(botLow);
+                        if (it != g_fillBots.end())
+                        {
+                            it->second.entered = false;
+                            it->second.outSinceMs = 0;
+                        }
+                    }
+                    uint32 const recoverBgTypeId = uint32(liveBg->GetBgTypeID());
+                    LOG_INFO("module", "[WowPsParty BGFill] {} detached from live bg {}; requeueing instead of retiring",
+                             bot->GetName(), recoverBgTypeId);
+                    if (!bot->InBattlegroundQueue()) QueueFillBot(bot, recoverBgTypeId);
+                    else                             AcceptBgInvite(bot);
+                    continue;
+                }
                 RetireFillBot(botLow, bot);
                 continue;
             }
 
             // Pre-pop: if the leader bailed the queue, the fill bots leave too.
             Player* leader = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(fe.leaderLow));
-            if (!leaderStillIn(leader, fe.bgTypeId)) { RetireFillBot(botLow, bot); continue; }
+            if (!LeaderStillInBgFlow(leader, fe.bgTypeId)) { RetireFillBot(botLow, bot); continue; }
 
             // Out-of-bracket pool bot: re-level it to the bracket BEFORE it queues (a bot
             // queues into its CURRENT level's bracket, so queuing first would land it in the
@@ -1298,7 +1343,7 @@ public:
         for (auto const& [leaderLow, bgTypeId] : leaders)
         {
             Player* leader = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(leaderLow));
-            if (!leaderStillIn(leader, bgTypeId))
+            if (!LeaderStillInBgFlow(leader, bgTypeId))
             {
                 // Leader gone and no fill bots left to retire -> drop the stale session.
                 std::lock_guard<std::mutex> lk(g_mutex);
