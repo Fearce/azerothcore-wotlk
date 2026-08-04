@@ -13,10 +13,13 @@
  * the human's heroes) are driven to queue + accept the pop from the world tick,
  * since gated party bots never click "Enter Battle". When the match/queue ends the
  * fill bots are logged out (the human's own heroes are NOT — they're real alts).
- * NB: a full N-v-N is best-effort, not guaranteed — out-of-bracket fills re-level one per
- * world tick (below), and CheckNormalMatch pops as soon as both sides reach MinPlayers, so
- * a big draw can start partially filled and the rest backfill as they queue. A sub-cap pop
- * (e.g. 14v20) is staggered fill, not a regression; the human is always in it.
+ * NB: the POP itself is always sub-cap — CheckNormalMatch stops selecting a side the moment
+ * it reaches MinPlayersPerTeam — so the match is created short (WSG's min of 6 out of a 10
+ * cap is the worst case) and the rest of the draw is left sitting in the queue. Two things
+ * close that gap during the pre-gate countdown: ReinviteIdleQueuedFills re-runs the queue
+ * update so the core invites the fills that are already queued, and TopUpBgInPrep draws more
+ * from the pool for whatever deficit is left. A sub-cap pop is staggered fill, not a
+ * regression; the human is always in it.
  *
  * How the human is NEVER locked out of their own match (the bug the earlier
  * enemy-only revert was avoiding): EVERY participant — human, heroes and all fills —
@@ -96,6 +99,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace
@@ -139,6 +143,10 @@ namespace
     // leaderGuidLow -> getMSTime() at queue: fill is PENDING (delayed). The world tick fires
     // StartFill once BG_FILL_DELAY_MS has elapsed and the BG hasn't popped on its own.
     std::unordered_map<uint32, uint32>    g_fillPendingMs;
+    // leaderGuidLow -> {bg instanceId, idle-fill count} of the last re-invite we logged, so the
+    // once-per-second nudge below reports each step of the backfill (5 idle -> 2 -> 0) instead
+    // of the same line every tick for as long as the match stays short.
+    std::unordered_map<uint32, std::pair<uint32, uint32>> g_reinviteLogged;
     std::mutex                            g_mutex;
 
     BattlegroundQueueTypeId QueueTypeFor(uint32 bgTypeId)
@@ -187,10 +195,84 @@ namespace
     // Battleground Queue") until the party is kicked and re-invited.
     bool LeaderStillInBgFlow(Player* leader, uint32 bgTypeId)
     {
-        if (!leader || !leader->IsInWorld()) return false;
+        if (!leader) return false;
+        // Accepting the pop hands the leader across a map: HandleBattleFieldPortOpcode drops
+        // their queue slot and TeleportTo removes them from the world for the whole client
+        // loading screen. IsInWorld() therefore reads false for SECONDS right after the pop —
+        // precisely when the match is still short — and every fill that hasn't entered yet was
+        // being retired as "match/queue over", so the fill team was culled to whoever won the
+        // invite race and the leftovers had to be spawned and logged in all over again.
+        if (leader->IsBeingTeleported()) return true;
+        if (!leader->IsInWorld()) return false;
         if (leader->InBattleground()) return GetLiveLeaderBattleground(leader) != nullptr;
         return leader->InBattlegroundQueueForBattlegroundQueueType(QueueTypeFor(bgTypeId))
             || HasPendingBgInvite(leader, bgTypeId);
+    }
+
+    // Our fill bots that are sitting in this match's queue holding no invite — the ones the
+    // pop's selection race left behind (see ReinviteIdleQueuedFills).
+    uint32 CountIdleQueuedFills(uint32 leaderLow, uint32 bgTypeId)
+    {
+        std::vector<uint32> candidates;
+        {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            for (auto const& kv : g_fillBots)
+                if (kv.second.leaderLow == leaderLow && kv.second.bgTypeId == bgTypeId && !kv.second.entered)
+                    candidates.push_back(kv.first);
+        }
+        uint32 idle = 0;
+        for (uint32 botLow : candidates)
+        {
+            Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(botLow));
+            if (!bot) continue;
+            // A bot mid-port looks idle from the queue's side and isn't: accepting the invite
+            // erases its GroupQueueInfo (so HasPendingBgInvite reads false) while its Player
+            // queue slot survives until Battleground::AddPlayer. InBattleground() is already
+            // true by then — it is set before the teleport — so it separates the two.
+            if (!bot->IsInWorld() || bot->InBattleground() || bot->IsBeingTeleported()) continue;
+            if (bot->InBattlegroundQueueForBattlegroundQueueType(QueueTypeFor(bgTypeId))
+                && !HasPendingBgInvite(bot, bgTypeId))
+                ++idle;
+        }
+        return idle;
+    }
+
+    // Get the fills that lost the pop's selection race INTO the live match.
+    //
+    // CheckNormalMatch stops adding groups to a side the moment that side reaches
+    // MinPlayersPerTeam, so a fill team that queues in one burst pops the match at the MINIMUM
+    // and leaves the rest in the queue: WSG's min is 6 here (raised by migration
+    // 2026_06_19_00 so a full party is never a premade), which is exactly the 6v6 Kevin got out
+    // of a 10-cap Warsong. The core would have topped that instance up from the queue on its
+    // next queue update — but nothing ever schedules one for a NORMAL battleground except a
+    // player joining or leaving it (BattlegroundMgr's periodic pass is rated-arena only), so
+    // the leftovers sat there, uninvited, for the whole match while TopUpBgInPrep counted them
+    // as in-flight and waited for bots that were never coming.
+    //
+    // So schedule the update the core would have run for a late joiner: its free-slot branch
+    // calls FillPlayersToBG + InviteGroupToBG against the LIVE instance, and the drive loop
+    // ports each newly-invited fill in on the next tick. bg->GetBgTypeID() is the QUEUE type
+    // (a Random BG instance keeps BATTLEGROUND_RB, its real map lives in GetBgTypeID(true)),
+    // which is both the queue our fills hold and the key the free-slot store is under.
+    void ReinviteIdleQueuedFills(Battleground* bg, uint32 leaderLow, uint32 bgTypeId)
+    {
+        uint32 const idle = CountIdleQueuedFills(leaderLow, bgTypeId);
+        if (!idle) return;
+
+        sBattlegroundMgr->ScheduleQueueUpdate(0, 0, QueueTypeFor(bgTypeId),
+                                              BattlegroundTypeId(bgTypeId), bg->GetBracketId());
+
+        std::pair<uint32, uint32> const stamp{ bg->GetInstanceID(), idle };
+        {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            auto& logged = g_reinviteLogged[leaderLow];
+            if (logged == stamp) return;
+            logged = stamp;
+        }
+        LOG_INFO("module",
+            "[WowPsParty BGFill] bg {} is short ({}v{} of {}) with {} fill(s) idle in its queue — re-running the queue update to invite them",
+            bgTypeId, bg->GetPlayersCountByTeam(TEAM_ALLIANCE), bg->GetPlayersCountByTeam(TEAM_HORDE),
+            bg->GetMaxPlayersPerTeam(), idle);
     }
 
     // CSV of RNDBOT account ids (the same parked pool the henchman hire draws from).
@@ -446,6 +528,15 @@ namespace
         if (bg->GetPlayersCountByTeam(TEAM_ALLIANCE) >= maxPerTeam
             && bg->GetPlayersCountByTeam(TEAM_HORDE) >= maxPerTeam) return;
 
+        uint32 const leaderLow = leader->GetGUID().GetCounter();
+        // The QUEUE the fills hold, which is also how the core keys this instance: a Random BG
+        // pop keeps BATTLEGROUND_RB here and exposes its real map via GetBgTypeID(true).
+        uint32 const bgTypeId  = uint32(bg->GetBgTypeID());
+
+        // Use the fills we already have before drawing more from the pool: the ones the pop
+        // left behind are queued and idle, and only a queue update will invite them.
+        ReinviteIdleQueuedFills(bg, leaderLow, bgTypeId);
+
         PlayerbotMgr* mgr = sPlayerbotsMgr.GetPlayerbotMgr(leader);
         if (!mgr) return;
         Battleground* tpl = sBattlegroundMgr->GetBattlegroundTemplate(bg->GetBgTypeID());
@@ -459,8 +550,6 @@ namespace
         std::string const acctCsv = RndbotAccountCsv();
         if (acctCsv.empty()) return;
 
-        uint32 const leaderLow  = leader->GetGUID().GetCounter();
-        uint32 const bgTypeId   = uint32(bg->GetBgTypeID());   // resolved real BG (Random BG -> real type)
         TeamId const leaderTeam = leader->GetTeamId();
 
         // Heroes (managed party bots) not yet in the BG will take the leader-team slots —
@@ -633,7 +722,11 @@ namespace
             leaderLow = it->second.leaderLow;
             g_fillBots.erase(it);
             for (auto const& kv : g_fillBots) if (kv.second.leaderLow == leaderLow) { stillHasSiblings = true; break; }
-            if (!stillHasSiblings) g_activeLeaders.erase(leaderLow);
+            if (!stillHasSiblings)
+            {
+                g_activeLeaders.erase(leaderLow);
+                g_reinviteLogged.erase(leaderLow);
+            }
         }
         if (bot && bot->GetSession())
         {
@@ -1479,7 +1572,11 @@ public:
                 g_fillPendingMs.erase(leaderLow);   // left the queue before the hold elapsed
                 bool hasFills = false;
                 for (auto const& kv : g_fillBots) if (kv.second.leaderLow == leaderLow) { hasFills = true; break; }
-                if (!hasFills) g_activeLeaders.erase(leaderLow);
+                if (!hasFills)
+                {
+                    g_activeLeaders.erase(leaderLow);
+                    g_reinviteLogged.erase(leaderLow);
+                }
                 continue;
             }
             // Delayed initial fill: once the hold window elapses AND the BG hasn't popped on
