@@ -158,23 +158,39 @@ namespace
             && invite.IsInvitedToBGInstanceGUID && invite.RemoveInviteTime;
     }
 
-    bool LeaderStillInBgFlow(Player* leader, uint32 bgTypeId)
-    {
-        return leader && leader->IsInWorld()
-            && (leader->InBattleground()
-                || leader->InBattlegroundQueueForBattlegroundQueueType(QueueTypeFor(bgTypeId))
-                || HasPendingBgInvite(leader, bgTypeId));
-    }
-
     // WAIT_LEAVE is a finished match; only a pre-gate or in-progress match should recover
-    // a detached fill bot.
+    // a detached fill bot. GetBattleground(TRUE) because the default also demands that the
+    // instance's MAP already exist, and a battleground map is created lazily by the first
+    // player to finish loading into it (MapInstanced::CreateInstanceForPlayer) — so for the
+    // whole of the leader's loading screen a perfectly live match resolves to null. Only the
+    // STATUS test belongs in this decision; a genuinely deleted instance still resolves to
+    // null with either argument.
     Battleground* GetLiveLeaderBattleground(Player* leader)
     {
         if (!leader || !leader->InBattleground()) return nullptr;
 
-        Battleground* bg = leader->GetBattleground();
+        Battleground* bg = leader->GetBattleground(true);
         if (!bg || bg->isArena()) return nullptr;
         return bg->GetStatus() == STATUS_WAIT_JOIN || bg->GetStatus() == STATUS_IN_PROGRESS ? bg : nullptr;
+    }
+
+    // The leader is still in the BG flow while they are queued for it, hold an invite from
+    // it, or are fighting the LIVE match it popped — but NOT once that match has ended. A
+    // finished battleground keeps BOTH the leader's bgInstanceID and their queue slot until
+    // they click "Leave Battleground" (up to TIME_TO_AUTOREMOVE), so either test on its own
+    // still reads "in the flow" minutes after the last flag cap. That window is long enough
+    // for RecoverOrphanedPartyBots to pull the heroes out of the dead instance and for the
+    // hero drive loop below to then read them as out-of-BG-and-unqueued and re-queue every
+    // one of them. Nothing drives those entries afterwards, and at this server's population
+    // the queue never pops to expire them, so the heroes sit in it indefinitely and every
+    // later group queue is refused ("Can't queue for a Random Battleground while in another
+    // Battleground Queue") until the party is kicked and re-invited.
+    bool LeaderStillInBgFlow(Player* leader, uint32 bgTypeId)
+    {
+        if (!leader || !leader->IsInWorld()) return false;
+        if (leader->InBattleground()) return GetLiveLeaderBattleground(leader) != nullptr;
+        return leader->InBattlegroundQueueForBattlegroundQueueType(QueueTypeFor(bgTypeId))
+            || HasPendingBgInvite(leader, bgTypeId);
     }
 
     // CSV of RNDBOT account ids (the same parked pool the henchman hire draws from).
@@ -903,6 +919,78 @@ namespace
             human->GetName(), uint32(arenaType), uint32(arenaType), teamId, uint32(members.size()), humanRating);
     }
 
+    // Withdraw a managed party bot from a battleground/arena queue exactly the way the core
+    // does for a player who clicks "Leave Queue" (HandleBattleFieldPortOpcode, action 0):
+    // the BattlegroundQueue entry first, then the Player slot. Clearing only the slot would
+    // strand the bot in m_QueuedPlayers, where it still counts toward the bracket and can be
+    // invited into a match nothing will ever accept.
+    void LeaveBgQueue(Player* pb, BattlegroundQueueTypeId qt)
+    {
+        sBattlegroundMgr->GetBattlegroundQueue(qt).RemovePlayer(pb->GetGUID(), true);
+        pb->RemoveBattlegroundQueueId(qt);
+    }
+
+    // Every battleground/arena queue slot a managed party bot holds that its party is not
+    // actually in. Both kinds block the HUMAN, in two different systems:
+    //   * a PHANTOM slot the BattlegroundQueue has no record of — InBattlegroundQueue reads
+    //     only the Player-object slots, so it reports "queued" forever, and
+    //   * a REAL entry the LEADER doesn't share — a hero left behind in a queue its party
+    //     has moved on from.
+    // The leader holds their own slot for a queue type as long as they are in it, invited
+    // from it, or inside the match it popped (SetBattlegroundId preserves the slot;
+    // RemovePlayerAtLeave is what finally clears it), so "the leader has no slot for this
+    // queue type" is exactly "this party is not queued here" — with no window where a live
+    // queue looks abandoned. An entry that already holds an INVITE is left alone whatever
+    // the leader looks like: it resolves itself either way (the bot accepts, or
+    // BGQueueRemoveEvent drops both the entry and the slot when the invite times out), and
+    // withdrawing an invited RATED entry would charge the party an arena rating loss. A
+    // shared rated entry is left alone for the sibling reason, below.
+    void DropOrphanedBgQueues(Player* pb)
+    {
+        if (pb->InBattleground()) return;   // its slots belong to that match, not to a queue
+
+        ObjectGuid const leaderGuid = WowPsParty::GetLeaderFor(pb->GetGUID());
+        Player* const leader = leaderGuid.IsEmpty() ? nullptr : ObjectAccessor::FindConnectedPlayer(leaderGuid);
+        char const* const leaderLabel = leader ? leader->GetName().c_str()
+                                              : (leaderGuid.IsEmpty() ? "(no directive)" : "(offline)");
+
+        for (uint8 i = 0; i < PLAYER_MAX_BATTLEGROUND_QUEUES; ++i)
+        {
+            BattlegroundQueueTypeId const qt = pb->GetBattlegroundQueueTypeId(i);
+            if (qt == BATTLEGROUND_QUEUE_NONE) continue;
+
+            GroupQueueInfo gi;
+            if (!sBattlegroundMgr->GetBattlegroundQueue(qt).GetPlayerGroupInfoData(pb->GetGUID(), &gi))
+            {
+                LOG_INFO("module",
+                    "[WowPsParty ArenaFill] clearing phantom BG queue slot (type {}) on {} — "
+                    "queue has no record of it; was blocking party LFG join",
+                    uint32(qt), pb->GetName());
+                pb->RemoveBattlegroundQueueId(qt);
+                continue;
+            }
+
+            if (gi.IsInvitedToBGInstanceGUID && gi.RemoveInviteTime)
+                continue;   // invite in flight — it accepts or expires on its own
+
+            // Pulling one member out of a SHARED rated entry makes the core drain the rest
+            // of that arena team out of the queue too (BattlegroundQueue.cpp:348-364) —
+            // which would yank a queue another human is sitting in. Leave those alone; a
+            // rated entry the hero holds alone is still cleaned.
+            if (gi.IsRated && gi.Players.size() > 1)
+                continue;
+
+            if (leader && leader->InBattlegroundQueueForBattlegroundQueueType(qt))
+                continue;   // the party really is queued here — hands off
+
+            LOG_INFO("module",
+                "[WowPsParty ArenaFill] withdrawing {} from stranded BG queue (type {}) — "
+                "leader {} is not in it; was blocking the party's next queue",
+                pb->GetName(), uint32(qt), leaderLabel);
+            LeaveBgQueue(pb, qt);
+        }
+    }
+
     // Self-heal managed party bots (henchmen + enrolled alts) orphaned in a FINISHED
     // arena/BG. Unlike the rndbot enemy team — which runs mod-playerbots' BG AI and
     // leaves itself on TIME_TO_AUTOREMOVE — the human's own party bots run only the
@@ -916,19 +1004,18 @@ namespace
     // tick independent of any ArenaFill session (that session retires when the ENEMY
     // team clears, which can be before our henchmen are out). Skips mid-port bots and
     // never touches an IN_PROGRESS match, so a live arena is never disturbed.
+    //
     // A managed party bot that has fully left a match must not keep *reporting* itself
     // battleground-bound. LFGMgr::Join checks every group member — plrg->InBattleground()
     // || plrg->InBattlegroundQueue() — and rejects the WHOLE party with
     // LFG_JOIN_USING_BG_SYSTEM ("you cannot queue for a dungeon while using battlegrounds
-    // or arenas") if any member still looks BG-bound. So one lingering bit on a henchman
-    // blocks the HUMAN from queueing a dungeon until they leave the party or relog. Two
-    // strays can survive a finished match:
-    //   * a bgData instance id pointing at a battleground that no longer exists, and
-    //   * a queue slot the BattlegroundQueue itself no longer tracks (InBattlegroundQueue
-    //     reads only the Player-object slots, so a phantom slot lies forever).
-    // Clear either; both are provably invalid — a live match is resolved by
-    // GetBattleground() and a real queue entry is found by GetPlayerGroupInfoData(), so
-    // neither is ever touched.
+    // or arenas") if any member still looks BG-bound; the battleground join does the same
+    // with ERR_IN_NON_RANDOM_BG / ERR_BATTLEGROUND_QUEUED_FOR_RATED. So one lingering bit
+    // on a henchman blocks the HUMAN until they leave the party or relog. A bgData instance
+    // id pointing at a battleground that no longer exists is one such stray; the queue slots
+    // are the other (DropOrphanedBgQueues). Both are provably invalid before they're
+    // touched — a live match is resolved by GetBattleground(), and a bot inside one returns
+    // below without its queue slots being read at all.
     static void ClearStaleBgState(Player* pb)
     {
         if (pb->InBattleground() && !pb->GetBattleground())
@@ -942,19 +1029,7 @@ namespace
 
         if (pb->InBattleground()) return;   // genuinely in a live match — hands off
 
-        for (uint8 i = 0; i < PLAYER_MAX_BATTLEGROUND_QUEUES; ++i)
-        {
-            BattlegroundQueueTypeId const qt = pb->GetBattlegroundQueueTypeId(i);
-            if (qt == BATTLEGROUND_QUEUE_NONE) continue;
-            GroupQueueInfo gi;
-            if (sBattlegroundMgr->GetBattlegroundQueue(qt).GetPlayerGroupInfoData(pb->GetGUID(), &gi))
-                continue;   // really queued — leave it alone
-            LOG_INFO("module",
-                "[WowPsParty ArenaFill] clearing phantom BG queue slot (type {}) on {} — "
-                "queue has no record of it; was blocking party LFG join",
-                uint32(qt), pb->GetName());
-            pb->RemoveBattlegroundQueueId(qt);
-        }
+        DropOrphanedBgQueues(pb);
     }
 
     void RecoverOrphanedPartyBots()
@@ -1119,9 +1194,37 @@ class PartyBgFillPlayerScript : public PlayerScript
 {
 public:
     PartyBgFillPlayerScript() : PlayerScript("PartyBgFillPlayerScript", {
+        PLAYERHOOK_CAN_JOIN_IN_BATTLEGROUND_QUEUE,
+        PLAYERHOOK_CAN_JOIN_IN_ARENA_QUEUE,
         PLAYERHOOK_ON_PLAYER_JOIN_BG,
         PLAYERHOOK_ON_PLAYER_JOIN_ARENA
     }) { }
+
+    // Sweep the party's stranded queue entries BEFORE the core reads them. Both join
+    // handlers fire their hook first and only then walk every group member (directly, and
+    // again inside Group::CanJoinBattlegroundQueue), refusing the WHOLE party if any of them
+    // sits in a battleground or arena queue — "Can't queue for a Random Battleground while
+    // in another Battleground Queue". A managed hero is only ever in a queue because this
+    // module put it there to follow the human, so an entry the human doesn't share is ours
+    // to withdraw — and doing it here, synchronously on the world thread, means the queue
+    // the player just clicked succeeds instead of failing once while the 1s sweep catches
+    // up. Neither hook ever denies a join: they only clean up, and every genuine refusal
+    // stays the core's to make.
+    bool OnPlayerCanJoinInBattlegroundQueue(Player* player, ObjectGuid /*battlemasterGuid*/,
+                                            BattlegroundTypeId /*bgTypeId*/, uint8 /*joinAsGroup*/,
+                                            GroupJoinBattlegroundResult& /*err*/) override
+    {
+        WithdrawStrandedPartyQueues(player);
+        return true;
+    }
+
+    bool OnPlayerCanJoinInArenaQueue(Player* player, ObjectGuid /*battlemasterGuid*/, uint8 /*arenaSlot*/,
+                                     BattlegroundTypeId /*bgTypeId*/, uint8 /*joinAsGroup*/, uint8 /*isRated*/,
+                                     GroupJoinBattlegroundResult& /*err*/) override
+    {
+        WithdrawStrandedPartyQueues(player);
+        return true;
+    }
 
     // Rated arena: a queue can only pop against an opposing arena team, so when a
     // managed party's leader queues rated, field an opposite-faction bot team (see
@@ -1192,6 +1295,24 @@ public:
     // fill bot synchronously inside the BG-removal hook — for every fill bot when a
     // 10v10/40v40 ends — is a re-entrant teardown crash risk. The world tick retires
     // them safely instead (it watches each fill bot leave its match via `entered`).
+
+private:
+    void WithdrawStrandedPartyQueues(Player* human)
+    {
+        if (!WowPsParty::IsEnabled() || !human) return;
+        if (sPlayerbotsMgr.GetPlayerbotAI(human)) return;   // a bot queued; only the human
+
+        std::vector<ObjectGuid> party;
+        WowPsParty::GetPartyGuidsFor(human->GetGUID(), party);
+        for (ObjectGuid const& g : party)
+        {
+            if (g == human->GetGUID()) continue;
+            Player* pb = ObjectAccessor::FindConnectedPlayer(g);
+            if (!pb || !pb->IsInWorld() || pb->IsBeingTeleported()) continue;
+            if (!sPlayerbotsMgr.GetPlayerbotAI(pb)) continue;   // managed heroes/henchmen only
+            DropOrphanedBgQueues(pb);
+        }
+    }
 };
 
 class PartyBgFillWorldScript : public WorldScript
