@@ -468,13 +468,21 @@ namespace
             uint32 const present = bg->GetPlayersCountByTeam(t);
 
             // My fills already heading to this team (spawned, not yet in) — counted so we
-            // don't re-spawn what's already in flight.
+            // don't re-spawn what's already in flight. A fill that ENTERED but currently
+            // reads out-of-BG (outSinceMs set: its BG_OUT_GRACE_MS window is running, see
+            // the recovery path in OnUpdate) counts here TOO. It has already dropped out of
+            // `present` yet the old `entered` skip left it out of `inFlight` as well, so for
+            // the whole ~8s grace this loop saw a phantom deficit and spawned a REPLACEMENT
+            // for a bot that comes right back — the visible "one leaves, a new one joins"
+            // churn, fired one tick (1s) after the flicker and long before the recovery
+            // path gets to requeue the original.
             uint32 inFlight = 0;
             {
                 std::lock_guard<std::mutex> lk(g_mutex);
                 for (auto const& kv : g_fillBots)
                 {
-                    if (kv.second.leaderLow != leaderLow || kv.second.entered) continue;
+                    if (kv.second.leaderLow != leaderLow) continue;
+                    if (kv.second.entered && !kv.second.outSinceMs) continue;   // genuinely in -> already in `present`
                     TeamId const feTeam = kv.second.ally
                         ? leaderTeam
                         : (leaderTeam == TEAM_ALLIANCE ? TEAM_HORDE : TEAM_ALLIANCE);
