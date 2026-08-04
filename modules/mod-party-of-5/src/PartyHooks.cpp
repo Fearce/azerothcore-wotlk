@@ -5,6 +5,9 @@
  * members, and auto-learns class spells on level-up. Each hook uses a
  * thread_local guard to avoid the obvious infinite recursion (each mirrored
  * grant would re-enter the hook and re-mirror forever).
+ *
+ * Also mirrors the leader's TEXT EMOTES onto their companions (/dance and the
+ * whole party dances) — see MirrorTextEmoteToParty below.
  */
 
 #include "PartyMgr.h"
@@ -25,6 +28,7 @@
 #include "LootMgr.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
+#include "Opcodes.h"     // SMSG_TEXT_EMOTE — replay the leader's emote line for a companion
 #include "Player.h"
 #include "QuestDef.h"
 #include "Reputation/ReputationMgr.h"
@@ -38,6 +42,8 @@
 #include "CheckMountStateAction.h"    // CheckMountStateAction::RecordManualMount
 #include "StringFormat.h"
 #include "Trainer.h"
+#include "World.h"        // sWorld->getFloatConfig(CONFIG_LISTEN_RANGE_TEXTEMOTE) — emote earshot
+#include "WorldPacket.h"
 #include "WorldSession.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
@@ -497,6 +503,186 @@ namespace
     }
 }
 
+namespace WowPsParty
+{
+    // ---- Emote mirroring -------------------------------------------------
+    // "/dance and my heroes dance too." A companion has no game client, so
+    // nothing turns the leader's CMSG_TEXT_EMOTE into an animation for it —
+    // this does for the whole party what WorldSession::HandleTextEmoteOpcode
+    // does for the one real player who typed it.
+    //
+    // Scope is exactly the emotes the core itself drives server-side: the
+    // looping dance state and every one-shot. /sit, /sleep and /kneel reach a
+    // real player as a client-side stand state and are deliberately left alone
+    // — a seated companion is stood back up by the follow ticker's next 1 Hz
+    // pass (PartyFollow.cpp), and one carrying any party power-regen buff
+    // (Blessing of Wisdom, Mana Spring) reads as mid-drink to BotIsConsuming
+    // (PartyRotation.cpp), which would park the party in a fake drink hold.
+
+    // Companions holding a mirrored dance -> the leader they copied it from.
+    // Guid counters, not Player*: either side can log out between passes.
+    // CMSG_TEXT_EMOTE is PROCESS_THREADSAFE (Opcodes.cpp), so the hook runs on
+    // a map-update thread while the clearing pass runs on the world thread.
+    static std::mutex g_danceMutex;
+    static std::unordered_map<uint32, ObjectGuid> g_mirroredDances;
+
+    static float EmoteListenRange()
+    {
+        return sWorld->getFloatConfig(CONFIG_LISTEN_RANGE_TEXTEMOTE);
+    }
+
+    // The "<Name> dances with <target>." line nearby clients print. The core
+    // builds this per-receiver locale (Acore::EmoteChatBuilder), but that
+    // builder is private to ChatHandler.cpp and the target's name is its only
+    // localised part — one packet at the default locale is the same text on
+    // this realm.
+    static void SendMirroredEmoteText(Player* bot, uint32 textEmote, uint32 emoteNum, Unit const* target)
+    {
+        std::string const name = target ? target->GetName() : "";
+        WorldPacket data(SMSG_TEXT_EMOTE, 20 + name.size());
+        data << bot->GetGUID();
+        data << uint32(textEmote);
+        data << uint32(emoteNum);
+        data << uint32(name.size());
+        if (name.size() > 1)
+            data << name;
+        else
+            data << uint8(0);
+        // self = false: the receiver is every real client watching the bot; the
+        // bot's own fake session has nothing to render.
+        bot->SendMessageToSetInRange(&data, EmoteListenRange(), false);
+    }
+
+    // Play the animation, following the core's switch. False = this emote does
+    // nothing for a clientless companion, so it must not claim the emote in
+    // chat either — a hero that prints "sits down." while still standing is
+    // worse than one that stays out of it.
+    static bool ApplyMirroredEmote(Player* bot, uint32 emoteAnim, ObjectGuid leaderGuid)
+    {
+        switch (emoteAnim)
+        {
+            case EMOTE_STATE_SLEEP:
+            case EMOTE_STATE_SIT:
+            case EMOTE_STATE_KNEEL:
+                return false;                           // stand states — see the note above
+            case EMOTE_ONESHOT_NONE:
+                return true;                            // text-only emote, nothing to animate
+            case EMOTE_STATE_DANCE:
+            {
+                bot->SetUInt32Value(UNIT_NPC_EMOTESTATE, EMOTE_STATE_DANCE);
+                std::lock_guard<std::mutex> lock(g_danceMutex);
+                g_mirroredDances[bot->GetGUID().GetCounter()] = leaderGuid;
+                return true;
+            }
+            default:
+                bot->HandleEmoteCommand(emoteAnim);     // one-shot, no state left behind
+                return true;
+        }
+    }
+
+    // A companion is eligible to copy the leader only if the emote would read as
+    // part of the same scene: alive, idle, and close enough that the mirrored
+    // chat line reaches the same people the leader's did.
+    static bool CanMirrorEmoteTo(Player* bot, Player* leader)
+    {
+        if (!bot || !bot->IsInWorld() || !bot->IsAlive())
+            return false;
+        if (bot->HasUnitState(UNIT_STATE_DIED))         // feign death — the core skips it too
+            return false;
+        if (!sPlayerbotsMgr.GetPlayerbotAI(bot))        // managed companion only
+            return false;
+        if (bot->IsInCombat())                          // fighting beats dancing
+            return false;
+        if (bot->IsInFlight() || bot->GetVehicle())     // strapped in; nothing to animate
+            return false;
+        if (bot->IsBeingTeleported())
+            return false;
+        // InMap, not the bare IsWithinDist: that one skips the map / instance /
+        // phase test, so a companion stranded in another copy of the same map id
+        // would compare as standing right here.
+        return bot->IsWithinDistInMap(leader, EmoteListenRange(), false);
+    }
+
+    // Copy `leader`'s text emote onto every companion it is running. Heroes,
+    // hired alts and henchmen alike — GetPartyGuidsFor is the follow-directive
+    // roster, so a second human's bots are correctly out of scope.
+    // Deliberately does NOT re-fire the emote's achievement credit or the
+    // CreatureAI::ReceiveEmote script call: the leader's own emote already did,
+    // and four echoes would re-trigger emote-gated quest scripts.
+    static void MirrorTextEmoteToParty(Player* leader, uint32 textEmote, uint32 emoteNum, ObjectGuid targetGuid)
+    {
+        if (!IsEnabled() || !leader || !leader->GetSession() || !leader->IsInWorld())
+            return;
+        if (sPlayerbotsMgr.GetPlayerbotAI(leader))      // only a human drives the party
+            return;
+
+        EmotesTextEntry const* em = sEmotesTextStore.LookupEntry(textEmote);
+        if (!em)
+            return;
+
+        std::vector<ObjectGuid> guids;
+        GetPartyGuidsFor(leader->GetGUID(), guids);
+
+        uint32 mirrored = 0;
+        for (ObjectGuid const& g : guids)
+        {
+            if (g == leader->GetGUID())
+                continue;
+            Player* bot = ObjectAccessor::FindConnectedPlayer(g);
+            if (!CanMirrorEmoteTo(bot, leader))
+                continue;
+            if (!ApplyMirroredEmote(bot, em->textid, leader->GetGUID()))
+                continue;
+
+            SendMirroredEmoteText(bot, textEmote, emoteNum,
+                                  targetGuid ? ObjectAccessor::GetUnit(*bot, targetGuid) : nullptr);
+            ++mirrored;
+        }
+
+        if (mirrored && IsLogVerbose())
+            LOG_INFO("module", "[WowPsParty] emote {} from {} mirrored to {} companion(s)",
+                     textEmote, leader->GetName(), mirrored);
+    }
+
+    // A mirrored dance lasts exactly as long as the leader's own. The core drops
+    // the leader's UNIT_NPC_EMOTESTATE the moment their client reports movement
+    // (MovementHandler.cpp); a companion has no client to send that, so this
+    // reads the leader's field as the authority rather than inventing a timer —
+    // which also survives the follow ticker's idle wander, where watching the
+    // companion's own feet would end the dance after a few seconds of standing
+    // together. Combat and death end it early, as they do for a player.
+    static void ClearFinishedDances()
+    {
+        std::lock_guard<std::mutex> lock(g_danceMutex);
+        for (auto it = g_mirroredDances.begin(); it != g_mirroredDances.end(); )
+        {
+            Player* bot = ObjectAccessor::FindConnectedPlayer(
+                ObjectGuid::Create<HighGuid::Player>(it->first));
+            // Gone, or something else owns the field now (death clears it) —
+            // drop the record without touching anyone.
+            if (!bot || !bot->IsInWorld()
+                || bot->GetUInt32Value(UNIT_NPC_EMOTESTATE) != EMOTE_STATE_DANCE)
+            {
+                it = g_mirroredDances.erase(it);
+                continue;
+            }
+            Player const* leader = ObjectAccessor::FindConnectedPlayer(it->second);
+            bool const leaderDancing = leader && leader->IsInWorld()
+                && leader->GetUInt32Value(UNIT_NPC_EMOTESTATE) == EMOTE_STATE_DANCE;
+            if (leaderDancing && !bot->IsInCombat())
+            {
+                ++it;
+                continue;
+            }
+            bot->SetUInt32Value(UNIT_NPC_EMOTESTATE, EMOTE_ONESHOT_NONE);
+            if (IsLogVerbose())
+                LOG_INFO("module", "[WowPsParty] {} stopped dancing ({})",
+                         bot->GetName(), leaderDancing ? "in combat" : "leader stopped");
+            it = g_mirroredDances.erase(it);
+        }
+    }
+}
+
 class PartyHooksPlayerScript : public PlayerScript
 {
 public:
@@ -513,8 +699,17 @@ public:
         PLAYERHOOK_ON_REMOVE_FROM_BATTLEGROUND,
         PLAYERHOOK_CAN_PLAYER_USE_PRIVATE_CHAT,
         PLAYERHOOK_ON_BEFORE_SEND_CHAT_MESSAGE,
-        PLAYERHOOK_ON_SPELL_CAST
+        PLAYERHOOK_ON_SPELL_CAST,
+        PLAYERHOOK_ON_TEXT_EMOTE
     }) { }
+
+    // /dance, /cheer, /sit — whatever the human just did, the companions they
+    // are running do too. Fires on the leader's own CMSG_TEXT_EMOTE, before the
+    // core plays it for them, so the whole party moves as one.
+    void OnPlayerTextEmote(Player* player, uint32 textEmote, uint32 emoteNum, ObjectGuid guid) override
+    {
+        WowPsParty::MirrorTextEmoteToParty(player, textEmote, emoteNum, guid);
+    }
 
     // Remember the last mount a human rode manually on a hero char, so that character
     // prefers the same mount when it's later AI-driven — "ride Winterspring Frostsaber
@@ -1357,12 +1552,38 @@ public:
     }
 };
 
+// Ends mirrored dances. Runs on its own short beat rather than the 1 Hz follow
+// ticker so the party stops dancing as the leader walks off, not a second
+// later. The pass only ever walks companions actually mid-dance, so it costs
+// nothing the rest of the time.
+class PartyEmoteWorldScript : public WorldScript
+{
+public:
+    PartyEmoteWorldScript() : WorldScript("PartyEmoteWorldScript", {
+        WORLDHOOK_ON_UPDATE
+    }) { }
+
+    void OnUpdate(uint32 diff) override
+    {
+        _accum += diff;
+        if (_accum < CLEAR_INTERVAL_MS)
+            return;
+        _accum -= CLEAR_INTERVAL_MS;
+        WowPsParty::ClearFinishedDances();
+    }
+
+private:
+    static constexpr uint32 CLEAR_INTERVAL_MS = 500;
+    uint32 _accum = 0;
+};
+
 void AddPartyHooksScripts()
 {
     new PartyHooksPlayerScript();
     new PartyHenchmanGroupScript();
     new PartyDamageTrackScript();
     new PartyArenaReadyBgScript();
+    new PartyEmoteWorldScript();
 }
 
 // Trampoline called from the [WowPsParty PATCH] in PlayerQuest.cpp::AddQuest.
