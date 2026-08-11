@@ -68,11 +68,13 @@
 #include "WorldSession.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #ifdef _WIN32
@@ -4179,6 +4181,298 @@ static void HandleAhSell(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+namespace
+{
+    // A 3.3.5a addon can only buy at the Auction House by driving the live UI one
+    // confirmed listing at a time, which is why the shopping list's Auctionator
+    // path needs a human at the keyboard for every stack. Buying from inside the
+    // core has no such constraint, so AH_BUY takes one shopping-list row and
+    // fills it outright — the mirror image of AH_SELL, auctioneer-less the same
+    // way, with the item delivered by the same won-auction mail a hand-clicked
+    // buyout produces.
+
+    // A single request is one shopping-list row: a few stacks. The cap is the
+    // runaway guard, reported back as `short` so the client stops rather than
+    // grinding the whole house into one item.
+    constexpr uint32 AH_BUY_MAX_AUCTIONS = 40;
+    constexpr uint32 AH_BUY_MAX_COUNT    = 10000;
+
+    struct AhBuyCandidate
+    {
+        uint32 id;
+        uint32 stack;
+        uint32 buyout;
+    };
+
+    // The core blocks buying your own auction and — for an OFFLINE owner — one
+    // listed by another character on your account. Party-of-5 keeps four more
+    // alts logged in, so the connected owner's account has to be checked too.
+    bool AhBuyOwnedByRequester(AuctionEntry const* auction, Player* requester)
+    {
+        if (auction->owner == requester->GetGUID())
+            return true;
+        uint32 const account = requester->GetSession()->GetAccountId();
+        if (Player* owner = ObjectAccessor::FindConnectedPlayer(auction->owner))
+            return owner->GetSession() && owner->GetSession()->GetAccountId() == account;
+        return sCharacterCache->GetCharacterAccountIdByGuid(auction->owner) == account;
+    }
+
+    void CollectAhBuyCandidates(AuctionHouseObject* house, Player* requester,
+                                uint32 itemEntry, std::vector<AhBuyCandidate>& out)
+    {
+        for (auto const& [id, auction] : house->GetAuctions())
+        {
+            if (!auction || auction->item_template != itemEntry) continue;
+            if (!auction->buyout || !auction->itemCount) continue;
+            if (AhBuyOwnedByRequester(auction, requester)) continue;
+            // The escrowed item has to still be resident: SendAuctionWonMail
+            // mails nothing when it isn't, and the gold would already be gone.
+            if (!sAuctionMgr->GetAItem(auction->item_guid)) continue;
+            out.push_back({ id, auction->itemCount, auction->buyout });
+        }
+    }
+
+    // Mirrors the client's WowPsShopping_ChooseAuction so an automatic pass buys
+    // what a human clicking Buy Next would: the cheapest per-unit stack that fits
+    // inside what's still missing, and only when nothing fits, the smallest
+    // unavoidable overshoot. Returns an index into `candidates`, or -1.
+    int PickAhBuyCandidate(std::vector<AhBuyCandidate> const& candidates,
+                           uint32 remaining, bool& overbuy)
+    {
+        int fit = -1, over = -1;
+        double fitUnit = 0.0, overUnit = 0.0;
+        uint32 overExcess = 0;
+
+        for (std::size_t i = 0; i < candidates.size(); ++i)
+        {
+            AhBuyCandidate const& c = candidates[i];
+            double const unit = double(c.buyout) / double(c.stack);
+            if (c.stack <= remaining)
+            {
+                if (fit < 0 || unit < fitUnit
+                    || (unit == fitUnit && c.stack > candidates[fit].stack))
+                {
+                    fit = int(i);
+                    fitUnit = unit;
+                }
+            }
+            else
+            {
+                uint32 const excess = c.stack - remaining;
+                if (over < 0 || excess < overExcess
+                    || (excess == overExcess && unit < overUnit))
+                {
+                    over = int(i);
+                    overExcess = excess;
+                    overUnit = unit;
+                }
+            }
+        }
+
+        overbuy = fit < 0;
+        return fit >= 0 ? fit : over;
+    }
+
+    // The buyout branch of WorldSession::HandleAuctionPlaceBid, minus the
+    // auctioneer-interaction check. `auction` is deleted by RemoveAuction, so
+    // the caller must not touch it afterwards.
+    void ExecuteAhBuyout(Player* buyer, AuctionHouseObject* house, AuctionEntry* auction)
+    {
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+
+        if (buyer->GetGUID() == auction->bidder)
+            buyer->ModifyMoney(-int32(auction->buyout - auction->bid));
+        else
+        {
+            buyer->ModifyMoney(-int32(auction->buyout));
+            if (auction->bidder)
+                sAuctionMgr->SendAuctionOutbiddedMail(auction, auction->buyout, buyer, trans);
+        }
+
+        auction->bidder = buyer->GetGUID();
+        auction->bid    = auction->buyout;
+        buyer->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_HIGHEST_AUCTION_BID,
+                                         auction->buyout);
+
+        sAuctionMgr->SendAuctionSalePendingMail(auction, trans);
+        sAuctionMgr->SendAuctionSuccessfulMail(auction, trans);
+        sAuctionMgr->SendAuctionWonMail(auction, trans);
+        sScriptMgr->OnAuctionSuccessful(house, auction);
+
+        auction->DeleteFromDB(trans);
+        sAuctionMgr->RemoveAItem(auction->item_guid);
+        house->RemoveAuction(auction);
+
+        buyer->SaveInventoryAndGoldToDB(trans);
+        CharacterDatabase.CommitTransaction(trans);
+    }
+
+    bool AhBuyNameEquals(std::string const& tmplName, std::string_view wanted)
+    {
+        if (tmplName.size() != wanted.size()) return false;
+        for (std::size_t i = 0; i < tmplName.size(); ++i)
+            if (std::tolower(static_cast<unsigned char>(tmplName[i]))
+                != std::tolower(static_cast<unsigned char>(wanted[i])))
+                return false;
+        return true;
+    }
+
+    // The client sends the entry id when it has one. A row pasted as plain guide
+    // text for an item nobody in the party owns has none, so fall back to the
+    // exact name — and because item names are not unique, break a tie towards
+    // whichever of them is actually listed on this Auction House.
+    uint32 ResolveAhBuyItem(uint32 entryHint, std::string_view name, AuctionHouseObject* house)
+    {
+        if (entryHint && sObjectMgr->GetItemTemplate(entryHint))
+            return entryHint;
+        if (name.empty())
+            return 0;
+
+        std::vector<uint32> matches;
+        for (auto const& [id, tmpl] : *sObjectMgr->GetItemTemplateStore())
+            if (AhBuyNameEquals(tmpl.Name1, name))
+                matches.push_back(id);
+
+        if (matches.size() <= 1)
+            return matches.empty() ? 0 : matches.front();
+
+        std::unordered_map<uint32, uint32> listings;
+        for (uint32 id : matches)
+            listings[id] = 0;
+        for (auto const& [auctionId, auction] : house->GetAuctions())
+            if (auction && auction->buyout)
+            {
+                auto itr = listings.find(auction->item_template);
+                if (itr != listings.end())
+                    ++itr->second;
+            }
+
+        uint32 best = matches.front(), bestListings = 0;
+        for (uint32 id : matches)
+            if (listings[id] > bestListings)
+            {
+                best = id;
+                bestListings = listings[id];
+            }
+        return best;
+    }
+}
+
+// AH_BUY\t<seq>\t<itemEntry>\t<wantCount>\t<itemName>
+//   Buys out the cheapest listings of one shopping-list item on the requester's
+//   own faction Auction House until <wantCount> units are secured. <itemEntry>
+//   may be 0 for an item the client has never cached; <itemName> then resolves
+//   it. No auctioneer is required (same as AH_SELL) and the requester pays, so
+//   the shared-gold hook mirrors the spend across the pool. Everything bought
+//   arrives in the requester's mailbox, exactly as a clicked buyout does.
+//   <seq> is echoed untouched so a reply belonging to an aborted pass can be
+//   recognised and dropped rather than credited to whatever row is current.
+//
+// Reply: AH_BUYRES\t<seq>\t<itemEntry>\t<boughtUnits>\t<spentCopper>\t<status>
+//   full  — the requested count is covered
+//   short — bought some, then ran out of listings (or hit the per-request cap)
+//   none  — nothing suitable is listed
+//   money — stopped because the next stack costs more than the requester has
+//   err   — malformed request, unknown item, or no reachable Auction House
+static void HandleAhBuy(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+
+    auto field = [&payload](std::size_t& from) -> std::string_view
+    {
+        auto const tab = payload.find('\t', from);
+        auto const out = payload.substr(from, tab == std::string_view::npos
+            ? std::string_view::npos : tab - from);
+        from = tab == std::string_view::npos ? payload.size() : tab + 1;
+        return out;
+    };
+    auto number = [](std::string_view sv)
+    { return uint32(std::strtoul(std::string(sv).c_str(), nullptr, 10)); };
+
+    std::size_t cursor = 0;
+    uint32 const seq       = number(field(cursor));
+    uint32 const entryHint = number(field(cursor));
+    uint32 want            = number(field(cursor));
+    std::string_view const name = payload.substr(std::min(cursor, payload.size()));
+
+    auto reply = [requester, seq](uint32 entry, uint32 bought, uint64 spent, char const* status)
+    {
+        SendWPSP(requester, Acore::StringFormat("AH_BUYRES\t{}\t{}\t{}\t{}\t{}",
+            seq, entry, bought, spent, status));
+    };
+
+    if (!want) { reply(entryHint, 0, 0, "err"); return; }
+    want = std::min(want, AH_BUY_MAX_COUNT);
+
+    AuctionHouseObject* house = sAuctionMgr->GetAuctionsMap(requester->GetFaction());
+    if (!house) { reply(entryHint, 0, 0, "err"); return; }
+
+    uint32 const itemEntry = ResolveAhBuyItem(entryHint, name, house);
+    ItemTemplate const* tmpl = itemEntry ? sObjectMgr->GetItemTemplate(itemEntry) : nullptr;
+    if (!tmpl)
+    {
+        LOG_INFO("module", "[WowPsParty AhBuy] {} asked for x{} of an unresolvable item (entry={} name='{}')",
+            requester->GetName(), want, entryHint, std::string(name));
+        reply(entryHint, 0, 0, "err");
+        return;
+    }
+
+    std::vector<AhBuyCandidate> candidates;
+    CollectAhBuyCandidates(house, requester, itemEntry, candidates);
+
+    uint32 bought = 0;
+    uint64 spent  = 0;
+    bool outOfMoney = false;
+
+    for (uint32 round = 0; round < AH_BUY_MAX_AUCTIONS && bought < want; ++round)
+    {
+        bool overbuy = false;
+        int const pick = PickAhBuyCandidate(candidates, want - bought, overbuy);
+        if (pick < 0) break;
+
+        AhBuyCandidate const chosen = candidates[pick];
+        candidates.erase(candidates.begin() + pick);
+
+        // Re-read: a rival buyer or the expiry pass may have taken this listing
+        // between the snapshot and now, and AddAuction reuses no ids.
+        AuctionEntry* auction = house->GetAuction(chosen.id);
+        if (!auction || auction->item_template != itemEntry
+            || auction->buyout != chosen.buyout || auction->itemCount != chosen.stack)
+            continue;
+
+        // The same veto the real bid handler honours (restricted accounts, and
+        // whatever else a module hangs off it).
+        if (!sScriptMgr->OnPlayerCanPlaceAuctionBid(requester, auction))
+        {
+            LOG_INFO("module", "[WowPsParty AhBuy] {} vetoed by OnPlayerCanPlaceAuctionBid on auction {}",
+                requester->GetName(), chosen.id);
+            break;
+        }
+
+        if (!requester->HasEnoughMoney(chosen.buyout)) { outOfMoney = true; break; }
+
+        ExecuteAhBuyout(requester, house, auction);
+        bought += chosen.stack;
+        spent  += chosen.buyout;
+
+        LOG_INFO("module", "[WowPsParty AhBuy] {} bought {} x '{}'(entry={}) for {} copper (auction {})",
+            requester->GetName(), chosen.stack, tmpl->Name1, itemEntry, chosen.buyout, chosen.id);
+
+        // The overshoot stack already covers the shortfall; buying past it would
+        // be waste the manual picker would never commit.
+        if (overbuy) break;
+    }
+
+    char const* status = outOfMoney ? "money"
+                       : bought >= want ? "full"
+                       : bought > 0 ? "short" : "none";
+
+    LOG_INFO("module", "[WowPsParty AhBuy] {} requested x{} '{}'(entry={}): bought={} spent={} status={}",
+        requester->GetName(), want, tmpl->Name1, itemEntry, bought, spent, status);
+
+    reply(itemEntry, bought, spent, status);
+}
+
 // Forward declaration: PULL_TOOLS uses the same preserve-or-bounce transfer
 // primitive as the later inventory actions.
 static Item* PullItemToRequester(Player* requester, Player* srcChar, Item* item);
@@ -6790,6 +7084,10 @@ public:
         else if (command == "AH_SELL")
         {
             HandleAhSell(player, payload);
+        }
+        else if (command == "AH_BUY")
+        {
+            HandleAhBuy(player, payload);
         }
         else if (command == "PULL_REAGENT")
         {
