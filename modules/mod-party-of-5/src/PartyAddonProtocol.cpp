@@ -6642,6 +6642,213 @@ static void HandleBootstrapParty(Player* requester)
         WowPsParty::SendRosterTo(requester);
 }
 
+// ---------------------------------------------------------------------------
+// Key staging — a locked world object the party could open should open for the
+// human, whoever is carrying the key.
+//
+// A lock's ITEM requirement (Lock.dbc LOCK_KEY_ITEM — Skadi's Harpoon Launchers
+// are lock 1777 -> item 37372 "Harpoon") is enforced by the CLIENT, not by us.
+// The lock id ships to the client in SMSG_GAMEOBJECT_QUERY_RESPONSE, the client
+// resolves it against the LOCAL player's own bags, and when the key isn't there
+// it never sends CMSG_GAMEOBJ_USE at all — GameObject::Use would have run the
+// object quite happily. So unlike every other shared-inventory requirement there
+// is no server-side `return` to relax with a trampoline: the key has to
+// physically be in the human's bags before they click. That is exactly what the
+// Party Inventory panel's Take was being used for by hand.
+//
+// So do it for them: while a human stands near an object whose lock names a key
+// they don't hold, consolidate that key out of the party's bags. The sweep
+// starts well outside interaction range so the object is already clickable by
+// the time they walk up to it.
+// ---------------------------------------------------------------------------
+
+// Far enough that the key lands before the player reaches the ~5 yard
+// interaction range, near enough that we only ever react to an object they are
+// actually walking up to.
+static constexpr float KEY_STAGE_RANGE_YD = 30.0f;
+static constexpr uint32 KEY_STAGE_INTERVAL_MS = 1000;
+
+// The key items named by the locks of spawned objects around `human`.
+static void CollectNearbyLockKeys(Player* human, std::vector<uint32>& keys)
+{
+    struct LockedGameObjectCheck
+    {
+        LockedGameObjectCheck(Player const* src, float range) : _src(src), _range(range) { }
+        bool operator()(GameObject* go) const
+        {
+            return go && go->isSpawned() && go->GetGOInfo()->GetLockId()
+                && _src->IsWithinDistInMap(go, _range);
+        }
+        Player const* _src;
+        float _range;
+    };
+
+    std::list<GameObject*> nearby;
+    LockedGameObjectCheck check(human, KEY_STAGE_RANGE_YD);
+    Acore::GameObjectListSearcher<LockedGameObjectCheck> searcher(human, nearby, check);
+    Cell::VisitObjects(human, searcher, KEY_STAGE_RANGE_YD);
+
+    for (GameObject* go : nearby)
+    {
+        LockEntry const* lock = sLockStore.LookupEntry(go->GetGOInfo()->GetLockId());
+        if (!lock) continue;
+        for (uint8 j = 0; j < MAX_LOCK_CASE; ++j)
+            if (lock->Type[j] == LOCK_KEY_ITEM && lock->Index[j]
+                && std::find(keys.begin(), keys.end(), lock->Index[j]) == keys.end())
+                keys.push_back(lock->Index[j]);
+    }
+}
+
+// Every loose copy of `itemId` in `owner`'s bags and KEYRING — collected before
+// anything moves, because the first MoveItemFromInventory invalidates the slot
+// walk. Keys sit in the keyring far more often than in a bag, so unlike the
+// profession-tool search this covers it. SafeItemTemplate, not GetEntry: a
+// mate's bag can hold a freed Item* whose value array faults on read.
+static void CollectLooseCopies(Player* owner, uint32 itemId, std::vector<Item*>& out)
+{
+    auto consider = [&](Item* item)
+    {
+        if (!item || item->IsEquipped() || item->IsNotEmptyBag() || item->IsInTrade()) return;
+        ItemTemplate const* proto = WowPsParty::SafeItemTemplate(item);
+        if (proto && proto->ItemId == itemId)
+            out.push_back(item);
+    };
+
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        consider(owner->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+    for (uint8 slot = KEYRING_SLOT_START; slot < CURRENCYTOKEN_SLOT_END; ++slot)
+        consider(owner->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+    for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        if (Bag* bag = owner->GetBagByPos(bagSlot))
+            for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+                consider(bag->GetItemByPos(slot));
+}
+
+// Move every copy of `key` that `owner` is carrying onto the human, counting them
+// into `moved`. Whole stacks, not one key: a consumable key (a harpoon) is spent
+// per click, and dripping the next one a second later is the same friction this
+// removes. False means the human's bags are full, so the caller should stop —
+// nothing else is going to fit either.
+static bool DrainKeyFromHolder(Player* human, Player* owner, uint32 key, uint32& moved)
+{
+    std::vector<Item*> copies;
+    CollectLooseCopies(owner, key, copies);
+    for (Item* copy : copies)
+    {
+        ItemTemplate const* proto = WowPsParty::SafeItemTemplate(copy);
+        std::string const keyName = proto ? proto->Name1 : "key";
+        // PullItemToRequester returns null BOTH when the human's bags are full and
+        // when the stack merged into one they already held, and the Item* is gone
+        // either way — so ask the human's own count which of the two happened
+        // rather than dereferencing it.
+        uint32 const before = human->GetItemCount(key);
+        if (!PullItemToRequester(human, owner, copy) && human->GetItemCount(key) == before)
+        {
+            LOG_WARN("module", "[WowPsParty KeyStage] {} could not take '{}'(entry={}) from {} — bags full",
+                     human->GetName(), keyName, key, owner->GetName());
+            return false;
+        }
+        ++moved;
+        LOG_INFO("module", "[WowPsParty KeyStage] {} took '{}'(entry={}) from {} for a nearby locked object",
+                 human->GetName(), keyName, key, owner->GetName());
+    }
+    return true;
+}
+
+// Consolidate every party-held copy of `keys` onto the human; returns how many
+// landed. Henchmen and hired alts count as holders even though their bags are
+// hidden from the Party Inventory panel: "any of my party members" is the whole
+// party, and a key nobody can even see is the worst case of all.
+static uint32 StageKeysFromParty(Player* human, std::vector<uint32> const& keys)
+{
+    std::vector<ObjectGuid> party;
+    WowPsParty::GetPartyGuidsFor(human->GetGUID(), party);
+
+    uint32 moved = 0;
+    for (ObjectGuid const& memberGuid : party)
+    {
+        if (memberGuid == human->GetGUID()) continue;
+        Player* owner = ObjectAccessor::FindConnectedPlayer(memberGuid);
+        if (!owner || WowPsParty::MemberStorageUnstable(owner)) continue;
+        // Same-Map* holders only — an off-map member is driven by another
+        // MapUpdater thread, and mutating its bags from here races its save (the
+        // use-after-free the reagent trampolines document).
+        if (owner->GetMap() != human->GetMap()) continue;
+
+        for (uint32 key : keys)
+            if (!DrainKeyFromHolder(human, owner, key, moved))
+                return moved;   // one bags-full warning per sweep, not one per holder
+    }
+    return moved;
+}
+
+// Drives the staging once a second, from the world tick — MapMgr::Update has
+// already joined every map worker by the time WorldScript::OnUpdate runs, so
+// reading one member's bags and writing another's is not racing a map update.
+// This is the same window the follow ticker moves party members in.
+class PartyKeyStageWorldScript : public WorldScript
+{
+public:
+    PartyKeyStageWorldScript() : WorldScript("PartyKeyStageWorldScript", {
+        WORLDHOOK_ON_UPDATE
+    }) { }
+
+    void OnUpdate(uint32 diff) override
+    {
+        if (!WowPsParty::IsEnabled()) return;
+        _accum += diff;
+        if (_accum < KEY_STAGE_INTERVAL_MS) return;
+        _accum = 0;
+
+        for (ObjectGuid const& leaderGuid : ActivePartyLeaders())
+            StageFor(ObjectAccessor::FindConnectedPlayer(leaderGuid));
+    }
+
+private:
+    // The distinct leaders of every tracked follow directive — read from our own
+    // in-memory directives rather than the session list or account_party, so a
+    // once-a-second sweep costs no query and never sees an unrelated player.
+    static std::vector<ObjectGuid> ActivePartyLeaders()
+    {
+        std::vector<ObjectGuid> followers;
+        WowPsParty::GetAllFollowers(followers);
+
+        std::vector<ObjectGuid> leaders;
+        for (ObjectGuid const& follower : followers)
+        {
+            ObjectGuid const leader = WowPsParty::GetLeaderFor(follower);
+            if (leader && std::find(leaders.begin(), leaders.end(), leader) == leaders.end())
+                leaders.push_back(leader);
+        }
+        return leaders;
+    }
+
+    static void StageFor(Player* human)
+    {
+        if (!human || WowPsParty::MemberStorageUnstable(human)) return;
+        if (sPlayerbotsMgr.GetPlayerbotAI(human)) return;   // only a human clicks objects
+        if (!human->IsAlive()) return;   // a corpse run past a chest shouldn't shuffle bags
+        WorldSession* session = human->GetSession();
+        if (!session || !WowPsParty::GetAccountSettings(session->GetAccountId()).sharedInventory)
+            return;
+
+        std::vector<uint32> keys;
+        CollectNearbyLockKeys(human, keys);
+        if (keys.empty()) return;
+
+        // Already able to open everything in reach — don't walk the party's bags
+        // (and don't hoover up spare copies of a key that is doing its job).
+        if (std::all_of(keys.begin(), keys.end(),
+                        [human](uint32 key) { return human->HasItemCount(key); }))
+            return;
+
+        if (StageKeysFromParty(human, keys))
+            WowPsParty::SendInventoryTo(human);
+    }
+
+    uint32 _accum = 0;
+};
+
 class PartyAddonProtocolScript : public PlayerScript
 {
 public:
@@ -8299,4 +8506,5 @@ public:
 void AddPartyAddonProtocolScripts()
 {
     new PartyAddonProtocolScript();
+    new PartyKeyStageWorldScript();   // hand the human the key to whatever they're standing at
 }
