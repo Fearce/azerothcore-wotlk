@@ -6790,8 +6790,17 @@ class PartyKeyStageWorldScript : public WorldScript
 {
 public:
     PartyKeyStageWorldScript() : WorldScript("PartyKeyStageWorldScript", {
+        WORLDHOOK_ON_STARTUP,
         WORLDHOOK_ON_UPDATE
     }) { }
+
+    // The sweep only ever logs when it moves something, so without this there is
+    // no way to tell "armed and nothing to do" from "this build predates it".
+    void OnStartup() override
+    {
+        LOG_INFO("module", "[WowPsParty KeyStage] sweep registered (interval={}ms, range={}y)",
+                 KEY_STAGE_INTERVAL_MS, KEY_STAGE_RANGE_YD);
+    }
 
     void OnUpdate(uint32 diff) override
     {
