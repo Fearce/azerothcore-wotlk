@@ -164,6 +164,12 @@ ObjectData const gameobjectData[] =
     { 0,                                0                               }
 };
 
+// The base camp is the only place the Flame Leviathan vehicles can be picked up,
+// so we keep checking that they are still standing there while a raid is around.
+Position const leviathanStartArea = { -716.568f, -54.8669f, 429.924f };
+constexpr float LEVIATHAN_START_AREA_RADIUS = 300.0f;
+constexpr uint32 LEVIATHAN_VEHICLE_CHECK_INTERVAL = 5 * IN_MILLISECONDS;
+
 class instance_ulduar : public InstanceMapScript
 {
 public:
@@ -191,6 +197,7 @@ public:
         ObjectGuid _repairSGUID[2];
         bool _leviathanTowers[4];
         GuidList _leviathanVehicles;
+        uint32 _leviathanVehicleCheckTimer;
 
         // Hodir
         bool _hmHodir;
@@ -211,6 +218,7 @@ public:
                 _leviathanTowers[i] = true;
 
             _leviathanVehicles.clear();
+            _leviathanVehicleCheckTimer = LEVIATHAN_VEHICLE_CHECK_INTERVAL;
 
             // Hodir
             _hmHodir = true; // If players fail the Hardmode then becomes false
@@ -235,6 +243,8 @@ public:
 
         void OnPlayerEnter(Player* player) override
         {
+            EnsureLeviathanStartVehicles();
+
             // mimiron tram:
             if (GameObject* MimironTram = GetGameObject(DATA_MIMIRON_TRAM))
             {
@@ -673,7 +683,13 @@ public:
                     }
 
                 case DATA_VEHICLE_SPAWN:
-                    SpawnLeviathanEncounterVehicles(data);
+                    // The base camp request is a "make sure they are there", not a
+                    // reset: respawning unconditionally would evict anyone already
+                    // sitting in a vehicle. Relocating and clearing still must not.
+                    if (data == VEHICLE_POS_START)
+                        EnsureLeviathanStartVehicles();
+                    else
+                        SpawnLeviathanEncounterVehicles(data);
                     return;
                 case DATA_DESPAWN_ALGALON:
                     DoUpdateWorldState(WORLD_STATE_ULDUAR_ALGALON_TIMER_ENABLED, 1);
@@ -875,6 +891,7 @@ public:
         void Update(uint32 diff) override
         {
             InstanceScript::Update(diff);
+            UpdateLeviathanStartVehicles(diff);
 
             if (_events.Empty())
                 return;
@@ -909,6 +926,11 @@ public:
         }
 
         void SpawnLeviathanEncounterVehicles(uint8 mode);
+        void UpdateLeviathanStartVehicles(uint32 diff);
+        void EnsureLeviathanStartVehicles();
+        bool IsLeviathanEncounterAvailable() const;
+        bool AnyLeviathanVehicleAlive();
+        bool AnyPlayerAtLeviathanStart();
 
         bool CheckAchievementCriteriaMeet(uint32 criteria_id, Player const*  /*source*/, Unit const*  /*target*/, uint32  /*miscvalue1*/) override
         {
@@ -1035,6 +1057,64 @@ void instance_ulduar::instance_ulduar_InstanceMapScript::SpawnLeviathanEncounter
             }
         }
     }
+}
+
+void instance_ulduar::instance_ulduar_InstanceMapScript::UpdateLeviathanStartVehicles(uint32 diff)
+{
+    if (_leviathanVehicleCheckTimer > diff)
+    {
+        _leviathanVehicleCheckTimer -= diff;
+        return;
+    }
+
+    _leviathanVehicleCheckTimer = LEVIATHAN_VEHICLE_CHECK_INTERVAL;
+    EnsureLeviathanStartVehicles();
+}
+
+void instance_ulduar::instance_ulduar_InstanceMapScript::EnsureLeviathanStartVehicles()
+{
+    if (!IsLeviathanEncounterAvailable())
+        return;
+
+    if (GetPersistentData(PERSISTENT_DATA_MAGE_BARRIER) != BASE_CAMP_INTRO_COMPLETE)
+        return;
+
+    if (AnyLeviathanVehicleAlive() || !AnyPlayerAtLeviathanStart())
+        return;
+
+    LOG_INFO("server.worldserver", "[Ulduar] Flame Leviathan start vehicles are gone - respawning them at the base camp.");
+    SpawnLeviathanEncounterVehicles(VEHICLE_POS_START);
+}
+
+bool instance_ulduar::instance_ulduar_InstanceMapScript::IsLeviathanEncounterAvailable() const
+{
+    // Once engaged the boss script owns the vehicles and parks them at its own
+    // positions, so the base camp has to stay out of the way. A brand new instance
+    // leaves the state undecided until the boss first spawns, a grid the raid has
+    // no reason to have loaded while it is still standing at the base camp.
+    EncounterState const state = GetBossState(BOSS_LEVIATHAN);
+    return state == NOT_STARTED || state == TO_BE_DECIDED;
+}
+
+bool instance_ulduar::instance_ulduar_InstanceMapScript::AnyLeviathanVehicleAlive()
+{
+    for (ObjectGuid const& guid : _leviathanVehicles)
+        if (Creature* vehicle = instance->GetCreature(guid))
+            if (vehicle->IsAlive())
+                return true;
+
+    return false;
+}
+
+bool instance_ulduar::instance_ulduar_InstanceMapScript::AnyPlayerAtLeviathanStart()
+{
+    Map::PlayerList const& players = instance->GetPlayers();
+    for (Map::PlayerList::const_iterator itr = players.begin(); itr != players.end(); ++itr)
+        if (Player* player = itr->GetSource())
+            if (player->GetExactDist(&leviathanStartArea) < LEVIATHAN_START_AREA_RADIUS)
+                return true;
+
+    return false;
 }
 
 void AddSC_instance_ulduar()

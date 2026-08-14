@@ -324,6 +324,9 @@ enum UlduarMisc
     VEHICLE_POS_LEVIATHAN                   = 1,
     VEHICLE_POS_NONE                        = 2,
 
+    // Value DATA_MAGE_BARRIER reaches once the base camp intro has played out
+    BASE_CAMP_INTRO_COMPLETE                = 3,
+
     EVENT_TOWER_OF_STORM_DESTROYED          = 21031,
     EVENT_TOWER_OF_FROST_DESTROYED          = 21032,
     EVENT_TOWER_OF_FLAMES_DESTROYED         = 21033,
