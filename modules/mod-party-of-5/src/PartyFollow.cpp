@@ -97,6 +97,13 @@
 // usually never sets that flag — without this a bot skinner finds nothing to skin.
 bool WowPsParty_ForceSkinReady(Player* skinner, Creature* creature);
 
+// Also PartyHooks.cpp: would skinning this corpse destroy loot a human party
+// member can still take (a quest drop, or ordinary loot they're standing over)?
+// UNIT_FLAG_SKINNABLE is no proof the body is finished — the party auto-loot pass
+// raises it the moment the ORDINARY items are in the party bags, which is the
+// instant of the kill, with the player's quest drop still lying there.
+bool WowPsParty_SkinWouldDestroyPartyLoot(Player* member, Creature* creature, std::string* reason);
+
 namespace WowPsParty
 {
     bool IsLogVerbose();   // from PartyBootstrap.cpp
@@ -4460,6 +4467,13 @@ namespace WowPsParty
         CreatureTemplate const* tmpl = c->GetCreatureTemplate();
         if (!tmpl || tmpl->SkinLootId == 0) return false;   // not a skinnable beast
         if (c->loot.loot_type == LOOT_SKINNING) return false;  // already skinned — never re-skin
+        // Readiness first, because it is the cheapest test that can rule the corpse out:
+        // unflagged AND untapped means nothing below can ever make it skinnable, and the
+        // loot/quest checks further down are the expensive part of this function (they
+        // run per nearby corpse, per skinner, per tick).
+        if (!c->HasUnitFlag(UNIT_FLAG_SKINNABLE)
+            && !c->GetLootRecipient() && !c->GetLootRecipientGroup())
+            return false;
         uint32 const skill = tmpl->GetRequiredLootSkill();
         if (!bot->HasSkill(skill)) return false;
         // Engine cast gate (Spell::CheckCast, skinning): the required value keys
@@ -4468,26 +4482,26 @@ namespace WowPsParty
         int32 const level      = c->GetLevel();
         int32 const reqValue   = (skillValue < 100) ? (level - 10) * 10 : level * 5;
         if (reqValue > skillValue) return false;
-        // Ready if the engine already flagged it (regular loot was removed first, so the
-        // quest item is already gone — safe to skin).
-        if (c->HasUnitFlag(UNIT_FLAG_SKINNABLE)) return true;
-        // Otherwise the force-skin path: a genuine party kill we can force ready at harvest
-        // (our bots leave corpse loot unfinished, so the flag is usually never set — see
-        // WowPsParty_ForceSkinReady, which force-CLEARS the leftover regular loot).
-        if (!(c->GetLootRecipient() || c->GetLootRecipientGroup()))
+        // The player's loot outranks the leather on EVERY path, the engine-flagged one
+        // included — UNIT_FLAG_SKINNABLE does not mean the body is finished, because our
+        // auto-loot pass raises it at the kill with the human's quest drop still on it.
+        if (WowPsParty_SkinWouldDestroyPartyLoot(bot, c, nullptr))
             return false;
-        // BUT never force-skin a corpse whose loot table can drop a QUEST item the
-        // human leader still needs — force-clearing the loot would destroy that drop.
-        // We DELIBERATELY do NOT also gate on UNIT_DYNFLAG_LOOTABLE: a QuestRequired
-        // drop only enters loot for a player who HAS the quest, so the skinner bot (the
-        // loot recipient, not on the quest) never sees it and the corpse carries NO
-        // lootable flag whenever its regular loot happens to roll empty — and that is
-        // exactly when Viv's Mistvale Giblets (a 40% QuestRequired drop off Elder Mistvale
-        // Gorillas) got skinned out from under her. The static loot-table check is the
-        // only signal that survives an empty regular roll. HaveQuestLootForPlayer ->
-        // HasQuestForItem self-clears the instant the leader has collected enough of the
-        // item (count met, before turn-in), so leather is only delayed while she still
-        // genuinely needs the drop — then these corpses skin normally again.
+        // An engine-flagged corpse is genuinely finished: the flag now only survives
+        // where the whole loot really was removed (the player emptied it through the
+        // loot window, or our auto-loot pass took everything AND the guard above found
+        // nothing left for a human).
+        if (c->HasUnitFlag(UNIT_FLAG_SKINNABLE)) return true;
+        // Force-skin path only. Never force-CLEAR the loot of a corpse whose loot TABLE
+        // can still drop a QUEST item the human leader needs, even when no such drop is
+        // on the body right now: a condition-gated quest drop is rolled against the LOOT
+        // OWNER, so when a bot tapped the kill the drop never entered the loot at all and
+        // the live check above has nothing to see — that is exactly how Viv's Mistvale
+        // Giblets (off Elder Mistvale Gorillas) got skinned out from under her. This
+        // static check is the only signal that survives that case.
+        // HaveQuestLootForPlayer -> HasQuestForItem self-clears the instant the leader has
+        // collected enough of the item (count met, before turn-in), so leather is only
+        // delayed while she still genuinely needs the drop — then these corpses skin again.
         if (Player* leader = ObjectAccessor::FindConnectedPlayer(GetLeaderFor(bot->GetGUID())))
             if (LootTemplates_Creature.HaveQuestLootForPlayer(
                     c->GetCreatureTemplate()->lootid, leader))
@@ -4520,6 +4534,18 @@ namespace WowPsParty
     // hard-return from UpdateAI, so the default loot AI never runs for them.
     static void SkinCorpse(Player* bot, Creature* c)
     {
+        // This is the call that destroys the corpse's loot, so it owns the guard
+        // rather than trusting its caller to have run IsSkinnableBy first. An
+        // engine-flagged corpse skips ForceSkinReady below (there is nothing left to
+        // force), which would otherwise leave that path with no gate at all.
+        std::string blocked;
+        if (WowPsParty_SkinWouldDestroyPartyLoot(bot, c, &blocked))
+        {
+            LOG_INFO("module", "[WowPsParty Skin] {} yields corpse guid={}: {}",
+                     bot->GetName(), c->GetGUID().GetCounter(), blocked);
+            return;
+        }
+
         // The engine usually never set UNIT_FLAG_SKINNABLE for us (bots leave
         // corpse loot unfinished), so finish the leftover loot + flag it exactly
         // like the human skinning-cast patch does. Bail if it isn't a real party

@@ -683,6 +683,203 @@ namespace WowPsParty
     }
 }
 
+namespace
+{
+    // Which per-player list carries this entry's looted state, if any. The shared
+    // LootItem::is_looted flag is only the truth for a plain entry: the core keeps
+    // per-player state for quest, free-for-all and condition-gated drops, and
+    // Player::StoreLootItem never even sets the shared flag for a free-for-all
+    // one. Membership of that list is also what makes the entry ADDRESSABLE —
+    // LootItemInSlot / GetMaxSlotInLootFor size a player's slot space from it, and
+    // the lists are built once at kill time for group members within loot-reward
+    // distance. So a player with no entry cannot take the item at all, now or
+    // later, and must not be treated as someone still owed it.
+    QuestItemMap const* PerPlayerLootStateFor(Loot const& loot, LootItem const& li, bool questSlot)
+    {
+        if (questSlot)              return &loot.GetPlayerQuestItems();
+        if (li.freeforall)          return &loot.GetPlayerFFAItems();
+        if (!li.conditions.empty()) return &loot.GetPlayerNonQuestNonFFAConditionalItems();
+        return nullptr;
+    }
+
+    bool EntryStillTakeableBy(Loot const& loot, LootItem const& li, uint8 index,
+                              Player* p, bool questSlot)
+    {
+        // The shared flag is authoritative when SET: the item is physically off
+        // the body, so nobody can take it — including via a per-player list that
+        // the taker (our auto-loot pass, which stores directly rather than through
+        // StoreLootItem) never updated.
+        if (li.is_looted) return false;
+
+        QuestItemMap const* perPlayer = PerPlayerLootStateFor(loot, li, questSlot);
+        if (!perPlayer) return true;
+
+        auto const itr = perPlayer->find(p->GetGUID());
+        if (itr == perPlayer->end() || !itr->second) return false;
+        for (QuestItem const& qi : *itr->second)
+            if (qi.index == index)
+                return !qi.is_looted;
+        return false;
+    }
+
+    // Every non-bot player whose loot rights a skin of `corpse` must respect.
+    // Both groups are consulted because they differ: a bot can tap the kill from
+    // outside the human's own Group object. A hero the human is currently DRIVING
+    // (.party swap) carries a PlayerbotAI that is merely paused, so it must count
+    // as a human here — quest credit is per character, and it may be the one on
+    // the quest. Ghosts are kept too: a player who died on the pull is running
+    // back for exactly that corpse.
+    std::vector<Player*> HumanLootClaimants(Player* member, Creature* corpse)
+    {
+        std::vector<Player*> humans;
+
+        auto add = [&humans](Player* p)
+        {
+            if (!p || !p->IsInWorld()) return;
+            if (sPlayerbotsMgr.GetPlayerbotAI(p) && !p->HasUnitFlag(UNIT_FLAG_POSSESSED)) return;
+            if (std::find(humans.begin(), humans.end(), p) == humans.end())
+                humans.push_back(p);
+        };
+        auto addGroup = [&add](Group* g)
+        {
+            if (!g) return;
+            for (GroupReference* itr = g->GetFirstMember(); itr != nullptr; itr = itr->next())
+                add(itr->GetSource());
+        };
+
+        add(member);
+        if (member) addGroup(member->GetGroup());
+        add(corpse->GetLootRecipient());
+        addGroup(corpse->GetLootRecipientGroup());
+        return humans;
+    }
+
+    // The human who can still take this normal-slot entry AS A QUEST OBJECTIVE.
+    // Quest drops reach items[] as condition-gated (CONDITION_QUESTTAKEN) rows —
+    // the dedicated quest_items[] list is walked separately. HasQuestForItem is
+    // the same predicate the core's own HaveQuestLootForPlayer uses, and it
+    // self-clears the instant the player has collected enough of the item, so
+    // nothing stays reserved after the objective is met. Cheapest test first: on
+    // a corpse the party already vacuumed, every entry is looted and we stop
+    // before the condition and quest-log walks.
+    Player* QuestDropClaimant(Loot const& loot, LootItem const& li, uint8 index,
+                              ObjectGuid src, std::vector<Player*> const& humans)
+    {
+        for (Player* p : humans)
+            if (EntryStillTakeableBy(loot, li, index, p, false)
+                && li.AllowedForPlayer(p, src)
+                && p->HasQuestForItem(li.itemid))
+                return p;
+        return nullptr;
+    }
+
+    // The human who still has a QUEST drop waiting on this corpse. Deliberately
+    // distance-independent, and deliberately indifferent to whether they are
+    // alive: quest loot is irreplaceable and a player who died on the pull is
+    // running back for exactly that corpse, so the skin waits until it is looted
+    // or the body despawns. AllowedForPlayer plus the per-player list check are
+    // what keep this from over-blocking — a drop nobody in the party can take
+    // leaves the corpse skinnable.
+    Player* PendingQuestLootOwner(Creature* corpse, std::vector<Player*> const& humans)
+    {
+        Loot const& loot = corpse->loot;
+        ObjectGuid const src = corpse->GetGUID();
+
+        for (uint8 i = 0; i < loot.quest_items.size(); ++i)
+        {
+            LootItem const& li = loot.quest_items[i];
+            for (Player* p : humans)
+                if (EntryStillTakeableBy(loot, li, i, p, true) && li.AllowedForPlayer(p, src))
+                    return p;
+        }
+        for (uint8 i = 0; i < loot.items.size(); ++i)
+            if (Player* p = QuestDropClaimant(loot, loot.items[i], i, src, humans))
+                return p;
+        return nullptr;
+    }
+
+    // Tell the player about a quest drop the party deliberately did NOT pick up.
+    // The auto-loot pass empties bodies so thoroughly that nobody opens a corpse
+    // any more, so without this the remaining sparkle is a mystery rather than an
+    // instruction — and the skinner visibly stalling on that corpse reads as a bug.
+    void AnnounceQuestDropLeftOnCorpse(Player* owner, ItemTemplate const& tmpl, LootItem const& li)
+    {
+        if (!owner || !owner->GetSession()) return;
+        uint32 const itemId = li.itemid;
+        std::string const itemName = tmpl.Name1;
+        std::string const msg = Acore::StringFormat(
+            "|cff66ccff[Loot]|r quest drop |cffffffff|Hitem:{}::::::::1::::|h[{}]|h|r left on the corpse for you",
+            itemId, itemName);
+        ChatHandler(owner->GetSession()).SendSysMessage(msg);
+    }
+
+    // Master-loot priority: a living human standing close enough to still take
+    // ordinary loot off the corpse. Unlike quest loot this is forfeited once they
+    // walk away, so it only defers the skin while they are actually here. Range is
+    // wide enough that a human walking up to the kill isn't beaten to it by a fast
+    // skinner.
+    constexpr float MASTER_LOOT_PRIORITY_RANGE = 40.0f;
+
+    Player* NearbyOrdinaryLootOwner(Creature* corpse, std::vector<Player*> const& humans)
+    {
+        Loot const& loot = corpse->loot;
+        ObjectGuid const src = corpse->GetGUID();
+        for (Player* p : humans)
+        {
+            if (!p->IsAlive() || !p->IsWithinDistInMap(corpse, MASTER_LOOT_PRIORITY_RANGE))
+                continue;
+            if (loot.gold > 0) return p;
+            for (uint8 i = 0; i < loot.items.size(); ++i)
+            {
+                LootItem const& li = loot.items[i];
+                if (EntryStillTakeableBy(loot, li, i, p, false) && li.AllowedForPlayer(p, src))
+                    return p;
+            }
+        }
+        return nullptr;
+    }
+}
+
+// Would treating `creature` as skinnable right now destroy loot a HUMAN party
+// member can still take? Skinning clears the corpse's loot outright and despawns
+// the body next update, so this is the one gate standing between the party's
+// skinner and the player's quest drops. `reason` (optional) receives a log-ready
+// explanation of the block.
+//
+// Every skin path must consult it — the force path in WowPsParty_ForceSkinReady
+// AND the path where the engine already set UNIT_FLAG_SKINNABLE. That flag is no
+// proof the body is finished: the party auto-loot pass below raises it as soon as
+// the ORDINARY items are in the party bags, which is the instant of the kill.
+bool WowPsParty_SkinWouldDestroyPartyLoot(Player* member, Creature* creature, std::string* reason)
+{
+    if (!creature || !WowPsParty::IsEnabled()) return false;
+
+    std::vector<Player*> const humans = HumanLootClaimants(member, creature);
+    if (humans.empty()) return false;
+
+    if (Player* owner = PendingQuestLootOwner(creature, humans))
+    {
+        if (reason)
+        {
+            std::string const name = owner->GetName();
+            *reason = Acore::StringFormat("unlooted quest drop {} can still take", name);
+        }
+        return true;
+    }
+    if (Player* owner = NearbyOrdinaryLootOwner(creature, humans))
+    {
+        if (reason)
+        {
+            std::string const name = owner->GetName();
+            float const range = MASTER_LOOT_PRIORITY_RANGE;
+            *reason = Acore::StringFormat("human {} within {}y of still-lootable corpse",
+                                          name, range);
+        }
+        return true;
+    }
+    return false;
+}
+
 class PartyHooksPlayerScript : public PlayerScript
 {
 public:
@@ -1175,6 +1372,7 @@ public:
         // Items: iterate, for each non-FFA non-looted item, find a taker
         // with bag space, store it. Announce each pickup in chat so the
         // user sees what the party scooped up.
+        std::vector<Player*> const humans = HumanLootClaimants(human, killed);
         for (size_t i = 0; i < loot->items.size(); ++i)
         {
             LootItem& li = loot->items[i];
@@ -1182,6 +1380,20 @@ public:
 
             ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(li.itemid);
             if (!tmpl) continue;
+
+            // A QUEST drop stays on the body. Quest credit is per character, so
+            // hoovering it into whichever hero had bag room costs the player the
+            // objective and leaves them fishing it back out of a companion's bags.
+            // Only quest objectives are held back — profession recipes and other
+            // condition-gated drops still flow into the shared party bags, since a
+            // hero may be the one who qualifies for them and this pass is a bot's
+            // only way to pick anything up. The skin guard keeps the party's
+            // skinner off the corpse until the player has taken it.
+            if (Player* owner = QuestDropClaimant(*loot, li, uint8(i), killed->GetGUID(), humans))
+            {
+                AnnounceQuestDropLeftOnCorpse(owner, *tmpl, li);
+                continue;
+            }
 
             // Spread loot evenly: for each item prefer the hero with the most
             // free bag space. When bags are equally full this naturally
@@ -1234,13 +1446,18 @@ public:
             }
         }
 
-        // Mark loot fully consumed if all items got taken.
+        // Mark loot fully consumed if all items got taken. "All" only ever means
+        // the ordinary items this pass moves into the party bags: quest_items[]
+        // is not even walked above, and a quest drop still on the body must not
+        // reach AllLootRemovedFromCorpse — that flags the corpse SKINNABLE, and
+        // the party's skinner then clears the loot and despawns the body before
+        // the player can walk over and take it.
         bool allTaken = (loot->gold == 0);
         for (auto const& li : loot->items)
         {
             if (!li.is_looted) { allTaken = false; break; }
         }
-        if (allTaken)
+        if (allTaken && !WowPsParty_SkinWouldDestroyPartyLoot(human, killed, nullptr))
             killed->AllLootRemovedFromCorpse();
     }
 
@@ -1985,52 +2202,14 @@ bool WowPsParty_ForceSkinReady(Player* skinner, Creature* creature)
     // the same Group object as the bot that tapped the kill.
     if (!recipient && !rgroup) return false;
 
-    // QUEST LOOT IS SACRED: never strip a corpse that still has an UNLOOTED quest
-    // item — the loot.clear() below would destroy it, and a quest drop only exists
-    // because a party member HAS that quest, so it WILL be wanted (Viv: "I have to
-    // kick my skinner to get the quest loot"). Defer regardless of who's nearby
-    // until the quest item is looted (or the corpse despawns) — leather is a bonus,
-    // quest loot is irreplaceable. Covers both the dedicated quest_items list and
-    // normal-slot conditional (needs_quest) drops.
-    for (LootItem const& li : creature->loot.quest_items)
-        if (!li.is_looted)
-        {
-            LOG_INFO("module",
-                "[WowPsParty Skin] defer skin of guid={}: unlooted quest item present",
-                creature->GetGUID().GetCounter());
-            return false;
-        }
-    for (LootItem const& li : creature->loot.items)
-        if (li.needs_quest && !li.is_looted)
-        {
-            LOG_INFO("module",
-                "[WowPsParty Skin] defer skin of guid={}: unlooted conditional quest drop",
-                creature->GetGUID().GetCounter());
-            return false;
-        }
-
-    // MASTER-LOOT PRIORITY: while the corpse is still lootable and a HUMAN party
-    // member is close enough to loot it, do NOT strip the loot to skin. The
-    // loot.clear() below destroys items the player hasn't grabbed yet. Give the
-    // human first dibs; once they've looted it (the lootable flag clears) or moved
-    // off, the skinner finishes it. Only HUMANS gate (bot AI absent) — bots looting
-    // into the shared bag never block skinning. Range widened so a human walking up
-    // to the kill isn't beaten to it by a fast skinner.
-    if (creature->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE))
+    // The player's loot comes first — quest drops are irreplaceable and the
+    // loot.clear() below destroys whatever is left on the body.
+    std::string blocked;
+    if (WowPsParty_SkinWouldDestroyPartyLoot(skinner, creature, &blocked))
     {
-        constexpr float MASTER_LOOT_PRIORITY_RANGE = 40.0f;
-        if (Group* sg = skinner->GetGroup())
-            for (GroupReference* itr = sg->GetFirstMember(); itr != nullptr; itr = itr->next())
-                if (Player* m = itr->GetSource())
-                    if (m->IsInWorld() && m->IsAlive()
-                        && !sPlayerbotsMgr.GetPlayerbotAI(m)
-                        && m->IsWithinDistInMap(creature, MASTER_LOOT_PRIORITY_RANGE))
-                    {
-                        LOG_INFO("module",
-                            "[WowPsParty Skin] defer skin of guid={}: human {} within {}y of still-lootable corpse",
-                            creature->GetGUID().GetCounter(), m->GetName(), MASTER_LOOT_PRIORITY_RANGE);
-                        return false;
-                    }
+        LOG_INFO("module", "[WowPsParty Skin] defer skin of guid={}: {}",
+                 creature->GetGUID().GetCounter(), blocked);
+        return false;
     }
 
     creature->loot.clear();                              // empty the normal loot
