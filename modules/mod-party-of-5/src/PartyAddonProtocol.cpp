@@ -48,6 +48,11 @@
 #include "AuctionHouseMgr.h"
 #include "DatabaseEnv.h"
 #include "GameTime.h"
+#include "Cell.h"                // grid search for the object an aimed on-use item
+#include "CellImpl.h"            // (a key, a charge) should be pointed at
+#include "GameObject.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
 #include "Item.h"
 #include "ItemTemplate.h"
 #include "LootMgr.h"   // Loot / LootItem — open lootable satchels from the shared bags
@@ -664,6 +669,21 @@ namespace WowPsParty
         entry = item->GetEntry();
 #endif
         return sObjectMgr->GetItemTemplate(entry);
+    }
+
+    // Item::IsLocked() is another value-array read (ITEM_FIELD_FLAGS), so scanning a
+    // MATE's bags for an unopened lockbox needs the same guard as the panel reads
+    // above — a freed Item* still sitting in a live member's slot would otherwise AV
+    // the world thread. Treats an unreadable slot as "not a candidate".
+    static bool SafeIsLocked(Item* item)
+    {
+        if (!item) return false;
+#ifdef _WIN32
+        __try { return item->IsLocked(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#else
+        return item->IsLocked();
+#endif
     }
 
     // GEAR\t<slot>\t<eqSlot>:<itemId>:<itemGuidLow>:<randProp>:<suffixFactor>:<enchant>:<gem0>:<gem1>:<gem2>;...
@@ -5404,6 +5424,233 @@ static void HandleCharterSign(Player* owner, Item* charter, Petition const* peti
     WowPsParty::SendInventoryTo(owner);
 }
 
+// An on-use spell the player normally AIMS: at a unit (a quest item fed to a mob,
+// like Zul'Drak Rat) or at an object (a key used on a chest). A real client sends
+// whatever the player picked; the shared grid has to resolve it by hand.
+static bool SpellHasExplicitTarget(SpellInfo const* si)
+{
+    return si && (si->GetExplicitTargetMask() & (TARGET_FLAG_UNIT_MASK | TARGET_FLAG_GAMEOBJECT_MASK)) != 0;
+}
+
+// Whether the caster is an acceptable target for their own on-use spell: the core's
+// InitExplicitTargets self-fallback (ally/party/raid flags) plus the client's auto-
+// self-cast for any other helpful unit spell. False for an enemy spell or an object
+// opener — those must be pointed at something else, or not cast at all.
+static bool SpellCanLandOnCaster(SpellInfo const* si)
+{
+    if (!si) return false;
+    uint32 const mask = si->GetExplicitTargetMask();
+    if (mask & TARGET_FLAG_GAMEOBJECT_MASK) return false;
+    if (mask & (TARGET_FLAG_UNIT_ALLY | TARGET_FLAG_UNIT_PARTY | TARGET_FLAG_UNIT_RAID)) return true;
+    return (mask & TARGET_FLAG_UNIT) != 0 && si->IsPositive();
+}
+
+// Whether this lock yields to the given cast item + spell, mirroring the accept
+// cases of Spell::CanOpenLock: a key whose entry the lock names, the spell the lock
+// names, a lock type the spell's OPEN_LOCK effect handles, or a lock with no
+// requirement at all. The exact skill-value test stays with the core — this only
+// decides WHICH candidate to aim at, and the core still has the final say.
+static bool LockYieldsTo(uint32 lockId, SpellInfo const* si, uint32 castItemEntry)
+{
+    LockEntry const* lock = sLockStore.LookupEntry(lockId);
+    if (!lock) return false;
+
+    bool requiresKey = false;
+    for (uint8 j = 0; j < MAX_LOCK_CASE; ++j)
+    {
+        switch (lock->Type[j])
+        {
+            case LOCK_KEY_ITEM:
+                if (lock->Index[j] && lock->Index[j] == castItemEntry) return true;
+                requiresKey = true;
+                break;
+            case LOCK_KEY_SKILL:
+                requiresKey = true;
+                for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                    if (si->Effects[i].Effect == SPELL_EFFECT_OPEN_LOCK
+                        && uint32(si->Effects[i].MiscValue) == lock->Index[j])
+                        return true;
+                break;
+            case LOCK_KEY_SPELL:
+                if (lock->Index[j] == si->Id) return true;
+                requiresKey = true;
+                break;
+            default:
+                break;
+        }
+    }
+    return !requiresKey;
+}
+
+// The object the human means when they right-click a key or a charge in the shared
+// grid. A normal client sends whichever object the player clicked with the targeting
+// reticle; the inventory panel has no way to express that, so take the nearest
+// candidate the player can actually see, whose lock this very item yields to — a
+// locked door a yard closer can't steal the cast, and standing at the chest is the
+// same intent the reticle would have expressed.
+//
+// Only OPENERS get an object picked for them. Every gameobject-target on-use item in
+// the 3.3.5a data is one (all 203 carry SPELL_EFFECT_OPEN_LOCK), and without a lock
+// to match against there is nothing to tell the intended object from a signpost — and
+// guessing wrong would burn the item's charge on it.
+static GameObject* AimableGameObject(Player* requester, SpellInfo const* si, uint32 castItemEntry)
+{
+    bool opensLocks = false;
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        if (si->Effects[i].Effect == SPELL_EFFECT_OPEN_LOCK) { opensLocks = true; break; }
+    if (!opensLocks) return nullptr;
+
+    // You have to be standing at the thing. Bounding the sweep also keeps one click
+    // from raycasting line of sight against every object in a city-sized grid.
+    constexpr float MAX_AIM_RANGE = 30.0f;
+    float range = si->GetMaxRange(si->IsPositive(), requester);
+    if (range <= 0.0f) range = INTERACTION_DISTANCE;
+    range = std::min(range, MAX_AIM_RANGE);
+
+    struct ReachableGoCheck
+    {
+        ReachableGoCheck(Player const* src, float range) : _src(src), _range(range) {}
+        bool operator()(GameObject* go) const
+        {
+            if (!go || !go->isSpawned() || !_src->IsWithinDistInMap(go, _range)) return false;
+            // An already-swung door / sprung object would only fail CheckCast with
+            // ALREADY_OPEN while shadowing the one the player meant.
+            if (go->GetGoType() == GAMEOBJECT_TYPE_DOOR && go->GetGoState() != GO_STATE_READY) return false;
+            return go->IsWithinLOSInMap(_src);
+        }
+        Player const* _src;
+        float _range;
+    };
+
+    std::list<GameObject*> candidates;
+    ReachableGoCheck check(requester, range);
+    Acore::GameObjectListSearcher<ReachableGoCheck> searcher(requester, candidates, check);
+    Cell::VisitObjects(requester, searcher, range);
+
+    GameObject* nearest = nullptr;
+    float nearestDist = 0.0f;
+    for (GameObject* go : candidates)
+    {
+        if (!LockYieldsTo(go->GetGOInfo()->GetLockId(), si, castItemEntry)) continue;
+        float const d = requester->GetDistance(go);
+        if (!nearest || d < nearestDist) { nearest = go; nearestDist = d; }
+    }
+    return nearest;
+}
+
+// A still-locked item this opener would open, searched over the whole party. Openers
+// with TARGET_GAMEOBJECT_ITEM_TARGET (skeleton keys, Seaforium charges, most quest
+// keys) take a locked ITEM as readily as a world object, and lockboxes are exactly
+// what the shared grid accumulates. Reports the holder so the caller can stage the box
+// onto the requester — the core only accepts an item target out of the CASTER's bags.
+static Item* FindPartyLockedItem(Player* requester, SpellInfo const* si, uint32 castItemEntry,
+                                 Player*& outHolder)
+{
+    auto openable = [&](Item* item) -> bool
+    {
+        if (!WowPsParty::SafeIsLocked(item)) return false;
+        ItemTemplate const* proto = WowPsParty::SafeItemTemplate(item);
+        return proto && proto->LockID && LockYieldsTo(proto->LockID, si, castItemEntry);
+    };
+    auto findIn = [&](Player* owner) -> Item*
+    {
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (Item* item = owner->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (openable(item)) return item;
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+            if (Bag* bag = owner->GetBagByPos(bagSlot))
+                for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+                    if (Item* item = bag->GetItemByPos(slot))
+                        if (openable(item)) return item;
+        return nullptr;
+    };
+
+    if (Item* own = findIn(requester)) { outHolder = requester; return own; }
+
+    QueryResult members = CharacterDatabase.Query(
+        "SELECT `guid` FROM `account_party` WHERE `account` = {}", requester->GetSession()->GetAccountId());
+    if (!members) return nullptr;
+    do
+    {
+        Player* mate = ObjectAccessor::FindConnectedPlayer(
+            ObjectGuid::Create<HighGuid::Player>(members->Fetch()[0].Get<uint32>()));
+        if (!mate || mate == requester || WowPsParty::MemberStorageUnstable(mate)) continue;
+        if (Item* box = findIn(mate)) { outHolder = mate; return box; }
+    } while (members->NextRow());
+    return nullptr;
+}
+
+// Point an aimed on-use spell at what the human is looking at: their selection for a
+// unit-target spell, the nearest object in range — or a party lockbox — for an
+// opener. Returns false, having said why, when there is nothing valid to aim at, so
+// the click reports instead of being swallowed.
+static bool AimAtRequesterTarget(Player* requester, SpellInfo const* si, uint32 castItemEntry,
+                                 std::string const& itemName, SpellCastTargets& targets)
+{
+    uint32 const mask = si->GetExplicitTargetMask();
+    if (mask & TARGET_FLAG_UNIT_MASK)
+        if (Unit* selected = ObjectAccessor::GetUnit(*requester, requester->GetTarget()))
+            if (si->CheckExplicitTarget(requester, selected) == SPELL_CAST_OK)
+            {
+                targets.SetUnitTarget(selected);
+                return true;
+            }
+
+    if (mask & TARGET_FLAG_GAMEOBJECT_MASK)
+        if (GameObject* go = AimableGameObject(requester, si, castItemEntry))
+        {
+            targets.SetGOTarget(go);
+            return true;
+        }
+
+    if (mask & TARGET_FLAG_GAMEOBJECT_ITEM)
+    {
+        Player* holder = nullptr;
+        if (Item* box = FindPartyLockedItem(requester, si, castItemEntry, holder))
+        {
+            ItemTemplate const* boxProto = WowPsParty::SafeItemTemplate(box);
+            std::string const boxName = boxProto ? boxProto->Name1 : "that container";
+            Item* staged = PullItemToRequester(requester, holder, box);
+            if (!staged)
+            {
+                ChatHandler(requester->GetSession()).PSendSysMessage(
+                    "|cffff5555[WowPsParty]|r Your bags are full — free a slot to open |cffffffff{}|r.", boxName);
+                return false;
+            }
+            targets.SetItemTarget(staged);
+            return true;
+        }
+    }
+
+    // Nothing picked, and the spell is a helpful one that lands on whoever cast it —
+    // the client's auto-self-cast. The gate matters: without it a NEGATIVE "any unit"
+    // quest item would happily fire at the requester, which CheckExplicitTarget does
+    // not reject, spending the charge and destroying the item for nothing.
+    if (SpellCanLandOnCaster(si))
+    {
+        targets.SetUnitTarget(requester);
+        return true;
+    }
+
+    if (mask & TARGET_FLAG_UNIT_MASK)
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Target what you want to use |cffffffff{}|r on first.", itemName);
+    else
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffff5555[WowPsParty]|r Stand next to what you want to use |cffffffff{}|r on.", itemName);
+    return false;
+}
+
+// Re-push the shared grid after a use moved, spent or bounced something. Every exit
+// from the use path needs it, including the ones that give up part-way — an item
+// staged onto the requester and then abandoned would otherwise still be drawn on its
+// old owner until some unrelated action refreshed the panel.
+static void RefreshPartyGrid(Player* requester, Player* srcChar)
+{
+    WowPsParty::SendInventoryTo(requester);
+    if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
+}
+
 // Core of USE / USEBYID — use a resolved bag item. CONSUMABLES (food/
 // potions) fire their on-use on the requester and lose a charge from the owner.
 // NON-consumables (recipes to learn, essences/shards that CONVERT via reagents,
@@ -5483,10 +5730,11 @@ static void UseOwnedItemInstance(Player* requester, Player* srcChar, Item* srcIt
     // grid item the user clicks gets enchanted (ENCHSCROLL -> the addon's pending-
     // enchant mode -> ENCHANT, which HandleEnchant applies via its scroll path +
     // consumes the scroll). The scroll is NOT consumed here.
-    if (uint32 const enchSpell = useSpell; PermEnchantIdOfSpell(sSpellMgr->GetSpellInfo(enchSpell)))
+    SpellInfo const* const useInfo = sSpellMgr->GetSpellInfo(useSpell);
+    if (PermEnchantIdOfSpell(useInfo))
     {
         std::ostringstream out;
-        out << "ENCHSCROLL\t" << enchSpell << '\t' << t->Name1;
+        out << "ENCHSCROLL\t" << useSpell << '\t' << t->Name1;
         SendWPSP(requester, out.str());
         ChatHandler(requester->GetSession()).PSendSysMessage(
             "|cff66ccff[WowPsParty]|r Now click the item you want to enchant with "
@@ -5496,17 +5744,25 @@ static void UseOwnedItemInstance(Player* requester, Player* srcChar, Item* srcIt
 
     // A GLYPH's on-use spell applies the glyph. Route it to the correct free slot
     // (see ApplyGlyphFromItem) instead of CastSpell, which would always pick slot 0.
-    if (SpellInfo const* si = sSpellMgr->GetSpellInfo(useSpell))
+    if (useInfo)
         for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
-            if (si->Effects[i].Effect == SPELL_EFFECT_APPLY_GLYPH)
+            if (useInfo->Effects[i].Effect == SPELL_EFFECT_APPLY_GLYPH)
             {
-                ApplyGlyphFromItem(requester, srcChar, srcItem, uint32(si->Effects[i].MiscValue));
+                ApplyGlyphFromItem(requester, srcChar, srcItem, uint32(useInfo->Effects[i].MiscValue));
                 return;
             }
 
+    bool const hasExplicitTarget = SpellHasExplicitTarget(useInfo);
+    bool const selfServing = !hasExplicitTarget || SpellCanLandOnCaster(useInfo);
+
     // CONSUMABLE (food/potion): fire the effect on the requester and decrement the
     // owner's stack. This path has no dupe — the engine isn't relied on to consume.
-    if (t->Class == ITEM_CLASS_CONSUMABLE)
+    // A consumable that must be AIMED SOMEWHERE ELSE is excluded: the blind self-cast
+    // can only fail for it, and the decrement below runs whether or not the cast
+    // landed, so an Empty Cursed Ooze Jar or a Netherweave Net was destroyed for
+    // nothing. Those fall through to the requester-cast path, where the engine's own
+    // TakeCastItem decides whether the charge was really spent.
+    if (t->Class == ITEM_CLASS_CONSUMABLE && selfServing)
     {
         requester->CastSpell(requester, useSpell, true);
         // Consume ONLY if the on-use spell is actually expendable — the same rule the
@@ -5546,18 +5802,31 @@ static void UseOwnedItemInstance(Player* requester, Player* srcChar, Item* srcIt
     // pipeline — no cross-character pull — and the engine consumes the input
     // exactly as a normal use. The old bare triggered cast skipped that
     // consumption, creating the output while leaving the input = the infinite dupe.
+    // An item that must be AIMED SOMEWHERE ELSE joins them. It used to be cast with
+    // default-constructed, i.e. EMPTY, targets: CheckCast bailed SPELL_FAILED_BAD_TARGETS
+    // and, because the caster was the item's OWNER — normally a henchman — even the error
+    // went to a bot's session, so the right-click did nothing at all, silently. Aim it at
+    // what the HUMAN picked and let the human cast, so selection, range and line of sight
+    // are all judged from the player who is standing there. A self-serving item stays on
+    // the owner-cast path: the core already resolves those to the caster, so pulling them
+    // over would only invent a bags-full failure for something that works today.
     bool isLearn = false;
     bool hasReagent = false;
-    if (SpellInfo const* si2 = sSpellMgr->GetSpellInfo(useSpell))
+    if (useInfo)
     {
         for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
-            if (si2->Effects[i].Effect == SPELL_EFFECT_LEARN_SPELL) { isLearn = true; break; }
+            if (useInfo->Effects[i].Effect == SPELL_EFFECT_LEARN_SPELL) { isLearn = true; break; }
         for (uint8 i = 0; i < MAX_SPELL_REAGENTS; ++i)
-            if (si2->Reagent[i] > 0 && si2->ReagentCount[i] > 0) { hasReagent = true; break; }
+            if (useInfo->Reagent[i] > 0 && useInfo->ReagentCount[i] > 0) { hasReagent = true; break; }
     }
-    bool const castByRequester = isLearn || hasReagent;
 
-    SpellCastTargets targets;   // default-constructed = self-cast
+    bool const castByRequester = isLearn || hasReagent || (hasExplicitTarget && !selfServing);
+    Player* caster   = srcChar;
+    Item*   castItem = srcItem;
+
+    // The cast item moves BEFORE the target is resolved: aiming an opener can stage a
+    // party lockbox into the requester's bags, and doing that first would strand the box
+    // there if the cast item then had nowhere to go.
     if (castByRequester && srcChar != requester)
     {
         uint32 const    entry   = srcItem->GetEntry();
@@ -5570,29 +5839,47 @@ static void UseOwnedItemInstance(Player* requester, Player* srcChar, Item* srcIt
             // consumed by the merge so its guid is gone, yet the reagent now sits in
             // the requester's bags. Distinguish that from a genuine no-room bounce-
             // back — where PullItemToRequester leaves the stack on its owner — so a
-            // merge still combines and only a real full-bags case aborts.
-            if (SafeGetItemByGuid(srcChar, srcGuid))
-            {
-                ChatHandler(requester->GetSession()).PSendSysMessage(
-                    "|cffff5555[WowPsParty]|r Your bags are full — free a slot to use |cffffffff{}|r.", t->Name1);
-                return;
-            }
+            // merge still combines and only a real full-bags case aborts. A bounce-
+            // back ALSO happens when the requester already holds the item's unique
+            // count (a key both they and a henchman carry) — their own copy is an
+            // equally good cast source, so check for one before calling it a failure.
+            //
             // Any same-entry stack is an acceptable cast source: the on-use spell
             // and its reagent cost are item-entry-keyed, not instance-keyed.
             pulled = requester->GetItemByEntry(entry);
-            if (!pulled) return;   // merged in but unfindable — bail rather than mis-cast
+            bool const stillOnOwner = SafeGetItemByGuid(srcChar, srcGuid) != nullptr;
+            if (!pulled)
+            {
+                if (stillOnOwner)
+                    ChatHandler(requester->GetSession()).PSendSysMessage(
+                        "|cffff5555[WowPsParty]|r Your bags are full — free a slot to use |cffffffff{}|r.", t->Name1);
+                RefreshPartyGrid(requester, srcChar);
+                return;   // bounced back, or merged in but unfindable — never mis-cast
+            }
+            // The clicked instance stayed put and a copy of the requester's own is
+            // being spent instead — say so, or the charge appears to come off the
+            // wrong stack for no stated reason.
+            if (stillOnOwner)
+                ChatHandler(requester->GetSession()).PSendSysMessage(
+                    "|cff66ccff[WowPsParty]|r Your bags are full — used your own |cffffffff{}|r instead.", t->Name1);
         }
         LOG_INFO("module",
-            "[WowPsParty Use] {} converts entry={} '{}' (reagent={} learn={}) as the human caster; owner was {}.",
-            requester->GetName(), entry, t->Name1, hasReagent, isLearn, srcChar->GetName());
-        requester->CastItemUseSpell(pulled, targets, 0, 0);
+            "[WowPsParty Use] {} uses entry={} '{}' guid={} (reagent={} learn={} aimed={}) as the human caster; clicked copy was {}'s.",
+            requester->GetName(), entry, t->Name1, pulled->GetGUID().GetCounter(),
+            hasReagent, isLearn, hasExplicitTarget, srcChar->GetName());
+        caster   = requester;
+        castItem = pulled;
     }
-    else
+
+    SpellCastTargets targets;   // left default-constructed = self-cast
+    if (hasExplicitTarget && !AimAtRequesterTarget(requester, useInfo, t->ItemId, t->Name1, targets))
     {
-        srcChar->CastItemUseSpell(srcItem, targets, 0, 0);
+        RefreshPartyGrid(requester, srcChar);   // the cast item may already have moved
+        return;
     }
-    WowPsParty::SendInventoryTo(requester);
-    if (srcChar != requester) WowPsParty::SendInventoryTo(srcChar);
+
+    caster->CastItemUseSpell(castItem, targets, 0, 0);
+    RefreshPartyGrid(requester, srcChar);
 }
 
 // USE\t<srcPartySlot>\t<srcItemGuidLow> — use a specific bag item instance
