@@ -6418,6 +6418,8 @@ namespace WowPsParty
     static constexpr uint32 FL_SPELL_LOAD_CATAPULT = 64414;
     static constexpr uint32 FL_SPELL_TAR           = 62286;
     static constexpr uint32 FL_SPELL_SONIC_HORN    = 62974;
+    static constexpr uint32 FL_SPELL_SPEED_BOOST   = 62299;   // chopper driver
+    static constexpr uint32 FL_SPELL_INCR_SPEED    = 62471;   // demolisher mechanic, boosts the hull
     static constexpr uint32 FL_SPELL_PURSUED       = 62374;
     static constexpr uint32 FL_SPELL_FLAME_VENTS   = 62396;   // 10s channel — what we interrupt
 
@@ -6433,7 +6435,10 @@ namespace WowPsParty
     static constexpr float FL_SIEGE_STANDOFF = 12.0f;    // inside Ram + Electroshock range
     static constexpr float FL_SHOOT_STANDOFF = 45.0f;    // inside the 10-70y arc window
     static constexpr float FL_TAR_STANDOFF   = 22.0f;    // ahead of the boss, in its path
-    static constexpr float FL_KITE_CLEARANCE = 55.0f;    // a lap node nearer than this is skipped
+    // A Pursued hull is being rammed for ~19k a hit inside 15y, so "far" has to mean the
+    // far side of the arena, not merely "not adjacent". At 55 a pursued hull still hugged
+    // the boss all the way round the lap.
+    static constexpr float FL_KITE_CLEARANCE = 90.0f;    // a lap node nearer than this is skipped
 
     // The Formation Grounds are one flat bowl at z 409.8, walled by the four towers at
     // roughly x 157..383 / y -141..74; the boss evades outside x [120,450]. This lap sits
@@ -6509,6 +6514,29 @@ namespace WowPsParty
     };
     static std::unordered_map<uint32, FlBotState> g_flBots;   // bot low guid -> state
 
+    // Seat CLAIMS. Boarding is not observable to the next bot in the same pass: the ride
+    // spell's aura lands asynchronously, so `GetPassenger(0)` still reads empty and the
+    // next companion boards the SAME hull — and an explicit-seat AddPassenger EJECTS the
+    // current occupant. Five bots piling onto one demolisher, four of them thrown back out
+    // to fight barefoot, is exactly what that produced live. A claim is authoritative for a
+    // few seconds regardless of what the vehicle kit says.
+    static std::unordered_map<uint32, std::pair<uint32, uint32>> g_flClaims;   // seat low guid -> (bot low guid, ms)
+    static constexpr uint32 FL_CLAIM_TTL_MS = 5000;
+
+    static bool FlSeatClaimedByOther(Creature* seat, Player* bot)
+    {
+        auto it = g_flClaims.find(seat->GetGUID().GetCounter());
+        if (it == g_flClaims.end()) return false;
+        if (getMSTime() - it->second.second > FL_CLAIM_TTL_MS) { g_flClaims.erase(it); return false; }
+        return it->second.first != bot->GetGUID().GetCounter();
+    }
+
+    static void FlClaimSeat(Creature* seat, Player* bot)
+    {
+        if (g_flClaims.size() > 256) g_flClaims.clear();   // hulls are temp summons; never reused
+        g_flClaims[seat->GetGUID().GetCounter()] = { bot->GetGUID().GetCounter(), getMSTime() };
+    }
+
     // How long a companion waits in a catapult seat before climbing back out. The throw
     // belongs to whoever drives the demolisher, and that may be the human — who has no
     // reason to press the button on our schedule.
@@ -6556,17 +6584,43 @@ namespace WowPsParty
             if (!c || !c->IsAlive()) continue;
             Vehicle* kit = c->GetVehicleKit();
             if (!kit || kit->GetPassenger(0)) continue;   // driver seat already taken
+            if (FlSeatClaimedByOther(c, bot)) continue;   // another companion is mid-board
             float const d = bot->GetDistance(c);
             if (d < bestD) { bestD = d; best = c; }
         }
         return best;
     }
 
+    // Any free player seat on a hull the party already crews — the chopper's pillion, a
+    // spare demolisher seat. The ordered job list only covers the jobs worth ASSIGNING; a
+    // 10-man raid has more companions than it has jobs, and a bot on a spare seat still
+    // shoots and still soaks a Pursued, which beats standing in the open on foot.
+    static Creature* FlAnySpareSeat(std::vector<Unit*> const& hulls, Player* bot, int8& outSeat)
+    {
+        for (Unit* hull : hulls)
+        {
+            Creature* c = hull ? hull->ToCreature() : nullptr;
+            if (!c || !c->IsAlive()) continue;
+            Vehicle* kit = c->GetVehicleKit();
+            if (!kit) continue;
+            for (auto const& s : kit->Seats)
+            {
+                if (s.first == 0 || !s.second.IsEmpty()) continue;   // never steal the driver seat
+                if (!s.second.SeatInfo || !s.second.SeatInfo->CanEnterOrExit()) continue;
+                if (FlSeatClaimedByOther(c, bot)) continue;
+                outSeat = s.first;
+                return c;
+            }
+        }
+        return nullptr;
+    }
+
     // Gunner and mechanic seats are ACCESSORY creatures riding the parent hull (siege
     // turret in seat 7, demolisher mechanic in seat 1) — a bot boards the accessory, not
     // the hull. Only ever offered on a hull a PARTY member already drives, so nobody ends
     // up manning a gun on a vehicle that never moves.
-    static Creature* FlFreeCrewSeat(std::vector<Unit*> const& hulls, uint32 hullEntry, int8 accessorySeat)
+    static Creature* FlFreeCrewSeat(std::vector<Unit*> const& hulls, Player* bot,
+                                    uint32 hullEntry, int8 accessorySeat)
     {
         for (Unit* hull : hulls)
         {
@@ -6577,7 +6631,9 @@ namespace WowPsParty
             if (!accessory || !accessory->IsAlive()) continue;
             Vehicle* sub = accessory->GetVehicleKit();
             if (!sub || sub->GetPassenger(0)) continue;
-            if (Creature* c = accessory->ToCreature()) return c;
+            Creature* c = accessory->ToCreature();
+            if (!c || FlSeatClaimedByOther(c, bot)) continue;   // another companion is mid-board
+            return c;
         }
         return nullptr;
     }
@@ -6588,17 +6644,29 @@ namespace WowPsParty
         uint8 held[FL_JOB_COUNT] = {};     // how many members hold each job
     };
 
+    // Census EVERY companion in the instance, not just this bot's own follow group. A
+    // 10-man Leviathan raid is several party-of-5 groups stitched together, and
+    // GetPartyGuidsFor only ever returns one of them — so each sub-party started the job
+    // list from scratch and converged on the same hulls. Walk the WoW group (which is the
+    // raid) and union the follow directives on top of it.
     static FlCrew FlSurveyParty(Player* bot, Player* leader)
     {
         FlCrew crew;
         std::vector<ObjectGuid> party;
         GetPartyGuidsFor(bot->GetGUID(), party);
-        if (party.empty() && leader) party.push_back(leader->GetGUID());
+        if (leader) party.push_back(leader->GetGUID());
+        if (Group* group = bot->GetGroup())
+            for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+                if (Player* m = itr->GetSource())
+                    party.push_back(m->GetGUID());
 
+        std::unordered_set<ObjectGuid> seen;
         for (ObjectGuid const& g : party)
         {
+            if (!seen.insert(g).second) continue;
             Player* p = ObjectAccessor::FindConnectedPlayer(g);
             if (!p || p == bot || !p->IsInWorld()) continue;
+            if (p->GetMapId() != bot->GetMapId()) continue;
             FlJob const job = FlJobOf(p);
             if (job == FL_JOB_NONE) continue;
             ++crew.held[job];
@@ -6610,10 +6678,23 @@ namespace WowPsParty
         return crew;
     }
 
+    // Board, and CLAIM the seat in the same breath so the rest of this pass treats it as
+    // taken — the vehicle kit won't show it for another tick or two, and the next bot to
+    // pick the same hull would eject us off it. Logs what actually happened rather than
+    // what we asked for: the previous build logged "took job N" on a board that a later
+    // companion immediately undid, which made the log read like a success.
+    static void FlBoard(Player* bot, Creature* seat, int8 seatId, uint32 job)
+    {
+        FlClaimSeat(seat, bot);
+        bot->EnterVehicle(seat, seatId);
+        bool const seated = bot->GetVehicleBase() == seat;
+        LOG_INFO("module", "[WowPsParty Leviathan] {} -> job {} seat {} on {} (entry {}) {}",
+                 bot->GetName(), job, int32(seatId), seat->GetName(), seat->GetEntry(),
+                 seated ? "OK" : "pending");
+    }
+
     // Claim the highest-priority job the party is still missing and whose hardware is
-    // actually reachable. Boarding is synchronous, and the follow ticker walks directives
-    // one at a time, so the next bot in the same pass already sees this seat taken.
-    // Returns false when nothing was free.
+    // actually reachable. Returns false when nothing was free.
     static bool FlTakeASeat(Player* bot, Player* leader)
     {
         FlCrew crew = FlSurveyParty(bot, leader);
@@ -6626,14 +6707,22 @@ namespace WowPsParty
                 case FL_JOB_SIEGE_DRIVER:   seat = FlFindFreeHull(bot, FL_NPC_SIEGE); break;
                 case FL_JOB_DEMO_DRIVER:    seat = FlFindFreeHull(bot, FL_NPC_DEMOLISHER); break;
                 case FL_JOB_CHOPPER_DRIVER: seat = FlFindFreeHull(bot, FL_NPC_CHOPPER); break;
-                case FL_JOB_SIEGE_GUNNER:   seat = FlFreeCrewSeat(crew.hulls, FL_NPC_SIEGE, FL_SEAT_SIEGE_TURRET); break;
-                case FL_JOB_DEMO_MECHANIC:  seat = FlFreeCrewSeat(crew.hulls, FL_NPC_DEMOLISHER, FL_SEAT_DEMO_MECHANIC); break;
+                case FL_JOB_SIEGE_GUNNER:   seat = FlFreeCrewSeat(crew.hulls, bot, FL_NPC_SIEGE, FL_SEAT_SIEGE_TURRET); break;
+                case FL_JOB_DEMO_MECHANIC:  seat = FlFreeCrewSeat(crew.hulls, bot, FL_NPC_DEMOLISHER, FL_SEAT_DEMO_MECHANIC); break;
                 default: break;
             }
             if (!seat) continue;   // that job's hardware isn't free — try the next one
-            bot->EnterVehicle(seat, 0);
-            LOG_INFO("module", "[WowPsParty Leviathan] {} took job {} on {} (entry {})",
-                     bot->GetName(), uint32(job), seat->GetName(), seat->GetEntry());
+            FlBoard(bot, seat, 0, uint32(job));
+            return true;
+        }
+
+        // The job list is what we want CREWED; a 10-man brings more companions than there
+        // are jobs for. Anyone left over takes any spare seat on a hull the party already
+        // runs — still shooting, still able to soak a Pursued, instead of on foot.
+        int8 spareSeat = 0;
+        if (Creature* spare = FlAnySpareSeat(crew.hulls, bot, spareSeat))
+        {
+            FlBoard(bot, spare, spareSeat, 0);
             return true;
         }
         // Retried every couple of seconds, so the line itself is throttled — an under-
@@ -6682,21 +6771,27 @@ namespace WowPsParty
         return best;
     }
 
-    // Being Pursued means the boss has dropped everything to ram US. Run the lap in one
-    // fixed direction, skipping any node that would take us back past the boss — driving
-    // "away" in a straight line just backs a vehicle into the arena wall.
+    // Being Pursued means the boss has dropped everything to ram US, and a Battering Ram
+    // lands inside 15y. Run the lap in one fixed direction and take the node that puts the
+    // MOST ground between us and the boss — the first merely-acceptable node ahead is
+    // usually still hugging it, which is what kept pursued hulls in ramming range.
+    // Distance from the boss dominates; the small step term only breaks ties towards
+    // continuing the lap rather than doubling back through it.
     static void FlDriveKiteLap(Creature* vc, Creature* boss)
     {
         uint8 const node = FlNearestLapNode(vc->GetPositionX(), vc->GetPositionY());
-        for (uint8 step = 2; step <= 6; ++step)
+        uint8 best = (node + 3) % FL_LAP_NODES;
+        float bestScore = -1.0f;
+        for (uint8 step = 1; step <= 7; ++step)
         {
-            FlPoint const& p = FL_LAP[(node + step) % FL_LAP_NODES];
-            if (boss->GetExactDist2d(p.x, p.y) < FL_KITE_CLEARANCE) continue;
-            FlSteer(vc, p.x, p.y);
-            return;
+            uint8 const idx = (node + step) % FL_LAP_NODES;
+            FlPoint const& p = FL_LAP[idx];
+            float const fromBoss = boss->GetExactDist2d(p.x, p.y);
+            if (fromBoss < FL_KITE_CLEARANCE) continue;   // never route back through the boss
+            float const score = fromBoss - float(step) * 2.0f;
+            if (score > bestScore) { bestScore = score; best = idx; }
         }
-        FlPoint const& fallback = FL_LAP[(node + 3) % FL_LAP_NODES];   // boss mid-lap: keep going anyway
-        FlSteer(vc, fallback.x, fallback.y);
+        FlSteer(vc, FL_LAP[best].x, FL_LAP[best].y);
     }
 
     // Hold a working distance from the boss. Inside the band we deliberately don't steer
@@ -6924,6 +7019,14 @@ namespace WowPsParty
     {
         Unit* hull = vc->GetVehicleBase();
 
+        // Our hull is the one being rammed — the mechanic's speed cooldown is the only
+        // thing on a demolisher that helps it outrun the Pursue, so it comes first.
+        Creature* hullCreature = hull ? hull->ToCreature() : nullptr;
+        if (hullCreature && FlIsPursued(hullCreature, boss)
+            && !vc->HasSpellCooldown(FL_SPELL_INCR_SPEED)
+            && vc->CastSpell(vc, FL_SPELL_INCR_SPEED, false) == SPELL_CAST_OK)
+            return true;
+
         // Grab Crate has to be cast by the PLAYER: its script walks
         // GetCaster()->GetVehicleBase() expecting to land on the mechanic seat and then
         // the demolisher, and only the rider's chain resolves that way. Casting it from
@@ -6958,6 +7061,10 @@ namespace WowPsParty
 
     static bool FlTickChopperDriver(Creature* vc, Unit* enemy, Creature* boss)
     {
+        // Outrunning the Pursue beats everything else a chopper could be doing.
+        if (FlIsPursued(vc, boss) && !vc->HasSpellCooldown(FL_SPELL_SPEED_BOOST)
+            && vc->CastSpell(vc, FL_SPELL_SPEED_BOOST, false) == SPELL_CAST_OK)
+            return true;
         // Tar drops behind the chopper, so it only lands in the boss's path while we are
         // the ones driving ahead of it — worth nothing against anything else.
         if (boss && vc->GetExactDist2d(boss) <= FL_TAR_STANDOFF * 1.6f
