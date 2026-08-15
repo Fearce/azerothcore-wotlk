@@ -11,6 +11,13 @@
  *      nearest one that is still alive, and re-picks when it dies. See the
  *      "Auto-routing" block in PartyPath.cpp.
  *
+ *      Not every objective is a boss in a room. The same block also drives the
+ *      SET-PIECES a dungeon opens with a conversation — an escort to start and
+ *      walk with, a wave fight that begins when somebody says they are ready, a
+ *      boss standing there waiting to be spoken to. Only options the DATABASE
+ *      proves are safe to click are taken; see the "Events" block for the rule
+ *      and for why a raid is treated differently.
+ *
  * Both produce the same shape — a dense polyline — so the playback machinery
  * (steer node, lead/halt hysteresis, stall blink) is shared.
  *

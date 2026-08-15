@@ -6,8 +6,10 @@
 #include "Cell.h"
 #include "CellImpl.h"
 #include "Chat.h"
+#include "CreatureAI.h"
 #include "DatabaseEnv.h"
 #include "GameObject.h"
+#include "GossipDef.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
 #include "Log.h"
@@ -17,6 +19,7 @@
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "PathGenerator.h"
+#include "ScriptMgr.h"
 #include "StringFormat.h"
 #include "Player.h"
 #include "WorldSession.h"
@@ -28,6 +31,7 @@
 #include <cmath>
 #include <cstring>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -381,12 +385,17 @@ namespace WowPsParty
         // short and the leader sits at its head — which is exactly what the playback's
         // leader-cursor expects.
         constexpr uint32 ROUTE_TTL_MS      = 12000;
+        constexpr uint32 ROUTE_TTL_MOVING_MS = 3000;   // ...for an objective that walks (an escort)
         constexpr float  ROUTE_REBUILD_MOVE = 35.0f;   // leader this far from the build origin -> rebuild
 
         // Objective bookkeeping.
         constexpr float  OBJECTIVE_ARRIVE       = 15.0f;   // "we're at the boss"
         constexpr float  OBJECTIVE_ALIVE_RADIUS = 90.0f;   // ...and nothing of its entry lives within this
         constexpr uint32 OBJECTIVE_CHECK_MS     = 1000;    // that sweep is a grid visit — pace it
+        // Standing AT the objective, out of combat, for this long means nothing is
+        // going to happen here on its own. Arriving at a boss normally means a pull
+        // within a second or two, so this only ever fires on a set-piece.
+        constexpr uint32 OBJECTIVE_STALL_MS     = 10000;
         constexpr uint32 AUTO_STATE_IDLE_MS     = 30 * 60 * 1000;   // drop an untouched instance's state
 
         // Gate pulling. GATE_ARRIVE is how close to the dead end of a blocked corridor
@@ -395,6 +404,23 @@ namespace WowPsParty
         constexpr float  GATE_ARRIVE       = 15.0f;
         constexpr float  GATE_SEARCH_RANGE = 30.0f;
         constexpr uint32 GATE_RETRY_MS     = 6000;
+
+        // Events. The talk range is deliberately OBJECTIVE_ARRIVE rather than the
+        // core's 5-yard INTERACTION_DISTANCE: that constant exists to stop a client
+        // clicking an NPC across the room, and a bot sends no packet. What matters
+        // here is the weaker, true claim — this NPC is the thing we walked to.
+        constexpr float  EVENT_TALK_RANGE   = OBJECTIVE_ARRIVE;
+        constexpr float  ESCORT_TRACK_RANGE = 100.0f;   // an escortee walks away from its spawn
+        // Retrying is only worth anything while the instance might still change its
+        // mind about offering the option, and giving up moves the tank on to the next
+        // starter — which is the common case: Shadowfang Keep's two prisoners stand
+        // side by side and each is offered to one faction only.
+        constexpr uint32 EVENT_RETRY_MS     = 6000;
+        constexpr uint32 EVENT_MAX_TRIES    = 3;
+        // How long a boss that is missing from its own room is given after we start
+        // something next to it, before we write it off as already dead. Long enough
+        // for a summon, and it only ticks down out of combat (the caller bails in it).
+        constexpr uint32 EVENT_HOLD_MS      = 60000;
 
         // ---- Long-range navmesh routing --------------------------------------
 
@@ -760,7 +786,8 @@ namespace WowPsParty
         struct AutoRouteState
         {
             uint32   mapId       = 0;
-            uint32   targetEntry = 0;          // the boss we're walking to (0 = none picked yet)
+            uint32   targetEntry = 0;          // what we're walking to (0 = none picked yet)
+            bool     targetIsEvent = false;    // ...and whether that entry is a boss or a set-piece
             RouteRef route;
             uint32   generation  = 0;          // bumped per rebuild; playback cursors reset with it
             uint32   builtMs     = 0;
@@ -769,8 +796,14 @@ namespace WowPsParty
             uint32   checkedMs   = 0;          // last "is the objective dead yet" sweep
             uint32   touchedMs   = 0;
             uint32   lastGateMs  = 0;
-            std::unordered_set<uint32> cleared;     // boss entries confirmed down this run
-            std::unordered_set<uint32> usedGates;   // gameobject guids we already pulled
+            uint32   lastTalkMs  = 0;          // throttles the gossip attempts
+            uint32   talkTries   = 0;          // ...on the CURRENT event objective only
+            uint32   heldSinceMs = 0;          // an event we started is allowed to summon its boss
+            uint32   arrivedMs   = 0;          // standing at the objective since (0 = not there)
+            float    aimX = 0.0f, aimY = 0.0f, aimZ = 0.0f;   // where the objective last WAS
+            std::unordered_set<uint32> cleared;      // boss entries confirmed down this run
+            std::unordered_set<uint32> usedGates;    // gameobject guids we already pulled
+            std::unordered_set<uint32> started;      // event starter entries already spoken to
         };
 
         // Keyed by instance id. AzerothCore hands a fresh instance a fresh id, so a
@@ -794,12 +827,19 @@ namespace WowPsParty
         {
             uint32   generation  = 0;
             uint32   targetEntry = 0;
+            bool     targetIsEvent = false;
             RouteRef route;
             uint32   builtMs     = 0;
             float    builtX = 0.0f, builtY = 0.0f, builtZ = 0.0f;
             bool     blocked     = false;
             uint32   checkedMs   = 0;
+            uint32   lastTalkMs  = 0;
+            uint32   talkTries   = 0;
+            uint32   heldSinceMs = 0;
+            uint32   arrivedMs   = 0;
+            float    aimX = 0.0f, aimY = 0.0f, aimZ = 0.0f;
             std::unordered_set<uint32> cleared;
+            std::unordered_set<uint32> started;
         };
 
         // Fetch (creating on first sight) the state for an instance, dropping any other
@@ -829,16 +869,25 @@ namespace WowPsParty
             AutoRouteState const& st = TouchAutoState(instanceId, mapId, now);
 
             AutoSnapshot snap;
-            snap.generation  = st.generation;
-            snap.targetEntry = st.targetEntry;
-            snap.route       = st.route;
-            snap.builtMs     = st.builtMs;
-            snap.builtX      = st.builtX;
-            snap.builtY      = st.builtY;
-            snap.builtZ      = st.builtZ;
-            snap.blocked     = st.blocked;
-            snap.checkedMs   = st.checkedMs;
-            snap.cleared     = st.cleared;
+            snap.generation    = st.generation;
+            snap.targetEntry   = st.targetEntry;
+            snap.targetIsEvent = st.targetIsEvent;
+            snap.route         = st.route;
+            snap.builtMs       = st.builtMs;
+            snap.builtX        = st.builtX;
+            snap.builtY        = st.builtY;
+            snap.builtZ        = st.builtZ;
+            snap.blocked       = st.blocked;
+            snap.checkedMs     = st.checkedMs;
+            snap.lastTalkMs    = st.lastTalkMs;
+            snap.talkTries     = st.talkTries;
+            snap.heldSinceMs   = st.heldSinceMs;
+            snap.arrivedMs     = st.arrivedMs;
+            snap.aimX          = st.aimX;
+            snap.aimY          = st.aimY;
+            snap.aimZ          = st.aimZ;
+            snap.cleared       = st.cleared;
+            snap.started       = st.started;
             return snap;
         }
 
@@ -938,6 +987,408 @@ namespace WowPsParty
             return name;
         }
 
+        // ---- Events: the set-piece a dungeon opens with a conversation ---------
+        //
+        // Not all of a dungeon is a boss standing in a room. Some of it is an escort
+        // that has to be started and then kept alive (Wailing Caverns' Naralex,
+        // Gnomeregan's bomb run), a wave fight that only begins when somebody says
+        // they are ready (Violet Hold), or a boss who is standing right there and
+        // will not start until somebody announces the party (Black Temple's Illidan
+        // waits on Akama, at his door). None of that has a creature to walk up to
+        // and kill, so the boss router on its own leaves the tank parked next to the
+        // thing it was supposed to start.
+        //
+        // The whole difficulty is which gossip option is safe to click, and the only
+        // honest answer is: the ones the DATABASE says start something.
+        //
+        //   * SmartAI-declared. A `smart_scripts` row with SMART_EVENT_GOSSIP_SELECT
+        //     names the exact menu and option, and following its `link` chain says
+        //     what selecting it does. We take an option only when that chain reaches
+        //     an action that BEGINS something, and never when it also casts or
+        //     teleports — Old Hillsbrad's Brazen "casts" a taxi ride out of the
+        //     instance, Dire Maul's guards cast a buff, and Violet Hold's second
+        //     option drops whoever picked it inside the prison alone.
+        //   * Script-declared. A C++-scripted NPC declares nothing at all, so the
+        //     only admissible case is the unambiguous one: its menu holds exactly
+        //     ONE option, which therefore cannot be confused with a goodbye or a
+        //     shortcut. Trial of the Champion's announcer offers four and is left
+        //     alone rather than guessed at.
+        //
+        // One guard carried over from the gate work, and it is load-bearing: the
+        // starter must be one of a kind on its map — a single spawn, and no other
+        // spawned entry sharing its script. Karazhan's twelve chess pieces,
+        // Blackrock Depths' twenty-eight Grim Patrons and Dire Maul's thirty-eight
+        // Gordok Brutes all carry a gossip menu, and not one of them is a set-piece
+        // trigger.
+        //
+        // A set-piece is LAST, never first. The tank walks the bosses it can reach
+        // and only turns to a conversation when the boss router has nothing better —
+        // the list is exhausted, or it has stood as far along as it can get for ten
+        // seconds and nothing has happened. That ordering is what keeps this honest
+        // in a raid: the four raid set-pieces the data admits (Black Temple's Akama
+        // at Illidan's door, Zul'Aman's Harrison Jones, Ulduar's Expedition Commander
+        // and Brann) are each reached only after the tank has run out of boss, which
+        // is exactly when a raid group walks over and talks to them too.
+        //
+        // `python tools\tank-route.py <map> --events` mirrors all of this and prints
+        // what each dungeon resolves to, so a change here is checkable without a
+        // deploy. Grep `[WowPsParty AutoEvent]` in Server.log for the live side.
+
+        // SmartScriptMgr.h :: SMART_EVENT / SMART_ACTION. Named locally rather than
+        // included: these are the numbers the `smart_scripts` ROWS carry, and the
+        // tooling that mirrors this rule reads them out of the same table.
+        constexpr uint32 SMART_EVENT_GOSSIP_SELECT = 62;
+
+        // Reaching one of these means the option starts something that runs on its own.
+        constexpr uint32 EVENT_START_ACTIONS[] = {
+            12,    // SUMMON_CREATURE        — the waves themselves
+            34,    // SET_INST_DATA          — the instance's own state machine moves on
+            35,    // SET_INST_DATA64
+            45,    // SET_DATA
+            53,    // ESCORT_START           — an escort sets off
+            113,   // START_CLOSEST_WAYPOINT
+            223,   // DO_ACTION              — a scripted encounter is told to begin
+        };
+        // ...and these disqualify the option no matter what else it does.
+        constexpr uint32 EVENT_VETO_ACTIONS[] = {
+            11,    // CAST     — a taxi out of the dungeon, or a buff we didn't ask for
+            62,    // TELEPORT — moves whoever picked it, away from the party
+        };
+        constexpr uint32 EVENT_ESCORT_ACTIONS[] = { 53, 113 };
+
+        // A set-piece trigger is one or two clicks in, never a deep conversation tree.
+        constexpr uint32 MENU_WALK_MAX_DEPTH = 3;
+
+        struct EventStep
+        {
+            uint32 menuId   = 0;
+            uint32 optionId = 0;
+        };
+
+        struct EventObjective
+        {
+            uint32      entry = 0;
+            std::string name;
+            float       x = 0.0f, y = 0.0f, z = 0.0f;
+            std::vector<EventStep> steps;    // the NPC's own menu -> ... -> the start option
+            bool        escorts = false;     // the starter walks off once started
+        };
+
+        static bool AnyOf(std::vector<uint32> const& actions, uint32 const* set, size_t count)
+        {
+            for (uint32 action : actions)
+                if (std::find(set, set + count, action) != set + count)
+                    return true;
+            return false;
+        }
+
+        // The clicks that only NAVIGATE toward the start option get the same veto as
+        // the start option itself: a submenu entry that quietly teleports on the way in
+        // would be worse than the one we refused to take at the end of it.
+        static bool PathIsClean(std::vector<EventStep> const& steps,
+                                std::map<std::pair<uint32, uint32>, std::vector<uint32>> const& perOption)
+        {
+            for (EventStep const& step : steps)
+            {
+                auto it = perOption.find({ step.menuId, step.optionId });
+                if (it != perOption.end()
+                    && AnyOf(it->second, EVENT_VETO_ACTIONS, std::size(EVENT_VETO_ACTIONS)))
+                    return false;
+            }
+            return true;
+        }
+
+        // Every action reachable from one gossip-select row, following `link`. A
+        // SmartAI script routinely says nothing on the row the option triggers and
+        // everything on the chain hanging off it: Wailing Caverns' disciple sets a
+        // faction, then links to "set active", then to the escort start.
+        static void CollectLinkedActions(std::unordered_map<uint32, std::pair<uint32, uint32>> const& rows,
+                                         uint32 rowId, std::vector<uint32>& actions)
+        {
+            std::unordered_set<uint32> visited;
+            while (visited.insert(rowId).second)
+            {
+                auto it = rows.find(rowId);
+                if (it == rows.end())
+                    return;
+                actions.push_back(it->second.first);
+                rowId = it->second.second;
+                if (!rowId)
+                    return;
+            }
+        }
+
+        // Walk the gossip tree from the NPC's own menu to the menu the start option
+        // lives on, the way a player clicks through it. Violet Hold's Sinclari is the
+        // reason this exists: her opening menu only offers a submenu, and the option
+        // that actually starts the prison run lives one click deeper.
+        static bool BuildMenuPath(uint32 fromMenu, uint32 toMenu, std::vector<EventStep>& steps)
+        {
+            steps.clear();
+            if (fromMenu == toMenu)
+                return true;
+
+            std::unordered_map<uint32, EventStep> opensWith;   // menu -> the click that reaches it
+            std::unordered_set<uint32> seen{ fromMenu };
+            std::vector<uint32> frontier{ fromMenu };
+            for (uint32 depth = 0; depth < MENU_WALK_MAX_DEPTH && !frontier.empty()
+                                   && !seen.count(toMenu); ++depth)
+            {
+                std::string inList;
+                for (uint32 menu : frontier)
+                {
+                    if (!inList.empty())
+                        inList += ',';
+                    inList += std::to_string(menu);
+                }
+                frontier.clear();
+
+                QueryResult q = WorldDatabase.Query(
+                    "SELECT `MenuID`, `OptionID`, `ActionMenuID` FROM `gossip_menu_option` "
+                    "WHERE `MenuID` IN ({}) AND `ActionMenuID` <> 0 ORDER BY `MenuID`, `OptionID`",
+                    inList);
+                if (!q)
+                    break;
+                do
+                {
+                    Field* f = q->Fetch();
+                    uint32 const child = f[2].Get<uint32>();
+                    if (!seen.insert(child).second)
+                        continue;
+                    opensWith[child] = EventStep{ f[0].Get<uint32>(), f[1].Get<uint32>() };
+                    frontier.push_back(child);
+                } while (q->NextRow());
+            }
+            if (!seen.count(toMenu))
+                return false;
+
+            std::vector<EventStep> reversed;
+            for (uint32 cursor = toMenu; cursor != fromMenu; )
+            {
+                auto it = opensWith.find(cursor);
+                if (it == opensWith.end())
+                    return false;
+                reversed.push_back(it->second);
+                cursor = it->second.menuId;
+            }
+            steps.assign(reversed.rbegin(), reversed.rend());
+            return true;
+        }
+
+        struct EventCandidate
+        {
+            uint32      entry = 0;
+            std::string name;
+            float       x = 0.0f, y = 0.0f, z = 0.0f;
+            uint32      menuId = 0;
+            bool        smart = false;
+        };
+
+        // Gossip-only NPCs spawned exactly once on the map, whose script (if any) is
+        // not shared with another spawned entry. Everything past this point is about
+        // which of their options — if any — may be clicked.
+        static std::vector<EventCandidate> LoadEventCandidates(uint32 mapId)
+        {
+            std::vector<EventCandidate> out;
+            QueryResult q = WorldDatabase.Query(
+                "SELECT ct.`entry`, ct.`name`, ct.`gossip_menu_id`, ct.`AIName`, "
+                "       MIN(c.`position_x`), MIN(c.`position_y`), MIN(c.`position_z`) "
+                "FROM `creature` c JOIN `creature_template` ct ON ct.`entry` = c.`id1` "
+                "WHERE c.`map` = {} AND (ct.`npcflag` & 1) AND (ct.`npcflag` & ~1) = 0 "
+                "  AND ct.`gossip_menu_id` <> 0 "
+                "  AND (ct.`AIName` = 'SmartAI' OR ct.`ScriptName` <> '') "
+                "  AND (ct.`ScriptName` = '' OR 1 = (SELECT COUNT(DISTINCT c2.`id1`) "
+                "        FROM `creature` c2 JOIN `creature_template` t2 ON t2.`entry` = c2.`id1` "
+                "        WHERE c2.`map` = {} AND t2.`ScriptName` = ct.`ScriptName`)) "
+                "GROUP BY ct.`entry`, ct.`name`, ct.`gossip_menu_id`, ct.`AIName` "
+                "HAVING COUNT(*) = 1 ORDER BY ct.`entry`", mapId, mapId);
+            if (!q)
+                return out;
+            do
+            {
+                Field* f = q->Fetch();
+                EventCandidate cand;
+                cand.entry  = f[0].Get<uint32>();
+                cand.name   = f[1].Get<std::string>();
+                cand.menuId = f[2].Get<uint32>();
+                cand.smart  = (f[3].Get<std::string>() == "SmartAI");
+                cand.x      = f[4].Get<float>();
+                cand.y      = f[5].Get<float>();
+                cand.z      = f[6].Get<float>();
+                out.push_back(std::move(cand));
+            } while (q->NextRow());
+            return out;
+        }
+
+        static bool ResolveSmartStart(EventCandidate const& cand, EventObjective& out)
+        {
+            QueryResult q = WorldDatabase.Query(
+                "SELECT `id`, `link`, `event_type`, `event_param1`, `event_param2`, `action_type` "
+                "FROM `smart_scripts` WHERE `source_type` = 0 AND `entryorguid` = {} ORDER BY `id`",
+                cand.entry);
+            if (!q)
+                return false;
+
+            std::unordered_map<uint32, std::pair<uint32, uint32>> rows;   // id -> (action, link)
+            std::map<std::pair<uint32, uint32>, std::vector<uint32>> perOption;   // (menu, option)
+            std::vector<std::pair<std::pair<uint32, uint32>, uint32>> selects;
+            do
+            {
+                Field* f = q->Fetch();
+                uint32 const id = f[0].Get<uint32>();
+                rows[id] = { f[5].Get<uint32>(), f[1].Get<uint32>() };
+                if (f[2].Get<uint32>() == SMART_EVENT_GOSSIP_SELECT)
+                    selects.push_back({ { f[3].Get<uint32>(), f[4].Get<uint32>() }, id });
+            } while (q->NextRow());
+
+            for (auto const& sel : selects)
+                CollectLinkedActions(rows, sel.second, perOption[sel.first]);
+
+            for (auto const& option : perOption)
+            {
+                if (!AnyOf(option.second, EVENT_START_ACTIONS, std::size(EVENT_START_ACTIONS))
+                    || AnyOf(option.second, EVENT_VETO_ACTIONS, std::size(EVENT_VETO_ACTIONS)))
+                    continue;
+                if (!BuildMenuPath(cand.menuId, option.first.first, out.steps)
+                    || !PathIsClean(out.steps, perOption))
+                    continue;
+                out.steps.push_back(EventStep{ option.first.first, option.first.second });
+                out.escorts = AnyOf(option.second, EVENT_ESCORT_ACTIONS,
+                                    std::size(EVENT_ESCORT_ACTIONS));
+                return true;
+            }
+            return false;
+        }
+
+        // A C++ script says nothing about what its option does, so the only case we
+        // will touch is the one that cannot be misread: a menu with exactly one
+        // option, which goes nowhere on its own and therefore must be running code.
+        static bool ResolveScriptedStart(EventCandidate const& cand, EventObjective& out)
+        {
+            QueryResult q = WorldDatabase.Query(
+                "SELECT `OptionID`, `OptionType`, `ActionMenuID`, `ActionPoiID`, `BoxCoded` "
+                "FROM `gossip_menu_option` WHERE `MenuID` = {}", cand.menuId);
+            if (!q || q->GetRowCount() != 1)
+                return false;
+
+            Field* f = q->Fetch();
+            if (f[1].Get<uint32>() != GOSSIP_OPTION_GOSSIP || f[2].Get<uint32>() || f[3].Get<uint32>()
+                || f[4].Get<bool>())
+                return false;
+
+            out.steps.push_back(EventStep{ cand.menuId, f[0].Get<uint32>() });
+            return true;
+        }
+
+        // (mapId) -> the set-pieces on it. Static world data, like the boss list, so
+        // one build per map serves the whole process.
+        static std::mutex                                             g_eventMutex;
+        static std::unordered_map<uint32, std::vector<EventObjective>> g_eventCache;
+
+        static std::vector<EventObjective> const& EnsureEventObjectives(uint32 mapId)
+        {
+            std::lock_guard<std::mutex> lock(g_eventMutex);
+            auto cached = g_eventCache.find(mapId);
+            if (cached != g_eventCache.end())
+                return cached->second;
+
+            std::vector<EventObjective>& out = g_eventCache[mapId];
+            for (EventCandidate const& cand : LoadEventCandidates(mapId))
+            {
+                EventObjective ev;
+                if (!(cand.smart ? ResolveSmartStart(cand, ev) : ResolveScriptedStart(cand, ev)))
+                    continue;
+                ev.entry = cand.entry;
+                ev.name  = cand.name;
+                ev.x     = cand.x;
+                ev.y     = cand.y;
+                ev.z     = cand.z;
+                LOG_INFO("module", "[WowPsParty AutoEvent] map {}: '{}' starts a set-piece "
+                                   "({} click(s), {})",
+                         mapId, ev.name, uint32(ev.steps.size()),
+                         ev.escorts ? "then walks a path" : "then runs on its own");
+                out.push_back(std::move(ev));
+            }
+            if (out.empty())
+                LOG_INFO("module", "[WowPsParty AutoEvent] map {}: no set-piece the data proves "
+                                   "is safe to start", mapId);
+            return out;
+        }
+
+        static Creature* FindLiveCreature(Player* viewer, uint32 entry, float range)
+        {
+            std::list<Creature*> found;
+            LiveCreatureOfEntry check(viewer, entry, range);
+            Acore::CreatureListSearcher<LiveCreatureOfEntry> searcher(viewer, found, check);
+            Cell::VisitObjects(viewer, searcher, range);
+
+            Creature* best = nullptr;
+            float bestD = std::numeric_limits<float>::max();
+            for (Creature* c : found)
+            {
+                float const d = viewer->GetDistance(c);
+                if (d < bestD) { bestD = d; best = c; }
+            }
+            return best;
+        }
+
+        // Click through to the start option exactly as a player's client would:
+        // PrepareGossipMenu applies the DB conditions, so an option the instance is
+        // not ready to offer is simply absent and we come back later. Then run the
+        // same three-way dispatch the packet handler runs, so a SmartAI row, a C++
+        // script and a plain submenu all behave as they do for a human.
+        static bool TalkToEventStarter(Player* bot, Creature* npc, EventObjective const& ev)
+        {
+            for (EventStep const& step : ev.steps)
+            {
+                bot->PrepareGossipMenu(npc, step.menuId, false);
+                GossipMenu& menu = bot->PlayerTalkClass->GetGossipMenu();
+                menu.SetSenderGUID(npc->GetGUID());
+                if (!menu.GetItem(step.optionId))
+                {
+                    bot->PlayerTalkClass->ClearMenus();
+                    return false;
+                }
+
+                uint32 const sender = bot->PlayerTalkClass->GetGossipOptionSender(step.optionId);
+                uint32 const action = bot->PlayerTalkClass->GetGossipOptionAction(step.optionId);
+                if (CreatureAI* ai = npc->AI())
+                    ai->sGossipSelect(bot, step.menuId, step.optionId);
+                if (!sScriptMgr->OnGossipSelect(bot, npc, sender, action))
+                    bot->OnGossipSelect(npc, step.optionId, step.menuId);
+            }
+            bot->PlayerTalkClass->ClearMenus();
+            return true;
+        }
+
+        // Start whatever set-piece is standing next to the tank. The cheapest of the
+        // three triggers, and the only one that costs no walking: it fires where the
+        // tank ALREADY is, at a boss objective it went to on purpose.
+        static bool StartNearbyEvent(Player* bot, std::vector<EventObjective> const& events,
+                                     AutoSnapshot& snap, uint32 now)
+        {
+            if (events.empty() || (snap.lastTalkMs && getMSTimeDiff(snap.lastTalkMs, now) < EVENT_RETRY_MS))
+                return false;
+
+            for (EventObjective const& ev : events)
+            {
+                if (snap.started.count(ev.entry))
+                    continue;
+                Creature* npc = FindLiveCreature(bot, ev.entry, EVENT_TALK_RANGE);
+                if (!npc)
+                    continue;
+                snap.lastTalkMs = now;
+                if (!TalkToEventStarter(bot, npc, ev))
+                    return false;   // conditions unmet — it is not our turn yet
+                snap.started.insert(ev.entry);
+                snap.heldSinceMs = now;
+                LOG_INFO("module", "[WowPsParty AutoEvent] {} started '{}' — the set-piece is running",
+                         bot->GetName(), ev.name);
+                return true;
+            }
+            return false;
+        }
+
         // ---- The routing tick -------------------------------------------------
 
         // What the tank should drive this tick. An empty route means "auto-routing has
@@ -948,6 +1399,17 @@ namespace WowPsParty
             uint32      generation = 0;
             bool        blocked    = false;   // the objective is walled off from here
             std::string objective;
+        };
+
+        // Where the tank is walking this tick, whichever kind of objective it came
+        // from. A boss stands where it spawned; an escortee does not, so an event's
+        // position is resolved per tick rather than fixed when it is picked.
+        struct RouteTarget
+        {
+            uint32      entry   = 0;      // 0 = nothing to route to
+            std::string name;
+            float       x = 0.0f, y = 0.0f, z = 0.0f;
+            bool        isEvent = false;
         };
 
         // Nearest boss still standing, measured by REAL walking distance — a boss 40y
@@ -999,16 +1461,25 @@ namespace WowPsParty
             if (it == g_auto.end())
                 return;
             AutoRouteState& st = it->second;
-            st.targetEntry = snap.targetEntry;
-            st.route       = snap.route;
-            st.generation  = snap.generation;
-            st.builtMs     = snap.builtMs;
-            st.builtX      = snap.builtX;
-            st.builtY      = snap.builtY;
-            st.builtZ      = snap.builtZ;
-            st.blocked     = snap.blocked;
-            st.checkedMs   = snap.checkedMs;
-            st.cleared     = snap.cleared;
+            st.targetEntry   = snap.targetEntry;
+            st.targetIsEvent = snap.targetIsEvent;
+            st.route         = snap.route;
+            st.generation    = snap.generation;
+            st.builtMs       = snap.builtMs;
+            st.builtX        = snap.builtX;
+            st.builtY        = snap.builtY;
+            st.builtZ        = snap.builtZ;
+            st.blocked       = snap.blocked;
+            st.checkedMs     = snap.checkedMs;
+            st.lastTalkMs    = snap.lastTalkMs;
+            st.talkTries     = snap.talkTries;
+            st.heldSinceMs   = snap.heldSinceMs;
+            st.arrivedMs     = snap.arrivedMs;
+            st.aimX          = snap.aimX;
+            st.aimY          = snap.aimY;
+            st.aimZ          = snap.aimZ;
+            st.cleared       = snap.cleared;
+            st.started       = snap.started;
         }
 
         // Advance the objective if the last one died, then keep a fresh route to it.
@@ -1016,6 +1487,136 @@ namespace WowPsParty
         // its head — exactly where the playback's leader-cursor expects to find them.
         // Everything expensive runs on a snapshot with no lock held; only one thread
         // ever drives a given instance, so the commit at the end can't race a peer.
+        static BossObjective const* FindBoss(std::vector<BossObjective> const& all, uint32 entry)
+        {
+            for (BossObjective const& obj : all)
+                if (obj.entry == entry)
+                    return &obj;
+            return nullptr;
+        }
+
+        static EventObjective const* FindEvent(std::vector<EventObjective> const& all, uint32 entry)
+        {
+            for (EventObjective const& ev : all)
+                if (ev.entry == entry)
+                    return &ev;
+            return nullptr;
+        }
+
+        // Bosses always come first; a set-piece is what the tank turns to when the boss
+        // list is exhausted, when the map never had one (Violet Hold's encounters are
+        // all summoned out of portals), or when it has got as far as a boss lets it and
+        // nothing has happened. One or two per map, so this measures straight lines —
+        // the corridor build that follows is what discovers a shut door anyway.
+        static bool PickEventObjective(Player* bot, std::vector<EventObjective> const& events,
+                                       AutoSnapshot const& snap, RouteTarget& out)
+        {
+            EventObjective const* best = nullptr;
+            float bestD = std::numeric_limits<float>::max();
+            for (EventObjective const& ev : events)
+            {
+                if (snap.started.count(ev.entry))
+                    continue;
+                float const d = Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                                       ev.x, ev.y, ev.z);
+                if (d < bestD) { bestD = d; best = &ev; }
+            }
+            if (!best)
+                return false;
+            out = RouteTarget{ best->entry, best->name, best->x, best->y, best->z, true };
+            return true;
+        }
+
+        // Standing at the dead end of a corridor that stops short of the objective.
+        // That is as far as this boss goes, and it counts as arriving for the purpose
+        // of giving up on it: a dungeon whose way OPENS with a conversation leaves the
+        // tank exactly here, a hundred yards short of a boss it will never reach —
+        // Zul'Aman's gate is Harrison Jones's to open, and no lever substitutes.
+        static bool BlockedAtRouteEnd(Player* bot, AutoSnapshot const& snap)
+        {
+            if (!snap.blocked || !snap.route || snap.route->empty())
+                return false;
+            Vec3 const& end = snap.route->back();
+            return Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                          end.x, end.y, end.z) <= GATE_ARRIVE;
+        }
+
+        // Is the boss objective done? "Nothing of its entry is standing here" is the
+        // test — but that is also exactly what a set-piece boss looks like BEFORE its
+        // event runs, so before writing one off, say the thing that starts it.
+        static bool BossObjectiveFinished(Player* bot, BossObjective const& target,
+                                          std::vector<EventObjective> const& events,
+                                          AutoSnapshot& snap, uint32 now)
+        {
+            if (BossStillStanding(bot, target))
+            {
+                // Present but idle. Black Temple's Illidan stands right there and does
+                // nothing until Akama, at his door, is told to open it.
+                StartNearbyEvent(bot, events, snap, now);
+                return false;
+            }
+            if (StartNearbyEvent(bot, events, snap, now))
+                return false;   // give what we just started its chance to summon the boss
+            return !snap.heldSinceMs || getMSTimeDiff(snap.heldSinceMs, now) >= EVENT_HOLD_MS;
+        }
+
+        // The event objective, resolved to where its starter is RIGHT NOW — an escort
+        // walks away from its spawn and the tank has to walk with it. Returns false
+        // once the set-piece has nothing left for the tank.
+        static bool EventObjectiveActive(Player* bot, EventObjective const& ev,
+                                         AutoSnapshot& snap, uint32 now, RouteTarget& out)
+        {
+            out.entry   = ev.entry;
+            out.name    = ev.name;
+            out.isEvent = true;
+            out.x = snap.aimX;
+            out.y = snap.aimY;
+            out.z = snap.aimZ;
+
+            // Locating the starter is a 100-yard grid visit, so it is paced exactly
+            // like the boss done-check rather than run every AI tick. In between, the
+            // tank steers at where the thing last was — for an escortee walking a yard
+            // a tick that is the same answer, and the route it feeds is rebuilt on its
+            // own three-second clock anyway.
+            if (getMSTimeDiff(snap.checkedMs, now) < OBJECTIVE_CHECK_MS)
+                return true;
+            snap.checkedMs = now;
+
+            Creature* live = FindLiveCreature(bot, ev.entry, ESCORT_TRACK_RANGE);
+            if (live)
+            {
+                out.x = live->GetPositionX();
+                out.y = live->GetPositionY();
+                out.z = live->GetPositionZ();
+            }
+
+            if (snap.started.count(ev.entry))
+                return ev.escorts && live != nullptr;   // walk with it until it is gone
+
+            if (!live || bot->GetDistance(live) > EVENT_TALK_RANGE)
+                return true;                            // still on our way to it
+            if (snap.lastTalkMs && getMSTimeDiff(snap.lastTalkMs, now) < EVENT_RETRY_MS)
+                return true;
+
+            snap.lastTalkMs = now;
+            if (TalkToEventStarter(bot, live, ev))
+            {
+                snap.started.insert(ev.entry);
+                snap.heldSinceMs = now;
+                LOG_INFO("module", "[WowPsParty AutoEvent] {} started '{}' — {}",
+                         bot->GetName(), ev.name,
+                         ev.escorts ? "walking with it from here" : "the set-piece is running");
+                return ev.escorts;
+            }
+            if (++snap.talkTries < EVENT_MAX_TRIES)
+                return true;   // the instance isn't offering the option yet — ask again shortly
+
+            LOG_INFO("module", "[WowPsParty AutoEvent] '{}' will not offer its option — leaving it to "
+                               "the party and following the leader instead", ev.name);
+            snap.started.insert(ev.entry);
+            return false;
+        }
+
         static AutoRoutePlan EnsureAutoRoute(Player* bot, Player* leader)
         {
             AutoRoutePlan plan;
@@ -1026,69 +1627,114 @@ namespace WowPsParty
             uint32 const mapId      = map->GetId();
             uint32 const instanceId = map->GetInstanceId();
             std::vector<BossObjective> const& bosses = EnsureBossObjectives(mapId, map->GetSpawnMode());
-            if (bosses.empty())
+            std::vector<EventObjective> const& events = EnsureEventObjectives(mapId);
+            if (bosses.empty() && events.empty())
                 return plan;
 
             AutoSnapshot snap = SnapshotAutoState(instanceId, mapId);
             uint32 const now = getMSTime();
 
-            BossObjective const* target = nullptr;
-            for (BossObjective const& obj : bosses)
-                if (obj.entry == snap.targetEntry) { target = &obj; break; }
-
-            // Is the objective done? The check is a 90-yard grid sweep, so it runs at
-            // most once a second, and only from close enough that the creature grid is
-            // loaded — further out "nothing alive here" would simply be a lie.
-            if (target
-                && getMSTimeDiff(snap.checkedMs, now) >= OBJECTIVE_CHECK_MS
-                && Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
-                          target->x, target->y, target->z) <= OBJECTIVE_ARRIVE)
+            RouteTarget target;
+            if (snap.targetEntry && snap.targetIsEvent)
             {
-                snap.checkedMs = now;
-                if (!BossStillStanding(bot, *target))
+                if (EventObjective const* ev = FindEvent(events, snap.targetEntry))
+                    if (!EventObjectiveActive(bot, *ev, snap, now, target))
+                        target = RouteTarget{};
+            }
+            else if (BossObjective const* boss = FindBoss(bosses, snap.targetEntry))
+            {
+                target = RouteTarget{ boss->entry, boss->name, boss->x, boss->y, boss->z, false };
+                bool const atBoss =
+                    Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                           boss->x, boss->y, boss->z) <= OBJECTIVE_ARRIVE;
+                if (!atBoss && !BlockedAtRouteEnd(bot, snap))
+                    snap.arrivedMs = 0;
+                else if (getMSTimeDiff(snap.checkedMs, now) >= OBJECTIVE_CHECK_MS)
                 {
-                    LOG_INFO("module", "[WowPsParty AutoRoute] {} is down — picking the next objective",
-                             target->name);
-                    snap.cleared.insert(target->entry);
-                    snap.targetEntry = 0;
-                    target = nullptr;
+                    snap.checkedMs = now;
+                    if (!snap.arrivedMs)
+                        snap.arrivedMs = now;
+
+                    RouteTarget promoted;
+                    // The done-check is a 90-yard grid sweep, so it only runs from
+                    // close enough that the creature grid is loaded. From the far side
+                    // of a shut door "nothing of its entry is alive here" would simply
+                    // be a lie, and would clear a boss nobody has fought.
+                    if (atBoss && BossObjectiveFinished(bot, *boss, events, snap, now))
+                    {
+                        LOG_INFO("module", "[WowPsParty AutoRoute] {} is down — picking the next "
+                                           "objective", boss->name);
+                        snap.cleared.insert(boss->entry);
+                        target = RouteTarget{};
+                    }
+                    else if (getMSTimeDiff(snap.arrivedMs, now) >= OBJECTIVE_STALL_MS
+                             && PickEventObjective(bot, events, snap, promoted))
+                    {
+                        // As far as this boss goes, and nothing is happening. Violet
+                        // Hold's prisoners sit caged until somebody tells Sinclari to
+                        // start the run, and she is eighty yards behind us — so the set-
+                        // piece is not an afterthought here, it is the way in.
+                        LOG_INFO("module", "[WowPsParty AutoEvent] nothing is happening at {} — "
+                                           "going to start '{}' instead", boss->name, promoted.name);
+                        target = promoted;
+                    }
                 }
             }
 
-            bool objectiveChanged = false;
-            if (!target)
+            if (!target.entry)
             {
-                target = PickObjective(bot, bosses, snap.cleared);
-                if (!target)
+                if (BossObjective const* next = PickObjective(bot, bosses, snap.cleared))
+                    target = RouteTarget{ next->entry, next->name, next->x, next->y, next->z, false };
+                else if (!PickEventObjective(bot, events, snap, target))
                 {
-                    // Everything we know how to route to is down. Drop the route and let
+                    // Everything we know how to route to is done. Drop the route and let
                     // the tank fall back to following the leader out.
-                    snap.targetEntry = 0;
+                    snap.targetEntry   = 0;
+                    snap.targetIsEvent = false;
                     snap.route.reset();
                     snap.blocked = false;
                     snap.generation = NextRouteGeneration();
                     CommitAutoState(instanceId, snap);
                     return plan;
                 }
-                snap.targetEntry = target->entry;
-                objectiveChanged = true;
                 LOG_INFO("module", "[WowPsParty AutoRoute] map {}: next objective is {} ({:.0f}y away)",
-                         mapId, target->name,
+                         mapId, target.name,
                          Dist3D(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
-                                target->x, target->y, target->z));
+                                target.x, target.y, target.z));
             }
-            plan.objective = target->name;
 
+            bool const objectiveChanged =
+                target.entry != snap.targetEntry || target.isEvent != snap.targetIsEvent;
+            if (objectiveChanged)
+            {
+                snap.targetEntry   = target.entry;
+                snap.targetIsEvent = target.isEvent;
+                snap.talkTries     = 0;
+                snap.arrivedMs     = 0;
+            }
+            // Where the objective is, as of the last tick that actually looked. A boss
+            // never moves, so this only matters for an escortee — it is what the tank
+            // steers at on the ticks between two grid sweeps.
+            snap.aimX = target.x;
+            snap.aimY = target.y;
+            snap.aimZ = target.z;
+            plan.objective = target.name;
+
+            // An event objective can WALK (an escortee does nothing else), so its route
+            // ages faster than a boss's. Everyone is moving together while it does, so
+            // the leader-moved term below usually fires first anyway; this is the floor
+            // for the case where the party stands still and the escort does not.
+            uint32 const ttl = target.isEvent ? ROUTE_TTL_MOVING_MS : ROUTE_TTL_MS;
             bool const stale = objectiveChanged
                 || !snap.route || snap.route->size() < 2
-                || getMSTimeDiff(snap.builtMs, now) > ROUTE_TTL_MS
+                || getMSTimeDiff(snap.builtMs, now) > ttl
                 || Dist3D(leader->GetPositionX(), leader->GetPositionY(), leader->GetPositionZ(),
                           snap.builtX, snap.builtY, snap.builtZ) > ROUTE_REBUILD_MOVE;
             if (stale)
             {
                 std::vector<Vec3> fresh;
                 bool gated = false;
-                bool const built = BuildRoute(leader, target->x, target->y, target->z, fresh, gated);
+                bool const built = BuildRoute(leader, target.x, target.y, target.z, fresh, gated);
                 // Record where we searched from either way, so a failed search doesn't
                 // re-run every single tick.
                 snap.builtMs = now;
@@ -1101,7 +1747,7 @@ namespace WowPsParty
                     snap.blocked = gated;
                     snap.generation = NextRouteGeneration();
                     LOG_INFO("module", "[WowPsParty AutoRoute] route to {}: {} node(s), {}",
-                             target->name, uint32(snap.route->size()),
+                             target.name, uint32(snap.route->size()),
                              gated ? "corridor stops short — a gate is shut" : "clear");
                 }
                 else
@@ -1112,7 +1758,7 @@ namespace WowPsParty
                     // route and the last verdict rather than inventing a gate to hunt for.
                     LOG_INFO("module", "[WowPsParty AutoRoute] no navmesh corridor from {} to {} "
                                        "right now — keeping the previous route",
-                             leader->GetName(), target->name);
+                             leader->GetName(), target.name);
                 }
             }
 
@@ -1388,7 +2034,8 @@ namespace WowPsParty
         if (!map || !map->IsDungeon())
             return false;
         std::vector<BossObjective> const& bosses = EnsureBossObjectives(mapId, map->GetSpawnMode());
-        if (bosses.empty())
+        std::vector<EventObjective> const& events = EnsureEventObjectives(mapId);
+        if (bosses.empty() && events.empty())
             return false;
 
         std::lock_guard<std::mutex> lock(g_autoMutex);
@@ -1397,6 +2044,9 @@ namespace WowPsParty
             return true;   // nothing confirmed down yet — everything is still to do
         for (BossObjective const& obj : bosses)
             if (!it->second.cleared.count(obj.entry))
+                return true;
+        for (EventObjective const& ev : events)
+            if (!it->second.started.count(ev.entry))
                 return true;
         return false;
     }
@@ -1419,13 +2069,14 @@ namespace WowPsParty
 
         std::vector<BossObjective> const& bosses =
             EnsureBossObjectives(mapId, leader->GetMap()->GetSpawnMode());
-        if (bosses.empty())
+        std::vector<EventObjective> const& events = EnsureEventObjectives(mapId);
+        if (bosses.empty() && events.empty())
             return Acore::StringFormat(
                 "|cffffcc00[WowPsParty]|r No recorded route here, and this map has no boss "
                 "encounters to auto-route to — the tank will follow you. Use Record Path "
                 "to teach it the way.");
 
-        uint32 pending = 0;
+        uint32 pending = 0, setPieces = 0;
         {
             std::lock_guard<std::mutex> lock(g_autoMutex);
             auto it = g_auto.find(leader->GetMap()->GetInstanceId());
@@ -1433,15 +2084,24 @@ namespace WowPsParty
             for (BossObjective const& obj : bosses)
                 if (fresh || !it->second.cleared.count(obj.entry))
                     ++pending;
+            for (EventObjective const& ev : events)
+                if (fresh || !it->second.started.count(ev.entry))
+                    ++setPieces;
         }
-        if (!pending)
+        if (!pending && !setPieces)
             return Acore::StringFormat(
                 "|cff66ccff[WowPsParty]|r Every boss here is already down — the tank will "
                 "just follow you out.");
+        if (!pending)
+            return Acore::StringFormat(
+                "|cff66ccff[WowPsParty]|r No recorded route and no boss left standing — the tank "
+                "will go and start the {} set-piece(s) this dungeon runs.", setPieces);
 
         return Acore::StringFormat(
             "|cff66ccff[WowPsParty]|r No recorded route — the tank will find its own way to "
-            "the {} boss(es) still standing, and open what it can along the way.", pending);
+            "the {} boss(es) still standing, open what it can along the way{}.", pending,
+            setPieces ? Acore::StringFormat(", and start the {} set-piece(s) here", setPieces)
+                      : std::string());
     }
 
     // Diagnostic: the TRUE nearest-waypoint distance to the leader across ALL
