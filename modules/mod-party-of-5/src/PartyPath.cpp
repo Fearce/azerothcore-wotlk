@@ -575,6 +575,70 @@ namespace WowPsParty
         static std::mutex                                            g_bossMutex;
         static std::unordered_map<uint32, std::vector<BossObjective>> g_bossCache;
 
+        // A script-summoned boss has no spawn to walk to — but its fight still happens
+        // somewhere, and Blizzard names the ENCOUNTER after the thing you walk up to
+        // rather than the thing you finally kill. Gundrak's "Drakkari Colossus" credits
+        // the summoned Drakkari Elemental; Utgarde Pinnacle's "Svala Sorrowgrave"
+        // credits her post-ritual form. In both, the pre-fight NPC is spawned right
+        // where the party needs to stand.
+        //
+        // So match the encounter name against creatures spawned on this map, exact or
+        // whole-word prefix either way. UNIQUENESS is what makes this safe: a name that
+        // matches two spawns is discarded rather than guessed at, because a wrong
+        // stand-in would send the tank somewhere arbitrary. Elites are preferred but not
+        // required — Utgarde Pinnacle's Svala is rank 0 while she runs the ritual, and
+        // demanding elite silently dropped the exact case this exists for.
+        //
+        // Verify any change with `python tools\tank-route.py <map>`, which mirrors this
+        // rule and prints every stand-in it resolves.
+        static bool ResolveStandIn(uint32 mapId, std::string const& encounterName, BossObjective& out)
+        {
+            std::string escaped;
+            escaped.reserve(encounterName.size() + 8);
+            for (char c : encounterName)
+            {
+                if (c == '\'' || c == '\\')
+                    escaped += '\\';
+                escaped += c;
+            }
+
+            // Both prefix directions, resolved in SQL so only real candidates come back.
+            QueryResult q = WorldDatabase.Query(
+                "SELECT ct.`name`, ct.`rank`, c.`position_x`, c.`position_y`, c.`position_z` "
+                "FROM `creature` c JOIN `creature_template` ct ON ct.`entry` = c.`id1` "
+                "WHERE c.`map` = {} AND CHAR_LENGTH(ct.`name`) >= 4 AND ("
+                "  ct.`name` = '{}' OR '{}' LIKE CONCAT(ct.`name`, ' %') "
+                "  OR ct.`name` LIKE CONCAT('{}', ' %')) "
+                "GROUP BY ct.`name`, ct.`rank`, c.`position_x`, c.`position_y`, c.`position_z`",
+                mapId, escaped, escaped, escaped);
+            if (!q)
+                return false;
+
+            std::vector<BossObjective> hits, elites;
+            do
+            {
+                Field* f = q->Fetch();
+                BossObjective candidate;
+                candidate.name = f[0].Get<std::string>();
+                candidate.x    = f[2].Get<float>();
+                candidate.y    = f[3].Get<float>();
+                candidate.z    = f[4].Get<float>();
+                if (f[1].Get<uint8>() >= 1)
+                    elites.push_back(candidate);
+                hits.push_back(std::move(candidate));
+            } while (q->NextRow());
+
+            std::vector<BossObjective> const& chosen = (elites.size() == 1) ? elites : hits;
+            if (chosen.size() != 1)
+                return false;   // ambiguous (or nothing) — never guess where to send the tank
+
+            out = chosen.front();
+            LOG_INFO("module", "[WowPsParty AutoRoute] map {}: '{}' is summoned — routing to '{}', "
+                               "who starts the fight there",
+                     mapId, encounterName, out.name);
+            return true;
+        }
+
         static std::vector<BossObjective> const& EnsureBossObjectives(uint32 mapId, uint8 difficulty)
         {
             std::lock_guard<std::mutex> lock(g_bossMutex);
@@ -600,7 +664,7 @@ namespace WowPsParty
             }
 
             std::string inList;
-            uint32 wanted = 0;
+            std::vector<std::pair<uint32, std::string>> credits;   // creditEntry -> encounter name
             for (DungeonEncounter const* enc : *encounters)
             {
                 if (!enc || enc->creditType != ENCOUNTER_CREDIT_KILL_CREATURE || !enc->creditEntry)
@@ -608,9 +672,10 @@ namespace WowPsParty
                 if (!inList.empty())
                     inList += ',';
                 inList += std::to_string(enc->creditEntry);
-                ++wanted;
+                char const* encounterName = enc->dbcEntry ? enc->dbcEntry->encounterName[0] : nullptr;
+                credits.emplace_back(enc->creditEntry, encounterName ? encounterName : "");
             }
-            if (!wanted)
+            if (credits.empty())
                 return out;
 
             // There is no entry->spawn index in memory, so this is the router's one
@@ -618,14 +683,14 @@ namespace WowPsParty
             QueryResult q = WorldDatabase.Query(
                 "SELECT `id1`, `position_x`, `position_y`, `position_z` FROM `creature` "
                 "WHERE `map` = {} AND `id1` IN ({}) ORDER BY `guid`", mapId, inList);
+            std::unordered_set<uint32> spawned;
             if (q)
             {
-                std::unordered_set<uint32> seen;
                 do
                 {
                     Field* f = q->Fetch();
                     uint32 const entry = f[0].Get<uint32>();
-                    if (!seen.insert(entry).second)
+                    if (!spawned.insert(entry).second)
                         continue;   // first spawn wins; a boss listed twice is one objective
                     BossObjective obj;
                     obj.entry = entry;
@@ -640,9 +705,25 @@ namespace WowPsParty
                 } while (q->NextRow());
             }
 
+            // Whatever is left is script-summoned and has nowhere to walk to — but the
+            // fight still happens SOMEWHERE, and a stand-in usually marks the spot.
+            uint32 viaStandIn = 0;
+            for (auto const& credit : credits)
+            {
+                if (spawned.count(credit.first) || credit.second.empty())
+                    continue;
+                BossObjective standIn;
+                if (!ResolveStandIn(mapId, credit.second, standIn))
+                    continue;
+                standIn.entry = credit.first;   // still killed/credited as the summoned boss
+                out.push_back(std::move(standIn));
+                ++viaStandIn;
+            }
+
             LOG_INFO("module", "[WowPsParty AutoRoute] map {} difficulty {}: {} of {} encounter "
-                               "boss(es) have a world spawn to route to",
-                     mapId, uint32(difficulty), uint32(out.size()), wanted);
+                               "boss(es) have somewhere to route to ({} via a stand-in)",
+                     mapId, uint32(difficulty), uint32(out.size()), uint32(credits.size()),
+                     viaStandIn);
             return out;
         }
 
@@ -765,10 +846,25 @@ namespace WowPsParty
         //
         // When a corridor stops short of the boss, the way is physically shut — the
         // door is baked closed in the navmesh. That is the signal to look for the thing
-        // a player would click. Only BUTTONs and GOOBERs are touched (levers, gongs,
-        // altars, panels); a LOCKED object is left alone, because opening one without
-        // its key would be a cheat rather than a convenience, and doors that a boss
-        // kill opens are already handled by the playback's wait-for-line-of-sight.
+        // a player would click.
+        //
+        // ONLY `GAMEOBJECT_TYPE_BUTTON`, and that restriction is load-bearing. In WoW's
+        // data model a BUTTON *is* a switch that changes a door or a state, which is
+        // exactly what we want; a GOOBER is the catch-all "player interacts, some script
+        // runs" type, and it is full of things that would be a disaster to click blind —
+        // Icecrown Citadel's seven Scourge Transporters (which would teleport the tank
+        // away from its party), Blackrock Depths' Dark Iron Keg Shotgun (which starts
+        // the Grim Guzzler bar brawl), boss-summoning spheres. Every gate verified to
+        // actually open a way is a BUTTON: Gundrak's three altars, Halls of Stone's
+        // Tribunal console, Utgarde Keep's forge bellows, Deadmines' and Shadowfang's
+        // levers, Blackrock Depths' Lyceum runes.
+        //
+        // Under-including costs a visible stall that `tank-route.py --chain` explains.
+        // Over-including scatters the party. So: BUTTON only.
+        //
+        // A LOCKED object is left alone regardless — opening one without its key would
+        // be a cheat rather than a convenience — and a door that a boss kill opens is
+        // already handled by the playback's wait-for-line-of-sight.
 
         struct UsableGateCheck
         {
@@ -781,7 +877,7 @@ namespace WowPsParty
                 GameObjectTemplate const* tmpl = go->GetGOInfo();
                 if (!tmpl)
                     return false;
-                if (tmpl->type != GAMEOBJECT_TYPE_BUTTON && tmpl->type != GAMEOBJECT_TYPE_GOOBER)
+                if (tmpl->type != GAMEOBJECT_TYPE_BUTTON)
                     return false;
                 if (tmpl->GetLockId())
                     return false;   // needs a key — not ours to force
