@@ -6510,6 +6510,7 @@ namespace WowPsParty
     {
         uint32 loadedMs    = 0;  // when we climbed into a catapult seat
         uint32 noSeatLogMs = 0;  // last "nothing free to board" line, for log throttling
+        uint32 fireLogMs   = 0;  // last "is this hull shooting" trace
         ObjectGuid convoyAnchor; // who our hull is currently set to follow on the drive in
     };
     static std::unordered_map<uint32, FlBotState> g_flBots;   // bot low guid -> state
@@ -7192,14 +7193,33 @@ namespace WowPsParty
         Creature* raw = FlFindLeviathan(bot);
         Creature* boss = (raw && raw->IsInCombat()) ? raw : nullptr;
         Unit* enemy = FlPickEnemy(bot, vc, boss);
+        bool fired = false;
         switch (job)
         {
-            case FL_JOB_SIEGE_DRIVER:   FlTickSiegeDriver(vc, enemy, boss); break;
-            case FL_JOB_SIEGE_GUNNER:   FlTickSiegeGunner(vc, enemy); break;
-            case FL_JOB_DEMO_DRIVER:    FlTickDemolisherDriver(vc, enemy, boss); break;
-            case FL_JOB_DEMO_MECHANIC:  FlTickDemolisherMechanic(bot, vc, enemy, boss); break;
-            case FL_JOB_CHOPPER_DRIVER: FlTickChopperDriver(vc, enemy, boss); break;
+            case FL_JOB_SIEGE_DRIVER:   fired = FlTickSiegeDriver(vc, enemy, boss); break;
+            case FL_JOB_SIEGE_GUNNER:   fired = FlTickSiegeGunner(vc, enemy); break;
+            case FL_JOB_DEMO_DRIVER:    fired = FlTickDemolisherDriver(vc, enemy, boss); break;
+            case FL_JOB_DEMO_MECHANIC:  fired = FlTickDemolisherMechanic(bot, vc, enemy, boss); break;
+            case FL_JOB_CHOPPER_DRIVER: fired = FlTickChopperDriver(vc, enemy, boss); break;
             default: break;
+        }
+
+        // Whether a hull is actually SHOOTING is the one thing the old logging couldn't
+        // answer, and it is the difference between "the crew is wrong" and "the crew is
+        // right but the abilities aren't landing". Throttled per bot so it stays readable.
+        if (boss)
+        {
+            FlBotState& state = g_flBots[bot->GetGUID().GetCounter()];
+            uint32 const now = getMSTime();
+            if (now - state.fireLogMs > 10000)
+            {
+                state.fireLogMs = now;
+                LOG_INFO("module",
+                         "[WowPsParty Leviathan] {} job={} fired={} enemy={} dist={:.0f} pursued={} bossHp={}%",
+                         bot->GetName(), uint32(job), fired ? 1 : 0,
+                         enemy ? enemy->GetEntry() : 0, vc->GetExactDist2d(boss),
+                         FlIsPursued(vc, boss) ? 1 : 0, boss->GetHealthPct());
+            }
         }
         return true;
     }
