@@ -6434,7 +6434,12 @@ namespace WowPsParty
     static constexpr int8  FL_SEAT_DEVICE_ON_SEAT  = 2;   // overload device, on a boss seat
 
     static constexpr float FL_SCAN_RANGE     = 300.0f;   // how far we look for the boss
-    static constexpr float FL_BOARD_RANGE    = 145.0f;   // base-camp vehicles are spread this wide
+    // The base camp parks its six hulls over roughly 170 yards, and the party walks in from
+    // further out still, so ANY per-bot radius is a wall a companion silently gives up at.
+    // It settles for whatever happens to be near — a chopper while two siege engines stand
+    // empty — or for a passenger seat on a hull somebody already drives. One instance-wide
+    // sweep, shared by the whole raid and refreshed a few times a minute, instead.
+    static constexpr float FL_HULL_SEARCH    = 500.0f;
     static constexpr float FL_LAUNCH_RANGE   = 55.0f;    // catapult reach onto the boss
     // 13 yards is the one band where a siege engine is fully armed: Ram reaches 15, and
     // Fire Cannon — the 76k gun its own turret carries — has a 10-yard MINIMUM range and
@@ -6487,6 +6492,7 @@ namespace WowPsParty
         FL_JOB_CHOPPER_DRIVER,
         FL_JOB_LAUNCH_READY,      // loaded into the catapult, waiting to be thrown
         FL_JOB_BOARDER,           // riding the boss, killing its defense turrets
+        FL_JOB_PASSENGER,         // sitting on a hull with no bar of its own
         FL_JOB_COUNT
     };
 
@@ -6497,16 +6503,21 @@ namespace WowPsParty
         if (!p) return FL_JOB_NONE;
         Unit const* veh = p->GetVehicleBase();
         if (!veh) return FL_JOB_NONE;
+        // Seat 0 is the only one that drives. A rider on any other seat of a hull has no
+        // ability bar and no steering, and reading it as the DRIVER made it run the driver's
+        // rotation on somebody else's vehicle.
+        bool const driving = p->GetTransSeat() == 0;
         switch (veh->GetEntry())
         {
-            case FL_NPC_SIEGE:         return FL_JOB_SIEGE_DRIVER;
             case FL_NPC_SIEGE_TURRET:  return FL_JOB_SIEGE_GUNNER;
             case FL_NPC_DEMO_MECHANIC: return FL_JOB_DEMO_MECHANIC;
-            case FL_NPC_CHOPPER:       return FL_JOB_CHOPPER_DRIVER;
             case FL_NPC_BOSS_SEAT:     return FL_JOB_BOARDER;
+            case FL_NPC_SIEGE:         return driving ? FL_JOB_SIEGE_DRIVER   : FL_JOB_PASSENGER;
+            case FL_NPC_CHOPPER:       return driving ? FL_JOB_CHOPPER_DRIVER : FL_JOB_PASSENGER;
             case FL_NPC_DEMOLISHER:
+                if (driving) return FL_JOB_DEMO_DRIVER;
                 return p->GetTransSeat() == FL_SEAT_DEMO_CATAPULT ? FL_JOB_LAUNCH_READY
-                                                                  : FL_JOB_DEMO_DRIVER;
+                                                                  : FL_JOB_PASSENGER;
             default:                   return FL_JOB_NONE;
         }
     }
@@ -6542,6 +6553,7 @@ namespace WowPsParty
         uint32 fireLogMs   = 0;  // last "is this hull shooting" trace
         uint32 repairSinceMs = 0;  // when this hull set off for a station; 0 = not going
         uint32 repairHoldMs  = 0;  // a trip that never got its heal; don't start another yet
+        uint32 holdLogMs     = 0;  // last "no hull, standing clear" line
         ObjectGuid convoyAnchor; // who our hull is currently set to follow on the drive in
     };
     static std::unordered_map<uint32, FlBotState> g_flBots;   // bot low guid -> state
@@ -6603,17 +6615,44 @@ namespace WowPsParty
         return boss && boss->IsInCombat();
     }
 
+    // Every hull in the instance, by guid, cached for a couple of seconds and shared by the
+    // whole raid. Guids and not pointers because the cache outlives a single pass and a hull
+    // can be destroyed inside it; occupancy is always re-read live off the vehicle kit.
+    static std::vector<ObjectGuid> const& FlAllHulls(Player* from)
+    {
+        struct HullCheck
+        {
+            bool operator()(Creature* c) const
+            {
+                if (!c || !c->IsAlive()) return false;
+                uint32 const e = c->GetEntry();
+                return e == FL_NPC_SIEGE || e == FL_NPC_DEMOLISHER || e == FL_NPC_CHOPPER;
+            }
+        };
+        static thread_local std::unordered_map<uint32, std::pair<std::vector<ObjectGuid>, uint32>> cache;
+        auto& slot = cache[from->GetInstanceId()];
+        uint32 const now = getMSTime();
+        if (slot.second && now - slot.second < 3000) return slot.first;
+
+        slot.second = now ? now : 1;
+        slot.first.clear();
+        std::list<Creature*> found;
+        HullCheck check;
+        Acore::CreatureListSearcher<HullCheck> searcher(from, found, check);
+        Cell::VisitObjects(from, searcher, FL_HULL_SEARCH);
+        for (Creature* c : found)
+            slot.first.push_back(c->GetGUID());
+        return slot.first;
+    }
+
     static Creature* FlFindFreeHull(Player* bot, uint32 entry)
     {
-        std::list<Creature*> found;
-        Acore::AllCreaturesOfEntryInRange check(bot, entry, FL_BOARD_RANGE);
-        Acore::CreatureListSearcher<Acore::AllCreaturesOfEntryInRange> searcher(bot, found, check);
-        Cell::VisitObjects(bot, searcher, FL_BOARD_RANGE);
         Creature* best = nullptr;
-        float bestD = FL_BOARD_RANGE * 2.0f;
-        for (Creature* c : found)
+        float bestD = std::numeric_limits<float>::max();
+        for (ObjectGuid const& guid : FlAllHulls(bot))
         {
-            if (!c || !c->IsAlive()) continue;
+            Creature* c = ObjectAccessor::GetCreature(*bot, guid);
+            if (!c || !c->IsAlive() || c->GetEntry() != entry) continue;
             Vehicle* kit = c->GetVehicleKit();
             if (!kit || kit->GetPassenger(0)) continue;   // driver seat already taken
             if (FlSeatClaimedByOther(c, bot)) continue;   // another companion is mid-board
@@ -6623,29 +6662,13 @@ namespace WowPsParty
         return best;
     }
 
-    // Any free player seat on a hull the party already crews — the chopper's pillion, a
-    // spare demolisher seat. The ordered job list only covers the jobs worth ASSIGNING; a
-    // 10-man raid has more companions than it has jobs, and a bot on a spare seat still
-    // shoots and still soaks a Pursued, which beats standing in the open on foot.
-    static Creature* FlAnySpareSeat(std::vector<Unit*> const& hulls, Player* bot, int8& outSeat)
-    {
-        for (Unit* hull : hulls)
-        {
-            Creature* c = hull ? hull->ToCreature() : nullptr;
-            if (!c || !c->IsAlive()) continue;
-            Vehicle* kit = c->GetVehicleKit();
-            if (!kit) continue;
-            for (auto const& s : kit->Seats)
-            {
-                if (s.first == 0 || !s.second.IsEmpty()) continue;   // never steal the driver seat
-                if (!s.second.SeatInfo || !s.second.SeatInfo->CanEnterOrExit()) continue;
-                if (FlSeatClaimedByOther(c, bot)) continue;
-                outSeat = s.first;
-                return c;
-            }
-        }
-        return nullptr;
-    }
+    // There is deliberately NO "take any spare seat" fallback. A bare passenger seat on a
+    // siege engine or demolisher rides at the front of a hull parked in Ram range, with none
+    // of the immunities a Flame Leviathan Seat grants, so its occupant is inside the boss's
+    // melee — which is what killed two companions outright on the pull. It also filled the
+    // human's own siege engine with four bots while two hulls stood empty, because a spare
+    // seat is always easier to find than a hull. Ten posts for ten raiders is the whole
+    // budget; a companion with no post waits for one instead of taking a seat that kills it.
 
     // Gunner and mechanic seats are ACCESSORY creatures riding the parent hull (siege
     // turret in seat 7, demolisher mechanic in seat 1) — a bot boards the accessory, not
@@ -6778,12 +6801,6 @@ namespace WowPsParty
             return FlBoardOrWalkTo(bot, seat, 0, uint32(job));
         }
 
-        // The job list is what we want CREWED; a 10-man brings more companions than there
-        // are jobs for. Anyone left over takes any spare seat on a hull the party already
-        // runs — still shooting, still able to soak a Pursued, instead of on foot.
-        int8 spareSeat = 0;
-        if (Creature* spare = FlAnySpareSeat(crew.hulls, bot, spareSeat))
-            return FlBoardOrWalkTo(bot, spare, spareSeat, 0);
         // Retried every couple of seconds, so the line itself is throttled — an under-
         // crewed party would otherwise write a page a minute into Server.log.
         uint32 const now = getMSTime();
@@ -6791,8 +6808,8 @@ namespace WowPsParty
         if (now - state.noSeatLogMs >= 15000)
         {
             state.noSeatLogMs = now;
-            LOG_INFO("module", "[WowPsParty Leviathan] {} found no free seat within {}y",
-                     bot->GetName(), uint32(FL_BOARD_RANGE));
+            LOG_INFO("module", "[WowPsParty Leviathan] {} has no post — {} hull(s) in the instance",
+                     bot->GetName(), FlAllHulls(bot).size());
         }
         return false;
     }
@@ -7337,21 +7354,54 @@ namespace WowPsParty
         return false;   // hand the tick to the bot's own rotation
     }
 
+    // A companion with no post must not be walked into the Formation Grounds on foot. The
+    // ordinary ground follow does exactly that, and its stall recovery goes further and
+    // TELEPORTS the bot onto the leader — who is in a hull, next to the boss. That pair is
+    // what killed two companions outright on the pull. Owning the tick here is what turns
+    // both of them off; the bot keeps asking for a hull every couple of seconds meanwhile.
+    static bool FlHoldOffTheField(Player* bot)
+    {
+        Creature* boss = FlFindLeviathan(bot);
+        if (!boss || !boss->IsInCombat()) return false;   // no fight yet, follow normally
+
+        uint8 best = 0;
+        float furthest = -1.0f;
+        for (uint8 i = 0; i < FL_LAP_NODES; ++i)
+        {
+            float const d = boss->GetExactDist2d(FL_LAP[i].x, FL_LAP[i].y);
+            if (d > furthest) { furthest = d; best = i; }
+        }
+        if (bot->GetExactDist2d(FL_LAP[best].x, FL_LAP[best].y) > 12.0f)
+            bot->GetMotionMaster()->MovePoint(0, FL_LAP[best].x, FL_LAP[best].y, FL_ARENA_Z);
+
+        FlBotState& state = g_flBots[bot->GetGUID().GetCounter()];
+        uint32 const now = getMSTime();
+        if (now - state.holdLogMs >= 20000)
+        {
+            state.holdLogMs = now;
+            LOG_INFO("module", "[WowPsParty Leviathan] {} has no hull — holding {:.0f}y clear of the boss",
+                     bot->GetName(), furthest);
+        }
+        return true;
+    }
+
     // Movement side of the encounter. Returns true when it owns this bot's tick.
     static bool TickLeviathanVehicle(Player* bot, Player* leader)
     {
         if (bot->GetMapId() != FL_MAP_ULDUAR) return false;
-        Unit* veh = bot->GetVehicleBase();
         FlJob const job = FlJobOf(bot);
 
-        if (job == FL_JOB_NONE)
+        // A passenger seat is a post we never assign, but the human can fill one and an old
+        // build did — so a rider without a bar keeps looking for a real one, and corrects
+        // itself the moment a hull frees up.
+        if (job == FL_JOB_NONE || job == FL_JOB_PASSENGER)
         {
-            // On foot. Board only once the encounter is actually running or the leader has
-            // taken a hull — outside that the party is just walking around Ulduar.
-            // A corpse cannot board: Unit::_EnterVehicle drops the ride on the floor for a
-            // dead passenger, which would log a boarding attempt every couple of seconds
-            // for as long as the bot waits on a resurrection.
-            if (!veh && bot->IsAlive()
+            // Board only once the encounter is actually running or the leader has taken a
+            // hull — outside that the party is just walking around Ulduar. A corpse cannot
+            // board: Unit::_EnterVehicle drops the ride on the floor for a dead passenger,
+            // which would log a boarding attempt every couple of seconds for as long as the
+            // bot waits on a resurrection.
+            if (bot->IsAlive()
                 && (LeviathanEncounterActive(bot) || FlJobOf(leader) != FL_JOB_NONE))
             {
                 uint32 const now = getMSTime();
@@ -7361,12 +7411,9 @@ namespace WowPsParty
                     last = now;
                     if (FlTakeASeat(bot, leader)) return true;
                 }
-                // Nothing free to climb into. Deliberately fall through to the ordinary
-                // ground follow rather than holding position: a companion that died and ran
-                // back, or one waiting on a hull to respawn at the base camp, should keep
-                // walking with the party and board when one frees up.
             }
-            return false;
+            if (job == FL_JOB_PASSENGER) return true;   // seated, nothing of its own to drive
+            return FlHoldOffTheField(bot);
         }
 
         Creature* boss = FlFindLeviathan(bot);
@@ -7602,6 +7649,9 @@ namespace WowPsParty
             // Checked before the cast throttle: a bot thrown onto the Leviathan fights with
             // its own spells, and its rotation already paces itself.
             if (job == FL_JOB_BOARDER) return FlTickBoarder(bot, vc);
+            // A rider on a bare passenger seat has no bar to run, so its own spells are the
+            // only thing it can contribute — hand the tick straight to its rotation.
+            if (job == FL_JOB_PASSENGER) return false;
             if (job != FL_JOB_NONE)
             {
                 // Retried several times a second rather than once. A vehicle ability shares
