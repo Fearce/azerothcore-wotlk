@@ -6406,6 +6406,7 @@ namespace WowPsParty
 
     static constexpr uint32 FL_SPELL_ELECTROSHOCK  = 62522;   // frontal cone, interrupts Flame Vents
     static constexpr uint32 FL_SPELL_SIEGE_RAM     = 62345;
+    static constexpr uint32 FL_SPELL_STEAM_RUSH    = 62346;   // 35y thrust along the hull's facing
     static constexpr uint32 FL_SPELL_FIRE_CANNON   = 62358;
     static constexpr uint32 FL_SPELL_TURRET_ROCKET = 62359;
     static constexpr uint32 FL_SPELL_HURL_BOULDER  = 62306;
@@ -6422,6 +6423,9 @@ namespace WowPsParty
     static constexpr uint32 FL_SPELL_INCR_SPEED    = 62471;   // demolisher mechanic, boosts the hull
     static constexpr uint32 FL_SPELL_PURSUED       = 62374;
     static constexpr uint32 FL_SPELL_FLAME_VENTS   = 62396;   // 10s channel — what we interrupt
+    static constexpr uint32 FL_SPELL_AUTO_REPAIR   = 62705;   // the station's heal; its 60s aura is the lockout
+    static constexpr uint32 FL_SPELL_RIDE_HARDCODED = 46598;  // VEHICLE_SPELL_RIDE_HARDCODED
+    static constexpr uint32 FL_GO_REPAIR_TRAP      = 194262;  // RX-214 Repair-o-matic Station TRAP
 
     static constexpr int8  FL_SEAT_SIEGE_TURRET    = 7;
     static constexpr int8  FL_SEAT_DEMO_MECHANIC   = 1;
@@ -6430,15 +6434,29 @@ namespace WowPsParty
     static constexpr int8  FL_SEAT_DEVICE_ON_SEAT  = 2;   // overload device, on a boss seat
 
     static constexpr float FL_SCAN_RANGE     = 300.0f;   // how far we look for the boss
-    static constexpr float FL_BOARD_RANGE    = 160.0f;   // base-camp vehicles are spread this wide
+    static constexpr float FL_BOARD_RANGE    = 145.0f;   // base-camp vehicles are spread this wide
     static constexpr float FL_LAUNCH_RANGE   = 55.0f;    // catapult reach onto the boss
-    static constexpr float FL_SIEGE_STANDOFF = 12.0f;    // inside Ram + Electroshock range
+    // 13 yards is the one band where a siege engine is fully armed: Ram reaches 15, and
+    // Fire Cannon — the 76k gun its own turret carries — has a 10-yard MINIMUM range and
+    // goes dead if the driver parks any closer.
+    static constexpr float FL_SIEGE_STANDOFF = 13.0f;
     static constexpr float FL_SHOOT_STANDOFF = 45.0f;    // inside the 10-70y arc window
     static constexpr float FL_TAR_STANDOFF   = 22.0f;    // ahead of the boss, in its path
-    // A Pursued hull is being rammed for ~19k a hit inside 15y, so "far" has to mean the
-    // far side of the arena, not merely "not adjacent". At 55 a pursued hull still hugged
-    // the boss all the way round the lap.
-    static constexpr float FL_KITE_CLEARANCE = 90.0f;    // a lap node nearer than this is skipped
+    static constexpr float FL_RAM_RANGE      = 17.0f;    // Ram is 15y + the boss's combat reach
+    static constexpr float FL_SHOCK_RANGE    = 24.0f;    // Electroshock's cone is 25y
+    static constexpr float FL_HORN_RANGE     = 30.0f;    // Sonic Horn's cone is 35y
+    static constexpr float FL_THRUST_RANGE   = 32.0f;    // pursued and this close -> Steam Rush out
+    // Kiting has to stay INSIDE our own weapon range or a pursued hull spends the whole
+    // 31-second pursue contributing nothing: Hurl Pyrite and Fire Cannon both stop at 70
+    // yards. Battering Ram is only cast when the boss is within 15 of its victim and
+    // splashes 25, so ~60 is simultaneously out of reach and still shooting. The previous
+    // "get as far away as possible" rule parked pursued hulls outside every gun they had.
+    static constexpr float FL_KITE_RANGE     = 60.0f;
+    static constexpr float FL_KITE_MIN       = 42.0f;    // a lap node nearer the boss than this is skipped
+    // Hulls carry 500k-1.1M health, so this is a genuine emergency threshold and not a
+    // routine one: 35% still leaves well over a minute of life against the ~2.5k/s the
+    // arena puts out, which comfortably covers the ~25-second round trip to a station.
+    static constexpr uint32 FL_REPAIR_PCT    = 35;
 
     // The Formation Grounds are one flat bowl at z 409.8, walled by the four towers at
     // roughly x 157..383 / y -141..74; the boss evades outside x [120,450]. This lap sits
@@ -6492,14 +6510,18 @@ namespace WowPsParty
         }
     }
 
-    // Fill order. An interrupter and a demolisher come before everything, then the
-    // gunner (the single biggest gun), then the mechanic (pyrite + the catapult ride),
-    // then tar. Past that we just want more hulls in the fight. Jobs a team-mate already
-    // holds are consumed in order, so the party spreads instead of stacking.
+    // Fill order. Ten-man parks SIX hulls at the base camp — two siege engines, two
+    // demolishers, two choppers — and each siege and demolisher carries a second gun on an
+    // accessory seat, so a full raid is exactly ten posts. Every HULL is crewed before any
+    // gun seat is: an undriven hull contributes nothing at all and cannot even be boarded
+    // as a gunner (a turret only fires from a vehicle somebody is steering), while a
+    // gunless siege still rams and still interrupts. Jobs a team-mate already holds are
+    // consumed in order, so the raid spreads instead of stacking.
     static FlJob const FL_JOB_ORDER[] =
     {
-        FL_JOB_SIEGE_DRIVER, FL_JOB_DEMO_DRIVER, FL_JOB_SIEGE_GUNNER, FL_JOB_DEMO_MECHANIC,
-        FL_JOB_CHOPPER_DRIVER, FL_JOB_DEMO_DRIVER, FL_JOB_SIEGE_DRIVER, FL_JOB_CHOPPER_DRIVER,
+        FL_JOB_SIEGE_DRIVER,  FL_JOB_DEMO_DRIVER,   FL_JOB_SIEGE_DRIVER, FL_JOB_DEMO_DRIVER,
+        FL_JOB_CHOPPER_DRIVER, FL_JOB_CHOPPER_DRIVER,
+        FL_JOB_SIEGE_GUNNER,  FL_JOB_DEMO_MECHANIC, FL_JOB_SIEGE_GUNNER, FL_JOB_DEMO_MECHANIC,
     };
 
     // Vehicle-keyed, and the hulls are temp summons that get a fresh guid on every raid
@@ -6687,7 +6709,15 @@ namespace WowPsParty
     static void FlBoard(Player* bot, Creature* seat, int8 seatId, uint32 job)
     {
         FlClaimSeat(seat, bot);
-        bot->EnterVehicle(seat, seatId);
+        // Unit::EnterVehicle casts the ride spell with only IGNORE_CASTER_MOUNTED_OR_ON_VEHICLE,
+        // so it still has to survive the ordinary CheckCast — and a companion fighting on
+        // foot is on the global cooldown or mid-cast almost continuously. The cast failed
+        // silently, over and over, which is why hulls sat empty with their whole crew
+        // standing next to them. Ride it fully triggered: that we want this bot in this
+        // seat is a decision already made, not a spell that may be refused.
+        bot->InterruptNonMeleeSpells(false);
+        bot->CastCustomSpell(FL_SPELL_RIDE_HARDCODED, SPELLVALUE_BASE_POINT0, seatId + 1,
+                             seat, TRIGGERED_FULL_MASK);
         bool const seated = bot->GetVehicleBase() == seat;
         LOG_INFO("module", "[WowPsParty Leviathan] {} -> job {} seat {} on {} (entry {}) {}",
                  bot->GetName(), job, int32(seatId), seat->GetName(), seat->GetEntry(),
@@ -6759,6 +6789,60 @@ namespace WowPsParty
         vc->GetMotionMaster()->MovePoint(0, x, y, FL_ARENA_Z);
     }
 
+    // The two RX-214 Repair-o-matic Stations in the Formation Grounds are the ONLY way a
+    // hull ever heals: the encounter respawns its vehicles at the base camp and only once
+    // every last one is destroyed, so nothing replaces a hull that dies mid-fight. Their
+    // trap fires spell_auto_repair inside 8 yards and sets the vehicle to full health, then
+    // locks that vehicle out for 60 seconds. Two static instance spawns, so the positions
+    // are looked up once and cached; an empty result is retried rather than cached, because
+    // the grid may simply not have been loaded yet the first time we asked.
+    struct FlStation { float x, y; };
+    static std::vector<FlStation> const& FlRepairStations(Creature* from)
+    {
+        struct StationCheck
+        {
+            bool operator()(GameObject* go) const
+            { return go && go->GetEntry() == FL_GO_REPAIR_TRAP; }
+        };
+        static thread_local std::unordered_map<uint32, std::pair<std::vector<FlStation>, uint32>> cache;
+        auto& slot = cache[from->GetInstanceId()];
+        uint32 const now = getMSTime();
+        if (!slot.first.empty() || (slot.second && now - slot.second < 15000))
+            return slot.first;
+
+        slot.second = now ? now : 1;
+        std::list<GameObject*> gos;
+        StationCheck check;
+        Acore::GameObjectListSearcher<StationCheck> searcher(from, gos, check);
+        Cell::VisitObjects(from, searcher, FL_SCAN_RANGE);
+        for (GameObject* go : gos)
+            slot.first.push_back({ go->GetPositionX(), go->GetPositionY() });
+        return slot.first;
+    }
+
+    // Break off for a station when the hull is hurt and hasn't just been repaired. Worth
+    // the round trip at almost any cost — a hull that dies is gone for the rest of the
+    // fight, and the raid loses that post permanently. Only ever taken while NOT pursued:
+    // dragging the boss to the western stations risks walking it past x=120, where its own
+    // position check evades the encounter outright.
+    static bool FlDriveRepair(Creature* vc)
+    {
+        if (vc->GetHealthPct() > float(FL_REPAIR_PCT)) return false;
+        if (vc->HasAura(FL_SPELL_AUTO_REPAIR)) return false;   // still locked out; fight on
+        FlStation const* best = nullptr;
+        float bestD = std::numeric_limits<float>::max();
+        for (FlStation const& s : FlRepairStations(vc))
+        {
+            float const d = vc->GetExactDist2d(s.x, s.y);
+            if (d < bestD) { bestD = d; best = &s; }
+        }
+        if (!best) return false;
+        // Parked on the pad: hold still and let the trap fire rather than re-issuing a
+        // spline to a point we are already standing on.
+        if (bestD > 6.0f) FlSteer(vc, best->x, best->y);
+        return true;
+    }
+
     static uint8 FlNearestLapNode(float x, float y)
     {
         uint8 best = 0;
@@ -6773,34 +6857,42 @@ namespace WowPsParty
     }
 
     // Being Pursued means the boss has dropped everything to ram US, and a Battering Ram
-    // lands inside 15y. Run the lap in one fixed direction and take the node that puts the
-    // MOST ground between us and the boss — the first merely-acceptable node ahead is
-    // usually still hugging it, which is what kept pursued hulls in ramming range.
-    // Distance from the boss dominates; the small step term only breaks ties towards
-    // continuing the lap rather than doubling back through it.
-    static void FlDriveKiteLap(Creature* vc, Creature* boss)
+    // lands inside 15y. Run the lap in one fixed direction and take the node sitting
+    // closest to FL_KITE_RANGE from the boss — far enough that the ram can never reach,
+    // near enough that our own 70-yard guns still bear. The small step term breaks ties
+    // towards continuing the lap rather than doubling back through the boss.
+    static FlPoint const& FlPickKiteNode(Creature* vc, Creature* boss)
     {
         uint8 const node = FlNearestLapNode(vc->GetPositionX(), vc->GetPositionY());
         uint8 best = (node + 3) % FL_LAP_NODES;
-        float bestScore = -1.0f;
+        float bestScore = -std::numeric_limits<float>::max();
         for (uint8 step = 1; step <= 7; ++step)
         {
             uint8 const idx = (node + step) % FL_LAP_NODES;
             FlPoint const& p = FL_LAP[idx];
             float const fromBoss = boss->GetExactDist2d(p.x, p.y);
-            if (fromBoss < FL_KITE_CLEARANCE) continue;   // never route back through the boss
-            float const score = fromBoss - float(step) * 2.0f;
+            if (fromBoss < FL_KITE_MIN) continue;   // never route back through the boss
+            float const score = -std::fabs(fromBoss - FL_KITE_RANGE) - float(step) * 2.0f;
             if (score > bestScore) { bestScore = score; best = idx; }
         }
-        FlSteer(vc, FL_LAP[best].x, FL_LAP[best].y);
+        return FL_LAP[best];
+    }
+
+    static void FlDriveKiteLap(Creature* vc, Creature* boss)
+    {
+        FlPoint const& p = FlPickKiteNode(vc, boss);
+        FlSteer(vc, p.x, p.y);
     }
 
     // Hold a working distance from the boss. Inside the band we deliberately don't steer
     // at all — a stationary hull is a hull that is shooting.
     static void FlDriveStandoff(Creature* vc, Creature* boss, float wanted)
     {
+        // A narrow band on purpose: at 1.5x a siege engine settles at nearly 20 yards and
+        // never closes, which puts it outside Ram and leaves it doing nothing but waiting
+        // for a vent to interrupt.
         float const d = vc->GetExactDist2d(boss);
-        if (d >= wanted * 0.8f && d <= wanted * 1.5f) return;
+        if (d >= wanted * 0.8f && d <= wanted * 1.2f) return;
         float const ang = boss->GetAngle(vc);
         float x = boss->GetPositionX() + std::cos(ang) * wanted;
         float y = boss->GetPositionY() + std::sin(ang) * wanted;
@@ -6862,6 +6954,7 @@ namespace WowPsParty
     static void FlDriveHull(Creature* vc, Creature* boss)
     {
         if (FlIsPursued(vc, boss)) { FlDriveKiteLap(vc, boss); return; }
+        if (FlDriveRepair(vc)) return;
         switch (vc->GetEntry())
         {
             case FL_NPC_SIEGE:      FlDriveStandoff(vc, boss, FL_SIEGE_STANDOFF); break;
@@ -6871,12 +6964,29 @@ namespace WowPsParty
         }
     }
 
-    // Hurl Boulder / Hurl Pyrite Barrel / Fire Cannon / Mortar are TRAJECTORY spells: the
-    // client normally supplies the arc, so a plain CastSpell resolves to no target at all
-    // and the shot silently does nothing. Hand-build the cast targets instead — source at
-    // the hull, destination on the boss. Spell::SelectImplicitTrajTargets only ever
-    // SHORTENS that destination (when something collides with the missile first), so
-    // aiming at the boss is what lands on the boss.
+    // Where to aim so a shot with real flight time actually connects. A barrel crossing 45
+    // yards at 40y/s is more than a second in the air, and the Leviathan is never standing
+    // still — it chases whoever it is pursuing at a speed that only climbs. Blue Pyrite
+    // splashes 20 yards, so leading the target is the difference between hitting every time
+    // and hitting when the boss happens to be turning.
+    static void FlAimAhead(WorldObject* target, float flightSeconds, float& x, float& y, float& z)
+    {
+        x = target->GetPositionX();
+        y = target->GetPositionY();
+        z = target->GetPositionZ();
+        Unit* moving = target->ToUnit();
+        if (!moving || !moving->isMoving()) return;
+        float const lead = moving->GetSpeed(MOVE_RUN) * flightSeconds;
+        x += std::cos(moving->GetOrientation()) * lead;
+        y += std::sin(moving->GetOrientation()) * lead;
+    }
+
+    // Hurl Boulder / Hurl Pyrite Barrel / Fire Cannon / Mortar / Anti-Air Rocket are
+    // TRAJECTORY spells: the client normally supplies the arc, so a plain CastSpell resolves
+    // to no target at all and the shot silently does nothing. Hand-build the cast targets
+    // instead — source at the hull, destination where the boss is heading.
+    // Spell::SelectImplicitTrajTargets only ever SHORTENS that destination (when something
+    // collides with the missile first), so aiming at the boss is what lands on the boss.
     static bool CastVehicleArc(Creature* vc, uint32 spellId, WorldObject* target)
     {
         if (!vc || !target) return false;
@@ -6885,11 +6995,15 @@ namespace WowPsParty
         float const dist = vc->GetExactDist2d(target);
         if (dist < si->GetMinRange(false) || dist > si->GetMaxRange(false)) return false;
 
+        constexpr float ARC_SPEED = 40.0f;
+        float x, y, z;
+        FlAimAhead(target, dist / ARC_SPEED, x, y, z);
+
         SpellCastTargets targets;
         targets.SetSrc(*vc);
-        targets.SetDst(*target);
+        targets.SetDst(x, y, z, vc->GetOrientation(), vc->GetMapId());
         targets.SetElevation(0.35f);
-        targets.SetSpeed(40.0f);
+        targets.SetSpeed(ARC_SPEED);
         return vc->CastSpell(targets, si, nullptr) == SPELL_CAST_OK;
     }
 
@@ -6975,32 +7089,61 @@ namespace WowPsParty
         return channel && channel->m_spellInfo->Id == FL_SPELL_FLAME_VENTS;
     }
 
+    // The only escape a siege engine owns. Steam Rush throws the hull 35 yards along its own
+    // FACING, so it has to be pointed at the lap node we are already running for before it
+    // fires — aimed anywhere else it is a 40-energy way to end up somewhere worse, under the
+    // boss or in a corner.
+    static bool FlSiegeThrust(Creature* vc, Creature* boss)
+    {
+        if (!boss || !FlIsPursued(vc, boss)) return false;
+        if (vc->GetExactDist2d(boss) > FL_THRUST_RANGE) return false;
+        if (vc->HasSpellCooldown(FL_SPELL_STEAM_RUSH)) return false;
+        FlPoint const& node = FlPickKiteNode(vc, boss);
+        float const away = vc->GetAngle(node.x, node.y);
+        vc->SetOrientation(away);
+        vc->SetFacingTo(away);
+        return vc->CastSpell(vc, FL_SPELL_STEAM_RUSH, false) == SPELL_CAST_OK;
+    }
+
     static bool FlTickSiegeDriver(Creature* vc, Unit* enemy, Creature* boss)
     {
+        // Breaking the pursue comes before any damage this hull could do. An uninterrupted
+        // ram lands ~19k and leaves a stacking damage-taken debuff behind it.
+        if (FlSiegeThrust(vc, boss)) return true;
+
         // While the Leviathan is up, Electroshock is spent on a Flame Vents channel and on
         // NOTHING else: its cooldown is 10s against a 20s vent cycle, so a shock fired on
-        // cooldown is a coin-flip on still being recharging when the vents open. In the
-        // gauntlet on the way in there is nothing to save it for — it is just an 8.5k
-        // frontal hit — so there it fires freely.
+        // cooldown is a coin-flip on still being recharging when the vents open. Ten seconds
+        // of unstopped vents is ~30k to every vehicle on the field and is what actually
+        // destroys the raid's hulls. In the gauntlet on the way in there is nothing to save
+        // it for — it is just an 8.5k frontal hit — so there it fires freely.
         if (boss)
         {
-            if (FlBossIsVenting(boss) && CastVehicleCone(vc, FL_SPELL_ELECTROSHOCK, boss, 15.0f))
+            if (FlBossIsVenting(boss) && CastVehicleCone(vc, FL_SPELL_ELECTROSHOCK, boss, FL_SHOCK_RANGE))
                 return true;
         }
-        else if (CastVehicleCone(vc, FL_SPELL_ELECTROSHOCK, enemy, 15.0f))
+        else if (CastVehicleCone(vc, FL_SPELL_ELECTROSHOCK, enemy, FL_SHOCK_RANGE))
             return true;
-        // Ram is a 15y frontal cone. Worth standing that close only when somebody ELSE is
-        // being pursued — a pursued siege that turns to ram gets battered instead.
-        return !FlIsPursued(vc, boss) && CastVehicleCone(vc, FL_SPELL_SIEGE_RAM, enemy, 13.0f);
+        // Ram is a 15y frontal cone for 22.5k. Worth standing that close only when somebody
+        // ELSE is being pursued — a pursued siege that turns to ram gets battered instead.
+        return !FlIsPursued(vc, boss) && CastVehicleCone(vc, FL_SPELL_SIEGE_RAM, enemy, FL_RAM_RANGE);
     }
 
     static bool FlTickSiegeGunner(Creature* vc, Unit* enemy)
     {
-        // Knock the pyrite crates down first — they are what keeps the demolishers loaded.
+        // Fire Cannon is the heaviest weapon on the field by a wide margin, so it is never
+        // given up for anything: crates are only worth shooting when the shot would be
+        // wasted anyway, i.e. the driver has parked us inside the cannon's 10-yard minimum
+        // or outside its 70-yard maximum.
+        if (CastVehicleArc(vc, FL_SPELL_FIRE_CANNON, enemy)) return true;
         if (Creature* crate = FlNearestCrate(vc, 80.0f))
-            if (CastVehicleAbility(vc, FL_SPELL_TURRET_ROCKET, crate))
+            if (CastVehicleArc(vc, FL_SPELL_TURRET_ROCKET, crate))
                 return true;
-        return CastVehicleArc(vc, FL_SPELL_FIRE_CANNON, enemy);
+        // Anti-Air Rocket has no range limit at all, which makes it the gunner's answer
+        // while the hull is running a kite lap far outside cannon range. It is a trajectory
+        // spell like the rest of them, so it goes through the arc caster — aimed with a
+        // plain CastSpell it resolves to no destination and does nothing at all.
+        return CastVehicleArc(vc, FL_SPELL_TURRET_ROCKET, enemy);
     }
 
     static bool FlTickDemolisherDriver(Creature* vc, Unit* enemy, Creature* boss)
@@ -7055,9 +7198,9 @@ namespace WowPsParty
 
         if (CastVehicleArc(vc, FL_SPELL_MORTAR, enemy)) return true;
         if (Creature* crate = FlNearestCrate(vc, 80.0f))
-            if (CastVehicleAbility(vc, FL_SPELL_MECH_ROCKET, crate))
+            if (CastVehicleArc(vc, FL_SPELL_MECH_ROCKET, crate))
                 return true;
-        return false;
+        return CastVehicleArc(vc, FL_SPELL_MECH_ROCKET, enemy);
     }
 
     static bool FlTickChopperDriver(Creature* vc, Unit* enemy, Creature* boss)
@@ -7072,7 +7215,7 @@ namespace WowPsParty
             && !vc->HasSpellCooldown(FL_SPELL_TAR)
             && vc->CastSpell(vc, FL_SPELL_TAR, false) == SPELL_CAST_OK)
             return true;
-        return CastVehicleCone(vc, FL_SPELL_SONIC_HORN, enemy, 10.0f);
+        return CastVehicleCone(vc, FL_SPELL_SONIC_HORN, enemy, FL_HORN_RANGE);
     }
 
     // A bot that has been thrown onto the boss fights with its OWN spells — the seat has
@@ -7103,7 +7246,11 @@ namespace WowPsParty
         {
             // On foot. Board only once the encounter is actually running or the leader has
             // taken a hull — outside that the party is just walking around Ulduar.
-            if (!veh && (LeviathanEncounterActive(bot) || FlJobOf(leader) != FL_JOB_NONE))
+            // A corpse cannot board: Unit::_EnterVehicle drops the ride on the floor for a
+            // dead passenger, which would log a boarding attempt every couple of seconds
+            // for as long as the bot waits on a resurrection.
+            if (!veh && bot->IsAlive()
+                && (LeviathanEncounterActive(bot) || FlJobOf(leader) != FL_JOB_NONE))
             {
                 uint32 const now = getMSTime();
                 uint32& last = g_vehAcquireMs[bot->GetGUID().GetCounter()];
@@ -7214,11 +7361,14 @@ namespace WowPsParty
             if (now - state.fireLogMs > 10000)
             {
                 state.fireLogMs = now;
+                // Hull health is in here because losing hulls, not missing damage, is what
+                // loses this fight: nothing respawns a destroyed vehicle mid-encounter.
+                Unit const* hull = vc->GetVehicleBase() ? vc->GetVehicleBase() : vc;
                 LOG_INFO("module",
-                         "[WowPsParty Leviathan] {} job={} fired={} enemy={} dist={:.0f} pursued={} bossHp={}%",
+                         "[WowPsParty Leviathan] {} job={} fired={} enemy={} dist={:.0f} pursued={} hullHp={:.0f}% bossHp={:.1f}%",
                          bot->GetName(), uint32(job), fired ? 1 : 0,
                          enemy ? enemy->GetEntry() : 0, vc->GetExactDist2d(boss),
-                         FlIsPursued(vc, boss) ? 1 : 0, boss->GetHealthPct());
+                         FlIsPursued(vc, boss) ? 1 : 0, hull->GetHealthPct(), boss->GetHealthPct());
             }
         }
         return true;
@@ -7352,10 +7502,15 @@ namespace WowPsParty
             if (job == FL_JOB_BOARDER) return FlTickBoarder(bot, vc);
             if (job != FL_JOB_NONE)
             {
-                if (bot->IsNonMeleeSpellCast(false, false, true)) return true;
+                // Retried several times a second rather than once. A vehicle ability shares
+                // the 1.5s global cooldown, so a fixed ~GCD throttle lands ON that cooldown
+                // about half the time and silently drops the shot; a short retry costs one
+                // failed CheckCast and gets the gun firing the instant it can. The guard is
+                // on the VEHICLE, not the rider — the hull is what casts.
+                if (vc->IsNonMeleeSpellCast(false, false, true)) return true;
                 uint32 const nowFl = getMSTime();
                 uint32& lastFl = g_vehCastMs[bot->GetGUID().GetCounter()];
-                if (nowFl - lastFl < 1300) return true;   // ~GCD throttle
+                if (nowFl - lastFl < 350) return true;
                 lastFl = nowFl;
                 return TickLeviathanAbilities(bot, vc, job);
             }
