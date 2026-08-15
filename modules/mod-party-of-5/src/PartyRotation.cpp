@@ -8819,8 +8819,10 @@ namespace WowPsParty
         // In a VEHICLE: the bot's normal spells are replaced by the vehicle's override
         // bar, so the normal rotation would just spam dead spells (the "drake/skeleton
         // does nothing" bug). Run the vehicle's own abilities instead. Gated on actually
-        // being in a vehicle, so normal rotations are untouched.
-        if (bot->GetVehicleBase()) return WowPsParty::TickBotVehicleAbilities(bot);
+        // being in a vehicle, so normal rotations are untouched. A false return means the
+        // seat has no bar of its own and the bot really does fight with its own spells
+        // (riding the Flame Leviathan) — fall through to the rotation below.
+        if (bot->GetVehicleBase() && WowPsParty::TickBotVehicleAbilities(bot)) return true;
 
         // On a taxi flight (escorting the leader's flight path): the flight spline
         // owns movement. Running the rotation would faceAndCast / reposition the
@@ -8937,7 +8939,13 @@ namespace WowPsParty
         // same helper as AssistTarget and the follow ticker: if this one stayed at a flat
         // 50y while they allowed 70y, a raid bot standing where it was told to stand
         // would silently refuse to cast there.
-        if (ObjectGuid const lg = GetLeaderFor(bot->GetGUID()))
+        //
+        // A bot ON A VEHICLE is exempt: it has no feet to walk back with, so the leash
+        // could only silence it. Reaching here at all means the vehicle has no ability bar
+        // of its own and the bot really is meant to fight with its own spells — a
+        // companion catapulted onto the Flame Leviathan, which is carrying it around the
+        // arena well past 70 yards from the leader.
+        if (ObjectGuid const lg = bot->GetVehicleBase() ? ObjectGuid::Empty : GetLeaderFor(bot->GetGUID()))
             if (Player* leader = ObjectAccessor::FindConnectedPlayer(lg))
                 if (leader->IsInWorld() && leader->GetMapId() == bot->GetMapId()
                     && bot->GetDistance(leader) > PartyLeashRadius(bot))

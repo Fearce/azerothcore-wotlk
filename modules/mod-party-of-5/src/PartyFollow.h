@@ -325,15 +325,22 @@ namespace WowPsParty
     void MarkCastHold(ObjectGuid followerGuid, uint32 holdMs);
     bool IsCastHeld(ObjectGuid guid);
 
-    // Vehicle behaviour (Oculus drakes, etc.). Both are gated behind a vehicle scenario by
-    // their callers, so normal follow/rotation is untouched otherwise.
+    // Vehicle behaviour (Oculus drakes, ToC joust, Ulduar's Flame Leviathan). All are
+    // gated behind a vehicle scenario by their callers, so normal follow/rotation is
+    // untouched otherwise.
     //  - TickBotVehicleMovement: from the follow ticker — board/acquire a vehicle when the
-    //    leader takes one, fly after the leader, exit when they do. True = owned this tick
-    //    (caller skips the normal ground follow).
+    //    leader takes one, fly/drive after the leader, exit when they do. True = owned this
+    //    tick (caller skips the normal ground follow).
     //  - TickBotVehicleAbilities: from TickRotation — fire the vehicle's own abilities
-    //    instead of the bot's (dead) normal spells. Always returns true (rotation skipped).
+    //    instead of the bot's (dead) normal spells. Returns FALSE only for a seat with no
+    //    ability bar of its own (riding the Leviathan), where the caller must fall through
+    //    to the bot's real rotation.
+    //  - LeviathanEncounterActive: Ulduar map + a Flame Leviathan in combat nearby. The
+    //    follow ticker uses it to run the vehicle tick even when nobody is seated, so a
+    //    companion whose hull was destroyed can claim a fresh one mid-fight.
     bool TickBotVehicleMovement(Player* bot, Player* leader);
     bool TickBotVehicleAbilities(Player* bot);
+    bool LeviathanEncounterActive(Player* p);
 
     // Post the party-chat "Lockpicking skill up! Now X/Y." line (the same
     // announcement the in-world Mining/Herbalism/Skinning gather paths use)

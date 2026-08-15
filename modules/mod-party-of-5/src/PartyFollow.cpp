@@ -44,6 +44,7 @@
 #include "SpellAuras.h"   // Aura::GetDuration — ribbon-pole XP buff top-off check
 #include "ThreatManager.h"   // threat-cap throttle: bots back off near the tank's threat
 #include "CombatManager.h"   // tank gather window: count mobs in combat with the tank
+#include "Spell.h"       // SpellCastTargets — the Leviathan hulls' trajectory abilities
 #include "SpellInfo.h"   // SpellInfo::Effects[] for the leader's mount-type check
 #include "Vehicle.h"     // vehicle behaviour: GetVehicleKit / seats / passengers
 #include "Battlefield.h"     // re-group gate: don't reform the party mid Wintergrasp war
@@ -83,6 +84,7 @@
 #include <atomic>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -6374,6 +6376,727 @@ namespace WowPsParty
         return true;
     }
 
+    // ---- Ulduar: Flame Leviathan ---------------------------------------------
+    // The Leviathan is fought entirely FROM the salvaged vehicles parked at the
+    // Expedition Base Camp — a party on foot has no way to damage it at all. Companions
+    // never boarded, which made the encounter unwinnable. Every bot now gets a seat, a
+    // job and the ability rotation that job exists for:
+    //
+    //   siege driver    stays in Electroshock range — the ONLY interrupt for Flame Vents
+    //   siege gunner    Fire Cannon, by far the hardest-hitting vehicle ability
+    //   demolisher      Hurl Pyrite Barrel / Hurl Boulder, plus the catapult
+    //   demo mechanic   Mortar + Grab Crate (pyrite is barrel ammo), and the passenger
+    //                   the catapult throws onto the boss
+    //   chopper         Tar in the boss's path, bleeding its Gathering Speed stacks
+    //   boarder         riding a Flame Leviathan Seat, killing a defense turret; enough
+    //                   dead turrets is what triggers the Systems Shutdown burn window
+    //
+    // Everything below is gated on the Leviathan creature being nearby, so the long drive
+    // in from the base camp keeps the ordinary follow-the-leader vehicle behaviour.
+    static constexpr uint32 FL_MAP_ULDUAR          = 603;
+    static constexpr uint32 FL_NPC_LEVIATHAN       = 33113;
+    static constexpr uint32 FL_NPC_SIEGE           = 33060;
+    static constexpr uint32 FL_NPC_SIEGE_TURRET    = 33067;   // gunner accessory, siege seat 7
+    static constexpr uint32 FL_NPC_CHOPPER         = 33062;
+    static constexpr uint32 FL_NPC_DEMOLISHER      = 33109;
+    static constexpr uint32 FL_NPC_DEMO_MECHANIC   = 33167;   // mechanic accessory, demo seat 1
+    static constexpr uint32 FL_NPC_BOSS_SEAT       = 33114;   // rides the boss; holds a turret
+    static constexpr uint32 FL_NPC_DEFENSE_TURRET  = 33142;
+    static constexpr uint32 FL_NPC_PYRITE_CRATE    = 33218;
+
+    static constexpr uint32 FL_SPELL_ELECTROSHOCK  = 62522;   // frontal cone, interrupts Flame Vents
+    static constexpr uint32 FL_SPELL_SIEGE_RAM     = 62345;
+    static constexpr uint32 FL_SPELL_FIRE_CANNON   = 62358;
+    static constexpr uint32 FL_SPELL_TURRET_ROCKET = 62359;
+    static constexpr uint32 FL_SPELL_HURL_BOULDER  = 62306;
+    static constexpr uint32 FL_SPELL_HURL_PYRITE   = 62490;
+    static constexpr uint32 FL_SPELL_DEMO_RAM      = 62308;
+    static constexpr uint32 FL_SPELL_THROW_PASSENGER = 62324;
+    static constexpr uint32 FL_SPELL_MORTAR        = 62634;
+    static constexpr uint32 FL_SPELL_MECH_ROCKET   = 64979;
+    static constexpr uint32 FL_SPELL_GRAB_CRATE    = 62479;
+    static constexpr uint32 FL_SPELL_LOAD_CATAPULT = 64414;
+    static constexpr uint32 FL_SPELL_TAR           = 62286;
+    static constexpr uint32 FL_SPELL_SONIC_HORN    = 62974;
+    static constexpr uint32 FL_SPELL_PURSUED       = 62374;
+    static constexpr uint32 FL_SPELL_FLAME_VENTS   = 62396;   // 10s channel — what we interrupt
+
+    static constexpr int8  FL_SEAT_SIEGE_TURRET    = 7;
+    static constexpr int8  FL_SEAT_DEMO_MECHANIC   = 1;
+    static constexpr int8  FL_SEAT_DEMO_CATAPULT   = 3;
+    static constexpr int8  FL_SEAT_TURRET_ON_SEAT  = 1;   // defense turret, on a boss seat
+    static constexpr int8  FL_SEAT_DEVICE_ON_SEAT  = 2;   // overload device, on a boss seat
+
+    static constexpr float FL_SCAN_RANGE     = 300.0f;   // how far we look for the boss
+    static constexpr float FL_BOARD_RANGE    = 160.0f;   // base-camp vehicles are spread this wide
+    static constexpr float FL_LAUNCH_RANGE   = 55.0f;    // catapult reach onto the boss
+    static constexpr float FL_SIEGE_STANDOFF = 12.0f;    // inside Ram + Electroshock range
+    static constexpr float FL_SHOOT_STANDOFF = 45.0f;    // inside the 10-70y arc window
+    static constexpr float FL_TAR_STANDOFF   = 22.0f;    // ahead of the boss, in its path
+    static constexpr float FL_KITE_CLEARANCE = 55.0f;    // a lap node nearer than this is skipped
+
+    // The Formation Grounds are one flat bowl at z 409.8, walled by the four towers at
+    // roughly x 157..383 / y -141..74; the boss evades outside x [120,450]. This lap sits
+    // comfortably inside all of that, and a pursued vehicle simply runs it — the boss
+    // never catches a vehicle that keeps moving around the outside.
+    struct FlPoint { float x, y; };
+    static constexpr float FL_ARENA_Z     = 409.8f;
+    static constexpr float FL_ARENA_MIN_X = 158.0f;
+    static constexpr float FL_ARENA_MAX_X = 382.0f;
+    static constexpr float FL_ARENA_MIN_Y = -134.0f;
+    static constexpr float FL_ARENA_MAX_Y = 68.0f;
+    static constexpr uint8 FL_LAP_NODES   = 12;
+    static FlPoint const FL_LAP[FL_LAP_NODES] =
+    {
+        {370.0f,  -32.0f}, {355.9f,   12.0f}, {317.5f,   44.2f}, {265.0f,   56.0f},
+        {212.5f,   44.2f}, {174.1f,   12.0f}, {160.0f,  -32.0f}, {174.1f,  -76.0f},
+        {212.5f, -108.2f}, {265.0f, -120.0f}, {317.5f, -108.2f}, {355.9f,  -76.0f},
+    };
+
+    enum FlJob : uint8
+    {
+        FL_JOB_NONE = 0,
+        FL_JOB_SIEGE_DRIVER,
+        FL_JOB_DEMO_DRIVER,
+        FL_JOB_SIEGE_GUNNER,
+        FL_JOB_DEMO_MECHANIC,
+        FL_JOB_CHOPPER_DRIVER,
+        FL_JOB_LAUNCH_READY,      // loaded into the catapult, waiting to be thrown
+        FL_JOB_BOARDER,           // riding the boss, killing its defense turrets
+        FL_JOB_COUNT
+    };
+
+    // Which job a member is doing, read straight off the vehicle + seat it occupies —
+    // no bookkeeping to go stale when a vehicle is destroyed or a bot is thrown.
+    static FlJob FlJobOf(Player const* p)
+    {
+        if (!p) return FL_JOB_NONE;
+        Unit const* veh = p->GetVehicleBase();
+        if (!veh) return FL_JOB_NONE;
+        switch (veh->GetEntry())
+        {
+            case FL_NPC_SIEGE:         return FL_JOB_SIEGE_DRIVER;
+            case FL_NPC_SIEGE_TURRET:  return FL_JOB_SIEGE_GUNNER;
+            case FL_NPC_DEMO_MECHANIC: return FL_JOB_DEMO_MECHANIC;
+            case FL_NPC_CHOPPER:       return FL_JOB_CHOPPER_DRIVER;
+            case FL_NPC_BOSS_SEAT:     return FL_JOB_BOARDER;
+            case FL_NPC_DEMOLISHER:
+                return p->GetTransSeat() == FL_SEAT_DEMO_CATAPULT ? FL_JOB_LAUNCH_READY
+                                                                  : FL_JOB_DEMO_DRIVER;
+            default:                   return FL_JOB_NONE;
+        }
+    }
+
+    // Fill order. An interrupter and a demolisher come before everything, then the
+    // gunner (the single biggest gun), then the mechanic (pyrite + the catapult ride),
+    // then tar. Past that we just want more hulls in the fight. Jobs a team-mate already
+    // holds are consumed in order, so the party spreads instead of stacking.
+    static FlJob const FL_JOB_ORDER[] =
+    {
+        FL_JOB_SIEGE_DRIVER, FL_JOB_DEMO_DRIVER, FL_JOB_SIEGE_GUNNER, FL_JOB_DEMO_MECHANIC,
+        FL_JOB_CHOPPER_DRIVER, FL_JOB_DEMO_DRIVER, FL_JOB_SIEGE_DRIVER, FL_JOB_CHOPPER_DRIVER,
+    };
+
+    // Vehicle-keyed, and the hulls are temp summons that get a fresh guid on every raid
+    // reset, so this is bounded explicitly rather than left to grow for the process's life.
+    static std::unordered_map<uint32, std::pair<float, float>> g_flSteer;   // vehicle low guid -> last steer point
+
+    struct FlBotState
+    {
+        uint32 loadedMs    = 0;  // when we climbed into a catapult seat
+        uint32 noSeatLogMs = 0;  // last "nothing free to board" line, for log throttling
+        ObjectGuid convoyAnchor; // who our hull is currently set to follow on the drive in
+    };
+    static std::unordered_map<uint32, FlBotState> g_flBots;   // bot low guid -> state
+
+    // How long a companion waits in a catapult seat before climbing back out. The throw
+    // belongs to whoever drives the demolisher, and that may be the human — who has no
+    // reason to press the button on our schedule.
+    static constexpr uint32 FL_CATAPULT_WAIT_MS = 9000;
+
+    // Asked on every follow tick AND every rotation tick of every companion, so the raw
+    // 300-yard grid search is cached per instance for a couple of seconds. thread_local
+    // because the follow ticker and the bot AI tick can run on different threads and a
+    // per-thread cache stays correct without a lock.
+    static Creature* FlFindLeviathan(WorldObject* from)
+    {
+        if (!from || from->GetMapId() != FL_MAP_ULDUAR) return nullptr;
+        static thread_local std::unordered_map<uint32, std::pair<ObjectGuid, uint32>> cache;
+        uint32 const now = getMSTime();
+        auto& slot = cache[from->GetInstanceId()];
+        if (slot.second && now - slot.second < 2000)
+            return slot.first.IsEmpty() ? nullptr : ObjectAccessor::GetCreature(*from, slot.first);
+
+        Creature* boss = from->FindNearestCreature(FL_NPC_LEVIATHAN, FL_SCAN_RANGE, true);
+        slot = { boss ? boss->GetGUID() : ObjectGuid::Empty, now ? now : 1 };
+        return boss;
+    }
+
+    // True once the encounter is live around this player — the gate that lets the vehicle
+    // tick run even when NEITHER the bot nor the leader is currently seated (a destroyed
+    // hull must be replaced mid-fight). Map-id checked first so this costs nothing anywhere
+    // else in the world.
+    bool LeviathanEncounterActive(Player* p)
+    {
+        if (!p || p->GetMapId() != FL_MAP_ULDUAR) return false;
+        Creature* boss = FlFindLeviathan(p);
+        return boss && boss->IsInCombat();
+    }
+
+    static Creature* FlFindFreeHull(Player* bot, uint32 entry)
+    {
+        std::list<Creature*> found;
+        Acore::AllCreaturesOfEntryInRange check(bot, entry, FL_BOARD_RANGE);
+        Acore::CreatureListSearcher<Acore::AllCreaturesOfEntryInRange> searcher(bot, found, check);
+        Cell::VisitObjects(bot, searcher, FL_BOARD_RANGE);
+        Creature* best = nullptr;
+        float bestD = FL_BOARD_RANGE * 2.0f;
+        for (Creature* c : found)
+        {
+            if (!c || !c->IsAlive()) continue;
+            Vehicle* kit = c->GetVehicleKit();
+            if (!kit || kit->GetPassenger(0)) continue;   // driver seat already taken
+            float const d = bot->GetDistance(c);
+            if (d < bestD) { bestD = d; best = c; }
+        }
+        return best;
+    }
+
+    // Gunner and mechanic seats are ACCESSORY creatures riding the parent hull (siege
+    // turret in seat 7, demolisher mechanic in seat 1) — a bot boards the accessory, not
+    // the hull. Only ever offered on a hull a PARTY member already drives, so nobody ends
+    // up manning a gun on a vehicle that never moves.
+    static Creature* FlFreeCrewSeat(std::vector<Unit*> const& hulls, uint32 hullEntry, int8 accessorySeat)
+    {
+        for (Unit* hull : hulls)
+        {
+            if (!hull || hull->GetEntry() != hullEntry || !hull->IsAlive()) continue;
+            Vehicle* kit = hull->GetVehicleKit();
+            if (!kit) continue;
+            Unit* accessory = kit->GetPassenger(accessorySeat);
+            if (!accessory || !accessory->IsAlive()) continue;
+            Vehicle* sub = accessory->GetVehicleKit();
+            if (!sub || sub->GetPassenger(0)) continue;
+            if (Creature* c = accessory->ToCreature()) return c;
+        }
+        return nullptr;
+    }
+
+    struct FlCrew
+    {
+        std::vector<Unit*> hulls;          // hulls a party member is currently on
+        uint8 held[FL_JOB_COUNT] = {};     // how many members hold each job
+    };
+
+    static FlCrew FlSurveyParty(Player* bot, Player* leader)
+    {
+        FlCrew crew;
+        std::vector<ObjectGuid> party;
+        GetPartyGuidsFor(bot->GetGUID(), party);
+        if (party.empty() && leader) party.push_back(leader->GetGUID());
+
+        for (ObjectGuid const& g : party)
+        {
+            Player* p = ObjectAccessor::FindConnectedPlayer(g);
+            if (!p || p == bot || !p->IsInWorld()) continue;
+            FlJob const job = FlJobOf(p);
+            if (job == FL_JOB_NONE) continue;
+            ++crew.held[job];
+            Unit* veh = p->GetVehicleBase();
+            Unit* hull = veh->GetVehicleBase() ? veh->GetVehicleBase() : veh;   // accessory -> its parent
+            if (std::find(crew.hulls.begin(), crew.hulls.end(), hull) == crew.hulls.end())
+                crew.hulls.push_back(hull);
+        }
+        return crew;
+    }
+
+    // Claim the highest-priority job the party is still missing and whose hardware is
+    // actually reachable. Boarding is synchronous, and the follow ticker walks directives
+    // one at a time, so the next bot in the same pass already sees this seat taken.
+    // Returns false when nothing was free.
+    static bool FlTakeASeat(Player* bot, Player* leader)
+    {
+        FlCrew crew = FlSurveyParty(bot, leader);
+        for (FlJob job : FL_JOB_ORDER)
+        {
+            if (crew.held[job]) { --crew.held[job]; continue; }   // a team-mate covers it
+            Creature* seat = nullptr;
+            switch (job)
+            {
+                case FL_JOB_SIEGE_DRIVER:   seat = FlFindFreeHull(bot, FL_NPC_SIEGE); break;
+                case FL_JOB_DEMO_DRIVER:    seat = FlFindFreeHull(bot, FL_NPC_DEMOLISHER); break;
+                case FL_JOB_CHOPPER_DRIVER: seat = FlFindFreeHull(bot, FL_NPC_CHOPPER); break;
+                case FL_JOB_SIEGE_GUNNER:   seat = FlFreeCrewSeat(crew.hulls, FL_NPC_SIEGE, FL_SEAT_SIEGE_TURRET); break;
+                case FL_JOB_DEMO_MECHANIC:  seat = FlFreeCrewSeat(crew.hulls, FL_NPC_DEMOLISHER, FL_SEAT_DEMO_MECHANIC); break;
+                default: break;
+            }
+            if (!seat) continue;   // that job's hardware isn't free — try the next one
+            bot->EnterVehicle(seat, 0);
+            LOG_INFO("module", "[WowPsParty Leviathan] {} took job {} on {} (entry {})",
+                     bot->GetName(), uint32(job), seat->GetName(), seat->GetEntry());
+            return true;
+        }
+        // Retried every couple of seconds, so the line itself is throttled — an under-
+        // crewed party would otherwise write a page a minute into Server.log.
+        uint32 const now = getMSTime();
+        FlBotState& state = g_flBots[bot->GetGUID().GetCounter()];
+        if (now - state.noSeatLogMs >= 15000)
+        {
+            state.noSeatLogMs = now;
+            LOG_INFO("module", "[WowPsParty Leviathan] {} found no free seat within {}y",
+                     bot->GetName(), uint32(FL_BOARD_RANGE));
+        }
+        return false;
+    }
+
+    static void FlClampToArena(float& x, float& y)
+    {
+        x = std::min(std::max(x, FL_ARENA_MIN_X), FL_ARENA_MAX_X);
+        y = std::min(std::max(y, FL_ARENA_MIN_Y), FL_ARENA_MAX_Y);
+    }
+
+    // Re-issue a point move only when the destination actually moved, so a vehicle that is
+    // already driving where we want isn't spline-reset into a stutter every tick.
+    static void FlSteer(Creature* vc, float x, float y)
+    {
+        bool const onPointMove = vc->isMoving()
+            && vc->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE;
+        if (g_flSteer.size() > 256) g_flSteer.clear();   // dead summons never come back
+        auto& last = g_flSteer[vc->GetGUID().GetCounter()];
+        if (onPointMove && std::fabs(last.first - x) < 5.0f && std::fabs(last.second - y) < 5.0f)
+            return;
+        last = { x, y };
+        vc->GetMotionMaster()->MovePoint(0, x, y, FL_ARENA_Z);
+    }
+
+    static uint8 FlNearestLapNode(float x, float y)
+    {
+        uint8 best = 0;
+        float bestD = std::numeric_limits<float>::max();
+        for (uint8 i = 0; i < FL_LAP_NODES; ++i)
+        {
+            float const dx = FL_LAP[i].x - x, dy = FL_LAP[i].y - y;
+            float const d = dx * dx + dy * dy;
+            if (d < bestD) { bestD = d; best = i; }
+        }
+        return best;
+    }
+
+    // Being Pursued means the boss has dropped everything to ram US. Run the lap in one
+    // fixed direction, skipping any node that would take us back past the boss — driving
+    // "away" in a straight line just backs a vehicle into the arena wall.
+    static void FlDriveKiteLap(Creature* vc, Creature* boss)
+    {
+        uint8 const node = FlNearestLapNode(vc->GetPositionX(), vc->GetPositionY());
+        for (uint8 step = 2; step <= 6; ++step)
+        {
+            FlPoint const& p = FL_LAP[(node + step) % FL_LAP_NODES];
+            if (boss->GetExactDist2d(p.x, p.y) < FL_KITE_CLEARANCE) continue;
+            FlSteer(vc, p.x, p.y);
+            return;
+        }
+        FlPoint const& fallback = FL_LAP[(node + 3) % FL_LAP_NODES];   // boss mid-lap: keep going anyway
+        FlSteer(vc, fallback.x, fallback.y);
+    }
+
+    // Hold a working distance from the boss. Inside the band we deliberately don't steer
+    // at all — a stationary hull is a hull that is shooting.
+    static void FlDriveStandoff(Creature* vc, Creature* boss, float wanted)
+    {
+        float const d = vc->GetExactDist2d(boss);
+        if (d >= wanted * 0.8f && d <= wanted * 1.5f) return;
+        float const ang = boss->GetAngle(vc);
+        float x = boss->GetPositionX() + std::cos(ang) * wanted;
+        float y = boss->GetPositionY() + std::sin(ang) * wanted;
+        FlClampToArena(x, y);
+        FlSteer(vc, x, y);
+    }
+
+    // A chopper's tar only slows the boss if the slick is where the boss is GOING, so the
+    // chopper drives to a point ahead of its nose rather than trailing it.
+    static void FlDriveTarRunner(Creature* vc, Creature* boss)
+    {
+        float x = boss->GetPositionX() + std::cos(boss->GetOrientation()) * FL_TAR_STANDOFF;
+        float y = boss->GetPositionY() + std::sin(boss->GetOrientation()) * FL_TAR_STANDOFF;
+        FlClampToArena(x, y);
+        FlSteer(vc, x, y);
+    }
+
+    static bool FlIsPursued(Creature* vc, Creature* boss)
+    {
+        if (!boss) return false;
+        return vc->HasAura(FL_SPELL_PURSUED) || boss->GetVictim() == vc;
+    }
+
+    // The hull this bot actually STEERS. A gunner, mechanic, catapult passenger or boarder
+    // gets nullptr: they sit on an ACCESSORY creature (or on the boss), and issuing movement
+    // on that would be an order for a turret to drive off its own mount.
+    static Creature* FlDrivenHull(Player* bot)
+    {
+        if (bot->GetTransSeat() != 0) return nullptr;
+        Creature* vc = bot->GetVehicleCreatureBase();
+        if (!vc || !vc->IsAlive()) return nullptr;
+        switch (vc->GetEntry())
+        {
+            case FL_NPC_SIEGE:
+            case FL_NPC_DEMOLISHER:
+            case FL_NPC_CHOPPER: return vc;
+            default:             return nullptr;
+        }
+    }
+
+    // Convoy behind the leader on the run in from the base camp — behind their vehicle
+    // normally, behind them on foot when the gauntlet has just destroyed it. Re-issued only
+    // when the anchor changes, so the follow spline isn't reset every tick.
+    static void FlConvoy(Player* bot, Creature* hull, Player* leader)
+    {
+        Unit* anchor = leader->GetVehicleBase() ? leader->GetVehicleBase() : static_cast<Unit*>(leader);
+        FlBotState& state = g_flBots[bot->GetGUID().GetCounter()];
+        if (state.convoyAnchor == anchor->GetGUID()
+            && hull->GetMotionMaster()->GetCurrentMovementGeneratorType() == FOLLOW_MOTION_TYPE)
+            return;
+        state.convoyAnchor = anchor->GetGUID();
+        int const fi = FormationIndexFor(bot->GetGUID(), leader->GetGUID());
+        hull->GetMotionMaster()->Clear();
+        hull->GetMotionMaster()->MoveFollow(anchor, 12.0f, 2.4f + 0.5f * float(fi >= 0 ? fi : 0));
+    }
+
+    // Drive one hull for a tick. Only the three driver hulls steer; gunners, mechanics and
+    // boarders are passengers and have nothing to own.
+    static void FlDriveHull(Creature* vc, Creature* boss)
+    {
+        if (FlIsPursued(vc, boss)) { FlDriveKiteLap(vc, boss); return; }
+        switch (vc->GetEntry())
+        {
+            case FL_NPC_SIEGE:      FlDriveStandoff(vc, boss, FL_SIEGE_STANDOFF); break;
+            case FL_NPC_DEMOLISHER: FlDriveStandoff(vc, boss, FL_SHOOT_STANDOFF); break;
+            case FL_NPC_CHOPPER:    FlDriveTarRunner(vc, boss); break;
+            default: break;
+        }
+    }
+
+    // Hurl Boulder / Hurl Pyrite Barrel / Fire Cannon / Mortar are TRAJECTORY spells: the
+    // client normally supplies the arc, so a plain CastSpell resolves to no target at all
+    // and the shot silently does nothing. Hand-build the cast targets instead — source at
+    // the hull, destination on the boss. Spell::SelectImplicitTrajTargets only ever
+    // SHORTENS that destination (when something collides with the missile first), so
+    // aiming at the boss is what lands on the boss.
+    static bool CastVehicleArc(Creature* vc, uint32 spellId, WorldObject* target)
+    {
+        if (!vc || !target) return false;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId);
+        if (!si || vc->HasSpellCooldown(spellId)) return false;
+        float const dist = vc->GetExactDist2d(target);
+        if (dist < si->GetMinRange(false) || dist > si->GetMaxRange(false)) return false;
+
+        SpellCastTargets targets;
+        targets.SetSrc(*vc);
+        targets.SetDst(*target);
+        targets.SetElevation(0.35f);
+        targets.SetSpeed(40.0f);
+        return vc->CastSpell(targets, si, nullptr) == SPELL_CAST_OK;
+    }
+
+    // Cone abilities (Electroshock, Ram, Sonic Horn) are selected server-side off the
+    // caster's orientation, so the hull has to be pointed at the target BEFORE the cast.
+    // SetOrientation updates the authoritative value immediately; SetFacingToObject is
+    // what makes the client see it turn.
+    static bool CastVehicleCone(Creature* vc, uint32 spellId, Unit* target, float maxDist)
+    {
+        if (!target || vc->GetExactDist2d(target) > maxDist) return false;
+        if (vc->HasSpellCooldown(spellId)) return false;
+        if (!vc->HasInArc(static_cast<float>(M_PI) / 3.0f, target))
+        {
+            vc->SetOrientation(vc->GetAngle(target));
+            vc->SetFacingToObject(target);
+        }
+        return vc->CastSpell(vc, spellId, false) == SPELL_CAST_OK;
+    }
+
+    static Creature* FlNearestCrate(Creature* vc, float range)
+    {
+        return vc->FindNearestCreature(FL_NPC_PYRITE_CRATE, range, true);
+    }
+
+    // A free Flame Leviathan Seat is the ride onto the boss's back. The seats ride the
+    // BOSS, so they're read off its vehicle kit rather than searched for in the world.
+    // A seat only counts when its defense turret is up (that turret is the whole reason
+    // to go) and its overload device isn't mid-channel — spell_vehicle_throw_passenger
+    // refuses to hand over a seat whose device is busy.
+    static Creature* FlFreeBossSeat(Creature* boss)
+    {
+        Vehicle* kit = boss->GetVehicleKit();
+        if (!kit) return nullptr;
+        for (auto const& entry : kit->Seats)
+        {
+            Unit* seat = kit->GetPassenger(entry.first);
+            if (!seat || !seat->IsAlive() || seat->GetEntry() != FL_NPC_BOSS_SEAT) continue;
+            Vehicle* seatKit = seat->GetVehicleKit();
+            if (!seatKit || seatKit->GetPassenger(0)) continue;
+            Unit* turret = seatKit->GetPassenger(FL_SEAT_TURRET_ON_SEAT);
+            if (!turret || !turret->IsAlive()) continue;
+            Unit* device = seatKit->GetPassenger(FL_SEAT_DEVICE_ON_SEAT);
+            if (!device || device->GetCurrentSpell(CURRENT_CHANNELED_SPELL)) continue;
+            if (Creature* c = seat->ToCreature()) return c;
+        }
+        return nullptr;
+    }
+
+    // Throw Passenger's script seats the passenger on the nearest free Flame Leviathan
+    // Seat within twice the effect radius of where the shot lands, and drops them on the
+    // ground under the boss when nothing is in reach. Aiming at a seat's EXACT position is
+    // what turns "catapult a bot and hope" into a launch that cannot miss.
+    static bool FlLaunchPassenger(Creature* demolisher, Creature* boss)
+    {
+        Vehicle* kit = demolisher->GetVehicleKit();
+        if (!kit) return false;
+        Unit* passenger = kit->GetPassenger(FL_SEAT_DEMO_CATAPULT);
+        if (!passenger || !passenger->IsPlayer()) return false;
+        Creature* seat = FlFreeBossSeat(boss);
+        if (!seat || demolisher->GetExactDist2d(seat) > FL_LAUNCH_RANGE) return false;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(FL_SPELL_THROW_PASSENGER);
+        if (!si || demolisher->HasSpellCooldown(FL_SPELL_THROW_PASSENGER)) return false;
+
+        SpellCastTargets targets;
+        targets.SetSrc(*demolisher);
+        targets.SetDst(*seat);
+        targets.SetElevation(0.6f);
+        targets.SetSpeed(30.0f);
+        if (demolisher->CastSpell(targets, si, nullptr) != SPELL_CAST_OK) return false;
+        g_flBots[passenger->GetGUID().GetCounter()].loadedMs = 0;
+        LOG_INFO("module", "[WowPsParty Leviathan] {} launched onto a boss seat",
+                 passenger->GetName());
+        return true;
+    }
+
+    // Flame Vents is a 10-second CHANNEL, not a cast — so the trigger is the boss's
+    // current channelled spell, not a generic "is it casting". Nothing else the boss does
+    // channels, so this never burns the 10s cooldown on the wrong thing.
+    static bool FlBossIsVenting(Creature* boss)
+    {
+        if (!boss) return false;
+        Spell* channel = boss->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
+        return channel && channel->m_spellInfo->Id == FL_SPELL_FLAME_VENTS;
+    }
+
+    static bool FlTickSiegeDriver(Creature* vc, Unit* enemy, Creature* boss)
+    {
+        // While the Leviathan is up, Electroshock is spent on a Flame Vents channel and on
+        // NOTHING else: its cooldown is 10s against a 20s vent cycle, so a shock fired on
+        // cooldown is a coin-flip on still being recharging when the vents open. In the
+        // gauntlet on the way in there is nothing to save it for — it is just an 8.5k
+        // frontal hit — so there it fires freely.
+        if (boss)
+        {
+            if (FlBossIsVenting(boss) && CastVehicleCone(vc, FL_SPELL_ELECTROSHOCK, boss, 15.0f))
+                return true;
+        }
+        else if (CastVehicleCone(vc, FL_SPELL_ELECTROSHOCK, enemy, 15.0f))
+            return true;
+        // Ram is a 15y frontal cone. Worth standing that close only when somebody ELSE is
+        // being pursued — a pursued siege that turns to ram gets battered instead.
+        return !FlIsPursued(vc, boss) && CastVehicleCone(vc, FL_SPELL_SIEGE_RAM, enemy, 13.0f);
+    }
+
+    static bool FlTickSiegeGunner(Creature* vc, Unit* enemy)
+    {
+        // Knock the pyrite crates down first — they are what keeps the demolishers loaded.
+        if (Creature* crate = FlNearestCrate(vc, 80.0f))
+            if (CastVehicleAbility(vc, FL_SPELL_TURRET_ROCKET, crate))
+                return true;
+        return CastVehicleArc(vc, FL_SPELL_FIRE_CANNON, enemy);
+    }
+
+    static bool FlTickDemolisherDriver(Creature* vc, Unit* enemy, Creature* boss)
+    {
+        if (boss && FlLaunchPassenger(vc, boss)) return true;
+        // Pyrite barrels hit twice as hard as boulders and stack the damage-taken debuff,
+        // so they go first and the boulder is what we fall back on when the ammo is out.
+        if (CastVehicleArc(vc, FL_SPELL_HURL_PYRITE, enemy)) return true;
+        if (CastVehicleArc(vc, FL_SPELL_HURL_BOULDER, enemy)) return true;
+        if (!FlIsPursued(vc, boss) && CastVehicleCone(vc, FL_SPELL_DEMO_RAM, enemy, 13.0f))
+            return true;
+        return false;
+    }
+
+    // The mechanic seat rides the demolisher, so the hull under it is its own vehicle base.
+    static bool FlTickDemolisherMechanic(Player* bot, Creature* vc, Unit* enemy, Creature* boss)
+    {
+        Unit* hull = vc->GetVehicleBase();
+
+        // Grab Crate has to be cast by the PLAYER: its script walks
+        // GetCaster()->GetVehicleBase() expecting to land on the mechanic seat and then
+        // the demolisher, and only the rider's chain resolves that way. Casting it from
+        // the seat creature would eject the seat off its own hull instead.
+        if (Creature* crate = FlNearestCrate(vc, 45.0f))
+            if (!bot->HasSpellCooldown(FL_SPELL_GRAB_CRATE)
+                && bot->CastSpell(crate, FL_SPELL_GRAB_CRATE, false) == SPELL_CAST_OK)
+                return true;
+
+        // Ride the catapult: load into the hull's launch seat and let the driver throw us
+        // on its next tick. Only worth doing when there is a turret up there to kill.
+        if (boss && hull && hull->GetVehicleKit()
+            && !hull->GetVehicleKit()->GetPassenger(FL_SEAT_DEMO_CATAPULT)
+            && !bot->HasSpellCooldown(FL_SPELL_LOAD_CATAPULT))
+        {
+            Creature* seat = FlFreeBossSeat(boss);
+            if (seat && hull->GetExactDist2d(seat) <= FL_LAUNCH_RANGE
+                && bot->CastSpell(bot, FL_SPELL_LOAD_CATAPULT, false) == SPELL_CAST_OK)
+            {
+                g_flBots[bot->GetGUID().GetCounter()].loadedMs = getMSTime();
+                LOG_INFO("module", "[WowPsParty Leviathan] {} loaded into the catapult", bot->GetName());
+                return true;
+            }
+        }
+
+        if (CastVehicleArc(vc, FL_SPELL_MORTAR, enemy)) return true;
+        if (Creature* crate = FlNearestCrate(vc, 80.0f))
+            if (CastVehicleAbility(vc, FL_SPELL_MECH_ROCKET, crate))
+                return true;
+        return false;
+    }
+
+    static bool FlTickChopperDriver(Creature* vc, Unit* enemy, Creature* boss)
+    {
+        // Tar drops behind the chopper, so it only lands in the boss's path while we are
+        // the ones driving ahead of it — worth nothing against anything else.
+        if (boss && vc->GetExactDist2d(boss) <= FL_TAR_STANDOFF * 1.6f
+            && !vc->HasSpellCooldown(FL_SPELL_TAR)
+            && vc->CastSpell(vc, FL_SPELL_TAR, false) == SPELL_CAST_OK)
+            return true;
+        return CastVehicleCone(vc, FL_SPELL_SONIC_HORN, enemy, 10.0f);
+    }
+
+    // A bot that has been thrown onto the boss fights with its OWN spells — the seat has
+    // no ability bar of its own. Point it at a live defense turret (which zeroes damage
+    // from anything that isn't a player riding a seat, so a companion is one of the few
+    // things that CAN kill it) and let the normal rotation run.
+    static bool FlTickBoarder(Player* bot, Creature* seat)
+    {
+        Vehicle* kit = seat->GetVehicleKit();
+        Unit* turret = kit ? kit->GetPassenger(FL_SEAT_TURRET_ON_SEAT) : nullptr;
+        // Our own seat's turret is down: a ranged companion can still reach a neighbouring
+        // one, and enough dead turrets is what forces the Systems Shutdown.
+        if (!turret || !turret->IsAlive())
+            turret = bot->FindNearestCreature(FL_NPC_DEFENSE_TURRET, 40.0f, true);
+        if (!turret || !turret->IsAlive()) return true;   // nothing to shoot — sit tight
+        if (bot->GetVictim() != turret) bot->Attack(turret, true);
+        return false;   // hand the tick to the bot's own rotation
+    }
+
+    // Movement side of the encounter. Returns true when it owns this bot's tick.
+    static bool TickLeviathanVehicle(Player* bot, Player* leader)
+    {
+        if (bot->GetMapId() != FL_MAP_ULDUAR) return false;
+        Unit* veh = bot->GetVehicleBase();
+        FlJob const job = FlJobOf(bot);
+
+        if (job == FL_JOB_NONE)
+        {
+            // On foot. Board only once the encounter is actually running or the leader has
+            // taken a hull — outside that the party is just walking around Ulduar.
+            if (!veh && (LeviathanEncounterActive(bot) || FlJobOf(leader) != FL_JOB_NONE))
+            {
+                uint32 const now = getMSTime();
+                uint32& last = g_vehAcquireMs[bot->GetGUID().GetCounter()];
+                if (now - last > 2000)
+                {
+                    last = now;
+                    if (FlTakeASeat(bot, leader)) return true;
+                }
+                // Nothing free to climb into. Deliberately fall through to the ordinary
+                // ground follow rather than holding position: a companion that died and ran
+                // back, or one waiting on a hull to respawn at the base camp, should keep
+                // walking with the party and board when one frees up.
+            }
+            return false;
+        }
+
+        Creature* boss = FlFindLeviathan(bot);
+        Creature* hull = FlDrivenHull(bot);
+        if (!boss || !boss->IsInCombat())
+        {
+            // Still driving in from the base camp. The generic vehicle path can't be used
+            // here for two reasons: it bails everyone out of their hulls the moment the
+            // leader has none — which is exactly when a gauntlet death makes keeping them
+            // matter most — and it would issue movement on a gunner's or mechanic's
+            // accessory seat rather than on a hull anyone can steer.
+            if (hull) FlConvoy(bot, hull, leader);
+            return true;
+        }
+
+        if (job == FL_JOB_LAUNCH_READY)
+        {
+            // Sitting in a catapult is only useful while somebody is about to fire it. The
+            // throw belongs to whoever drives the demolisher — which may be the human, who
+            // has no reason to press it on our schedule — so give up on a timer as well as
+            // when the seat we aimed for is gone, and climb back to the mechanic post.
+            FlBotState& state = g_flBots[bot->GetGUID().GetCounter()];
+            bool const stale = !state.loadedMs || getMSTime() - state.loadedMs > FL_CATAPULT_WAIT_MS;
+            if (stale || !FlFreeBossSeat(boss))
+                if (Unit* hull = bot->GetVehicleBase())
+                    if (Vehicle* kit = hull->GetVehicleKit())
+                        if (Unit* mech = kit->GetPassenger(FL_SEAT_DEMO_MECHANIC))
+                            if (Vehicle* sub = mech->GetVehicleKit(); sub && !sub->GetPassenger(0))
+                            {
+                                state.loadedMs = 0;
+                                bot->EnterVehicle(mech, 0);
+                                LOG_INFO("module",
+                                         "[WowPsParty Leviathan] {} was never thrown — back to the mechanic seat",
+                                         bot->GetName());
+                            }
+            return true;
+        }
+
+        if (hull) FlDriveHull(hull, boss);
+        return true;
+    }
+
+    // What this hull should be shooting. The boss once it is engaged; otherwise whatever
+    // the party is already fighting — the run in from the base camp is a vehicle gauntlet
+    // (Ulduar Colossus and its defenders) that has to be shot down from the hulls too. The
+    // nearby-hostile fallback is deliberately gated on somebody already being in combat:
+    // an idle hull parked at the base camp must not start a fight of its own.
+    static Unit* FlPickEnemy(Player* bot, Creature* vc, Creature* boss)
+    {
+        if (boss && vc->IsValidAttackTarget(boss)) return boss;
+        Player* leader = ObjectAccessor::FindConnectedPlayer(GetLeaderFor(bot->GetGUID()));
+        if (leader)
+        {
+            Unit* victim = leader->GetVictim();
+            if (!victim && leader->GetVehicleBase()) victim = leader->GetVehicleBase()->GetVictim();
+            if (victim && victim->IsAlive() && vc->IsValidAttackTarget(victim)) return victim;
+        }
+        if (Unit* own = vc->GetVictim(); own && own->IsAlive() && vc->IsValidAttackTarget(own))
+            return own;
+        if (!vc->IsInCombat() && !(leader && leader->IsInCombat())) return nullptr;
+        return vc->SelectNearbyTarget(nullptr, 60.0f);
+    }
+
+    // Ability side of the encounter. Returns true when it consumed the tick, false to let
+    // the bot's own rotation run (the boarder case).
+    static bool TickLeviathanAbilities(Player* bot, Creature* vc, FlJob job)
+    {
+        if (job == FL_JOB_BOARDER) return FlTickBoarder(bot, vc);
+        if (job == FL_JOB_LAUNCH_READY) return true;   // mid-flight; the driver owns us
+
+        // A non-null boss here means "the Leviathan fight is LIVE" — every handler reads it
+        // that way (hold the interrupt, lay tar, catapult, kite).
+        Creature* raw = FlFindLeviathan(bot);
+        Creature* boss = (raw && raw->IsInCombat()) ? raw : nullptr;
+        Unit* enemy = FlPickEnemy(bot, vc, boss);
+        switch (job)
+        {
+            case FL_JOB_SIEGE_DRIVER:   FlTickSiegeDriver(vc, enemy, boss); break;
+            case FL_JOB_SIEGE_GUNNER:   FlTickSiegeGunner(vc, enemy); break;
+            case FL_JOB_DEMO_DRIVER:    FlTickDemolisherDriver(vc, enemy, boss); break;
+            case FL_JOB_DEMO_MECHANIC:  FlTickDemolisherMechanic(bot, vc, enemy, boss); break;
+            case FL_JOB_CHOPPER_DRIVER: FlTickChopperDriver(vc, enemy, boss); break;
+            default: break;
+        }
+        return true;
+    }
+
     // Most-injured party member that is itself on a vehicle (so a vehicle heal/shield has
     // a sensible target) at or below pctMax. Includes the leader. Returns the VEHICLE base.
     static Unit* MostInjuredVehicleAlly(Player* bot, Player* leader, uint32 pctMax)
@@ -6414,6 +7137,12 @@ namespace WowPsParty
         if (!bot || !leader) return false;
         Unit* botVeh  = bot->GetVehicleBase();
         Unit* leadVeh = leader->GetVehicleBase();
+
+        // Flame Leviathan owns BOTH sides of its scenario, and has to be asked first: the
+        // fight goes on after the human's own hull is destroyed, so the generic "leader
+        // left their vehicle -> everyone bails" rule below would empty the whole party's
+        // vehicles at the worst possible moment.
+        if (TickLeviathanVehicle(bot, leader)) return true;
 
         if (botVeh)   // bot is riding -> drive its vehicle after the leader's
         {
@@ -6475,13 +7204,36 @@ namespace WowPsParty
     }
 
     // Ability side, called from TickRotation when the bot is in a vehicle. Returns true
-    // (handled) so the normal rotation is skipped — the bot's normal spells don't work in
-    // a vehicle; its abilities come from the vehicle's override bar.
+    // (handled) so the normal rotation is skipped — in most vehicles the bot's normal
+    // spells don't work and its abilities come from the vehicle's override bar. Returns
+    // FALSE for the one seat where they do (riding the Leviathan), so the caller falls
+    // through to the bot's own rotation.
     bool TickBotVehicleAbilities(Player* bot)
     {
         if (!bot) return true;
         Creature* vc = bot->GetVehicleCreatureBase();
         if (!vc) return true;
+
+        // A Leviathan hull's abilities are all bespoke (trajectory arcs, cones, the
+        // catapult), so it never goes through the generic first-castable loop below — that
+        // loop would fire the arcs with no destination and they would silently do nothing.
+        if (bot->GetMapId() == FL_MAP_ULDUAR)
+        {
+            FlJob const job = FlJobOf(bot);
+            // Checked before the cast throttle: a bot thrown onto the Leviathan fights with
+            // its own spells, and its rotation already paces itself.
+            if (job == FL_JOB_BOARDER) return FlTickBoarder(bot, vc);
+            if (job != FL_JOB_NONE)
+            {
+                if (bot->IsNonMeleeSpellCast(false, false, true)) return true;
+                uint32 const nowFl = getMSTime();
+                uint32& lastFl = g_vehCastMs[bot->GetGUID().GetCounter()];
+                if (nowFl - lastFl < 1300) return true;   // ~GCD throttle
+                lastFl = nowFl;
+                return TickLeviathanAbilities(bot, vc, job);
+            }
+        }
+
         if (bot->IsNonMeleeSpellCast(false, false, true)) return true;
 
         uint32 const now = getMSTime();
@@ -8370,8 +9122,11 @@ namespace WowPsParty
             // owned by the vehicle driver — board/acquire, fly after the leader, exit.
             // Gated on a vehicle actually being involved, so the normal ground follow
             // below is untouched otherwise. (A dead bot falls through to the revive logic.)
+            // (Flame Leviathan also qualifies with NOBODY seated: a companion whose hull
+            // was destroyed mid-fight has to be able to claim a fresh one.)
             if (follower->IsAlive()
-                && (follower->GetVehicleBase() || leader->GetVehicleBase())
+                && (follower->GetVehicleBase() || leader->GetVehicleBase()
+                    || LeviathanEncounterActive(follower))
                 && TickBotVehicleMovement(follower, leader))
                 return true;
 
