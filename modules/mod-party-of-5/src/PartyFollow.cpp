@@ -6457,6 +6457,7 @@ namespace WowPsParty
     // routine one: 35% still leaves well over a minute of life against the ~2.5k/s the
     // arena puts out, which comfortably covers the ~25-second round trip to a station.
     static constexpr uint32 FL_REPAIR_PCT    = 35;
+    static constexpr float FL_MAX_LEAD       = 12.0f;    // never aim further ahead than a splash
 
     // The Formation Grounds are one flat bowl at z 409.8, walled by the four towers at
     // roughly x 157..383 / y -141..74; the boss evades outside x [120,450]. This lap sits
@@ -6512,16 +6513,22 @@ namespace WowPsParty
 
     // Fill order. Ten-man parks SIX hulls at the base camp — two siege engines, two
     // demolishers, two choppers — and each siege and demolisher carries a second gun on an
-    // accessory seat, so a full raid is exactly ten posts. Every HULL is crewed before any
-    // gun seat is: an undriven hull contributes nothing at all and cannot even be boarded
-    // as a gunner (a turret only fires from a vehicle somebody is steering), while a
-    // gunless siege still rams and still interrupts. Jobs a team-mate already holds are
-    // consumed in order, so the raid spreads instead of stacking.
+    // accessory seat, so a full raid is exactly ten posts. Jobs a team-mate already holds
+    // are consumed in order, so the group spreads instead of stacking, and the list has to
+    // read correctly at every prefix rather than only at its end:
+    //
+    //   first four   both interrupters and both demolishers — the fight's damage
+    //   fifth        a mechanic, because a party of five otherwise has nobody who can grab
+    //                pyrite or ride the catapult, and no dead turret means no Systems
+    //                Shutdown and no burn window at all
+    //   past that    the remaining hulls, then the guns; an undriven hull contributes
+    //                nothing and cannot even be manned as a gunner, while a gunless siege
+    //                still rams and still interrupts
     static FlJob const FL_JOB_ORDER[] =
     {
-        FL_JOB_SIEGE_DRIVER,  FL_JOB_DEMO_DRIVER,   FL_JOB_SIEGE_DRIVER, FL_JOB_DEMO_DRIVER,
-        FL_JOB_CHOPPER_DRIVER, FL_JOB_CHOPPER_DRIVER,
-        FL_JOB_SIEGE_GUNNER,  FL_JOB_DEMO_MECHANIC, FL_JOB_SIEGE_GUNNER, FL_JOB_DEMO_MECHANIC,
+        FL_JOB_SIEGE_DRIVER,   FL_JOB_DEMO_DRIVER, FL_JOB_SIEGE_DRIVER, FL_JOB_DEMO_DRIVER,
+        FL_JOB_DEMO_MECHANIC,  FL_JOB_CHOPPER_DRIVER, FL_JOB_SIEGE_GUNNER,
+        FL_JOB_CHOPPER_DRIVER, FL_JOB_SIEGE_GUNNER, FL_JOB_DEMO_MECHANIC,
     };
 
     // Vehicle-keyed, and the hulls are temp summons that get a fresh guid on every raid
@@ -6533,16 +6540,18 @@ namespace WowPsParty
         uint32 loadedMs    = 0;  // when we climbed into a catapult seat
         uint32 noSeatLogMs = 0;  // last "nothing free to board" line, for log throttling
         uint32 fireLogMs   = 0;  // last "is this hull shooting" trace
+        uint32 repairSinceMs = 0;  // when this hull set off for a station; 0 = not going
+        uint32 repairHoldMs  = 0;  // a trip that never got its heal; don't start another yet
         ObjectGuid convoyAnchor; // who our hull is currently set to follow on the drive in
     };
     static std::unordered_map<uint32, FlBotState> g_flBots;   // bot low guid -> state
 
-    // Seat CLAIMS. Boarding is not observable to the next bot in the same pass: the ride
-    // spell's aura lands asynchronously, so `GetPassenger(0)` still reads empty and the
-    // next companion boards the SAME hull — and an explicit-seat AddPassenger EJECTS the
-    // current occupant. Five bots piling onto one demolisher, four of them thrown back out
-    // to fight barefoot, is exactly what that produced live. A claim is authoritative for a
-    // few seconds regardless of what the vehicle kit says.
+    // Seat CLAIMS. An explicit-seat AddPassenger EJECTS whoever is already there, so two
+    // companions picking the same hull in one pass throw each other back out — five bots
+    // piling onto one demolisher, four of them left to fight barefoot, is exactly what that
+    // produced live. Boarding IS observable within the pass now that the ride is cast
+    // directly, but a claim still covers the window between a bot deciding on a seat and
+    // reaching it: a claim is authoritative for a few seconds regardless of the vehicle kit.
     static std::unordered_map<uint32, std::pair<uint32, uint32>> g_flClaims;   // seat low guid -> (bot low guid, ms)
     static constexpr uint32 FL_CLAIM_TTL_MS = 5000;
 
@@ -6702,11 +6711,10 @@ namespace WowPsParty
     }
 
     // Board, and CLAIM the seat in the same breath so the rest of this pass treats it as
-    // taken — the vehicle kit won't show it for another tick or two, and the next bot to
-    // pick the same hull would eject us off it. Logs what actually happened rather than
-    // what we asked for: the previous build logged "took job N" on a board that a later
-    // companion immediately undid, which made the log read like a success.
-    static void FlBoard(Player* bot, Creature* seat, int8 seatId, uint32 job)
+    // taken — the next bot to pick the same hull would eject us off it. Logs what actually
+    // happened rather than what we asked for: an earlier build logged "took job N" on a
+    // board that a later companion immediately undid, which made the log read like success.
+    static bool FlBoard(Player* bot, Creature* seat, int8 seatId, uint32 job)
     {
         FlClaimSeat(seat, bot);
         // Unit::EnterVehicle casts the ride spell with only IGNORE_CASTER_MOUNTED_OR_ON_VEHICLE,
@@ -6719,9 +6727,33 @@ namespace WowPsParty
         bot->CastCustomSpell(FL_SPELL_RIDE_HARDCODED, SPELLVALUE_BASE_POINT0, seatId + 1,
                              seat, TRIGGERED_FULL_MASK);
         bool const seated = bot->GetVehicleBase() == seat;
+        // A directly-cast ride resolves inside that call, so a miss here is a real refusal
+        // (the core turned us down) and not a pending one. Release the claim rather than
+        // blocking that seat for everyone else until the claim ages out.
+        if (!seated) g_flClaims.erase(seat->GetGUID().GetCounter());
         LOG_INFO("module", "[WowPsParty Leviathan] {} -> job {} seat {} on {} (entry {}) {}",
                  bot->GetName(), job, int32(seatId), seat->GetName(), seat->GetEntry(),
-                 seated ? "OK" : "pending");
+                 seated ? "OK" : "refused");
+        return seated;
+    }
+
+    // Walking distance to a seat we have chosen. The ride is cast fully triggered, which
+    // bypasses the spell's own range check along with the global cooldown, so without this
+    // a companion at the base camp would teleport into a hull already fighting in the
+    // Formation Grounds. Anything further away, we walk to first.
+    static constexpr float FL_BOARD_STEP_IN = 25.0f;
+
+    static bool FlBoardOrWalkTo(Player* bot, Creature* seat, int8 seatId, uint32 job)
+    {
+        Unit* mount = seat->GetVehicleBase() ? seat->GetVehicleBase() : seat;   // accessory -> hull
+        if (bot->GetExactDist2d(mount) > FL_BOARD_STEP_IN)
+        {
+            FlClaimSeat(seat, bot);   // hold it while we cross the ground
+            bot->GetMotionMaster()->MovePoint(0, mount->GetPositionX(), mount->GetPositionY(),
+                                              mount->GetPositionZ());
+            return true;
+        }
+        return FlBoard(bot, seat, seatId, job);
     }
 
     // Claim the highest-priority job the party is still missing and whose hardware is
@@ -6743,8 +6775,7 @@ namespace WowPsParty
                 default: break;
             }
             if (!seat) continue;   // that job's hardware isn't free — try the next one
-            FlBoard(bot, seat, 0, uint32(job));
-            return true;
+            return FlBoardOrWalkTo(bot, seat, 0, uint32(job));
         }
 
         // The job list is what we want CREWED; a 10-man brings more companions than there
@@ -6752,10 +6783,7 @@ namespace WowPsParty
         // runs — still shooting, still able to soak a Pursued, instead of on foot.
         int8 spareSeat = 0;
         if (Creature* spare = FlAnySpareSeat(crew.hulls, bot, spareSeat))
-        {
-            FlBoard(bot, spare, spareSeat, 0);
-            return true;
-        }
+            return FlBoardOrWalkTo(bot, spare, spareSeat, 0);
         // Retried every couple of seconds, so the line itself is throttled — an under-
         // crewed party would otherwise write a page a minute into Server.log.
         uint32 const now = getMSTime();
@@ -6797,6 +6825,14 @@ namespace WowPsParty
     // are looked up once and cached; an empty result is retried rather than cached, because
     // the grid may simply not have been loaded yet the first time we asked.
     struct FlStation { float x, y; };
+    static constexpr uint8 FL_STATION_COUNT  = 2;
+    static constexpr float FL_STATION_SEARCH = 500.0f;   // the far corner of the lap is ~315y out
+    // The trap's activation diameter is 8, so its radius is FOUR yards, and it looks for a
+    // PLAYER rather than the vehicle — park the hull on the pad, not politely short of it.
+    static constexpr float FL_STATION_PARK   = 2.0f;
+    static constexpr uint32 FL_REPAIR_GIVE_UP_MS = 30000;
+    static constexpr uint32 FL_REPAIR_HOLD_MS    = 60000;   // the pad's own lockout
+
     static std::vector<FlStation> const& FlRepairStations(Creature* from)
     {
         struct StationCheck
@@ -6807,16 +6843,22 @@ namespace WowPsParty
         static thread_local std::unordered_map<uint32, std::pair<std::vector<FlStation>, uint32>> cache;
         auto& slot = cache[from->GetInstanceId()];
         uint32 const now = getMSTime();
-        if (!slot.first.empty() || (slot.second && now - slot.second < 15000))
+        // Cache only a COMPLETE answer. A sweep that reached one station and not the other
+        // would otherwise be frozen in for the life of the instance, sending every hull in
+        // the raid across the arena to the same far pad.
+        if (slot.first.size() >= FL_STATION_COUNT || (slot.second && now - slot.second < 15000))
             return slot.first;
 
         slot.second = now ? now : 1;
+        slot.first.clear();
         std::list<GameObject*> gos;
         StationCheck check;
         Acore::GameObjectListSearcher<StationCheck> searcher(from, gos, check);
-        Cell::VisitObjects(from, searcher, FL_SCAN_RANGE);
+        Cell::VisitObjects(from, searcher, FL_STATION_SEARCH);
         for (GameObject* go : gos)
             slot.first.push_back({ go->GetPositionX(), go->GetPositionY() });
+        if (slot.first.size() >= FL_STATION_COUNT)
+            LOG_INFO("module", "[WowPsParty Leviathan] found {} repair station(s)", slot.first.size());
         return slot.first;
     }
 
@@ -6825,10 +6867,30 @@ namespace WowPsParty
     // fight, and the raid loses that post permanently. Only ever taken while NOT pursued:
     // dragging the boss to the western stations risks walking it past x=120, where its own
     // position check evades the encounter outright.
-    static bool FlDriveRepair(Creature* vc)
+    static bool FlDriveRepair(Creature* vc, FlBotState& state)
     {
-        if (vc->GetHealthPct() > float(FL_REPAIR_PCT)) return false;
-        if (vc->HasAura(FL_SPELL_AUTO_REPAIR)) return false;   // still locked out; fight on
+        uint32 const now = getMSTime();
+        if (vc->GetHealthPct() > float(FL_REPAIR_PCT) || vc->HasAura(FL_SPELL_AUTO_REPAIR))
+        {
+            state.repairSinceMs = 0;   // healed, or locked out and not worth the drive
+            return false;
+        }
+        // The pad may be on its own cooldown from another hull's visit, and a trap that
+        // never fires would otherwise hold this hull off the field for the whole encounter.
+        // Abandoning is a hold, not a permanent refusal — the pad frees up.
+        if (state.repairSinceMs && now - state.repairSinceMs > FL_REPAIR_GIVE_UP_MS)
+        {
+            state.repairSinceMs = 0;
+            state.repairHoldMs = now + FL_REPAIR_HOLD_MS;
+            LOG_INFO("module", "[WowPsParty Leviathan] {} gave up on the repair pad, back to the fight",
+                     vc->GetName());
+        }
+        if (state.repairHoldMs)
+        {
+            if (int32(now - state.repairHoldMs) < 0) return false;
+            state.repairHoldMs = 0;
+        }
+
         FlStation const* best = nullptr;
         float bestD = std::numeric_limits<float>::max();
         for (FlStation const& s : FlRepairStations(vc))
@@ -6837,9 +6899,16 @@ namespace WowPsParty
             if (d < bestD) { bestD = d; best = &s; }
         }
         if (!best) return false;
+
+        if (!state.repairSinceMs)
+        {
+            state.repairSinceMs = now ? now : 1;
+            LOG_INFO("module", "[WowPsParty Leviathan] {} broke off to repair at {:.0f}% ({:.0f}y out)",
+                     vc->GetName(), vc->GetHealthPct(), bestD);
+        }
         // Parked on the pad: hold still and let the trap fire rather than re-issuing a
         // spline to a point we are already standing on.
-        if (bestD > 6.0f) FlSteer(vc, best->x, best->y);
+        if (bestD > FL_STATION_PARK) FlSteer(vc, best->x, best->y);
         return true;
     }
 
@@ -6864,18 +6933,24 @@ namespace WowPsParty
     static FlPoint const& FlPickKiteNode(Creature* vc, Creature* boss)
     {
         uint8 const node = FlNearestLapNode(vc->GetPositionX(), vc->GetPositionY());
-        uint8 best = (node + 3) % FL_LAP_NODES;
+        uint8 best = 0, fallback = 0;
         float bestScore = -std::numeric_limits<float>::max();
+        float furthest = -1.0f;
         for (uint8 step = 1; step <= 7; ++step)
         {
             uint8 const idx = (node + step) % FL_LAP_NODES;
             FlPoint const& p = FL_LAP[idx];
             float const fromBoss = boss->GetExactDist2d(p.x, p.y);
+            // Whatever happens, remember the node that gets us the most ground: the boss can
+            // be parked mid-lap with every candidate inside the exclusion band, and the
+            // thrust uses this same answer as a FACING — a fallback that hasn't cleared the
+            // band would aim a 35-yard charge straight at it.
+            if (fromBoss > furthest) { furthest = fromBoss; fallback = idx; }
             if (fromBoss < FL_KITE_MIN) continue;   // never route back through the boss
             float const score = -std::fabs(fromBoss - FL_KITE_RANGE) - float(step) * 2.0f;
             if (score > bestScore) { bestScore = score; best = idx; }
         }
-        return FL_LAP[best];
+        return FL_LAP[bestScore > -std::numeric_limits<float>::max() ? best : fallback];
     }
 
     static void FlDriveKiteLap(Creature* vc, Creature* boss)
@@ -6951,10 +7026,13 @@ namespace WowPsParty
 
     // Drive one hull for a tick. Only the three driver hulls steer; gunners, mechanics and
     // boarders are passengers and have nothing to own.
-    static void FlDriveHull(Creature* vc, Creature* boss)
+    static void FlDriveHull(Player* bot, Creature* vc, Creature* boss)
     {
-        if (FlIsPursued(vc, boss)) { FlDriveKiteLap(vc, boss); return; }
-        if (FlDriveRepair(vc)) return;
+        FlBotState& state = g_flBots[bot->GetGUID().GetCounter()];
+        // A pursued hull runs the lap and does not go anywhere near a station: dragging the
+        // boss west risks walking it past x=120, where its own position check evades.
+        if (FlIsPursued(vc, boss)) { state.repairSinceMs = 0; FlDriveKiteLap(vc, boss); return; }
+        if (FlDriveRepair(vc, state)) return;
         switch (vc->GetEntry())
         {
             case FL_NPC_SIEGE:      FlDriveStandoff(vc, boss, FL_SIEGE_STANDOFF); break;
@@ -6976,7 +7054,11 @@ namespace WowPsParty
         z = target->GetPositionZ();
         Unit* moving = target->ToUnit();
         if (!moving || !moving->isMoving()) return;
-        float const lead = moving->GetSpeed(MOVE_RUN) * flightSeconds;
+        // Clamped to inside the smallest splash on these bars. A Leviathan with a stack of
+        // Gathering Speed would otherwise be led thirty-odd yards, and a destination that
+        // far out also flattens the arc that SelectImplicitTrajTargets derives from it —
+        // the missile would sail over the boss and land behind it.
+        float const lead = std::min(moving->GetSpeed(MOVE_RUN) * flightSeconds, FL_MAX_LEAD);
         x += std::cos(moving->GetOrientation()) * lead;
         y += std::sin(moving->GetOrientation()) * lead;
     }
@@ -7023,9 +7105,24 @@ namespace WowPsParty
         return vc->CastSpell(vc, spellId, false) == SPELL_CAST_OK;
     }
 
+    // Asked by three of the five jobs on every ability tick, and the tick is now several
+    // times a second — a raw 80-yard grid sweep per hull per pass is the one place this
+    // rotation could actually cost the map thread anything. Crates fall rarely; a second of
+    // staleness costs nothing.
     static Creature* FlNearestCrate(Creature* vc, float range)
     {
-        return vc->FindNearestCreature(FL_NPC_PYRITE_CRATE, range, true);
+        static thread_local std::unordered_map<uint32, std::pair<ObjectGuid, uint32>> cache;
+        uint32 const now = getMSTime();
+        auto& slot = cache[vc->GetGUID().GetCounter()];
+        if (slot.second && now - slot.second < 1000)
+        {
+            Creature* cached = slot.first.IsEmpty() ? nullptr : ObjectAccessor::GetCreature(*vc, slot.first);
+            return (cached && cached->IsAlive() && vc->GetDistance(cached) <= range) ? cached : nullptr;
+        }
+        if (cache.size() > 256) cache.clear();   // hulls are temp summons; guids never recur
+        Creature* found = vc->FindNearestCreature(FL_NPC_PYRITE_CRATE, range, true);
+        slot = { found ? found->GetGUID() : ObjectGuid::Empty, now ? now : 1 };
+        return found;
     }
 
     // A free Flame Leviathan Seat is the ride onto the boss's back. The seats ride the
@@ -7090,37 +7187,42 @@ namespace WowPsParty
     }
 
     // The only escape a siege engine owns. Steam Rush throws the hull 35 yards along its own
-    // FACING, so it has to be pointed at the lap node we are already running for before it
-    // fires — aimed anywhere else it is a 40-energy way to end up somewhere worse, under the
-    // boss or in a corner.
+    // FACING, so it has to be pointed at the lap node we are already running for — aimed
+    // anywhere else it is a 40-energy way to end up somewhere worse, under the boss or in a
+    // corner. SetOrientation and NOT SetFacingTo: the latter launches a stationary spline,
+    // which cancels the MovePoint keeping this hull away from a Battering Ram in the first
+    // place. Only the authoritative orientation matters here — it is what the charge effect
+    // reads to pick its destination, in this same call.
     static bool FlSiegeThrust(Creature* vc, Creature* boss)
     {
         if (!boss || !FlIsPursued(vc, boss)) return false;
         if (vc->GetExactDist2d(boss) > FL_THRUST_RANGE) return false;
         if (vc->HasSpellCooldown(FL_SPELL_STEAM_RUSH)) return false;
         FlPoint const& node = FlPickKiteNode(vc, boss);
-        float const away = vc->GetAngle(node.x, node.y);
-        vc->SetOrientation(away);
-        vc->SetFacingTo(away);
-        return vc->CastSpell(vc, FL_SPELL_STEAM_RUSH, false) == SPELL_CAST_OK;
+        vc->SetOrientation(vc->GetAngle(node.x, node.y));
+        if (vc->CastSpell(vc, FL_SPELL_STEAM_RUSH, false) != SPELL_CAST_OK) return false;
+        LOG_INFO("module", "[WowPsParty Leviathan] {} thrust clear of the pursue ({:.0f}y out)",
+                 vc->GetName(), vc->GetExactDist2d(boss));
+        return true;
     }
 
     static bool FlTickSiegeDriver(Creature* vc, Unit* enemy, Creature* boss)
     {
-        // Breaking the pursue comes before any damage this hull could do. An uninterrupted
-        // ram lands ~19k and leaves a stacking damage-taken debuff behind it.
-        if (FlSiegeThrust(vc, boss)) return true;
-
         // While the Leviathan is up, Electroshock is spent on a Flame Vents channel and on
         // NOTHING else: its cooldown is 10s against a 20s vent cycle, so a shock fired on
         // cooldown is a coin-flip on still being recharging when the vents open. Ten seconds
         // of unstopped vents is ~30k to every vehicle on the field and is what actually
         // destroys the raid's hulls. In the gauntlet on the way in there is nothing to save
         // it for — it is just an 8.5k frontal hit — so there it fires freely.
+        //
+        // It also outranks escaping our own pursue, and has to: a thrust throws us 35 yards
+        // clear, which is well outside the shock's cone, so thrusting first trades one hull
+        // taking a ram for every hull taking a full vent.
         if (boss)
         {
             if (FlBossIsVenting(boss) && CastVehicleCone(vc, FL_SPELL_ELECTROSHOCK, boss, FL_SHOCK_RANGE))
                 return true;
+            if (!FlBossIsVenting(boss) && FlSiegeThrust(vc, boss)) return true;
         }
         else if (CastVehicleCone(vc, FL_SPELL_ELECTROSHOCK, enemy, FL_SHOCK_RANGE))
             return true;
@@ -7303,7 +7405,7 @@ namespace WowPsParty
             return true;
         }
 
-        if (hull) FlDriveHull(hull, boss);
+        if (hull) FlDriveHull(bot, hull, boss);
         return true;
     }
 
@@ -7505,12 +7607,14 @@ namespace WowPsParty
                 // Retried several times a second rather than once. A vehicle ability shares
                 // the 1.5s global cooldown, so a fixed ~GCD throttle lands ON that cooldown
                 // about half the time and silently drops the shot; a short retry costs one
-                // failed CheckCast and gets the gun firing the instant it can. The guard is
-                // on the VEHICLE, not the rider — the hull is what casts.
+                // failed CheckCast and gets the gun firing the instant it can. The hull is
+                // what casts most of these, but the mechanic's Grab Crate and catapult load
+                // are cast by the RIDER, so both have to be clear.
                 if (vc->IsNonMeleeSpellCast(false, false, true)) return true;
+                if (bot->IsNonMeleeSpellCast(false, false, true)) return true;
                 uint32 const nowFl = getMSTime();
                 uint32& lastFl = g_vehCastMs[bot->GetGUID().GetCounter()];
-                if (nowFl - lastFl < 350) return true;
+                if (nowFl - lastFl < 400) return true;
                 lastFl = nowFl;
                 return TickLeviathanAbilities(bot, vc, job);
             }
