@@ -10180,14 +10180,15 @@ namespace WowPsParty
                 // two while the leader stands still (Mill's idle oscillation).
                 g_humanize[d.followerGuid.GetCounter()].eligible = false;
 
-                // If THIS WING has a recorded path AND the tank's "follow recorded path"
-                // toggle is ON (default), the path-follow ticker drives the tank's motion —
-                // skip MoveFollow so the two don't fight. Must be leader-WING-aware (not just
-                // "any path on the map"): in an un-recorded wing of a multi-wing dungeon the
-                // path ticker bails, so MoveFollow has to run or the tank is stranded. With
-                // the toggle OFF, TankFollowPath bails too, so we DON'T yield here — the tank
-                // leads via the lead-ahead MoveFollow below instead of the recording.
-                if (WowPsParty::HasPathForLeader(leader->GetMapId(), leader)
+                // If the tank has a route to drive here — a recorded one for THIS WING, or
+                // an auto route to a boss still standing — and its "lead the route" toggle
+                // is ON (default), the path-follow ticker owns the tank's motion; skip
+                // MoveFollow so the two don't fight. Must be leader-WING-aware (not just
+                // "any path on the map"): where neither route exists the path ticker bails,
+                // so MoveFollow has to run or the tank is stranded. With the toggle OFF,
+                // TankFollowPath bails too, so we DON'T yield here — the tank leads via the
+                // lead-ahead MoveFollow below instead.
+                if (WowPsParty::TankRouteAvailable(leader->GetMapId(), leader)
                     && WowPsParty::BotFollowRecordedPath(d.followerGuid))
                     return true;
 

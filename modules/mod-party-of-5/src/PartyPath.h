@@ -1,5 +1,18 @@
 /*
- * WowPs Party-of-5 — Dungeon path recording + tank playback.
+ * WowPs Party-of-5 — Dungeon tank routing: recorded playback + auto-routing.
+ *
+ * There are TWO route sources, and the tank prefers them in this order:
+ *
+ *   1) A RECORDED route for the wing (see below) — a route a human walked, so
+ *      it takes the corners the way you wanted them taken.
+ *   2) An AUTO route, generated live from the navmesh (no recording needed).
+ *      This is what makes an un-recorded dungeon work: the module reads the
+ *      dungeon's boss list out of DungeonEncounter.dbc, walks the tank to the
+ *      nearest one that is still alive, and re-picks when it dies. See the
+ *      "Auto-routing" block in PartyPath.cpp.
+ *
+ * Both produce the same shape — a dense polyline — so the playback machinery
+ * (steer node, lead/halt hysteresis, stall blink) is shared.
  *
  * Idea: walk through each dungeon once in a GM-mode/superspeed ghost while
  * the server samples your position. Subsequent runs, the assigned tank
@@ -37,6 +50,8 @@
 
 #include "Define.h"
 #include "ObjectGuid.h"
+
+#include <string>
 
 class Player;
 
@@ -80,6 +95,17 @@ namespace WowPsParty
     // True if a recorded path exists for the WING the leader is in (proximity, the
     // same test playback uses) — so the lead-tank gate matches TankFollowPath.
     bool HasPathForLeader(uint32 mapId, Player* leader);
+
+    // True if the tank has ANY route to drive here — a recorded wing route, or an
+    // auto route to a boss that is still standing. This is the gate PartyFollow's
+    // follow ticker uses to yield the lead tank's feet, so it must stay cheap: it
+    // reads cached state only and never builds a route.
+    bool TankRouteAvailable(uint32 mapId, Player* leader);
+
+    // One-line summary of what the tank will do in this dungeon, for the message the
+    // party leader gets on entering (PartyHooks::OnPlayerMapChanged). Names the
+    // recorded route, or the auto route's next boss, or says why there's neither.
+    std::string DescribeTankRoute(Player* leader);
 }
 
 #endif

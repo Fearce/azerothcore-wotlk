@@ -1013,9 +1013,9 @@ public:
         }, std::chrono::seconds(2));
     }
 
-    // On entering a dungeon, tell the party leader whether a tank route is recorded
-    // for this map — so it's obvious up front whether the tank will lead the pull
-    // path or just follow. Only the human owner (has followers; bots never do) sees it.
+    // On entering a dungeon, tell the party leader how the tank will get around here:
+    // a recorded route, an auto route to the bosses still standing, or neither. Only
+    // the human owner (has followers; bots never do) sees it.
     void OnPlayerMapChanged(Player* player) override
     {
         if (!player || !player->GetMap() || !player->GetMap()->IsDungeon())
@@ -1023,15 +1023,9 @@ public:
         if (WowPsParty::CountFollowersFor(player->GetGUID()) == 0)
             return;   // not leading a party here — nothing to say about a tank route
 
-        uint32 const wps = WowPsParty::GetPathWaypointCount(player->GetMapId());
-        if (wps > 0)
-            ChatHandler(player->GetSession()).PSendSysMessage(
-                "|cff66ccff[WowPsParty]|r Recorded tank route found for this dungeon "
-                "({} waypoints) — the tank will lead the pull path.", wps);
-        else
-            ChatHandler(player->GetSession()).PSendSysMessage(
-                "|cffffcc00[WowPsParty]|r No recorded tank route for this dungeon — "
-                "the tank will follow you. Use Record Path to record one.");
+        std::string const summary = WowPsParty::DescribeTankRoute(player);
+        if (!summary.empty())
+            ChatHandler(player->GetSession()).PSendSysMessage(summary);
     }
 
     // Mirror a freshly-discovered FLIGHT PATH (taxi node) to every other LOADED
