@@ -1507,7 +1507,6 @@ public:
         // Items: iterate, for each non-FFA non-looted item, find a taker
         // with bag space, store it. Announce each pickup in chat so the
         // user sees what the party scooped up.
-        bool leftForRaid = false;   // did the raid carve-out hold anything back?
         std::vector<Player*> const humans = HumanLootClaimants(human, killed);
         for (size_t i = 0; i < loot->items.size(); ++i)
         {
@@ -1537,7 +1536,6 @@ public:
             // hands it out through the loot window.
             if (raid && WowPsParty::RaidRollsForItem(raid, li, *tmpl))
             {
-                leftForRaid = true;
                 if (!li.is_blocked)
                     AnnounceRaidLootLeftOnCorpse(human, *tmpl, li);
                 LOG_INFO("module",
@@ -1634,8 +1632,15 @@ public:
         // other door. Re-deriving that visibility here would be a second guess (the
         // answer can have changed since the fill), so restore the floor by counting
         // what is demonstrably still lying here instead.
-        if (leftForRaid)
-            WowPsParty::RestoreUnlootedFloor(*loot);
+        //
+        // Unconditional, not just for the raid carve-out: the over-spend belongs to
+        // the decrement, not to the raid, and an ordinary party leaves drops behind
+        // too (every party bag full). Same destruction, no roll involved — the tally
+        // hits 0 with that drop still on the body, the player opens the corpse and
+        // closes it without taking it, and DoLootRelease clears straight through it.
+        // A no-op on a body this pass emptied completely (nothing left to count), so
+        // it cannot cost a fully-looted corpse its skinning.
+        WowPsParty::RestoreUnlootedFloor(*loot);
 
         // Mark loot fully consumed if all items got taken. "All" only ever means
         // the ordinary items this pass moves into the party bags: quest_items[]
