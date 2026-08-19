@@ -42,6 +42,14 @@
 #include "ArenaTeam.h"
 #include "ArenaTeamMgr.h"
 
+// [WowPsParty PATCH] Defined in the mod-party-of-5 module (PartyHooks.cpp).
+// An AI companion is not somebody you roll against. True = keep this member out
+// of the roll being built. Without it a raid of one player and their companions
+// puts 39 bodies in every roll: none of them answers (a managed companion
+// hard-returns past mod-playerbots' UpdateAI) so the player's Need waits out the
+// full 60-second timer, and the ones that do answer roll Need on the upgrade.
+extern bool WowPsParty_BotStandsDownFromRoll(Player* member, Group* group);
+
 Roll::Roll(ObjectGuid _guid, LootItem const& li) : itemGUID(_guid), itemid(li.itemid),
     itemRandomPropId(li.randomPropertyId), itemRandomSuffix(li.randomSuffix), itemCount(li.count),
     totalPlayersRolling(0), totalNeed(0), totalGreed(0), totalPass(0), itemSlot(0),
@@ -1024,6 +1032,8 @@ void Group::GroupLoot(Loot* loot, WorldObject* pLootedObject)
                 Player* member = itr->GetSource();
                 if (!member || !member->GetSession())
                     continue;
+                if (WowPsParty_BotStandsDownFromRoll(member, this))   // [WowPsParty PATCH]
+                    continue;
                 if (member->IsAtLootRewardDistance(pLootedObject))
                 {
                     r->totalPlayersRolling++;
@@ -1109,6 +1119,8 @@ void Group::GroupLoot(Loot* loot, WorldObject* pLootedObject)
             Player* member = itr->GetSource();
             if (!member || !member->GetSession())
                 continue;
+            if (WowPsParty_BotStandsDownFromRoll(member, this))   // [WowPsParty PATCH]
+                continue;
 
             if (member->IsAtLootRewardDistance(pLootedObject))
             {
@@ -1172,6 +1184,8 @@ void Group::NeedBeforeGreed(Loot* loot, WorldObject* lootedObject)
             {
                 Player* playerToRoll = itr->GetSource();
                 if (!playerToRoll || !playerToRoll->GetSession())
+                    continue;
+                if (WowPsParty_BotStandsDownFromRoll(playerToRoll, this))   // [WowPsParty PATCH]
                     continue;
 
                 if (playerToRoll->IsAtGroupRewardDistance(lootedObject))
@@ -1247,6 +1261,8 @@ void Group::NeedBeforeGreed(Loot* loot, WorldObject* lootedObject)
         {
             Player* playerToRoll = itr->GetSource();
             if (!playerToRoll || !playerToRoll->GetSession())
+                continue;
+            if (WowPsParty_BotStandsDownFromRoll(playerToRoll, this))   // [WowPsParty PATCH]
                 continue;
 
             if (playerToRoll->IsAtGroupRewardDistance(lootedObject))

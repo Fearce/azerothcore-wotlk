@@ -154,6 +154,87 @@ namespace WowPsParty
             static_cast<uint32>(group->GetLootMethod()));
     }
 
+    // ---- Raid loot belongs to the raid ---------------------------------------
+    // The auto-loot bypass in OnPlayerCreatureKill empties a body at the instant
+    // of the kill. That is a single-player convenience, and it costs nothing while
+    // the "group" is one person and their companions — but the core only starts a
+    // group's loot rolls when somebody OPENS the corpse (Player::SendLoot), and
+    // after the bypass has run nobody ever does. In a raid that swallowed the very
+    // drops the group is entitled to roll for: the epics a boss dropped were in a
+    // companion's bags before a roll window could exist. So in a raid the party
+    // takes only what the group's own loot threshold calls trash, leaves the rest
+    // on the body, starts the rolls the open would have started, and keeps the
+    // companions out of them.
+
+    // The raid whose loot rules own a drop, or nullptr when ordinary party sharing
+    // applies. A battleground / battlefield group is a raid too, and nobody rolls
+    // for what its NPCs drop, so those keep the old behaviour.
+    static Group* RaidLootRules(Group* group)
+    {
+        if (!group || !group->isRaidGroup() || group->isBGGroup() || group->isBFGroup())
+            return nullptr;
+        return group;
+    }
+
+    // Only ever the group that TAPPED the body, and only when the killer is in it.
+    // Rolling out a corpse another group is entitled to would block their items
+    // (Roll sets is_blocked) on loot that was never ours to hand out.
+    static Group* RaidLootRulesForCorpse(Player* killer, Creature* killed)
+    {
+        if (!killer || !killed) return nullptr;
+        Group* const group = killed->GetLootRecipientGroup();
+        if (!group || group != killer->GetGroup()) return nullptr;
+        return RaidLootRules(group);
+    }
+
+    // The group's own threshold is the line: at or above it a drop is rolled (or
+    // master-looted) instead of round-robined, exactly as it would be for a raid
+    // of people. is_blocked means a roll is already running on it.
+    static bool RaidRollsForItem(Group const* raid, LootItem const& li, ItemTemplate const& tmpl)
+    {
+        return li.is_blocked || tmpl.Quality >= uint32(raid->GetLootThreshold());
+    }
+
+    // The core starts a group's rolls the first time somebody OPENS the body
+    // (Player::SendLoot). After the auto-loot pass has run nobody ever will, so
+    // the drops we leave for the raid would sit there unoffered — start the rolls
+    // here instead. Only the two methods whose whole interaction IS the roll:
+    // master loot, round robin and free-for-all hand items out through the loot
+    // WINDOW, and those packets belong with the open. Their above-threshold drops
+    // are still left on the body by the pass below, for the player to take there.
+    static void StartRaidLootRolls(Group* raid, Creature* killed)
+    {
+        Loot& loot = killed->loot;
+        if (loot.loot_type != LOOT_NONE) return;   // already roll-processed
+
+        switch (raid->GetLootMethod())
+        {
+            case GROUP_LOOT:        raid->GroupLoot(&loot, killed);      break;
+            case NEED_BEFORE_GREED: raid->NeedBeforeGreed(&loot, killed); break;
+            default: return;
+        }
+        // Claim the body as roll-processed exactly as opening it would, so a later
+        // open can't build a second set of rolls over the same items.
+        loot.loot_type = LOOT_CORPSE;
+    }
+
+    // A body with nobody behind it. A hero the human is DRIVING (.party swap)
+    // keeps a merely PAUSED PlayerbotAI, so it is a person right now.
+    static bool IsBotBody(Player* member)
+    {
+        PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(member);
+        return ai && !ai->IsRealPlayer() && !member->HasUnitFlag(UNIT_FLAG_POSSESSED);
+    }
+
+    static bool GroupHasRealPerson(Group* group)
+    {
+        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+            if (Player* member = itr->GetSource())
+                if (member->GetSession() && !IsBotBody(member))
+                    return true;
+        return false;
+    }
+
     // ---- Party-wide KEY sharing ---------------------------------------------
     // Every item id that some lock accepts as its KEY (LOCK_KEY_ITEM). Built once
     // from Lock.dbc. Catches doors/chests that need the key sitting in the bags.
@@ -813,6 +894,23 @@ namespace
         ChatHandler(owner->GetSession()).SendSysMessage(msg);
     }
 
+    // Tell the player about a drop the party left for the raid that is NOT being
+    // rolled for (master loot, or a roll nobody was eligible for) — a roll puts up
+    // its own window and says it better. The auto-loot pass empties bodies so
+    // thoroughly that nobody opens a corpse any more, so without this the body
+    // keeps a sparkle for no visible reason and the drop is quietly missed.
+    void AnnounceRaidLootLeftOnCorpse(Player* human, ItemTemplate const& tmpl, LootItem const& li)
+    {
+        if (!human || !human->GetSession()) return;
+        uint32 const itemId = li.itemid;
+        std::string const itemName = tmpl.Name1;
+        std::string const msg = Acore::StringFormat(
+            "|cff66ccff[Loot]|r |cffffffff|Hitem:{}::::::::1::::|h[{}]|h|r is the raid's — "
+            "left on the body, loot it to take it",
+            itemId, itemName);
+        ChatHandler(human->GetSession()).SendSysMessage(msg);
+    }
+
     // Master-loot priority: a living human standing close enough to still take
     // ordinary loot off the corpse. Unlike quest loot this is forfeited once they
     // walk away, so it only defers the skin while they are actually here. Range is
@@ -853,6 +951,17 @@ namespace
 bool WowPsParty_SkinWouldDestroyPartyLoot(Player* member, Creature* creature, std::string* reason)
 {
     if (!creature || !WowPsParty::IsEnabled()) return false;
+
+    // A group loot roll is still running on this body. Skinning calls
+    // Loot::clear(), which invalidates the Roll's loot reference — the item
+    // nobody has won yet would simply cease to exist mid-roll. The core arms and
+    // clears this timer itself around the roll, so it is exactly the question.
+    if (creature->m_groupLootTimer)
+    {
+        if (reason)
+            *reason = "a group loot roll is still running on this corpse";
+        return true;
+    }
 
     std::vector<Player*> const humans = HumanLootClaimants(member, creature);
     if (humans.empty()) return false;
@@ -1291,7 +1400,9 @@ public:
     //   * Drop each into the first party member that has bag space
     //   * Auto-pickup the gold to the killer (FFA semantics)
     // Gear shared across the whole party — Cuid2-style "the party is one wallet
-    // and one inventory."
+    // and one inventory." A RAID is the exception: anything at or above the
+    // group's loot threshold is left on the body for the group's own rules to
+    // hand out (see RaidLootRules).
     void OnPlayerCreatureKill(Player* killer, Creature* killed) override
     {
         if (!WowPsParty::IsEnabled() || !killer || !killed) return;
@@ -1363,6 +1474,13 @@ public:
         Player* human = leaderGuid ? ObjectAccessor::FindConnectedPlayer(leaderGuid) : killer;
         if (!human || !human->GetSession()) human = killer;
 
+        // We are about to empty this body, so nobody will ever open it — start the
+        // raid's rolls now, before the pass below decides what it may take (it reads
+        // the is_blocked the roll sets).
+        Group* const raid = WowPsParty::RaidLootRulesForCorpse(killer, killed);
+        if (raid)
+            WowPsParty::StartRaidLootRolls(raid, killed);
+
         // Items: iterate, for each non-FFA non-looted item, find a taker
         // with bag space, store it. Announce each pickup in chat so the
         // user sees what the party scooped up.
@@ -1386,6 +1504,23 @@ public:
             if (Player* owner = QuestDropClaimant(*loot, li, uint8(i), killed->GetGUID(), humans))
             {
                 AnnounceQuestDropLeftOnCorpse(owner, *tmpl, li);
+                continue;
+            }
+
+            // In a raid the group's loot rules outrank the shared party bags for
+            // anything at or above its threshold: it stays on the body, either
+            // because a roll is now running on it or because the raid's method
+            // hands it out through the loot window.
+            if (raid && WowPsParty::RaidRollsForItem(raid, li, *tmpl))
+            {
+                if (!li.is_blocked)
+                    AnnounceRaidLootLeftOnCorpse(human, *tmpl, li);
+                LOG_INFO("module",
+                    "[WowPsParty Loot] left {} (quality {}) on corpse {} for the raid — "
+                    "method={} threshold={} rolling={}",
+                    tmpl->Name1, uint32(tmpl->Quality), killed->GetGUID().GetCounter(),
+                    uint32(raid->GetLootMethod()), uint32(raid->GetLootThreshold()),
+                    li.is_blocked ? 1 : 0);
                 continue;
             }
 
@@ -1419,6 +1554,15 @@ public:
                 if (newItem)
                 {
                     li.is_looted = true;
+                    // Keep the core's own tally straight. This pass stores directly
+                    // rather than through Player::StoreLootItem, and an unlootedCount
+                    // that never comes down leaves Loot::isLooted() permanently false
+                    // — so a body we only PARTLY emptied (a raid drop left for the
+                    // roll) keeps its sparkle forever, because the teardown at the end
+                    // of the roll (Group::CountTheRoll) is gated on isLooted().
+                    // Guarded: free-for-all and conditional entries are counted per
+                    // eligible player, so the tally is not one-per-item.
+                    if (loot->unlootedCount) --loot->unlootedCount;
                     // A KEY (e.g. the ZF Executioner's Key) that lands on one hero
                     // leaves the human unable to open the gate — give the whole
                     // party a copy. No-op for normal loot.
@@ -2069,6 +2213,29 @@ void WowPsParty_TakeReagent(Player* crafter, uint32 itemId, uint32 count)
                  crafter->GetName(), remaining, itemId);
 }
 
+// Trampoline called from the [WowPsParty PATCH] in Group::GroupLoot and
+// Group::NeedBeforeGreed, once per member per item they are about to build a roll
+// over. True keeps that member OUT of the roll.
+//
+// A companion is not somebody you roll against. Both kinds of bot had to go: a
+// managed party bot hard-returns past mod-playerbots' UpdateAI and never answers
+// a roll at all — with 39 of them in the roll the player's Need would sit out the
+// whole 60-second timer before resolving — and a pool bot that DOES answer
+// (LootRollAction) rolls Need on any upgrade, which is a bot taking an epic off a
+// person. Opting them out with Player::SetPassOnGroupLoot was the other option and
+// is worse: the core counts that vote as a roller anyway, and broadcasts a "passed
+// on" line for each one to the whole raid.
+//
+// A group with no person in it is left alone, so bot-only groups still roll among
+// themselves exactly as before. Deliberately realm-wide rather than party-of-5
+// only: a pool bot filling ANY player's group shouldn't roll against them either.
+bool WowPsParty_BotStandsDownFromRoll(Player* member, Group* group)
+{
+    if (!WowPsParty::IsEnabled() || !member || !group) return false;
+    if (!WowPsParty::IsBotBody(member)) return false;
+    return WowPsParty::GroupHasRealPerson(group);
+}
+
 // Trampoline called from the [WowPsParty PATCH] in Player::StoreLootItem (the
 // loot-window path: gathering nodes, chests, fishing, manual corpse loot). The
 // shared-inventory party is ONE pooled inventory across the human's HEROES, so
@@ -2087,6 +2254,20 @@ Player* WowPsParty_PickLootReceiver(Player* looter, uint32 itemid, uint32 count)
         return looter;                                   // solo: own bag, vanilla
     if (WowPsParty::IsHenchman(looter->GetGUID()))
         return looter;                                   // henchman loot stays its own
+
+    // In a raid the group's loot rules decide where a drop goes, so anything at
+    // or above its threshold stays with whoever the raid gave it to. Otherwise
+    // the epic the player just won or picked off the body would be shuffled into
+    // whichever hero had the emptier bags — the same "a bot took my epic" the
+    // kill-hook carve-out exists to stop. This trampoline also serves
+    // Player::AutoStoreLoot (prospect / mill / disenchant / pickpocket) and the
+    // two item-creation sites in Spell.cpp, so while in a raid those outputs stay
+    // with their maker too — deliberate: the shared panel shows them either way.
+    if (Group* raid = WowPsParty::RaidLootRules(looter->GetGroup()))
+        if (ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(itemid))
+            if (tmpl->Quality >= uint32(raid->GetLootThreshold()))
+                return looter;
+
     if (count == 0) count = 1;
 
     // Candidates: the looter + every loaded HERO peer sharing the looter's Map*.
