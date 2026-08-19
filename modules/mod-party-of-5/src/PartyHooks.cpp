@@ -1560,9 +1560,23 @@ public:
                     // — so a body we only PARTLY emptied (a raid drop left for the
                     // roll) keeps its sparkle forever, because the teardown at the end
                     // of the roll (Group::CountTheRoll) is gated on isLooted().
-                    // Guarded: free-for-all and conditional entries are counted per
-                    // eligible player, so the tally is not one-per-item.
-                    if (loot->unlootedCount) --loot->unlootedCount;
+                    //
+                    // Only ever for an item the FILL actually counted. A
+                    // condition-gated drop is counted LAZILY, the moment somebody
+                    // opens the loot window (Loot::FillNonQuestNonFFAConditionalLoot
+                    // sets is_counted) — and this pass exists precisely so that
+                    // nobody ever does. Decrementing for one of those spends the
+                    // count belonging to a drop still ON the body: unlootedCount
+                    // reaches 0 while a raid epic is mid-roll, isLooted() starts
+                    // saying the corpse is empty, and the next loot release runs
+                    // Loot::clear() straight through the unwon item. The predicate is
+                    // the core's own (LootMgr.cpp::FillLoot, LootItemStorage.cpp).
+                    bool const wasCounted =
+                        li.is_counted ||
+                        (!li.needs_quest && li.conditions.empty() &&
+                         !tmpl->HasFlag(ITEM_FLAG_MULTI_DROP));
+                    if (wasCounted && loot->unlootedCount)
+                        --loot->unlootedCount;
                     // A KEY (e.g. the ZF Executioner's Key) that lands on one hero
                     // leaves the human unable to open the gate — give the whole
                     // party a copy. No-op for normal loot.
