@@ -1484,6 +1484,7 @@ public:
         // Items: iterate, for each non-FFA non-looted item, find a taker
         // with bag space, store it. Announce each pickup in chat so the
         // user sees what the party scooped up.
+        bool leftForRaid = false;   // did the raid carve-out hold anything back?
         std::vector<Player*> const humans = HumanLootClaimants(human, killed);
         for (size_t i = 0; i < loot->items.size(); ++i)
         {
@@ -1513,6 +1514,7 @@ public:
             // hands it out through the loot window.
             if (raid && WowPsParty::RaidRollsForItem(raid, li, *tmpl))
             {
+                leftForRaid = true;
                 if (!li.is_blocked)
                     AnnounceRaidLootLeftOnCorpse(human, *tmpl, li);
                 LOG_INFO("module",
@@ -1597,6 +1599,24 @@ public:
                 }
             }
         }
+
+        // Backstop for the wasCounted guess above. That predicate is only HALF of
+        // what Loot::FillLoot does: the fill also skips its ++unlootedCount for any
+        // drop that no group member was AllowedForPlayer at the time — an unusable
+        // or already-known recipe (ITEM_FLAG_HIDE_UNUSABLE_RECIPE / a BoP recipe),
+        // a faction-flagged item, a quest starter everybody has already done. Those
+        // clear needs_quest/conditions/MULTI_DROP, so the predicate calls them
+        // counted and taking one spends a count belonging to a drop still ON the
+        // body — the same over-spend the predicate was tightened to stop, by the
+        // other door. Re-deriving that visibility here would be a second guess (the
+        // answer can have changed since the fill), so instead just refuse the only
+        // outcome that actually destroys anything: a tally of 0 while a raid item
+        // is still lying here makes Loot::isLooted() claim the corpse is empty, and
+        // the next DoLootRelease runs Loot::clear() straight through an item nobody
+        // has won yet. Being one too HIGH only costs the body its sparkle.
+        if (leftForRaid && loot->unlootedCount == 0)
+            for (auto const& li : loot->items)
+                if (!li.is_looted) { loot->unlootedCount = 1; break; }
 
         // Mark loot fully consumed if all items got taken. "All" only ever means
         // the ordinary items this pass moves into the party bags: quest_items[]
