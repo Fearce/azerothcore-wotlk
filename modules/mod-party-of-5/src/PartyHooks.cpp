@@ -218,6 +218,29 @@ namespace WowPsParty
         loot.loot_type = LOOT_CORPSE;
     }
 
+    // One count for every ordinary drop still lying on the body, so that
+    // Loot::isLooted() cannot claim the corpse is empty while a raid item is
+    // unclaimed on it — that is what lets the next DoLootRelease run Loot::clear()
+    // straight through an item nobody has won yet.
+    //
+    // A floor, never a ceiling: quest_items[] are counted in the same tally and
+    // this pass does not walk them, so lowering it would destroy a quest drop the
+    // player has not collected. And it must be a floor rather than a one-off "if
+    // it reached zero, make it one" — Group::CountTheRoll spends one count per
+    // item it awards (Group.cpp, unguarded --unlootedCount), so a single spare
+    // count is gone the moment the rolls resolve and the over-spend re-emerges
+    // 60 seconds later, against exactly the drops nobody won.
+    static void RestoreUnlootedFloor(Loot& loot)
+    {
+        uint32 stillHere = 0;
+        for (LootItem const& li : loot.items)
+            if (!li.is_looted)
+                ++stillHere;
+
+        if (loot.unlootedCount < stillHere)
+            loot.unlootedCount = uint8(stillHere);
+    }
+
     // A body with nobody behind it. A hero the human is DRIVING (.party swap)
     // keeps a merely PAUSED PlayerbotAI, so it is a person right now.
     static bool IsBotBody(Player* member)
@@ -1609,14 +1632,10 @@ public:
         // counted and taking one spends a count belonging to a drop still ON the
         // body — the same over-spend the predicate was tightened to stop, by the
         // other door. Re-deriving that visibility here would be a second guess (the
-        // answer can have changed since the fill), so instead just refuse the only
-        // outcome that actually destroys anything: a tally of 0 while a raid item
-        // is still lying here makes Loot::isLooted() claim the corpse is empty, and
-        // the next DoLootRelease runs Loot::clear() straight through an item nobody
-        // has won yet. Being one too HIGH only costs the body its sparkle.
-        if (leftForRaid && loot->unlootedCount == 0)
-            for (auto const& li : loot->items)
-                if (!li.is_looted) { loot->unlootedCount = 1; break; }
+        // answer can have changed since the fill), so restore the floor by counting
+        // what is demonstrably still lying here instead.
+        if (leftForRaid)
+            WowPsParty::RestoreUnlootedFloor(*loot);
 
         // Mark loot fully consumed if all items got taken. "All" only ever means
         // the ordinary items this pass moves into the party bags: quest_items[]
