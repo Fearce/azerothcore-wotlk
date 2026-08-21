@@ -7441,8 +7441,14 @@ public:
             std::string const name = tmpl ? tmpl->Name1 : std::to_string(entry);
             if (WowPsParty::AddLootBlacklist(account, entry))
             {
+                // "will no longer pick up", never "will leave behind" — the same verb
+                // the decline line is careful to avoid. A blacklisted drop is DISCARDED
+                // at the kill (MarkPartyTookLootItem), so telling the player here that
+                // the party leaves it behind promises them a body to walk back to that
+                // this feature specifically empties. See party-loot-blacklist.md.
                 ChatHandler(player->GetSession()).PSendSysMessage(
-                    "|cff66ccff[WowPsParty]|r your party will leave |cffffffff|Hitem:{}::::::::1::::|h[{}]|h|r behind.",
+                    "|cff66ccff[WowPsParty]|r your party will no longer pick up "
+                    "|cffffffff|Hitem:{}::::::::1::::|h[{}]|h|r.",
                     entry, name);
                 // Say so rather than picking silently: the player asked for a name and
                 // got one specific item out of several that answer to it.
