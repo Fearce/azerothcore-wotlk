@@ -259,7 +259,10 @@ namespace WowPsParty
     // 0 while a raid epic is mid-roll, isLooted() starts saying the corpse is empty,
     // and the next loot release runs Loot::clear() straight through the unwon item.
     // The predicate is the core's own (LootMgr.cpp::FillLoot, LootItemStorage.cpp).
-    static void MarkPartyTookLootItem(Loot& loot, LootItem& li, ItemTemplate const& tmpl)
+    // Declared in PartyMgr.h — PartyFollow.cpp's henchman corpse loot retires a
+    // blacklisted drop through this same helper, so the two paths share one
+    // definition of "was this drop counted" instead of drifting apart.
+    void MarkPartyTookLootItem(Loot& loot, LootItem& li, ItemTemplate const& tmpl)
     {
         li.is_looted = true;
 

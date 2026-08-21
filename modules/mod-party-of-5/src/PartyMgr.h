@@ -28,6 +28,9 @@
 
 class Player;
 class Item;
+struct Loot;
+struct LootItem;
+struct ItemTemplate;
 
 namespace WowPsParty
 {
@@ -110,6 +113,17 @@ namespace WowPsParty
     std::vector<uint32> GetLootBlacklist(uint32 account);
     void LootBlacklistRefreshFromDB(uint32 account);
     void EnsureLootBlacklistTable();  // CREATE TABLE IF NOT EXISTS — call on startup
+
+    // Retire one drop from a body — into the party bags, or, for a blacklisted
+    // entry, into nothing. Both mean "the party is done with this slot", so both
+    // owe the corpse's is_looted + unlootedCount tally the same bookkeeping, and a
+    // slot left un-retired keeps Loot::isLooted() false forever: the body never
+    // loses UNIT_DYNFLAG_LOOTABLE, AllLootRemovedFromCorpse never fires, and the
+    // party's skinner is refused the corpse for as long as a human stands near it.
+    // Defined in PartyHooks.cpp and shared with the henchman's own corpse loot in
+    // PartyFollow.cpp so the two cannot drift on the core's was-this-drop-counted
+    // predicate. (Definition carries the full rationale.)
+    void MarkPartyTookLootItem(Loot& loot, LootItem& li, ItemTemplate const& tmpl);
 
     // Load one party member's persisted `party_loadout` row (rotation + every
     // behaviour toggle) into the runtime caches. Combat reads ONLY those caches,
