@@ -3683,9 +3683,10 @@ static void HandleMill(Player* requester, std::string_view payload)
 // instead put an ordinary SPELL_EFFECT_LEARN_SPELL on the ON_USE slot; reading only
 // the first shape dropped every one of them silently. Empty = not a recipe we teach.
 //
-// The remaining 119 class-9 ON_USE rows — warlock Grimoires, Book of Glyph Mastery —
+// The remaining 94 class-9 ON_USE rows — warlock Grimoires, Book of Glyph Mastery —
 // teach nothing this way (their on-use spell is a pet dummy / a random discovery), so
-// they resolve empty and fall through to the ordinary cast path, unchanged.
+// they resolve empty and fall through to the ordinary cast path, unchanged. The other
+// 928 class-9 rows carry no item spell at all and never reach here.
 //
 // Returns a VECTOR, not one spell: Spell::EffectLearnSpell runs once per effect index,
 // and item 6619 "Manual: The Path of Defense" carries three (Defensive Stance 71,
