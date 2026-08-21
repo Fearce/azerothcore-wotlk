@@ -6875,6 +6875,31 @@ namespace WowPsParty
             if (!found) return false;
 
             ItemTemplate const* t = found->GetTemplate();
+            // A RECIPE's on-use spell is the generic "Learning" (483), which reads the
+            // craft to teach out of the cast ITEM. Cast bare, as this verb does, it
+            // teaches spell 0 — a rule that fires forever and does nothing. Recipes are
+            // handed out by the Party Inventory's Learn button, which picks the member
+            // with the profession; refuse them here instead of pretending.
+            // Logged at most once a minute per bot: this verb is re-entered every
+            // rotation tick, and the throttle that would have covered it is 30 lines
+            // below, past this return. Unthrottled it writes ~4 lines/second into a
+            // Server.log that is already 97% per-tick noise.
+            if (t->Class == ITEM_CLASS_RECIPE)
+            {
+                static std::unordered_map<uint32, uint32> lastRecipeWarnMs;
+                uint32 const nowMs = getMSTime();
+                std::lock_guard<std::mutex> lock(g_useThrottleMutex);
+                uint32& warned = lastRecipeWarnMs[bot->GetGUID().GetCounter()];
+                if (!warned || nowMs - warned >= 60000)
+                {
+                    warned = nowMs;
+                    LOG_INFO("module",
+                        "[WowPsParty Rotation] {} use_item '{}' IGNORED — a recipe is learned from "
+                        "the Party Inventory's Learn button, not from a rotation rule.",
+                        bot->GetName(), t->Name1);
+                }
+                return false;
+            }
             uint32 useSpell = 0;
             int32  cdMs     = 0;
             for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)

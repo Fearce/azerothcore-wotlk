@@ -3672,6 +3672,321 @@ static void HandleMill(Player* requester, std::string_view payload)
     WowPsParty::SendInventoryTo(requester);
 }
 
+// ---------------------------------------------------------------------------
+// Recipes — taught to the party member who can LEARN them
+// ---------------------------------------------------------------------------
+// The craft a recipe teaches, in the two shapes 3.3.5a data uses. 2034 of the 3066
+// class-9 rows carry it behind ITEM_SPELLTRIGGER_LEARN_SPELL_ID with the generic
+// "Learning" (483) on use — a pairing ObjectMgr::LoadItemTemplates rejects the item
+// over, so it is safe to rely on. Another 103 (Expert Cookbook, Book of Glyph
+// Mastery, the fishing books) instead put an ordinary SPELL_EFFECT_LEARN_SPELL on
+// the ON_USE slot; those are exactly the "manual" the Learn button advertises, and
+// reading only the first shape dropped them silently. 0 = not a recipe.
+static uint32 RecipeTaughtSpell(ItemTemplate const* tmpl)
+{
+    if (!tmpl || tmpl->Class != ITEM_CLASS_RECIPE)
+        return 0;
+    for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+        if (tmpl->Spells[i].SpellTrigger == ITEM_SPELLTRIGGER_LEARN_SPELL_ID && tmpl->Spells[i].SpellId > 0)
+            return uint32(tmpl->Spells[i].SpellId);
+    for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+    {
+        if (tmpl->Spells[i].SpellTrigger != ITEM_SPELLTRIGGER_ON_USE || tmpl->Spells[i].SpellId <= 0)
+            continue;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(uint32(tmpl->Spells[i].SpellId));
+        if (!si)
+            continue;
+        for (uint8 e = 0; e < MAX_SPELL_EFFECTS; ++e)
+            if (si->Effects[e].Effect == SPELL_EFFECT_LEARN_SPELL && si->Effects[e].TriggerSpell)
+                return si->Effects[e].TriggerSpell;
+    }
+    return 0;
+}
+
+// Whether one member can be taught one recipe, and if not, why. Order matters: the
+// verdict is picked across the WHOLE party, so the reason listed first wins over the
+// ones below it. SKILL SHORT outranks ALREADY KNOWN deliberately — with one alt at
+// the cap and another 10 points off the same profession, "already known, sell it" is
+// advice that throws away a recipe the second alt still wants. Below those, nothing
+// will ever change. Mirrors Player::CanUseItem's gates (PlayerStorage.cpp) plus the
+// already-known test the engine does NOT do: Player::learnSpell no-ops on a known
+// spell while Spell::TakeCastItem still eats the recipe, so casting to find out
+// destroys it for nothing.
+enum class RecipeFit : uint8
+{
+    Learnable,
+    SkillTooLow,
+    AlreadyKnown,
+    NoProfession,
+    Ineligible,
+};
+
+static RecipeFit RateRecipeFit(Player* p, ItemTemplate const* tmpl, uint32 taughtSpell)
+{
+    if (p->HasSpell(taughtSpell))
+        return RecipeFit::AlreadyKnown;
+    if (tmpl->HasFlag2(ITEM_FLAG2_FACTION_HORDE) && p->GetTeamId(true) != TEAM_HORDE)
+        return RecipeFit::Ineligible;
+    if (tmpl->HasFlag2(ITEM_FLAG2_FACTION_ALLIANCE) && p->GetTeamId(true) != TEAM_ALLIANCE)
+        return RecipeFit::Ineligible;
+    if ((tmpl->AllowableClass & p->getClassMask()) == 0 || (tmpl->AllowableRace & p->getRaceMask()) == 0)
+        return RecipeFit::Ineligible;
+    if (p->GetLevel() < tmpl->RequiredLevel)
+        return RecipeFit::Ineligible;
+    if (tmpl->RequiredSpell != 0 && !p->HasSpell(tmpl->RequiredSpell))
+        return RecipeFit::Ineligible;
+    if (tmpl->RequiredSkill != 0)
+    {
+        uint16 const skill = p->GetSkillValue(tmpl->RequiredSkill);
+        if (skill == 0)
+            return RecipeFit::NoProfession;
+        if (skill < tmpl->RequiredSkillRank)
+            return RecipeFit::SkillTooLow;
+    }
+    return RecipeFit::Learnable;
+}
+
+// The account's party slots resolved to live players, indexed by slot. Every
+// `GuidForAccountSlot` is a blocking SELECT on the world thread, and the Learn drain
+// fires twelve LEARNs a second — resolving per candidate turned one button press
+// into hundreds of queries. The FindPlayer fallback mirrors SendInventoryTo: the
+// connected-only lookup misses a member the grid is still showing (after an LFG
+// dungeon), and a silent miss there is a recipe that never gets an answer.
+static std::vector<Player*> ResolvePartySlots(uint32 account)
+{
+    std::vector<Player*> members(WowPsParty::PARTY_SIZE, nullptr);
+    for (uint8 slot = 0; slot < WowPsParty::PARTY_SIZE; ++slot)
+    {
+        uint32 const g = WowPsParty::GuidForAccountSlot(account, slot);
+        if (!g) continue;
+        ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(g);
+        Player* p = ObjectAccessor::FindConnectedPlayer(og);
+        if (!p) p = ObjectAccessor::FindPlayer(og);
+        members[slot] = p;
+    }
+    return members;
+}
+
+// Who to teach a recipe to — and, when nobody can, the near-miss worth naming.
+// "Nissemia is 50 Cooking short" is the only form of refusal a player can act on;
+// a bare "nobody can learn it" leaves them staring at the same pile.
+struct RecipeVerdict
+{
+    Player*   learner      = nullptr;
+    RecipeFit reason       = RecipeFit::NoProfession;   // meaningful only when learner is null
+    Player*   closest      = nullptr;                   // the member `reason` describes
+    uint16    closestSkill = 0;
+};
+
+static RecipeVerdict ChooseRecipeLearner(Player* requester, std::vector<Player*> const& members,
+                                         ItemTemplate const* tmpl, uint32 taughtSpell)
+{
+    RecipeVerdict best;
+    bool haveReason = false;
+
+    auto consider = [&](Player* p)
+    {
+        if (!p || best.learner) return;
+        RecipeFit const fit = RateRecipeFit(p, tmpl, taughtSpell);
+        if (fit == RecipeFit::Learnable) { best.learner = p; return; }
+        uint16 const skill = tmpl->RequiredSkill ? p->GetSkillValue(tmpl->RequiredSkill) : 0;
+        // Lower enum value = more actionable, so it wins. Between two members stuck on
+        // the same reason, the one closest to the requirement is the one to name.
+        if (!haveReason || fit < best.reason || (fit == best.reason && skill > best.closestSkill))
+        {
+            haveReason        = true;
+            best.reason       = fit;
+            best.closest      = p;
+            best.closestSkill = skill;
+        }
+    };
+
+    // The human first: it is their character, and a recipe they can learn themselves
+    // shouldn't go to a party-mate just because that mate sits in slot 0.
+    consider(requester);
+    for (Player* p : members)
+        if (p && p != requester)
+            consider(p);
+    return best;
+}
+
+// Wire codes for LEARN_RESULT. The bulk "Learn" button drains one LEARN per recipe
+// and tallies these client-side into a single summary, so a bag of 40 recipes costs
+// one chat line instead of 40.
+enum RecipeLearnCode : uint8
+{
+    RECIPE_LEARNED       = 1,
+    RECIPE_ALREADY_KNOWN = 2,
+    RECIPE_SKILL_TOO_LOW = 3,
+    RECIPE_NO_PROFESSION = 4,
+    RECIPE_INELIGIBLE    = 5,
+    RECIPE_NOT_A_RECIPE  = 6,
+    RECIPE_UNAVAILABLE   = 7,   // owner or item gone between the queue and the reply
+};
+
+static char const* SkillLineName(uint32 skillId)
+{
+    SkillLineEntry const* entry = sSkillLineStore.LookupEntry(skillId);
+    return (entry && entry->name[LOCALE_enUS]) ? entry->name[LOCALE_enUS] : "that profession";
+}
+
+// Teach one recipe to whichever party member can learn it, and consume it.
+//
+// Learning is applied DIRECTLY (learnSpell + consume) rather than by moving the
+// recipe onto the learner and casting it. The learner is normally a clientless
+// bot, and the cross-character move has its own failure mode (full bags) that
+// would strand the recipe halfway through an action the player asked for once —
+// the same reason HandleDisenchant rolls its loot table by hand. `quiet` is the
+// bulk path: the per-item chat is suppressed and only the machine-readable
+// LEARN_RESULT goes back, because the client is tallying. `gen` is the client's run
+// id, echoed into every reply so a straggler can't be counted into the next run.
+static void TeachRecipeFromParty(Player* requester, Player* owner, Item* item, bool quiet,
+                                 uint32 gen, std::vector<Player*> const& members)
+{
+    ItemTemplate const* tmpl = WowPsParty::SafeItemTemplate(item);
+    ChatHandler ch(requester->GetSession());
+    std::string const itemName = tmpl ? tmpl->Name1 : "that item";
+
+    auto report = [&](RecipeLearnCode code, std::string const& line)
+    {
+        SendWPSP(requester, Acore::StringFormat("LEARN_RESULT\t{}\t{}\t{}",
+            uint32(code), gen, itemName));
+        if (!quiet || code == RECIPE_LEARNED)
+            ch.SendSysMessage(line);
+    };
+
+    if (!tmpl)
+    {
+        report(RECIPE_UNAVAILABLE,
+            "|cffff5555[WowPsParty]|r That item is no longer in the party's bags.");
+        return;
+    }
+
+    uint32 const taughtSpell = RecipeTaughtSpell(tmpl);
+    if (!taughtSpell)
+    {
+        report(RECIPE_NOT_A_RECIPE, Acore::StringFormat(
+            "|cffff5555[WowPsParty]|r |cffffffff{}|r doesn't teach anything.", tmpl->Name1));
+        return;
+    }
+
+    RecipeVerdict const v = ChooseRecipeLearner(requester, members, tmpl, taughtSpell);
+    if (!v.learner)
+    {
+        switch (v.reason)
+        {
+            case RecipeFit::AlreadyKnown:
+                report(RECIPE_ALREADY_KNOWN, Acore::StringFormat(
+                    "|cff66ccff[WowPsParty]|r {} already knows |cffffffff{}|r — nothing left to learn from it.",
+                    v.closest->GetName(), tmpl->Name1));
+                break;
+            case RecipeFit::SkillTooLow:
+                report(RECIPE_SKILL_TOO_LOW, Acore::StringFormat(
+                    "|cffff5555[WowPsParty]|r |cffffffff{}|r needs {} {} — {} is the closest at {}.",
+                    tmpl->Name1, SkillLineName(tmpl->RequiredSkill), tmpl->RequiredSkillRank,
+                    v.closest->GetName(), v.closestSkill));
+                break;
+            case RecipeFit::NoProfession:
+                report(RECIPE_NO_PROFESSION, Acore::StringFormat(
+                    "|cffff5555[WowPsParty]|r Nobody in the party has {} — |cffffffff{}|r can't be learned.",
+                    SkillLineName(tmpl->RequiredSkill), tmpl->Name1));
+                break;
+            default:
+                report(RECIPE_INELIGIBLE, Acore::StringFormat(
+                    "|cffff5555[WowPsParty]|r No party member meets |cffffffff{}|r's requirements.", tmpl->Name1));
+                break;
+        }
+        return;
+    }
+
+    uint32 const      itemEntry   = tmpl->ItemId;
+    std::string const learnerName = v.learner->GetName();
+    // learnSpell runs OnPlayerLearnSpell hooks and recurses through rank chains, so
+    // `item` must not be dereferenced across it — a freed Item* still sitting in a bag
+    // slot is this module's most-repeated crash class. Take the guid now, re-resolve
+    // after, and treat a vanished item as "already spent" rather than guessing.
+    ObjectGuid const itemGuid = item->GetGUID();
+
+    v.learner->learnSpell(taughtSpell);
+
+    Item* spent = SafeGetItemByGuid(owner, itemGuid);
+    if (spent)
+    {
+        if (spent->GetCount() > 1)
+        {
+            spent->SetCount(spent->GetCount() - 1);
+            spent->SetState(ITEM_CHANGED, owner);
+        }
+        else
+            owner->DestroyItem(spent->GetBagSlot(), spent->GetSlot(), true);
+    }
+
+    report(RECIPE_LEARNED, Acore::StringFormat(
+        "|cff66ccff[WowPsParty]|r {} learned |cffffffff{}|r.", learnerName, itemName));
+    LOG_INFO("module",
+        "[WowPsParty Learn] requester={} owner={} learner={} recipe='{}'(entry={}) spell={}",
+        requester->GetName(), owner->GetName(), learnerName, itemName, itemEntry, taughtSpell);
+
+    // The bulk drain re-requests the grid once at the end of the run; pushing a full
+    // inventory per recipe would send forty of them for one button press.
+    if (!quiet)
+    {
+        WowPsParty::SendInventoryTo(requester);
+        if (owner != requester) WowPsParty::SendInventoryTo(owner);
+    }
+}
+
+// LEARN\t<srcPartySlot>\t<srcItemGuidLow>[\t<quiet>[\t<gen>]] — teach a recipe out of
+// the shared bags to whoever can learn it. Reached two ways: right-clicking a recipe
+// in the grid (bare, gen 0) and the Learn button's bulk drain (quiet=1 + its run id).
+//
+// Every exit here must still answer with a LEARN_RESULT. A silent return leaves the
+// drain's outstanding count one too high, so the run burns its whole grace period and
+// then omits the item from the summary entirely — the shape that makes a bulk action
+// look like it half-worked.
+static void HandleLearnRecipe(Player* requester, std::string_view payload)
+{
+    if (!requester || !requester->GetSession()) return;
+
+    std::vector<std::string_view> field;
+    for (size_t start = 0; start <= payload.size(); )
+    {
+        size_t const tab = payload.find('\t', start);
+        field.push_back(payload.substr(start, tab == std::string_view::npos
+                                             ? std::string_view::npos : tab - start));
+        if (tab == std::string_view::npos) break;
+        start = tab + 1;
+    }
+    if (field.size() < 2) return;
+
+    auto toUint = [](std::string_view sv) { return uint32(std::strtoul(std::string(sv).c_str(), nullptr, 10)); };
+    uint32 const srcSlot        = toUint(field[0]);
+    uint32 const srcItemGuidLow = toUint(field[1]);
+    bool const   quiet          = field.size() > 2 && field[2] == "1";
+    uint32 const gen            = field.size() > 3 ? toUint(field[3]) : 0;
+    if (!srcItemGuidLow) return;
+
+    uint32 const account = requester->GetSession()->GetAccountId();
+    std::vector<Player*> const members = ResolvePartySlots(account);
+
+    Player* owner = srcSlot < members.size() ? members[srcSlot] : nullptr;
+    Item*   item  = owner ? SafeGetItemByGuid(owner, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow))
+                          : nullptr;
+    // Mid-logout the inventory is tearing down; mutating it there is what the four
+    // sibling handlers guard against, and the drain aims twelve of these a second at
+    // up to five different owners.
+    if (!owner || !item || WowPsParty::MemberStorageUnstable(owner))
+    {
+        SendWPSP(requester, Acore::StringFormat("LEARN_RESULT\t{}\t{}\t?", uint32(RECIPE_UNAVAILABLE), gen));
+        if (!quiet)
+            ChatHandler(requester->GetSession()).PSendSysMessage(
+                "|cffff5555[WowPsParty]|r That item is no longer reachable — try Refresh.");
+        return;
+    }
+
+    TeachRecipeFromParty(requester, owner, item, quiet, gen, members);
+}
+
 // PICKLOCK\t<srcPartySlot>\t<srcItemGuidLow> — pick a locked box (junkbox / lockbox /
 // strongbox) from any party member's bags using a party ROGUE's Lockpicking skill.
 // Mirrors HandleDisenchant: any party member whose Lockpicking >= the box's required
@@ -5742,6 +6057,19 @@ static void UseOwnedItemInstance(Player* requester, Player* srcChar, Item* srcIt
         return;
     }
 
+    // A RECIPE goes to whichever party member can LEARN it, which is almost never the
+    // human. The requester-cast path below pulled it into the human's bags and cast it
+    // there, and nothing on that path checks the recipe's RequiredSkill — neither
+    // Spell::CheckItems nor CheckCast gates a player-target LEARN_SPELL — so
+    // Player::CastItemUseSpell's special learning branch taught the craft to the HUMAN
+    // and destroyed the recipe, or, if they already knew it, destroyed it for nothing.
+    if (RecipeTaughtSpell(t))
+    {
+        TeachRecipeFromParty(requester, srcChar, srcItem, /*quiet=*/false, /*gen=*/0,
+                             ResolvePartySlots(requester->GetSession()->GetAccountId()));
+        return;
+    }
+
     // A GLYPH's on-use spell applies the glyph. Route it to the correct free slot
     // (see ApplyGlyphFromItem) instead of CastSpell, which would always pick slot 0.
     if (useInfo)
@@ -5788,7 +6116,9 @@ static void UseOwnedItemInstance(Player* requester, Player* srcChar, Item* srcIt
     // Two on-use item kinds MUST be cast by the (never-a-bot) REQUESTER, not the
     // owning party member — so pull the item over (like a recipe) and use it via
     // the real item-use pipeline on the requester:
-    //   * A RECIPE (learns a spell): the requester must be the one who LEARNS it.
+    //   * A SPELL-TEACHING item that ISN'T a recipe (a mount, a companion pet): the
+    //     requester must be the one who LEARNS it. Recipes left this path above —
+    //     they belong to whoever has the profession, not to whoever clicked.
     //   * A REAGENT-CONSUMING CONVERSION (essence/shard "combine 3 -> 1", mote
     //     combines, …): Spell::TakeReagents gives ANY bot caster its reagents for
     //     FREE (the autonomous-rotation rule, WowPsParty_PlayerHasBotAI). Casting
@@ -7695,6 +8025,10 @@ public:
         else if (command == "MILL")
         {
             HandleMill(player, payload);
+        }
+        else if (command == "LEARN")
+        {
+            HandleLearnRecipe(player, payload);
         }
         else if (command == "PICKLOCK")
         {
