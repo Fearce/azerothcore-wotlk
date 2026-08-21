@@ -244,6 +244,90 @@ namespace WowPsParty
         else       s.killXpRate  = rate;
     }
 
+    // ----- Loot blacklist ----------------------------------------------------
+    // Presence of an account's key means "loaded" — an account with an EMPTY set
+    // is a real answer, so a plain `.empty()` test would re-query the DB on every
+    // single dropped item.
+    static std::unordered_map<uint32, std::unordered_set<uint32>> g_lootBlacklist;
+    static std::mutex                                             g_blacklistMutex;
+
+    void EnsureLootBlacklistTable()
+    {
+        CharacterDatabase.DirectExecute(
+            "CREATE TABLE IF NOT EXISTS `party_loot_blacklist` ("
+            "`account` INT UNSIGNED NOT NULL, "
+            "`item` INT UNSIGNED NOT NULL, "
+            "PRIMARY KEY (`account`, `item`))");
+    }
+
+    void LootBlacklistRefreshFromDB(uint32 account)
+    {
+        std::unordered_set<uint32> entries;
+        QueryResult q = CharacterDatabase.Query(
+            "SELECT `item` FROM `party_loot_blacklist` WHERE `account` = {}", account);
+        if (q) do {
+            entries.insert(q->Fetch()[0].Get<uint32>());
+        } while (q->NextRow());
+
+        std::lock_guard<std::mutex> lock(g_blacklistMutex);
+        g_lootBlacklist[account] = std::move(entries);
+    }
+
+    bool LootBlacklisted(uint32 account, uint32 itemEntry)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_blacklistMutex);
+            auto it = g_lootBlacklist.find(account);
+            if (it != g_lootBlacklist.end())
+                return it->second.count(itemEntry) != 0;
+        }
+        LootBlacklistRefreshFromDB(account);
+        std::lock_guard<std::mutex> lock(g_blacklistMutex);
+        return g_lootBlacklist[account].count(itemEntry) != 0;
+    }
+
+    std::vector<uint32> GetLootBlacklist(uint32 account)
+    {
+        auto sortedSnapshot = [account]() -> std::optional<std::vector<uint32>>
+        {
+            std::lock_guard<std::mutex> lock(g_blacklistMutex);
+            auto it = g_lootBlacklist.find(account);
+            if (it == g_lootBlacklist.end()) return std::nullopt;
+            std::vector<uint32> out(it->second.begin(), it->second.end());
+            std::sort(out.begin(), out.end());
+            return out;
+        };
+        if (auto cached = sortedSnapshot()) return *cached;
+        LootBlacklistRefreshFromDB(account);
+        return sortedSnapshot().value_or(std::vector<uint32>());
+    }
+
+    bool AddLootBlacklist(uint32 account, uint32 itemEntry)
+    {
+        if (!itemEntry) return false;
+        if (LootBlacklisted(account, itemEntry)) return false;   // also warms the cache
+        // Synchronous: this is a rare, user-initiated write that immediately tells the
+        // player it took effect, so it must not be a queued write that a crash could
+        // lose. (The reader is the in-process cache below, not the row.)
+        CharacterDatabase.DirectExecute(
+            "INSERT IGNORE INTO `party_loot_blacklist` (`account`, `item`) VALUES ({}, {})",
+            account, itemEntry);
+        std::lock_guard<std::mutex> lock(g_blacklistMutex);
+        g_lootBlacklist[account].insert(itemEntry);
+        return true;
+    }
+
+    bool RemoveLootBlacklist(uint32 account, uint32 itemEntry)
+    {
+        if (!LootBlacklisted(account, itemEntry)) return false;
+        CharacterDatabase.DirectExecute(
+            "DELETE FROM `party_loot_blacklist` WHERE `account` = {} AND `item` = {}",
+            account, itemEntry);
+        std::lock_guard<std::mutex> lock(g_blacklistMutex);
+        g_lootBlacklist[account].erase(itemEntry);
+        return true;
+    }
+
     // ----- Henchmen ----------------------------------------------------------
 
     // Cached CSV of random-bot account ids ("rndbot*"), read once from the

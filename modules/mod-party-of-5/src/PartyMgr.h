@@ -96,6 +96,21 @@ namespace WowPsParty
     void EnsureSettingsTable();   // CREATE TABLE IF NOT EXISTS — call on startup
     void EnsureRosterOrderColumn();  // ADD characters.roster_order if missing — call on startup
 
+    // ----- Loot blacklist ----------------------------------------------------
+    // Item entries the account's party refuses. Every path that puts DROPPED loot
+    // into the shared bags consults it, so a listed item never reaches a companion:
+    // the kill auto-loot pass, the henchman's own corpse loot, and the spread that
+    // redirects a hand-looted item to whichever hero has room. Persisted in
+    // `party_loot_blacklist`, cached per account like the toggles above.
+    bool LootBlacklisted(uint32 account, uint32 itemEntry);
+    // Both return false when the row was already in (or already absent from) the list.
+    bool AddLootBlacklist(uint32 account, uint32 itemEntry);
+    bool RemoveLootBlacklist(uint32 account, uint32 itemEntry);
+    // Ascending item entries — the order the panel lists them in.
+    std::vector<uint32> GetLootBlacklist(uint32 account);
+    void LootBlacklistRefreshFromDB(uint32 account);
+    void EnsureLootBlacklistTable();  // CREATE TABLE IF NOT EXISTS — call on startup
+
     // Load one party member's persisted `party_loadout` row (rotation + every
     // behaviour toggle) into the runtime caches. Combat reads ONLY those caches,
     // so every path that brings a saved member into an active party — login

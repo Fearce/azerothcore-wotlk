@@ -91,6 +91,7 @@ public:
         // live DB if a migration hasn't run yet.
         WowPsParty::EnsureSettingsTable();
         WowPsParty::EnsureRosterOrderColumn();
+        WowPsParty::EnsureLootBlacklistTable();
     }
 };
 

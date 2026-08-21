@@ -413,6 +413,85 @@ namespace WowPsParty
         SendWPSP(player, out.str());
     }
 
+    // BL_BEGIN / BL\t<entry>:<quality>:<name>\t... / BL_END — the account's loot
+    // blacklist, streamed so a long list can't overflow one addon message and arrive
+    // truncated. The NAME comes from the server rather than the client's GetItemInfo
+    // because the panel must be able to show an item this client has never seen.
+    void SendLootBlacklistTo(Player* player)
+    {
+        if (!player || !player->GetSession()) return;
+        std::vector<uint32> const entries =
+            GetLootBlacklist(player->GetSession()->GetAccountId());
+
+        SendWPSP(player, "BL_BEGIN");
+
+        std::string chunk;
+        chunk.reserve(240);
+        auto flush = [&]()
+        {
+            if (chunk.empty()) return;
+            SendWPSP(player, "BL\t" + chunk);
+            chunk.clear();
+        };
+        for (uint32 entry : entries)
+        {
+            ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(entry);
+            // A blacklisted entry whose item no longer exists in the DB still has to
+            // be listed, or the player can never remove it.
+            std::string rec = std::to_string(entry) + ':'
+                            + std::to_string(tmpl ? uint32(tmpl->Quality) : 1u) + ':'
+                            + (tmpl ? tmpl->Name1 : "item " + std::to_string(entry));
+            if (chunk.size() + rec.size() + 1 > 240)
+                flush();
+            if (!chunk.empty()) chunk += '\t';
+            chunk += rec;
+        }
+        flush();
+
+        SendWPSP(player, "BL_END");
+    }
+
+    // Resolve what the player typed into an item entry. The addon already turns a
+    // shift-clicked link into its numeric id, so this is either that id or a name
+    // typed by hand. Names match case-insensitively and exactly — a substring match
+    // would silently blacklist "Pattern: Bag of Many Hides" when asked for "Bag".
+    //
+    // 2040 lowercased names in item_template are shared by more than one entry
+    // ("Bloodstained Fortune" by 20 of them), so `shared` reports how many matched
+    // and the LOWEST entry is taken: unordered_map iteration order is not stable, so
+    // returning the first hit would blacklist a different item run to run. Returns 0
+    // for no match.
+    uint32 ResolveItemEntryForBlacklist(std::string const& text, uint32* shared = nullptr)
+    {
+        if (shared) *shared = 0;
+        if (text.empty()) return 0;
+
+        if (text.find_first_not_of("0123456789") == std::string::npos)
+        {
+            uint32 const entry = uint32(std::strtoul(text.c_str(), nullptr, 10));
+            return sObjectMgr->GetItemTemplate(entry) ? entry : 0;
+        }
+
+        auto lower = [](unsigned char c) { return char(std::tolower(c)); };
+        std::string wanted = text;
+        std::transform(wanted.begin(), wanted.end(), wanted.begin(), lower);
+
+        uint32 best = 0, matches = 0;
+        for (auto const& [entry, tmpl] : *sObjectMgr->GetItemTemplateStore())
+        {
+            // Length first: the store holds ~50k rows and this runs on the map thread
+            // that handled the click, so the common case must not allocate.
+            if (tmpl.Name1.size() != wanted.size()) continue;
+            if (!std::equal(wanted.begin(), wanted.end(), tmpl.Name1.begin(),
+                            [&lower](char a, char b) { return a == lower(b); }))
+                continue;
+            ++matches;
+            if (!best || entry < best) best = entry;
+        }
+        if (shared) *shared = matches;
+        return best;
+    }
+
     // HENCHMEN\t<rec>;<rec>;...   rec = guid:name:cls:level:role:cost:spec
     // The hireable random-pool candidates near the player's level. (spec is a short
     // abbrev, possibly empty for a talentless low-level char.)
@@ -7339,6 +7418,61 @@ public:
             LOG_INFO("module",
                 "[WowPsParty] SET_XPRATE account={} {}={}", account, which, rate);
             WowPsParty::SendSettingsTo(player);   // echo back the clamped value
+        }
+        else if (command == "REQ_BLACKLIST")
+        {
+            WowPsParty::SendLootBlacklistTo(player);
+        }
+        else if (command == "BL_ADD")
+        {
+            // BL_ADD\t<item id | exact item name>
+            std::string const text(payload);
+            uint32 const account = player->GetSession()->GetAccountId();
+            uint32 shared = 0;
+            uint32 const entry = WowPsParty::ResolveItemEntryForBlacklist(text, &shared);
+            if (!entry)
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cff66ccff[WowPsParty]|r no item called \"{}\" — shift-click the item "
+                    "into the box, or type its exact name.", text);
+                return;
+            }
+            ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(entry);
+            std::string const name = tmpl ? tmpl->Name1 : std::to_string(entry);
+            if (WowPsParty::AddLootBlacklist(account, entry))
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cff66ccff[WowPsParty]|r your party will leave |cffffffff|Hitem:{}::::::::1::::|h[{}]|h|r behind.",
+                    entry, name);
+                // Say so rather than picking silently: the player asked for a name and
+                // got one specific item out of several that answer to it.
+                if (shared > 1)
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cff66ccff[WowPsParty]|r {} items share that name — this is entry {}. "
+                        "Shift-click the one you mean if it isn't this one.", shared, entry);
+            }
+            else
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cff66ccff[WowPsParty]|r {} is already blacklisted.", name);
+            LOG_INFO("module",
+                "[WowPsParty Blacklist] account={} add '{}' -> entry {}", account, text, entry);
+            WowPsParty::SendLootBlacklistTo(player);
+        }
+        else if (command == "BL_DEL")
+        {
+            // BL_DEL\t<item id>
+            uint32 const entry = std::strtoul(std::string(payload).c_str(), nullptr, 10);
+            uint32 const account = player->GetSession()->GetAccountId();
+            if (WowPsParty::RemoveLootBlacklist(account, entry))
+            {
+                ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(entry);
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cff66ccff[WowPsParty]|r your party will pick up {} again.",
+                    tmpl ? tmpl->Name1 : std::to_string(entry));
+            }
+            LOG_INFO("module",
+                "[WowPsParty Blacklist] account={} remove entry {}", account, entry);
+            WowPsParty::SendLootBlacklistTo(player);
         }
         else if (command == "REQ_HENCHMEN")
         {

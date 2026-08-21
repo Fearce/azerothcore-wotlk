@@ -163,7 +163,15 @@ namespace WowPsParty
         // Computed by item QUALITY vs the group loot threshold, NOT li.is_underthreshold
         // — the latter is only set once a player opens the corpse (GroupLoot), which
         // hasn't happened at grid-scan time.
-        static bool HenchClaimable(Creature const* c, ObjectGuid self, Group const* grp)
+        //
+        // `leaderAccount` is the directive leader's, never the bot's own — a hired
+        // henchman is a random-pool character on an `rndbot` account. Its blacklist
+        // has to be consulted HERE and not only in the take loop: a corpse whose only
+        // remaining trash is blacklisted would otherwise stay claimable forever, and
+        // the henchman would walk to it, take nothing, and re-pick it every 30s
+        // instead of following the party.
+        static bool HenchClaimable(Creature const* c, ObjectGuid self, Group const* grp,
+                                   uint32 leaderAccount)
         {
             Loot const& loot = c->loot;
             // Only walk to a corpse that round-robin assigned to THIS henchman. The old
@@ -182,6 +190,7 @@ namespace WowPsParty
             for (LootItem const& li : loot.items)
             {
                 if (li.is_looted || li.freeforall) continue;
+                if (leaderAccount && LootBlacklisted(leaderAccount, li.itemid)) continue;
                 ItemTemplate const* t = sObjectMgr->GetItemTemplate(li.itemid);
                 if (t && t->Quality < threshold) return true;  // under-threshold trash that's OURS
             }
@@ -194,8 +203,9 @@ namespace WowPsParty
         // actually take (HenchClaimable). LOOT_SKINNING corpses are the alts' skinner.
         struct NearbyLootableCorpseCheck
         {
-            NearbyLootableCorpseCheck(WorldObject const* src, float range, Group* grp, ObjectGuid self)
-                : _src(src), _range(range), _self(self), _grp(grp) {}
+            NearbyLootableCorpseCheck(WorldObject const* src, float range, Group* grp,
+                                      ObjectGuid self, uint32 leaderAccount)
+                : _src(src), _range(range), _self(self), _grp(grp), _leaderAccount(leaderAccount) {}
             bool operator()(Creature* c) const
             {
                 if (!c || c->IsAlive() || !_src->IsWithinDist(c, _range, false))
@@ -206,12 +216,13 @@ namespace WowPsParty
                     return false;                    // skin loot — not ours to take
                 if (c->GetLootRecipientGroup() != _grp)
                     return false;                    // only our group's kills
-                return HenchClaimable(c, _self, _grp);  // ignore rolls / other members' trash
+                return HenchClaimable(c, _self, _grp, _leaderAccount);  // ignore rolls / other members' trash
             }
             WorldObject const* _src;
             float _range;
             ObjectGuid _self;
             Group* _grp;
+            uint32 _leaderAccount;
         };
 
         // Matches a live, attackable enemy whose name is in the focus list (names
@@ -5243,10 +5254,11 @@ namespace WowPsParty
     }
 
     static Creature* FindNearestLootableCorpse(Player* bot, float range,
-                                               ObjectGuid avoid, Group* grp)
+                                               ObjectGuid avoid, Group* grp,
+                                               uint32 leaderAccount)
     {
         std::list<Creature*> crs;
-        NearbyLootableCorpseCheck check(bot, range, grp, bot->GetGUID());
+        NearbyLootableCorpseCheck check(bot, range, grp, bot->GetGUID(), leaderAccount);
         Acore::CreatureListSearcher<NearbyLootableCorpseCheck> searcher(bot, crs, check);
         Cell::VisitObjects(bot, searcher, range);
 
@@ -5315,7 +5327,7 @@ namespace WowPsParty
     // Loot a reached corpse via the engine, like a player right-click + auto-loot:
     // open it, let the built-in money handler split the gold across the party,
     // then store each item slot under the group's loot rules, then release.
-    static void LootCorpseForHenchman(Player* hench, Creature* c)
+    static void LootCorpseForHenchman(Player* hench, Creature* c, uint32 leaderAccount)
     {
         ObjectGuid const guid = c->GetGUID();
 
@@ -5348,6 +5360,11 @@ namespace WowPsParty
             {
                 LootItem const& li = c->loot.items[i];
                 if (li.is_looted || li.freeforall || li.is_blocked || !li.is_underthreshold)
+                    continue;
+                // Left for the player to take at the window if they want it — this
+                // path never empties the body outright, so nothing is destroyed by
+                // declining here.
+                if (leaderAccount && LootBlacklisted(leaderAccount, li.itemid))
                     continue;
                 // Capture before looting — StoreLootItem flips li.is_looted.
                 uint32 const itemid = li.itemid;
@@ -5432,6 +5449,12 @@ namespace WowPsParty
         if (!leader || !leader->IsInWorld())          { HenchLootLog(gLow, "skip: leader not in world"); return; }
         if (leader->GetMapId() != bot->GetMapId())    { HenchLootLog(gLow, "skip: leader other map"); return; }
 
+        // Whose loot blacklist governs this bot. Resolved once here and threaded down:
+        // the claim predicate and the take loop must agree, or the bot walks to a
+        // corpse it will then refuse to empty.
+        uint32 const leaderAccount =
+            leader->GetSession() ? leader->GetSession()->GetAccountId() : 0;
+
         // Reuse the gather approach-state slot: a henchman NEVER gathers (Tick
         // Gathering bails at the henchman gate before touching g_gather), so its
         // entry is free, and reusing it gives us the follow-ticker yield
@@ -5460,14 +5483,14 @@ namespace WowPsParty
             && target->loot.loot_type != LOOT_SKINNING
             && target->GetLootRecipientGroup() == grp
             && !CorpseLootBlockedByAggro(bot, target)        // a patrol wandered onto it -> drop it, be careful
-            && HenchClaimable(target, bot->GetGUID(), grp);  // still something here FOR US?
+            && HenchClaimable(target, bot->GetGUID(), grp, leaderAccount);  // still something here FOR US?
 
         if (!valid)
         {
             // Lost / emptied / now-guarded committed corpse — pick the nearest valid one,
             // skipping any we recently gave up reaching / just looted.
             target = FindNearestLootableCorpse(bot, HENCH_LOOT_SCAN_RANGE,
-                (now < avoidUntil) ? avoid : ObjectGuid::Empty, grp);
+                (now < avoidUntil) ? avoid : ObjectGuid::Empty, grp, leaderAccount);
             std::lock_guard<std::mutex> lock(g_gatherMutex);
             auto& st = g_gather[gLow];
             st.node     = target ? target->GetGUID() : ObjectGuid::Empty;
@@ -5490,7 +5513,7 @@ namespace WowPsParty
 
         if (bot->IsWithinDistInMap(target, HENCH_LOOT_REACH))
         {
-            LootCorpseForHenchman(bot, target);
+            LootCorpseForHenchman(bot, target, leaderAccount);
             ObjectGuid const tg = target->GetGUID();
             float const cx = target->GetPositionX();
             float const cy = target->GetPositionY();
@@ -5510,7 +5533,7 @@ namespace WowPsParty
             // angle so the henchman doesn't sit and drink ON the corpse and block the
             // player from looting it (Kevin). Party isn't in combat here (checked above),
             // so a brief reposition is safe; the follow ticker brings it back after.
-            if (!FindNearestLootableCorpse(bot, HENCH_LOOT_SCAN_RANGE, tg, grp))
+            if (!FindNearestLootableCorpse(bot, HENCH_LOOT_SCAN_RANGE, tg, grp, leaderAccount))
             {
                 float const ang = float((gLow * 2654435761u + now) % 6283u) / 1000.0f;  // ~0..2pi, varies per bot/time
                 float ex = cx + std::cos(ang) * HENCH_LOOT_STEPOFF;

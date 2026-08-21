@@ -241,6 +241,36 @@ namespace WowPsParty
             loot.unlootedCount = uint8(stillHere);
     }
 
+    // Retire one drop from the body — either into the party bags or, for a
+    // blacklisted entry, into nothing. Both are "the party is done with this
+    // slot", so both owe the tally the same bookkeeping.
+    //
+    // Keep the core's own count straight: this pass stores directly rather than
+    // through Player::StoreLootItem, and an unlootedCount that never comes down
+    // leaves Loot::isLooted() permanently false — so a body we only PARTLY emptied
+    // (a raid drop left for the roll) keeps its sparkle forever, because the
+    // teardown at the end of the roll (Group::CountTheRoll) is gated on isLooted().
+    //
+    // Only ever for an item the FILL actually counted. A condition-gated drop is
+    // counted LAZILY, the moment somebody opens the loot window
+    // (Loot::FillNonQuestNonFFAConditionalLoot sets is_counted) — and this pass
+    // exists precisely so that nobody ever does. Decrementing for one of those
+    // spends the count belonging to a drop still ON the body: unlootedCount reaches
+    // 0 while a raid epic is mid-roll, isLooted() starts saying the corpse is empty,
+    // and the next loot release runs Loot::clear() straight through the unwon item.
+    // The predicate is the core's own (LootMgr.cpp::FillLoot, LootItemStorage.cpp).
+    static void MarkPartyTookLootItem(Loot& loot, LootItem& li, ItemTemplate const& tmpl)
+    {
+        li.is_looted = true;
+
+        bool const wasCounted =
+            li.is_counted ||
+            (!li.needs_quest && li.conditions.empty() &&
+             !tmpl.HasFlag(ITEM_FLAG_MULTI_DROP));
+        if (wasCounted && loot.unlootedCount)
+            --loot.unlootedCount;
+    }
+
     // A body with nobody behind it. A hero the human is DRIVING (.party swap)
     // keeps a merely PAUSED PlayerbotAI, so it is a person right now.
     static bool IsBotBody(Player* member)
@@ -934,6 +964,42 @@ namespace
         ChatHandler(human->GetSession()).SendSysMessage(msg);
     }
 
+    // Tell the player about a drop the party refused because they blacklisted it.
+    // Nothing else on the corpse would show it: the body is emptied at the kill, so
+    // a silent skip is indistinguishable from the item never having dropped — and a
+    // blacklist you can't see working is one you stop trusting. Greyed, because it
+    // is an item the player has already said they don't want.
+    //
+    // Once a minute per item, because a blacklist earns its keep on exactly the
+    // things that drop off every second mob — unthrottled, the line confirming the
+    // feature works IS the spam the feature was added to stop.
+    constexpr uint32 BLACKLIST_ANNOUNCE_INTERVAL_MS = 60 * IN_MILLISECONDS;
+
+    void AnnounceBlacklistedDropSkipped(Player* human, ItemTemplate const& tmpl, LootItem const& li)
+    {
+        if (!human || !human->GetSession()) return;
+
+        static std::unordered_map<uint64, uint32> lastAnnounced;   // (account<<32|entry) -> ms
+        static std::mutex announceMutex;
+        uint64 const key = (uint64(human->GetSession()->GetAccountId()) << 32) | li.itemid;
+        uint32 const now = getMSTime();
+        {
+            std::lock_guard<std::mutex> lock(announceMutex);
+            auto it = lastAnnounced.find(key);
+            if (it != lastAnnounced.end() &&
+                getMSTimeDiff(it->second, now) < BLACKLIST_ANNOUNCE_INTERVAL_MS)
+                return;
+            lastAnnounced[key] = now;
+        }
+
+        uint32 const itemId = li.itemid;
+        std::string const itemName = tmpl.Name1;
+        std::string const msg = Acore::StringFormat(
+            "|cff888888[Loot] left |Hitem:{}::::::::1::::|h[{}]|h behind — blacklisted.|r",
+            itemId, itemName);
+        ChatHandler(human->GetSession()).SendSysMessage(msg);
+    }
+
     // Master-loot priority: a living human standing close enough to still take
     // ordinary loot off the corpse. Unlike quest loot this is forfeited once they
     // walk away, so it only defers the skin while they are actually here. Range is
@@ -1547,6 +1613,33 @@ public:
                 continue;
             }
 
+            // The player's own blacklist (Interface -> AddOns -> WowPsParty -> Loot
+            // blacklist). Deliberately LAST of the three carve-outs: a quest drop is
+            // still the player's to collect and the raid's rules still outrank the
+            // shared bags, so blacklisting an item must not swallow a drop that was
+            // about to be rolled for. Retired rather than left lying: an item left on
+            // the body keeps it lootable, which both denies the corpse to the party's
+            // skinner (NearbyOrdinaryLootOwner) and leaves a sparkle on every kill.
+            if (WowPsParty::LootBlacklisted(account, li.itemid))
+            {
+                AnnounceBlacklistedDropSkipped(human, *tmpl, li);
+                // Named lvalues: Acore::StringFormat forwards through
+                // fmt::make_format_args, which binds non-const references only.
+                std::string const skippedName = tmpl->Name1;
+                uint32 const skippedId = li.itemid;
+                uint32 const skippedCount = li.count;
+                uint32 const corpse = killed->GetGUID().GetCounter();
+                // Verbose-only: Server.log already runs to ~350 MB, and a blacklisted
+                // common drop would add a line to it on every second kill.
+                if (WowPsParty::IsLogVerbose())
+                    LOG_INFO("module",
+                        "[WowPsParty Loot] blacklisted {} (entry {}) x{} left behind on corpse {} "
+                        "for account {}",
+                        skippedName, skippedId, skippedCount, corpse, account);
+                WowPsParty::MarkPartyTookLootItem(*loot, li, *tmpl);
+                continue;
+            }
+
             // Spread loot evenly: for each item prefer the hero with the most
             // free bag space. When bags are equally full this naturally
             // round-robins (each pickup drops that hero's free count by one, so
@@ -1576,30 +1669,7 @@ public:
                                                     li.randomPropertyId);
                 if (newItem)
                 {
-                    li.is_looted = true;
-                    // Keep the core's own tally straight. This pass stores directly
-                    // rather than through Player::StoreLootItem, and an unlootedCount
-                    // that never comes down leaves Loot::isLooted() permanently false
-                    // — so a body we only PARTLY emptied (a raid drop left for the
-                    // roll) keeps its sparkle forever, because the teardown at the end
-                    // of the roll (Group::CountTheRoll) is gated on isLooted().
-                    //
-                    // Only ever for an item the FILL actually counted. A
-                    // condition-gated drop is counted LAZILY, the moment somebody
-                    // opens the loot window (Loot::FillNonQuestNonFFAConditionalLoot
-                    // sets is_counted) — and this pass exists precisely so that
-                    // nobody ever does. Decrementing for one of those spends the
-                    // count belonging to a drop still ON the body: unlootedCount
-                    // reaches 0 while a raid epic is mid-roll, isLooted() starts
-                    // saying the corpse is empty, and the next loot release runs
-                    // Loot::clear() straight through the unwon item. The predicate is
-                    // the core's own (LootMgr.cpp::FillLoot, LootItemStorage.cpp).
-                    bool const wasCounted =
-                        li.is_counted ||
-                        (!li.needs_quest && li.conditions.empty() &&
-                         !tmpl->HasFlag(ITEM_FLAG_MULTI_DROP));
-                    if (wasCounted && loot->unlootedCount)
-                        --loot->unlootedCount;
+                    WowPsParty::MarkPartyTookLootItem(*loot, li, *tmpl);
                     // A KEY (e.g. the ZF Executioner's Key) that lands on one hero
                     // leaves the human unable to open the gate — give the whole
                     // party a copy. No-op for normal loot.
@@ -2312,6 +2382,13 @@ Player* WowPsParty_PickLootReceiver(Player* looter, uint32 itemid, uint32 count)
         return looter;                                   // solo: own bag, vanilla
     if (WowPsParty::IsHenchman(looter->GetGUID()))
         return looter;                                   // henchman loot stays its own
+
+    // A blacklisted item the player hand-looted anyway stays with whoever took it.
+    // The list says "no companion of mine picks this up", and spreading it into a
+    // hero's bags is exactly that — while an explicit click is not something to
+    // second-guess, so it is kept rather than refused.
+    if (WowPsParty::LootBlacklisted(looter->GetSession()->GetAccountId(), itemid))
+        return looter;
 
     // In a raid the group's loot rules decide where a drop goes, so anything at
     // or above its threshold stays with whoever the raid gave it to. Otherwise
