@@ -125,6 +125,17 @@ namespace WowPsParty
     // predicate. (Definition carries the full rationale.)
     void MarkPartyTookLootItem(Loot& loot, LootItem& li, ItemTemplate const& tmpl);
 
+    // The greyed "[Loot] discarded [X] — blacklisted" line. A declined drop is
+    // DESTROYED, so a silent skip is indistinguishable from the item never having
+    // dropped, and this line is the only record it ever did. Defined in
+    // PartyHooks.cpp next to its sibling announcements and shared with the
+    // henchman's own corpse loot (PartyFollow.cpp) — that path is the ONLY one that
+    // runs for a henchman-landed kill, since OnPlayerCreatureKill bails on the
+    // `rndbot` account, so leaving it out there hides the feature on most of the
+    // party's kills. Throttles itself to once a minute per (account, entry).
+    void AnnounceBlacklistedDropSkipped(Player* human, ItemTemplate const& tmpl,
+                                        LootItem const& li);
+
     // Load one party member's persisted `party_loadout` row (rotation + every
     // behaviour toggle) into the runtime caches. Combat reads ONLY those caches,
     // so every path that brings a saved member into an active party — login

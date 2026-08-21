@@ -818,6 +818,59 @@ namespace WowPsParty
             it = g_mirroredDances.erase(it);
         }
     }
+
+    // Tell the player about a drop the party refused because they blacklisted it.
+    // Nothing else on the corpse would show it: the body is emptied at the kill, so
+    // a silent skip is indistinguishable from the item never having dropped — and a
+    // blacklist you can't see working is one you stop trusting. Greyed, because it
+    // is an item the player has already said they don't want.
+    //
+    // Says DISCARDED, never "left behind". The two sibling announcements below
+    // (AnnounceQuestDropLeftOnCorpse, AnnounceRaidLootLeftOnCorpse: "left on the
+    // corpse for you", "left on the body, loot it to take it") mean exactly that —
+    // the item is still there to walk back for. A declined blacklist drop is
+    // destroyed (MarkPartyTookLootItem), so borrowing their verb sends the player to
+    // an empty body for an item that no longer exists. It is the one line that has to
+    // be unambiguous, because it is the only record the item ever dropped.
+    //
+    // Lives HERE rather than beside those siblings, which are file-local in the
+    // anonymous namespace below: both loot paths destroy blacklisted drops and so
+    // both owe the player this line, and PartyFollow.cpp's henchman corpse loot is
+    // the ONLY path that runs for a henchman-landed kill (OnPlayerCreatureKill bails
+    // on the `rndbot` account). Internal linkage would have left the feature silent
+    // on most of the party's kills. Declared in PartyMgr.h.
+    //
+    // Once a minute per item, because a blacklist earns its keep on exactly the
+    // things that drop off every second mob — unthrottled, the line confirming the
+    // feature works IS the spam the feature was added to stop. The throttle is shared
+    // by both callers precisely because it is one static here.
+    constexpr uint32 BLACKLIST_ANNOUNCE_INTERVAL_MS = 60 * IN_MILLISECONDS;
+
+    void AnnounceBlacklistedDropSkipped(Player* human, ItemTemplate const& tmpl, LootItem const& li)
+    {
+        if (!human || !human->GetSession()) return;
+
+        static std::unordered_map<uint64, uint32> lastAnnounced;   // (account<<32|entry) -> ms
+        static std::mutex announceMutex;
+        uint64 const key = (uint64(human->GetSession()->GetAccountId()) << 32) | li.itemid;
+        uint32 const now = getMSTime();
+        {
+            std::lock_guard<std::mutex> lock(announceMutex);
+            auto it = lastAnnounced.find(key);
+            if (it != lastAnnounced.end() &&
+                getMSTimeDiff(it->second, now) < BLACKLIST_ANNOUNCE_INTERVAL_MS)
+                return;
+            lastAnnounced[key] = now;
+        }
+
+        uint32 const itemId = li.itemid;
+        std::string const itemName = tmpl.Name1;
+        std::string const msg = Acore::StringFormat(
+            "|cff888888[Loot] discarded |Hitem:{}::::::::1::::|h[{}]|h — blacklisted, "
+            "so it was not left on the body.|r",
+            itemId, itemName);
+        ChatHandler(human->GetSession()).SendSysMessage(msg);
+    }
 }
 
 namespace
@@ -967,50 +1020,12 @@ namespace
         ChatHandler(human->GetSession()).SendSysMessage(msg);
     }
 
-    // Tell the player about a drop the party refused because they blacklisted it.
-    // Nothing else on the corpse would show it: the body is emptied at the kill, so
-    // a silent skip is indistinguishable from the item never having dropped — and a
-    // blacklist you can't see working is one you stop trusting. Greyed, because it
-    // is an item the player has already said they don't want.
-    //
-    // Says DISCARDED, never "left behind". The two sibling announcements either side
-    // of this one ("left on the corpse for you", "left on the body, loot it to take
-    // it") mean exactly that — the item is still there to walk back for. A declined
-    // blacklist drop is destroyed (MarkPartyTookLootItem), so borrowing their verb
-    // sends the player to an empty body for an item that no longer exists. It is the
-    // one line that has to be unambiguous, because it is the only record the item
-    // ever dropped.
-    //
-    // Once a minute per item, because a blacklist earns its keep on exactly the
-    // things that drop off every second mob — unthrottled, the line confirming the
-    // feature works IS the spam the feature was added to stop.
-    constexpr uint32 BLACKLIST_ANNOUNCE_INTERVAL_MS = 60 * IN_MILLISECONDS;
-
-    void AnnounceBlacklistedDropSkipped(Player* human, ItemTemplate const& tmpl, LootItem const& li)
-    {
-        if (!human || !human->GetSession()) return;
-
-        static std::unordered_map<uint64, uint32> lastAnnounced;   // (account<<32|entry) -> ms
-        static std::mutex announceMutex;
-        uint64 const key = (uint64(human->GetSession()->GetAccountId()) << 32) | li.itemid;
-        uint32 const now = getMSTime();
-        {
-            std::lock_guard<std::mutex> lock(announceMutex);
-            auto it = lastAnnounced.find(key);
-            if (it != lastAnnounced.end() &&
-                getMSTimeDiff(it->second, now) < BLACKLIST_ANNOUNCE_INTERVAL_MS)
-                return;
-            lastAnnounced[key] = now;
-        }
-
-        uint32 const itemId = li.itemid;
-        std::string const itemName = tmpl.Name1;
-        std::string const msg = Acore::StringFormat(
-            "|cff888888[Loot] discarded |Hitem:{}::::::::1::::|h[{}]|h — blacklisted, "
-            "so it was not left on the body.|r",
-            itemId, itemName);
-        ChatHandler(human->GetSession()).SendSysMessage(msg);
-    }
+    // The third sibling — the greyed "[Loot] discarded [X] — blacklisted" line — is
+    // deliberately NOT here: it lives in `namespace WowPsParty` above, because the
+    // henchman's own corpse loot (PartyFollow.cpp) destroys blacklisted drops too and
+    // has to say so with the same words. A function in this anonymous namespace has
+    // internal linkage and cannot be shared across translation units. Read it next to
+    // MarkPartyTookLootItem — the retire and the line that reports it belong together.
 
     // Master-loot priority: a living human standing close enough to still take
     // ordinary loot off the corpse. Unlike quest loot this is forfeited once they
@@ -1634,7 +1649,7 @@ public:
             // skinner (NearbyOrdinaryLootOwner) and leaves a sparkle on every kill.
             if (WowPsParty::LootBlacklisted(account, li.itemid))
             {
-                AnnounceBlacklistedDropSkipped(human, *tmpl, li);
+                WowPsParty::AnnounceBlacklistedDropSkipped(human, *tmpl, li);
                 // Named lvalues: Acore::StringFormat forwards through
                 // fmt::make_format_args, which binds non-const references only.
                 std::string const skippedName = tmpl->Name1;

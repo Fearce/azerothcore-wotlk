@@ -5323,6 +5323,41 @@ namespace WowPsParty
         }
     }
 
+    // Did the FILL actually count this drop in `unlootedCount`? Loot::AddItem skips
+    // its ++unlootedCount whenever NO group member was AllowedForPlayer at fill time
+    // (LootMgr.cpp) — an unusable recipe (ITEM_FLAG_HIDE_UNUSABLE_RECIPE, or a BoP
+    // recipe every member already knows), a faction-restricted drop, a quest starter
+    // already handed in. MarkPartyTookLootItem's predicate cannot see any of that.
+    //
+    // Only the blacklist decline needs this, and only here: every other way this file
+    // retires a slot goes through Player::StoreLootItem, which bails at the very same
+    // AllowedForPlayer check BEFORE its own --unlootedCount. So the blind decrement is
+    // new to the decline branch rather than a pre-existing sin, and spending a count
+    // the fill never made is not cosmetic — unlootedCount reaches 0 while a green is
+    // still mid-roll (is_blocked, skipped by the take loop below) or a quest drop sits
+    // in quest_items[], Loot::isLooted() turns true, and LootCorpseForHenchman's
+    // closing DoLootRelease runs Loot::clear() straight through it: the roll dies and
+    // the item is gone with no message. Recipes are exactly what the blacklist exists
+    // for, so the two collide on the feature's own main path.
+    //
+    // Why not PartyHooks' RestoreUnlootedFloor, which guards the kill pass against the
+    // same over-spend: that pass empties the body outright, so anything still not
+    // looted really is owed. HERE an un-counted drop the henchman is not allowed to
+    // take stays behind on ordinary corpses too, and raising the count to cover it
+    // would leave the body sparkling and unskinnable for good — the exact bug the
+    // retire was added to fix.
+    static bool FillCountedThisDrop(Player* hench, Loot const& loot, LootItem const& li)
+    {
+        if (li.is_counted) return true;      // conditional drop, counted lazily on open
+        Group* grp = hench->GetGroup();
+        if (!grp) return false;
+        for (GroupReference* itr = grp->GetFirstMember(); itr; itr = itr->next())
+            if (Player* m = itr->GetSource())
+                if (li.AllowedForPlayer(m, loot.sourceWorldObjectGUID))
+                    return true;
+        return false;
+    }
+
     // Loot a reached corpse via the engine, like a player right-click + auto-loot:
     // open it, let the built-in money handler split the gold across the party,
     // then store each item slot under the group's loot rules, then release.
@@ -5372,8 +5407,28 @@ namespace WowPsParty
                 // MarkPartyTookLootItem.
                 if (leaderAccount && LootBlacklisted(leaderAccount, li.itemid))
                 {
-                    if (ItemTemplate const* bl = sObjectMgr->GetItemTemplate(li.itemid))
+                    ItemTemplate const* bl = sObjectMgr->GetItemTemplate(li.itemid);
+                    // Retire either way; only SPEND a count the fill actually made
+                    // (FillCountedThisDrop — over-spending it clears the corpse out
+                    // from under a green that is still mid-roll).
+                    if (bl && FillCountedThisDrop(hench, c->loot, li))
                         MarkPartyTookLootItem(c->loot, li, *bl);
+                    else
+                        li.is_looted = true;
+                    // Tell the human, exactly as the kill pass does. This path is the
+                    // ONLY one that runs for a henchman-landed kill — the killer is on
+                    // an `rndbot` account, so OnPlayerCreatureKill's GetParty is empty
+                    // and it returns before its own announce — so without this the
+                    // blacklist is invisible on most of the party's kills, and a
+                    // blacklist you can't see working is one that gets blamed for a
+                    // drop that simply never dropped. Throttled once a minute per item.
+                    if (bl)
+                    {
+                        ObjectGuid const lg = GetLeaderFor(hench->GetGUID());
+                        if (Player* human =
+                                lg ? ObjectAccessor::FindConnectedPlayer(lg) : nullptr)
+                            AnnounceBlacklistedDropSkipped(human, *bl, li);
+                    }
                     continue;
                 }
                 // Capture before looting — StoreLootItem flips li.is_looted.
