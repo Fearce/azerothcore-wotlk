@@ -970,6 +970,14 @@ namespace
     // blacklist you can't see working is one you stop trusting. Greyed, because it
     // is an item the player has already said they don't want.
     //
+    // Says DISCARDED, never "left behind". The two sibling announcements either side
+    // of this one ("left on the corpse for you", "left on the body, loot it to take
+    // it") mean exactly that — the item is still there to walk back for. A declined
+    // blacklist drop is destroyed (MarkPartyTookLootItem), so borrowing their verb
+    // sends the player to an empty body for an item that no longer exists. It is the
+    // one line that has to be unambiguous, because it is the only record the item
+    // ever dropped.
+    //
     // Once a minute per item, because a blacklist earns its keep on exactly the
     // things that drop off every second mob — unthrottled, the line confirming the
     // feature works IS the spam the feature was added to stop.
@@ -995,7 +1003,8 @@ namespace
         uint32 const itemId = li.itemid;
         std::string const itemName = tmpl.Name1;
         std::string const msg = Acore::StringFormat(
-            "|cff888888[Loot] left |Hitem:{}::::::::1::::|h[{}]|h behind — blacklisted.|r",
+            "|cff888888[Loot] discarded |Hitem:{}::::::::1::::|h[{}]|h — blacklisted, "
+            "so it was not left on the body.|r",
             itemId, itemName);
         ChatHandler(human->GetSession()).SendSysMessage(msg);
     }
@@ -1633,7 +1642,7 @@ public:
                 // common drop would add a line to it on every second kill.
                 if (WowPsParty::IsLogVerbose())
                     LOG_INFO("module",
-                        "[WowPsParty Loot] blacklisted {} (entry {}) x{} left behind on corpse {} "
+                        "[WowPsParty Loot] blacklisted {} (entry {}) x{} discarded from corpse {} "
                         "for account {}",
                         skippedName, skippedId, skippedCount, corpse, account);
                 WowPsParty::MarkPartyTookLootItem(*loot, li, *tmpl);
