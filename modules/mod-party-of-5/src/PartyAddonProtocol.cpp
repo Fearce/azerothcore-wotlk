@@ -3675,20 +3675,33 @@ static void HandleMill(Player* requester, std::string_view payload)
 // ---------------------------------------------------------------------------
 // Recipes — taught to the party member who can LEARN them
 // ---------------------------------------------------------------------------
-// The craft a recipe teaches, in the two shapes 3.3.5a data uses. 2034 of the 3066
+// Every craft a recipe teaches, in the two shapes 3.3.5a data uses. 2034 of the 3066
 // class-9 rows carry it behind ITEM_SPELLTRIGGER_LEARN_SPELL_ID with the generic
 // "Learning" (483) on use — a pairing ObjectMgr::LoadItemTemplates rejects the item
-// over, so it is safe to rely on. Another 103 (Expert Cookbook, Book of Glyph
-// Mastery, the fishing books) instead put an ordinary SPELL_EFFECT_LEARN_SPELL on
-// the ON_USE slot; those are exactly the "manual" the Learn button advertises, and
-// reading only the first shape dropped them silently. 0 = not a recipe.
-static uint32 RecipeTaughtSpell(ItemTemplate const* tmpl)
+// over, so it is safe to rely on. Exactly 10 more (Expert Cookbook, Master Cookbook,
+// the four fishing books, the three first-aid manuals, Manual: The Path of Defense)
+// instead put an ordinary SPELL_EFFECT_LEARN_SPELL on the ON_USE slot; reading only
+// the first shape dropped every one of them silently. Empty = not a recipe we teach.
+//
+// The remaining 119 class-9 ON_USE rows — warlock Grimoires, Book of Glyph Mastery —
+// teach nothing this way (their on-use spell is a pet dummy / a random discovery), so
+// they resolve empty and fall through to the ordinary cast path, unchanged.
+//
+// Returns a VECTOR, not one spell: Spell::EffectLearnSpell runs once per effect index,
+// and item 6619 "Manual: The Path of Defense" carries three (Defensive Stance 71,
+// Sunder Armor 7386, Taunt 355). Returning the first taught one ability and then
+// destroyed the manual, losing the other two with no way to get them back.
+static std::vector<uint32> RecipeTaughtSpells(ItemTemplate const* tmpl)
 {
+    std::vector<uint32> taught;
     if (!tmpl || tmpl->Class != ITEM_CLASS_RECIPE)
-        return 0;
+        return taught;
     for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
         if (tmpl->Spells[i].SpellTrigger == ITEM_SPELLTRIGGER_LEARN_SPELL_ID && tmpl->Spells[i].SpellId > 0)
-            return uint32(tmpl->Spells[i].SpellId);
+        {
+            taught.push_back(uint32(tmpl->Spells[i].SpellId));
+            return taught;   // LoadItemTemplates allows this trigger on slot 1 only
+        }
     for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
     {
         if (tmpl->Spells[i].SpellTrigger != ITEM_SPELLTRIGGER_ON_USE || tmpl->Spells[i].SpellId <= 0)
@@ -3698,9 +3711,9 @@ static uint32 RecipeTaughtSpell(ItemTemplate const* tmpl)
             continue;
         for (uint8 e = 0; e < MAX_SPELL_EFFECTS; ++e)
             if (si->Effects[e].Effect == SPELL_EFFECT_LEARN_SPELL && si->Effects[e].TriggerSpell)
-                return si->Effects[e].TriggerSpell;
+                taught.push_back(si->Effects[e].TriggerSpell);
     }
-    return 0;
+    return taught;
 }
 
 // Whether one member can be taught one recipe, and if not, why. Order matters: the
@@ -3721,9 +3734,15 @@ enum class RecipeFit : uint8
     Ineligible,
 };
 
-static RecipeFit RateRecipeFit(Player* p, ItemTemplate const* tmpl, uint32 taughtSpell)
+// `taught` is every spell the item confers. ALREADY KNOWN means the member knows them
+// ALL — a multi-spell manual whose holder trained one of its abilities separately still
+// has something to give, and calling that "already known" would advise selling it.
+static RecipeFit RateRecipeFit(Player* p, ItemTemplate const* tmpl, std::vector<uint32> const& taught)
 {
-    if (p->HasSpell(taughtSpell))
+    bool knowsAll = true;
+    for (uint32 spell : taught)
+        if (!p->HasSpell(spell)) { knowsAll = false; break; }
+    if (knowsAll)
         return RecipeFit::AlreadyKnown;
     if (tmpl->HasFlag2(ITEM_FLAG2_FACTION_HORDE) && p->GetTeamId(true) != TEAM_HORDE)
         return RecipeFit::Ineligible;
@@ -3746,12 +3765,23 @@ static RecipeFit RateRecipeFit(Player* p, ItemTemplate const* tmpl, uint32 taugh
     return RecipeFit::Learnable;
 }
 
-// The account's party slots resolved to live players, indexed by slot. Every
+// The account's party slots resolved to live players, indexed BY SLOT (holes stay
+// null — HandleLearnRecipe indexes this with the client's srcPartySlot). Every
 // `GuidForAccountSlot` is a blocking SELECT on the world thread, and the Learn drain
 // fires twelve LEARNs a second — resolving per candidate turned one button press
-// into hundreds of queries. The FindPlayer fallback mirrors SendInventoryTo: the
-// connected-only lookup misses a member the grid is still showing (after an LFG
-// dungeon), and a silent miss there is a recipe that never gets an answer.
+// into hundreds of queries.
+//
+// A member whose storage is mid-teardown is dropped here rather than at the call
+// site: this vector is both the OWNER lookup and the pool ChooseRecipeLearner reads
+// value arrays off (GetTeamId/getClassMask/GetLevel/HasSpell/GetSkillValue) and then
+// hands `learnSpell`. That is exactly the read `MemberStorageUnstable` exists to
+// forbid — see its comment and the twenty sibling handlers that filter the same way.
+// Filtering here makes a torn-down owner surface as the RECIPE_UNAVAILABLE the
+// handler already sends, and makes such a member ineligible to be the learner.
+//
+// FindConnectedPlayer alone: ObjectAccessor::FindPlayer is that same lookup plus an
+// IsInWorld() filter, so it is a strict subset and can never rescue a null — and
+// MemberStorageUnstable requires IsInWorld() anyway.
 static std::vector<Player*> ResolvePartySlots(uint32 account)
 {
     std::vector<Player*> members(WowPsParty::PARTY_SIZE, nullptr);
@@ -3759,10 +3789,9 @@ static std::vector<Player*> ResolvePartySlots(uint32 account)
     {
         uint32 const g = WowPsParty::GuidForAccountSlot(account, slot);
         if (!g) continue;
-        ObjectGuid const og = ObjectGuid::Create<HighGuid::Player>(g);
-        Player* p = ObjectAccessor::FindConnectedPlayer(og);
-        if (!p) p = ObjectAccessor::FindPlayer(og);
-        members[slot] = p;
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(g));
+        if (!WowPsParty::MemberStorageUnstable(p))
+            members[slot] = p;
     }
     return members;
 }
@@ -3779,7 +3808,7 @@ struct RecipeVerdict
 };
 
 static RecipeVerdict ChooseRecipeLearner(Player* requester, std::vector<Player*> const& members,
-                                         ItemTemplate const* tmpl, uint32 taughtSpell)
+                                         ItemTemplate const* tmpl, std::vector<uint32> const& taught)
 {
     RecipeVerdict best;
     bool haveReason = false;
@@ -3787,7 +3816,7 @@ static RecipeVerdict ChooseRecipeLearner(Player* requester, std::vector<Player*>
     auto consider = [&](Player* p)
     {
         if (!p || best.learner) return;
-        RecipeFit const fit = RateRecipeFit(p, tmpl, taughtSpell);
+        RecipeFit const fit = RateRecipeFit(p, tmpl, taught);
         if (fit == RecipeFit::Learnable) { best.learner = p; return; }
         uint16 const skill = tmpl->RequiredSkill ? p->GetSkillValue(tmpl->RequiredSkill) : 0;
         // Lower enum value = more actionable, so it wins. Between two members stuck on
@@ -3837,9 +3866,11 @@ static char const* SkillLineName(uint32 skillId)
 // bot, and the cross-character move has its own failure mode (full bags) that
 // would strand the recipe halfway through an action the player asked for once —
 // the same reason HandleDisenchant rolls its loot table by hand. `quiet` is the
-// bulk path: the per-item chat is suppressed and only the machine-readable
-// LEARN_RESULT goes back, because the client is tallying. `gen` is the client's run
-// id, echoed into every reply so a straggler can't be counted into the next run.
+// bulk path: every REFUSAL is suppressed to its machine-readable LEARN_RESULT and the
+// client tallies them into one summary line, so a bag of 40 costs one line instead of
+// 40. A LEARNED line is still printed — the summary only counts ("Learned 3 recipes"),
+// and which craft went to which member is the part worth naming. `gen` is the client's
+// run id, echoed into every reply so a straggler can't be counted into the next run.
 static void TeachRecipeFromParty(Player* requester, Player* owner, Item* item, bool quiet,
                                  uint32 gen, std::vector<Player*> const& members)
 {
@@ -3862,15 +3893,15 @@ static void TeachRecipeFromParty(Player* requester, Player* owner, Item* item, b
         return;
     }
 
-    uint32 const taughtSpell = RecipeTaughtSpell(tmpl);
-    if (!taughtSpell)
+    std::vector<uint32> const taught = RecipeTaughtSpells(tmpl);
+    if (taught.empty())
     {
         report(RECIPE_NOT_A_RECIPE, Acore::StringFormat(
             "|cffff5555[WowPsParty]|r |cffffffff{}|r doesn't teach anything.", tmpl->Name1));
         return;
     }
 
-    RecipeVerdict const v = ChooseRecipeLearner(requester, members, tmpl, taughtSpell);
+    RecipeVerdict const v = ChooseRecipeLearner(requester, members, tmpl, taught);
     if (!v.learner)
     {
         switch (v.reason)
@@ -3907,7 +3938,19 @@ static void TeachRecipeFromParty(Player* requester, Player* owner, Item* item, b
     // after, and treat a vanished item as "already spent" rather than guessing.
     ObjectGuid const itemGuid = item->GetGUID();
 
-    v.learner->learnSpell(taughtSpell);
+    // Every spell the item confers, not just the first: the engine's own
+    // Spell::EffectLearnSpell runs once per effect index, and the item is consumed
+    // below either way. Skip the ones this member already trained separately —
+    // learnSpell no-ops on those, and re-sending them is pointless packet traffic.
+    std::string taughtList;
+    for (uint32 spell : taught)
+    {
+        if (v.learner->HasSpell(spell))
+            continue;
+        v.learner->learnSpell(spell);
+        if (!taughtList.empty()) taughtList += ",";
+        taughtList += std::to_string(spell);
+    }
 
     Item* spent = SafeGetItemByGuid(owner, itemGuid);
     if (spent)
@@ -3925,7 +3968,7 @@ static void TeachRecipeFromParty(Player* requester, Player* owner, Item* item, b
         "|cff66ccff[WowPsParty]|r {} learned |cffffffff{}|r.", learnerName, itemName));
     LOG_INFO("module",
         "[WowPsParty Learn] requester={} owner={} learner={} recipe='{}'(entry={}) spell={}",
-        requester->GetName(), owner->GetName(), learnerName, itemName, itemEntry, taughtSpell);
+        requester->GetName(), owner->GetName(), learnerName, itemName, itemEntry, taughtList);
 
     // The bulk drain re-requests the grid once at the end of the run; pushing a full
     // inventory per recipe would send forty of them for one button press.
@@ -3940,10 +3983,12 @@ static void TeachRecipeFromParty(Player* requester, Player* owner, Item* item, b
 // the shared bags to whoever can learn it. Reached two ways: right-clicking a recipe
 // in the grid (bare, gen 0) and the Learn button's bulk drain (quiet=1 + its run id).
 //
-// Every exit here must still answer with a LEARN_RESULT. A silent return leaves the
-// drain's outstanding count one too high, so the run burns its whole grace period and
-// then omits the item from the summary entirely — the shape that makes a bulk action
-// look like it half-worked.
+// Every exit that KNOWS the run id must still answer with a LEARN_RESULT. A silent
+// return leaves the drain's outstanding count one too high, so the run burns its whole
+// grace period and then omits the item from the summary entirely — the shape that makes
+// a bulk action look like it half-worked. The one exit that cannot answer is a payload
+// too short to carry a `gen`: a reply stamped with the wrong run id is worse than none,
+// since the client would decrement a run this item was never part of.
 static void HandleLearnRecipe(Player* requester, std::string_view payload)
 {
     if (!requester || !requester->GetSession()) return;
@@ -3964,17 +4009,18 @@ static void HandleLearnRecipe(Player* requester, std::string_view payload)
     uint32 const srcItemGuidLow = toUint(field[1]);
     bool const   quiet          = field.size() > 2 && field[2] == "1";
     uint32 const gen            = field.size() > 3 ? toUint(field[3]) : 0;
-    if (!srcItemGuidLow) return;
 
     uint32 const account = requester->GetSession()->GetAccountId();
     std::vector<Player*> const members = ResolvePartySlots(account);
 
     Player* owner = srcSlot < members.size() ? members[srcSlot] : nullptr;
-    Item*   item  = owner ? SafeGetItemByGuid(owner, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow))
-                          : nullptr;
+    Item*   item  = (owner && srcItemGuidLow)
+                  ? SafeGetItemByGuid(owner, ObjectGuid::Create<HighGuid::Item>(srcItemGuidLow))
+                  : nullptr;
     // Mid-logout the inventory is tearing down; mutating it there is what the four
     // sibling handlers guard against, and the drain aims twelve of these a second at
-    // up to five different owners.
+    // up to five different owners. ResolvePartySlots already dropped such a member to
+    // null, so this re-check is belt-and-braces rather than the only guard.
     if (!owner || !item || WowPsParty::MemberStorageUnstable(owner))
     {
         SendWPSP(requester, Acore::StringFormat("LEARN_RESULT\t{}\t{}\t?", uint32(RECIPE_UNAVAILABLE), gen));
@@ -6063,7 +6109,9 @@ static void UseOwnedItemInstance(Player* requester, Player* srcChar, Item* srcIt
     // Spell::CheckItems nor CheckCast gates a player-target LEARN_SPELL — so
     // Player::CastItemUseSpell's special learning branch taught the craft to the HUMAN
     // and destroyed the recipe, or, if they already knew it, destroyed it for nothing.
-    if (RecipeTaughtSpell(t))
+    // A class-9 row that teaches NOTHING (warlock Grimoires, Book of Glyph Mastery)
+    // resolves empty and falls through to the ordinary cast path below, unchanged.
+    if (!RecipeTaughtSpells(t).empty())
     {
         TeachRecipeFromParty(requester, srcChar, srcItem, /*quiet=*/false, /*gen=*/0,
                              ResolvePartySlots(requester->GetSession()->GetAccountId()));
