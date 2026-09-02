@@ -4282,7 +4282,11 @@ bool PlayerbotAI::CastVehicleSpell(uint32 spellId, Unit* target)
         targets.SetElevation(elev);
     }
 
-    if (spellInfo->Targets & TARGET_FLAG_SOURCE_LOCATION)
+    if (spellInfo->Targets & TARGET_FLAG_DEST_LOCATION)
+    {
+        targets.SetSrc(vehicleBase->GetPositionX(), vehicleBase->GetPositionY(), vehicleBase->GetPositionZ());
+    }
+    else if (spellInfo->Targets & TARGET_FLAG_SOURCE_LOCATION)
     {
         targets.SetSrc(vehicleBase->GetPositionX(), vehicleBase->GetPositionY(), vehicleBase->GetPositionZ());
     }
@@ -4348,6 +4352,9 @@ bool PlayerbotAI::CastVehicleSpell(uint32 spellId, float x, float y, float z)
     if (!spellInfo)
         return false;
 
+    if ((spellInfo->Targets & TARGET_FLAG_DEST_LOCATION) == 0)
+        return false;
+
     if (ServerFacade::instance().GetDistance2d(vehicleBase, x, y) > 120.0f)
         return false;
 
@@ -4365,8 +4372,7 @@ bool PlayerbotAI::CastVehicleSpell(uint32 spellId, float x, float y, float z)
     float elev = dist >= 110.0f ? 1.0f : pow(((dist + 10.0f) / 120.0f), 2.0f);
     targets.SetElevation(elev);
 
-    if (spellInfo->Targets & TARGET_FLAG_SOURCE_LOCATION)
-        targets.SetSrc(vehicleBase->GetPositionX(), vehicleBase->GetPositionY(), vehicleBase->GetPositionZ());
+    targets.SetSrc(vehicleBase->GetPositionX(), vehicleBase->GetPositionY(), vehicleBase->GetPositionZ());
 
     SpellCastResult result = spell->prepare(&targets);
     if (result != SPELL_CAST_OK)
