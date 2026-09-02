@@ -5,11 +5,13 @@
 #include <FollowMasterStrategy.h>
 
 #include <cmath>
+#include <limits>
 
 #include "AiObjectContext.h"
 #include "DBCEnums.h"
 #include "GameObject.h"
 #include "Group.h"
+#include "InstanceScript.h"
 #include "LastMovementValue.h"
 #include "ObjectGuid.h"
 #include "PlayerbotAI.h"
@@ -64,9 +66,23 @@ constexpr FlameLeviathanTowerInfo flameLeviathanTowers[] = {
     { EVENT_TOWER_OF_FLAMES_DESTROYED, GO_TOWER_OF_FLAMES },
 };
 
+bool FlameLeviathanFightIsLive(Player* bot)
+{
+    if (!bot)
+        return false;
+
+    if (Creature* flameLeviathan = bot->FindNearestCreature(NPC_LEVIATHAN, 500.0f, true))
+        return flameLeviathan->IsInCombat();
+
+    return false;
+}
+
 GameObject* FindNearestIntactFlameLeviathanTower(Player* bot)
 {
     if (!bot)
+        return nullptr;
+
+    if (FlameLeviathanFightIsLive(bot))
         return nullptr;
 
     GameObject* nearestTower = nullptr;

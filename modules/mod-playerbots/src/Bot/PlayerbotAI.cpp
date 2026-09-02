@@ -4292,7 +4292,9 @@ bool PlayerbotAI::CastVehicleSpell(uint32 spellId, Unit* target)
         targets.SetUnitTarget(spellTarget);
     }
 
-    spell->prepare(&targets);
+    SpellCastResult result = spell->prepare(&targets);
+    if (result != SPELL_CAST_OK)
+        return false;
 
     if (seat->CanControl() && vehicleBase->isMoving() && spell->GetCastTime())
     {
@@ -4366,7 +4368,9 @@ bool PlayerbotAI::CastVehicleSpell(uint32 spellId, float x, float y, float z)
     if (spellInfo->Targets & TARGET_FLAG_SOURCE_LOCATION)
         targets.SetSrc(vehicleBase->GetPositionX(), vehicleBase->GetPositionY(), vehicleBase->GetPositionZ());
 
-    spell->prepare(&targets);
+    SpellCastResult result = spell->prepare(&targets);
+    if (result != SPELL_CAST_OK)
+        return false;
 
     if (seat->CanControl() && vehicleBase->isMoving() && spell->GetCastTime())
     {

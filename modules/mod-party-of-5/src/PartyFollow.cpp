@@ -60,6 +60,7 @@
 #include "GameEventMgr.h"   // IsHolidayActive — Midsummer ribbon-pole dance gate
 #include "DBCStores.h"
 #include "GameObject.h"
+#include "InstanceScript.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
 #include "LootMgr.h"
@@ -6493,6 +6494,14 @@ namespace WowPsParty
     static constexpr uint32 FL_NPC_BOSS_SEAT       = 33114;   // rides the boss; holds a turret
     static constexpr uint32 FL_NPC_DEFENSE_TURRET  = 33142;
     static constexpr uint32 FL_NPC_PYRITE_CRATE    = 33218;
+    static constexpr uint32 FL_GO_TOWER_OF_FROST   = 194370;
+    static constexpr uint32 FL_GO_TOWER_OF_FLAMES  = 194371;
+    static constexpr uint32 FL_GO_TOWER_OF_LIFE    = 194375;
+    static constexpr uint32 FL_GO_TOWER_OF_STORMS  = 194377;
+    static constexpr uint32 FL_EVENT_TOWER_OF_LIFE_DESTROYED   = 21030;
+    static constexpr uint32 FL_EVENT_TOWER_OF_STORM_DESTROYED  = 21031;
+    static constexpr uint32 FL_EVENT_TOWER_OF_FROST_DESTROYED  = 21032;
+    static constexpr uint32 FL_EVENT_TOWER_OF_FLAMES_DESTROYED = 21033;
 
     static constexpr uint32 FL_SPELL_ELECTROSHOCK  = 62522;   // frontal cone, interrupts Flame Vents
     static constexpr uint32 FL_SPELL_SIEGE_RAM     = 62345;
@@ -6541,6 +6550,7 @@ namespace WowPsParty
     static constexpr float FL_SHOCK_RANGE    = 24.0f;    // Electroshock's cone is 25y
     static constexpr float FL_HORN_RANGE     = 30.0f;    // Sonic Horn's cone is 35y
     static constexpr float FL_THRUST_RANGE   = 32.0f;    // pursued and this close -> Steam Rush out
+    static constexpr float FL_TOWER_SEARCH   = 200.0f;   // local tower objective while driving in
     // Kiting has to stay INSIDE our own weapon range or a pursued hull spends the whole
     // 31-second pursue contributing nothing: Hurl Pyrite and Fire Cannon both stop at 70
     // yards. Battering Ram is only cast when the boss is within 15 of its victim and
@@ -6630,6 +6640,20 @@ namespace WowPsParty
         FL_JOB_SIEGE_DRIVER,   FL_JOB_DEMO_DRIVER, FL_JOB_SIEGE_DRIVER, FL_JOB_DEMO_DRIVER,
         FL_JOB_DEMO_MECHANIC,  FL_JOB_CHOPPER_DRIVER, FL_JOB_SIEGE_GUNNER,
         FL_JOB_CHOPPER_DRIVER, FL_JOB_SIEGE_GUNNER, FL_JOB_DEMO_MECHANIC,
+    };
+
+    struct FlTowerObjective
+    {
+        uint32 eventId;
+        uint32 gameObjectEntry;
+    };
+
+    static FlTowerObjective const FL_TOWERS[] =
+    {
+        {FL_EVENT_TOWER_OF_LIFE_DESTROYED,   FL_GO_TOWER_OF_LIFE},
+        {FL_EVENT_TOWER_OF_STORM_DESTROYED,  FL_GO_TOWER_OF_STORMS},
+        {FL_EVENT_TOWER_OF_FROST_DESTROYED,  FL_GO_TOWER_OF_FROST},
+        {FL_EVENT_TOWER_OF_FLAMES_DESTROYED, FL_GO_TOWER_OF_FLAMES},
     };
 
     // Vehicle-keyed, and the hulls are temp summons that get a fresh guid on every raid
@@ -7196,6 +7220,33 @@ namespace WowPsParty
         return vc->CastSpell(targets, si, nullptr) == SPELL_CAST_OK;
     }
 
+    static GameObject* FlNearestIntactTower(Creature* vc)
+    {
+        if (!vc || vc->GetMapId() != FL_MAP_ULDUAR) return nullptr;
+
+        InstanceScript* instance = vc->GetInstanceScript();
+        GameObject* nearest = nullptr;
+        float nearestDistance = std::numeric_limits<float>::max();
+
+        for (FlTowerObjective const& towerInfo : FL_TOWERS)
+        {
+            if (instance && instance->GetData(towerInfo.eventId) == 0)
+                continue;
+
+            GameObject* tower = vc->FindNearestGameObject(towerInfo.gameObjectEntry, FL_TOWER_SEARCH, true);
+            if (!tower) continue;
+
+            float const distance = vc->GetExactDist2d(tower);
+            if (distance < nearestDistance)
+            {
+                nearest = tower;
+                nearestDistance = distance;
+            }
+        }
+
+        return nearest;
+    }
+
     // Cone abilities (Electroshock, Ram, Sonic Horn) are selected server-side off the
     // caster's orientation, so the hull has to be pointed at the target BEFORE the cast.
     // SetOrientation updates the authoritative value immediately; SetFacingToObject is
@@ -7338,12 +7389,13 @@ namespace WowPsParty
         return !FlIsPursued(vc, boss) && CastVehicleCone(vc, FL_SPELL_SIEGE_RAM, enemy, FL_RAM_RANGE);
     }
 
-    static bool FlTickSiegeGunner(Creature* vc, Unit* enemy)
+    static bool FlTickSiegeGunner(Creature* vc, Unit* enemy, GameObject* tower)
     {
         // Fire Cannon is the heaviest weapon on the field by a wide margin, so it is never
         // given up for anything: crates are only worth shooting when the shot would be
         // wasted anyway, i.e. the driver has parked us inside the cannon's 10-yard minimum
         // or outside its 70-yard maximum.
+        if (CastVehicleArc(vc, FL_SPELL_FIRE_CANNON, tower)) return true;
         if (CastVehicleArc(vc, FL_SPELL_FIRE_CANNON, enemy)) return true;
         if (Creature* crate = FlNearestCrate(vc, 80.0f))
             if (CastVehicleArc(vc, FL_SPELL_TURRET_ROCKET, crate))
@@ -7355,11 +7407,13 @@ namespace WowPsParty
         return CastVehicleArc(vc, FL_SPELL_TURRET_ROCKET, enemy);
     }
 
-    static bool FlTickDemolisherDriver(Creature* vc, Unit* enemy, Creature* boss)
+    static bool FlTickDemolisherDriver(Creature* vc, Unit* enemy, Creature* boss, GameObject* tower)
     {
         if (boss && FlLaunchPassenger(vc, boss)) return true;
         // Pyrite barrels hit twice as hard as boulders and stack the damage-taken debuff,
         // so they go first and the boulder is what we fall back on when the ammo is out.
+        if (CastVehicleArc(vc, FL_SPELL_HURL_PYRITE, tower)) return true;
+        if (CastVehicleArc(vc, FL_SPELL_HURL_BOULDER, tower)) return true;
         if (CastVehicleArc(vc, FL_SPELL_HURL_PYRITE, enemy)) return true;
         if (CastVehicleArc(vc, FL_SPELL_HURL_BOULDER, enemy)) return true;
         if (!FlIsPursued(vc, boss) && CastVehicleCone(vc, FL_SPELL_DEMO_RAM, enemy, 13.0f))
@@ -7368,7 +7422,7 @@ namespace WowPsParty
     }
 
     // The mechanic seat rides the demolisher, so the hull under it is its own vehicle base.
-    static bool FlTickDemolisherMechanic(Player* bot, Creature* vc, Unit* enemy, Creature* boss)
+    static bool FlTickDemolisherMechanic(Player* bot, Creature* vc, Unit* enemy, Creature* boss, GameObject* tower)
     {
         Unit* hull = vc->GetVehicleBase();
 
@@ -7405,6 +7459,7 @@ namespace WowPsParty
             }
         }
 
+        if (CastVehicleArc(vc, FL_SPELL_MORTAR, tower)) return true;
         if (CastVehicleArc(vc, FL_SPELL_MORTAR, enemy)) return true;
         if (Creature* crate = FlNearestCrate(vc, 80.0f))
             if (CastVehicleArc(vc, FL_SPELL_MECH_ROCKET, crate))
@@ -7579,13 +7634,17 @@ namespace WowPsParty
         Creature* raw = FlFindLeviathan(bot);
         Creature* boss = (raw && raw->IsInCombat()) ? raw : nullptr;
         Unit* enemy = FlPickEnemy(bot, vc, boss);
+        GameObject* tower = nullptr;
+        if (!boss && (job == FL_JOB_SIEGE_GUNNER || job == FL_JOB_DEMO_DRIVER || job == FL_JOB_DEMO_MECHANIC))
+            tower = FlNearestIntactTower(vc);
+
         bool fired = false;
         switch (job)
         {
             case FL_JOB_SIEGE_DRIVER:   fired = FlTickSiegeDriver(vc, enemy, boss); break;
-            case FL_JOB_SIEGE_GUNNER:   fired = FlTickSiegeGunner(vc, enemy); break;
-            case FL_JOB_DEMO_DRIVER:    fired = FlTickDemolisherDriver(vc, enemy, boss); break;
-            case FL_JOB_DEMO_MECHANIC:  fired = FlTickDemolisherMechanic(bot, vc, enemy, boss); break;
+            case FL_JOB_SIEGE_GUNNER:   fired = FlTickSiegeGunner(vc, enemy, tower); break;
+            case FL_JOB_DEMO_DRIVER:    fired = FlTickDemolisherDriver(vc, enemy, boss, tower); break;
+            case FL_JOB_DEMO_MECHANIC:  fired = FlTickDemolisherMechanic(bot, vc, enemy, boss, tower); break;
             case FL_JOB_CHOPPER_DRIVER: fired = FlTickChopperDriver(vc, enemy, boss); break;
             default: break;
         }
