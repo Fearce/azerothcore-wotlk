@@ -33,6 +33,79 @@ const std::vector<uint32> availableVehicles = {NPC_VEHICLE_CHOPPER, NPC_SALVAGED
                                                NPC_SALVAGED_DEMOLISHER_TURRET, NPC_SALVAGED_SIEGE_ENGINE,
                                                NPC_SALVAGED_SIEGE_ENGINE_TURRET};
 
+namespace
+{
+enum FlameLeviathanTowerGameObjects : uint32
+{
+    GO_TOWER_OF_FROST = 194370,
+    GO_TOWER_OF_FLAMES = 194371,
+    GO_TOWER_OF_LIFE = 194375,
+    GO_TOWER_OF_STORMS = 194377,
+};
+
+enum FlameLeviathanTowerEvents : uint32
+{
+    EVENT_TOWER_OF_LIFE_DESTROYED = 21030,
+    EVENT_TOWER_OF_STORM_DESTROYED = 21031,
+    EVENT_TOWER_OF_FROST_DESTROYED = 21032,
+    EVENT_TOWER_OF_FLAMES_DESTROYED = 21033,
+};
+
+struct FlameLeviathanTowerInfo
+{
+    uint32 eventId;
+    uint32 gameObjectEntry;
+};
+
+constexpr FlameLeviathanTowerInfo flameLeviathanTowers[] = {
+    { EVENT_TOWER_OF_LIFE_DESTROYED, GO_TOWER_OF_LIFE },
+    { EVENT_TOWER_OF_STORM_DESTROYED, GO_TOWER_OF_STORMS },
+    { EVENT_TOWER_OF_FROST_DESTROYED, GO_TOWER_OF_FROST },
+    { EVENT_TOWER_OF_FLAMES_DESTROYED, GO_TOWER_OF_FLAMES },
+};
+
+GameObject* FindNearestIntactFlameLeviathanTower(Player* bot)
+{
+    if (!bot)
+        return nullptr;
+
+    GameObject* nearestTower = nullptr;
+    float nearestDistance = std::numeric_limits<float>::max();
+    InstanceScript* instance = bot->GetInstanceScript();
+
+    for (FlameLeviathanTowerInfo const& towerInfo : flameLeviathanTowers)
+    {
+        if (instance && instance->GetData(towerInfo.eventId) == 0)
+            continue;
+
+        GameObject* tower = bot->FindNearestGameObject(towerInfo.gameObjectEntry, 200.0f, true);
+        if (!tower)
+            continue;
+
+        float distance = bot->GetDistance2d(tower);
+        if (distance < nearestDistance)
+        {
+            nearestTower = tower;
+            nearestDistance = distance;
+        }
+    }
+
+    return nearestTower;
+}
+
+bool CastVehicleSpellAtGameObject(PlayerbotAI* botAI, Player* bot, uint32 spellId, GameObject* target)
+{
+    if (!botAI || !bot || !target)
+        return false;
+
+    SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!spellInfo || !(spellInfo->Targets & TARGET_FLAG_DEST_LOCATION))
+        return false;
+
+    return botAI->CastVehicleSpell(spellId, target->GetPositionX(), target->GetPositionY(), target->GetPositionZ());
+}
+}
+
 const std::vector<Position> corners = {
     {183.53f, 66.53f, 409.80f}, {383.03f, 75.10f, 411.71f}, {379.74f, -133.05f, 410.88f}, {158.67f, -137.54f, 409.80f}};
 
@@ -126,8 +199,26 @@ bool FlameLeviathanVehicleAction::MoveAvoidChasing(Unit* target)
 
 bool FlameLeviathanVehicleAction::DemolisherAction(Unit* target)
 {
+    if (GameObject* tower = FindNearestIntactFlameLeviathanTower(bot))
+    {
+        uint32 spellId = 62490;
+        if (CastVehicleSpellAtGameObject(botAI, bot, spellId, tower))
+        {
+            vehicleBase_->AddSpellCooldown(spellId, 0, 1000);
+            return true;
+        }
+
+        spellId = 62306;
+        if (CastVehicleSpellAtGameObject(botAI, bot, spellId, tower))
+        {
+            vehicleBase_->AddSpellCooldown(spellId, 0, 1000);
+            return true;
+        }
+    }
+
     if (!target)
         return false;
+
     Aura* bluePyrite = target->GetAura(68605);
     if (!bluePyrite || (vehicleBase_->GetPower(POWER_ENERGY) >= 20) || bluePyrite->GetDuration() <= 5000)
     {
@@ -196,6 +287,16 @@ bool FlameLeviathanVehicleAction::DemolisherTurretAction(Unit* target)
             }
         }
     }
+    if (GameObject* tower = FindNearestIntactFlameLeviathanTower(bot))
+    {
+        uint32 spellId = 62634;
+        if (CastVehicleSpellAtGameObject(botAI, bot, spellId, tower))
+        {
+            vehicleBase_->AddSpellCooldown(spellId, 0, 1000);
+            return true;
+        }
+    }
+
     if (!target)
         return false;
     uint32 spellId = 62634;
@@ -234,8 +335,19 @@ bool FlameLeviathanVehicleAction::SiegeEngineAction(Unit* target)
 
 bool FlameLeviathanVehicleAction::SiegeEngineTurretAction(Unit* target)
 {
+    if (GameObject* tower = FindNearestIntactFlameLeviathanTower(bot))
+    {
+        uint32 spellId = 62358;
+        if (CastVehicleSpellAtGameObject(botAI, bot, spellId, tower))
+        {
+            vehicleBase_->AddSpellCooldown(spellId, 0, 1000);
+            return true;
+        }
+    }
+
     if (!target)
         return false;
+
     uint32 spellId = 62358;
     if (botAI->CanCastVehicleSpell(spellId, target))
         if (botAI->CastVehicleSpell(spellId, target))
