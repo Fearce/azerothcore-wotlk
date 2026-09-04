@@ -6364,15 +6364,24 @@ namespace WowPsParty
     static std::unordered_map<uint32, uint32> g_vehCastMs;      // guidLow -> last ability-cast ms
 
     // The Oculus drakes are PER-PLAYER summons, not free-standing vehicles a bot could
-    // board — so when the leader is on one, a bot gets its OWN by casting the matching
-    // ride spell on itself (the same spell the drake-giver casts on a player). entry->ride.
-    static uint32 OculusRideSpellForDrake(uint32 vehEntry)
+    // board — so when the leader is on one, a bot gets its OWN by casting the "Call
+    // <Colour> Drake" summon spell on itself (item_template.spellid_1 of the essence
+    // item a human right-clicks after the drake-giver's gossip; item use just routes
+    // to the same self-cast). That spell's own SpellScript
+    // (spell_oculus_call_ruby_emerald_amber_drake) summons the drake creature in
+    // front of the caster, and the drake's IsSummonedBy then casts the "Ride <Colour>
+    // Drake Que" spell FROM ITSELF onto the caster to seat them — so casting the Ride
+    // Que spell here directly (the previous version of this function) skipped the part
+    // that actually creates a vehicle to board: with no drake creature summoned, that
+    // self-cast had nothing to seat the bot in and silently did nothing, which is why
+    // party bots never mounted up for Eregos. entry->summon spell.
+    static uint32 OculusSummonSpellForDrake(uint32 vehEntry)
     {
         switch (vehEntry)
         {
-            case 27692: return 49427;   // Emerald Drake
-            case 27755: return 49459;   // Amber Drake
-            case 27756: return 49463;   // Ruby Drake
+            case 27692: return 49345;   // Call Emerald Drake
+            case 27755: return 49461;   // Call Amber Drake
+            case 27756: return 49462;   // Call Ruby Drake
             default:    return 0;
         }
     }
@@ -7740,11 +7749,11 @@ namespace WowPsParty
 
         if (leadVeh)   // leader is riding, bot is not -> get the bot onto a vehicle too
         {
-            if (uint32 ride = OculusRideSpellForDrake(leadVeh->GetEntry()))
+            if (uint32 summon = OculusSummonSpellForDrake(leadVeh->GetEntry()))
             {
                 uint32 const now = getMSTime();
                 uint32& last = g_vehAcquireMs[bot->GetGUID().GetCounter()];
-                if (now - last > 3000) { last = now; bot->CastSpell(bot, ride, true); }
+                if (now - last > 3000) { last = now; bot->CastSpell(bot, summon, true); }
                 return true;
             }
             // ToC joust: the mounts are FREE pre-spawned vehicles — board the nearest

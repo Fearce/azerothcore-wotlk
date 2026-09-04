@@ -675,6 +675,25 @@ namespace WowPsParty
 
             std::vector<BossObjective>& out = g_bossCache[key];
 
+            // The Oculus (map 578) is drake-flight between every encounter, not gated
+            // ground: Drakos and Varos sit past navmesh gaps recastnav never bridged
+            // (the ramps up the tower), and Urom + Eregos are entirely off the mesh,
+            // reachable only astride a personal drake. There is no lever anywhere on
+            // this map for `--probe`'s "corridor stops short" verdict to mean a real
+            // shut door — so left alone, the tank would walk to that dead end and wait
+            // forever for a gate that will never open (`tools\tank-route.py 578
+            // --probe`; `.claude\rules\party-tank-auto-route.md`). Route nothing here;
+            // TankFollowPath's no-route fallback mirrors the leader's own movement
+            // instead, which is how a human actually crosses this dungeon on foot and
+            // — once TickBotVehicleMovement seats the tank on its own drake — in the air.
+            if (mapId == 578)
+            {
+                LOG_INFO("module", "[WowPsParty AutoRoute] map {} (The Oculus): ground "
+                                   "auto-route unavailable — drake-flight dungeon, tank "
+                                   "mirrors the leader instead", mapId);
+                return out;
+            }
+
             // Heroic keys are often empty because the encounter is registered under
             // normal only — fall back rather than routing nowhere on heroic.
             DungeonEncounterList const* encounters =
