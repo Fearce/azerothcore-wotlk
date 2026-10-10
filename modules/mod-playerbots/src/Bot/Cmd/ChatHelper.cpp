@@ -171,6 +171,16 @@ ChatHelper::ChatHelper(PlayerbotAI* botAI) : PlayerbotAIAware(botAI)
     specs[CLASS_DEATH_KNIGHT][1] = "frost";
     specs[CLASS_DEATH_KNIGHT][2] = "unholy";
 
+    classes[CLASS_NECROMANCER] = "necromancer";
+    specs[CLASS_NECROMANCER][0] = "summoning";
+    specs[CLASS_NECROMANCER][1] = "poison and bone";
+    specs[CLASS_NECROMANCER][2] = "curses";
+
+    classes[CLASS_SORCERESS] = "sorceress";
+    specs[CLASS_SORCERESS][0] = "fire";
+    specs[CLASS_SORCERESS][1] = "lightning";
+    specs[CLASS_SORCERESS][2] = "cold";
+
     races[RACE_DWARF] = "Dwarf";
     races[RACE_GNOME] = "Gnome";
     races[RACE_HUMAN] = "Human";

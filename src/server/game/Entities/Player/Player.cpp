@@ -5140,7 +5140,9 @@ void Player::GetDodgeFromAgility(float& diminishing, float& nondiminishing)
         0.036587f, // Mage
         0.024211f, // Warlock
         0.0f,      // ??
-        0.056097f  // Druid
+        0.056097f, // Druid
+        0.024211f, // Necromancer (Warlock's)
+        0.036587f  // Sorceress (Mage's)
     };
     // Crit/agility to dodge/agility coefficient multipliers; 3.2.0 increased required agility by 15%
     const float crit_to_dodge[MAX_CLASSES] =
@@ -5155,7 +5157,9 @@ void Player::GetDodgeFromAgility(float& diminishing, float& nondiminishing)
         1.00f / 1.15f,  // Mage
         0.97f / 1.15f,  // Warlock (?)
         0.0f,           // ??
-        2.00f / 1.15f   // Druid
+        2.00f / 1.15f,  // Druid
+        0.97f / 1.15f,  // Necromancer (Warlock's)
+        1.00f / 1.15f   // Sorceress (Mage's)
     };
 
     uint8 level = GetLevel();
@@ -16445,6 +16449,8 @@ std::string Player::GetPlayerName()
         case CLASS_SHAMAN:       color = "|cff0070DE"; break;
         case CLASS_WARLOCK:      color = "|cff9482C9"; break;
         case CLASS_WARRIOR:      color = "|cffC79C6E"; break;
+        case CLASS_NECROMANCER:  color = "|cff2EB88A"; break;
+        case CLASS_SORCERESS:    color = "|cffD94DFF"; break;
     }
 
     return "|Hplayer:" + name + "|h" + color + name + "|h|r";

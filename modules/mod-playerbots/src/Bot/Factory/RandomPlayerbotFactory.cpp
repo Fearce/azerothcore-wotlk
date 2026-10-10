@@ -701,7 +701,8 @@ void RandomPlayerbotFactory::CreateRandomBots()
                                                 time_t(0), LOCALE_enUS, 0, false, false, 0, true);
         sessionBots.push_back(session);
 
-        for (uint8 cls = CLASS_WARRIOR; cls < MAX_CLASSES - count; ++cls)
+        // Bots only know the Blizzard classes; the d2x classes (CLASSMASK_D2) have no AI.
+        for (uint8 cls = CLASS_WARRIOR; cls < CLASS_DRUID + 1 - count; ++cls)
         {
             // skip nonexistent classes
             if (!((1 << (cls - 1)) & CLASSMASK_ALL_PLAYABLE) || !sChrClassesStore.LookupEntry(cls))

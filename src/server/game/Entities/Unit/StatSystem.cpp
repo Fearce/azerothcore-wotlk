@@ -481,7 +481,8 @@ void Player::UpdateAttackPowerAndDamage(bool ranged)
                 break;
             }
         }
-        else if (IsClass(CLASS_MAGE, CLASS_CONTEXT_STATS) || IsClass(CLASS_PRIEST, CLASS_CONTEXT_STATS) || IsClass(CLASS_WARLOCK, CLASS_CONTEXT_STATS))
+        else if (IsClass(CLASS_MAGE, CLASS_CONTEXT_STATS) || IsClass(CLASS_PRIEST, CLASS_CONTEXT_STATS) || IsClass(CLASS_WARLOCK, CLASS_CONTEXT_STATS) ||
+                 IsClass(CLASS_NECROMANCER, CLASS_CONTEXT_STATS) || IsClass(CLASS_SORCERESS, CLASS_CONTEXT_STATS))
         {
             val2 = GetStat(STAT_STRENGTH) - 10.0f;
         }
@@ -720,7 +721,9 @@ const float m_diminishing_k[MAX_CLASSES] =
     0.9830f,  // Mage
     0.9830f,  // Warlock
     0.0f,     // ??
-    0.9720f   // Druid
+    0.9720f,  // Druid
+    0.9830f,  // Necromancer (Warlock's)
+    0.9830f   // Sorceress (Mage's)
 };
 
 float Player::GetMissPercentageFromDefence() const
@@ -737,7 +740,9 @@ float Player::GetMissPercentageFromDefence() const
         16.00f,     // Mage    //?
         16.00f,     // Warlock //?
         0.0f,       // ??
-        16.00f      // Druid   //?
+        16.00f,     // Druid   //?
+        16.00f,     // Necromancer (Warlock's)
+        16.00f      // Sorceress (Mage's)
     };
 
     float diminishing = 0.0f, nondiminishing = 0.0f;
@@ -764,7 +769,9 @@ void Player::UpdateParryPercentage()
         0.0f,           // Mage
         0.0f,           // Warlock
         0.0f,           // ??
-        0.0f            // Druid
+        0.0f,           // Druid
+        0.0f,           // Necromancer: cannot parry, like Warlock
+        0.0f            // Sorceress: cannot parry, like Mage
     };
 
     // No parry
@@ -810,7 +817,9 @@ void Player::UpdateDodgePercentage()
         150.375940f,    // Mage
         150.375940f,    // Warlock
         0.0f,           // ??
-        116.890707f     // Druid
+        116.890707f,    // Druid
+        150.375940f,    // Necromancer (Warlock's)
+        150.375940f     // Sorceress (Mage's)
     };
 
     float diminishing = 0.0f, nondiminishing = 0.0f;

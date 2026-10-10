@@ -109,7 +109,7 @@ void Pet::AddToWorld()
     {
         if (Player* owner = GetOwner())
         {
-            if (getPetType() == SUMMON_PET && owner->IsClass(CLASS_WARLOCK, CLASS_CONTEXT_PET))
+            if (getPetType() == SUMMON_PET && (owner->IsClass(CLASS_WARLOCK, CLASS_CONTEXT_PET) || owner->IsClass(CLASS_NECROMANCER, CLASS_CONTEXT_PET)))
             {
                 owner->SetLastPetSpell(GetUInt32Value(UNIT_CREATED_BY_SPELL));
             }
@@ -1044,7 +1044,8 @@ bool Guardian::InitStatsForLevel(uint8 petlevel)
                 if (owner->IsClass(CLASS_WARLOCK, CLASS_CONTEXT_PET) ||
                         owner->IsClass(CLASS_SHAMAN, CLASS_CONTEXT_PET) ||          // Fire Elemental
                         owner->IsClass(CLASS_DEATH_KNIGHT, CLASS_CONTEXT_PET) ||    // Risen Ghoul
-                        owner->IsClass(CLASS_MAGE, CLASS_CONTEXT_PET))              // Water Elemental with glyph
+                        owner->IsClass(CLASS_MAGE, CLASS_CONTEXT_PET) ||            // Water Elemental with glyph
+                        owner->IsClass(CLASS_NECROMANCER, CLASS_CONTEXT_PET))       // Golems
                     petType = SUMMON_PET;
                 else if (owner->IsClass(CLASS_HUNTER, CLASS_CONTEXT_PET))
                 {
@@ -2291,6 +2292,8 @@ bool Pet::IsPermanentPetFor(Player* owner) const
                 return GetCreatureTemplate()->type == CREATURE_TYPE_UNDEAD;
             else if (owner->IsClass(CLASS_MAGE, CLASS_CONTEXT_PET))
                 return GetEntry() == 37994;
+            else if (owner->IsClass(CLASS_NECROMANCER, CLASS_CONTEXT_PET))
+                return true;                                // a golem stays until it dies, as in Diablo II
             else
                 return false;
         case HUNTER_PET:

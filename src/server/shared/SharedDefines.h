@@ -133,22 +133,28 @@ enum Classes
     CLASS_MAGE          = 8, // TITLE Mage
     CLASS_WARLOCK       = 9, // TITLE Warlock
     //CLASS_UNK           = 10,
-    CLASS_DRUID         = 11 // TITLE Druid
+    CLASS_DRUID         = 11, // TITLE Druid
+    CLASS_NECROMANCER   = 12, // TITLE Necromancer
+    CLASS_SORCERESS     = 13  // TITLE Sorceress
 };
 
 // max+1 for player class
-#define MAX_CLASSES       12
+#define MAX_CLASSES       14
 
 #define CLASSMASK_ALL_PLAYABLE \
     ((1<<(CLASS_WARRIOR-1))|(1<<(CLASS_PALADIN-1))|(1<<(CLASS_HUNTER-1))| \
     (1<<(CLASS_ROGUE-1))  |(1<<(CLASS_PRIEST-1)) |(1<<(CLASS_SHAMAN-1))| \
     (1<<(CLASS_MAGE-1))   |(1<<(CLASS_WARLOCK-1))|(1<<(CLASS_DRUID-1)) | \
-    (1<<(CLASS_DEATH_KNIGHT-1)))
+    (1<<(CLASS_DEATH_KNIGHT-1))|(1<<(CLASS_NECROMANCER-1))|(1<<(CLASS_SORCERESS-1)))
+
+// The Diablo II classes: no Blizzard content (bot AI, class quests, trainers) knows about them
+#define CLASSMASK_D2 ((1<<(CLASS_NECROMANCER-1))|(1<<(CLASS_SORCERESS-1)))
 
 // valid classes for creature_template.unit_class
 #define CLASSMASK_ALL_CREATURES ((1<<(CLASS_WARRIOR-1)) | (1<<(CLASS_PALADIN-1)) | (1<<(CLASS_ROGUE-1)) | (1<<(CLASS_MAGE-1)))
 
-#define CLASSMASK_WAND_USERS ((1<<(CLASS_PRIEST-1))|(1<<(CLASS_MAGE-1))|(1<<(CLASS_WARLOCK-1)))
+#define CLASSMASK_WAND_USERS ((1<<(CLASS_PRIEST-1))|(1<<(CLASS_MAGE-1))|(1<<(CLASS_WARLOCK-1))| \
+    (1<<(CLASS_NECROMANCER-1))|(1<<(CLASS_SORCERESS-1)))
 
 #define PLAYER_MAX_BATTLEGROUND_QUEUES 2
 
@@ -3798,7 +3804,9 @@ enum SpellFamilyNames
     // 14 - unused
     SPELLFAMILY_DEATHKNIGHT = 15,
     // 16 - unused
-    SPELLFAMILY_PET         = 17
+    SPELLFAMILY_PET         = 17,
+    SPELLFAMILY_NECROMANCER = 18,                           // d2x: ChrClasses.SpellClassSet of class 12
+    SPELLFAMILY_SORCERESS   = 19                            // d2x: ChrClasses.SpellClassSet of class 13
 };
 
 enum TradeStatus
