@@ -1439,7 +1439,12 @@ public:
     bool DeleteGameTele(std::string_view name);
 
     Trainer::Trainer* GetTrainer(uint32 creatureId);
-    std::vector<Trainer::Trainer const*> const& GetClassTrainers(uint8 classId) const { return _classTrainers.at(classId); }
+    std::vector<Trainer::Trainer const*> const& GetClassTrainers(uint8 classId) const
+    {
+        static std::vector<Trainer::Trainer const*> const none;   // the Diablo II classes have no trainers
+        auto itr = _classTrainers.find(classId);
+        return itr != _classTrainers.end() ? itr->second : none;
+    }
 
     [[nodiscard]] VendorItemData const* GetNpcVendorItemList(uint32 entry) const
     {
