@@ -96,6 +96,7 @@ public:
             { "getvalue",       HandleDebugGetValueCommand,            rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
             { "getitemvalue",   HandleDebugGetItemValueCommand,        rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
             { "Mod32Value",     HandleDebugMod32ValueCommand,          rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
+            { "privateclasspolicy", HandlePrivateClassFieldPolicyCommand, rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
             { "play",           debugPlayCommandTable },
             { "send",           debugSendCommandTable },
             { "setaurastate",   HandleDebugSetAuraStateCommand,        rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
@@ -1242,6 +1243,13 @@ public:
         }
 
         unit->ModifyAuraState(*state, apply);
+        return true;
+    }
+
+    static bool HandlePrivateClassFieldPolicyCommand(ChatHandler* handler)
+    {
+        LOG_INFO("commands", "[PrivateMods] debug-field-policy=reported version=1");
+        handler->SendSysMessage("Private class field policy: immutable (v1)");
         return true;
     }
 
