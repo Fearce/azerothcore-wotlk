@@ -28,6 +28,7 @@
 #include "ObjectMgr.h"
 #include "PetPackets.h"
 #include "Player.h"
+#include "PrivateClassSpellPolicy.h"
 #include "QueryHolder.h"
 #include "ScriptMgr.h"
 #include "SpellAuraEffects.h"
@@ -1760,6 +1761,14 @@ void Pet::_SaveAuras(CharacterDatabaseTransaction trans)
 
 bool Pet::addSpell(uint32 spellId, ActiveStates active /*= ACT_DECIDE*/, PetSpellState state /*= PETSPELL_NEW*/, PetSpellType type /*= PETSPELL_NORMAL*/)
 {
+    Player* owner = GetOwner();
+    if (!PrivateClasses::CanAcquireSpell(spellId, owner ? owner->getClass() : 0,
+        owner && owner->GetSession() && owner->GetSession()->CanUsePrivateClassAssets()))
+    {
+        LOG_INFO("module", "[WowPs PrivateMods] pet-learn-spell=denied spell={} reason=private-class-policy", spellId);
+        return false; // Preserve persisted rows when participation is disabled.
+    }
+
     SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
     if (!spellInfo)
     {

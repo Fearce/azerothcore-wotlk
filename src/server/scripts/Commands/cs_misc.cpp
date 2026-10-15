@@ -41,6 +41,7 @@
 #include "ObjectAccessor.h"
 #include "Pet.h"
 #include "Player.h"
+#include "PrivateClassSpellPolicy.h"
 #include "PoolMgr.h"
 #include "RBAC.h"
 #include "Realm.h"
@@ -51,6 +52,8 @@
 #include "Transport.h"
 #include "WeatherMgr.h"
 #include "WorldSessionMgr.h"
+#include "WorldSession.h"
+#include "Log.h"
 
 /// @todo: this import is not necessary for compilation and marked as unused by the IDE
 //  however, for some reasons removing it would cause a damn linking issue
@@ -60,6 +63,21 @@
 
 constexpr auto SPELL_STUCK = 7355;
 constexpr auto SPELL_FREEZE = 9454;
+
+namespace
+{
+    bool CanGrantAura(ChatHandler* handler, SpellInfo const* spell)
+    {
+        Player* source = handler->GetSession()->GetPlayer();
+        if (PrivateClasses::CanAcquireSpell(spell->Id, source->getClass(),
+            handler->GetSession()->CanUsePrivateClassAssets()))
+            return true;
+
+        LOG_INFO("module", "[WowPs PrivateMods] aura-command=denied spell={} reason=private-class-policy", spell->Id);
+        handler->SendErrorMessage("Private class abilities require an authorized private class session.");
+        return false;
+    }
+}
 
 struct AccountFlagText
 {
@@ -686,6 +704,9 @@ public:
             return false;
         }
 
+        if (!CanGrantAura(handler, spell))
+            return false;
+
         if (!SpellMgr::IsSpellValid(spell))
         {
             handler->SendErrorMessage(LANG_COMMAND_SPELL_BROKEN, spell->Id);
@@ -711,6 +732,9 @@ public:
             handler->SendErrorMessage(LANG_COMMAND_NOSPELLFOUND);
             return false;
         }
+
+        if (!CanGrantAura(handler, spell))
+            return false;
 
         if (!SpellMgr::IsSpellValid(spell))
         {

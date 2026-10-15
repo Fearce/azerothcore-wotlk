@@ -24,9 +24,11 @@
 #include "ObjectMgr.h"
 #include "Pet.h"
 #include "Player.h"
+#include "PrivateClassSpellPolicy.h"
 #include "RBAC.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "WorldSession.h"
 
 using namespace Acore::ChatCommands;
 
@@ -93,6 +95,15 @@ public:
         if (!spell)
         {
             handler->SendErrorMessage(LANG_COMMAND_NOSPELLFOUND);
+            return false;
+        }
+
+        Player* owner = handler->GetSession()->GetPlayer();
+        if (!PrivateClasses::CanAcquireSpell(spell->Id, owner->getClass(),
+            handler->GetSession()->CanUsePrivateClassAssets()))
+        {
+            LOG_INFO("module", "[WowPs PrivateMods] pet-learn-command=denied spell={} reason=private-class-policy", spell->Id);
+            handler->SendErrorMessage("Private class abilities require an authorized private class session.");
             return false;
         }
 

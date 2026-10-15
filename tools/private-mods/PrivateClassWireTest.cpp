@@ -1,5 +1,6 @@
 #include "PrivateClassPolicy.h"
 #include "PrivateClassFieldPolicy.h"
+#include "PrivateClassSpellPolicy.h"
 #include "D2xWire.h"
 #include "D2xAccess.h"
 #include "RealmRouting.h"
@@ -31,6 +32,11 @@ void Word(Bytes& data, uint32_t value)
 void Policy()
 {
     using namespace PrivateClasses;
+    for (uint32_t spell : {109999u, 110000u, 119999u, 120000u})
+        for (uint8_t ownerClass = 0; ownerClass < 20; ++ownerClass)
+            for (bool assets : {false, true})
+                Require(CanAcquireSpell(spell, ownerClass, assets) ==
+                    (!IsCustomSpell(spell) || (IsCustom(ownerClass) && assets)));
     Require(!CanEditIdentityField(0x00000801, 0x00000c01));
     Require(!CanEditIdentityField(0x00000801, 0x00000d01));
     Require(!CanEditIdentityField(0x00000801, 0x3f000c01)); // float bits cannot bypass

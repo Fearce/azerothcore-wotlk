@@ -1249,7 +1249,7 @@ public:
     static bool HandlePrivateClassFieldPolicyCommand(ChatHandler* handler)
     {
         LOG_INFO("commands", "[PrivateMods] debug-field-policy=reported version=1");
-        handler->SendSysMessage("Private class field policy: immutable (v1)");
+        handler->SendSysMessage("Private class field policy: immutable (v1); spell grants: opt-in (v1)");
         return true;
     }
 
