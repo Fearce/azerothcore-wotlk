@@ -63,6 +63,33 @@ bool ScriptMgr::CanPacketSend(WorldSession* session, WorldPacket const& packet)
     CALL_ENABLED_BOOLEAN_HOOKS(ServerScript, SERVERHOOK_CAN_PACKET_SEND, !script->CanPacketSend(session, packet));
 }
 
+PacketRewrite ScriptMgr::OnPacketSendRewrite(WorldSession* session, WorldPacket const& packet, WorldPacket& replacement)
+{
+    auto const& scripts = ScriptRegistry<ServerScript>::EnabledHooks[SERVERHOOK_ON_PACKET_SEND_REWRITE];
+    if (scripts.empty())
+        return PacketRewrite::Unchanged;
+
+    // Each script sees what the previous ones decided to send.
+    PacketRewrite result = PacketRewrite::Unchanged;
+    for (ServerScript* script : scripts)
+    {
+        WorldPacket next;
+        switch (script->OnPacketSendRewrite(session, result == PacketRewrite::Replaced ? replacement : packet, next))
+        {
+            case PacketRewrite::Dropped:
+                return PacketRewrite::Dropped;
+            case PacketRewrite::Replaced:
+                replacement = std::move(next);
+                result = PacketRewrite::Replaced;
+                break;
+            default:
+                break;
+        }
+    }
+
+    return result;
+}
+
 bool ScriptMgr::CanPacketReceive(WorldSession* session, WorldPacket const& packet)
 {
     if (ScriptRegistry<ServerScript>::ScriptPointerList.empty())

@@ -114,6 +114,15 @@ ProcessPriority = 0
 RealmsStateUpdateDelay = 20
 
 #
+#    RealmAccess
+#        Description: Realms listed only to specific accounts. Every other account never sees them in
+#                     the realm list. Entries are separated by ';', account ids by spaces.
+#        Example:     "2:101 205" - realm 2 is listed only to accounts 101 and 205
+#        Default:     "" - every realm is listed to every account
+
+RealmAccess = ""
+
+#
 #    WrongPass.MaxCount
 #        Description: Number of login attempts with wrong password before the account or IP will be
 #                     banned.

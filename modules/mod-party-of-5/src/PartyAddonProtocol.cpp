@@ -322,13 +322,14 @@ namespace
             "LEFT JOIN `account_party` ap ON ap.guid = c.guid AND ap.account = c.account "
             "LEFT JOIN `party_loadout` pl ON pl.guid = c.guid "
             "WHERE c.account = {} AND (c.deleteInfos_Account IS NULL OR c.deleteInfos_Account = 0) "
+            "  AND c.class <= {} "
             // The player's hand-sorted roster order wins; characters not yet placed
             // (roster_order NULL) fall to the bottom in the legacy enrolled-first /
             // name order, which also seeds the very first sort before any move.
             // KEEP THIS SORT IDENTICAL to the MGMT_MOVE read, or arrows swap the wrong row.
             "ORDER BY (c.roster_order IS NULL) ASC, c.roster_order ASC, "
             "         COALESCE(ap.slot, 255) ASC, c.name ASC",
-            accountId);
+            accountId, WowPsParty::LAST_PARTY_CLASS);
 
         std::ostringstream out;
         out << "MGMT_LIST\t";
@@ -7043,8 +7044,8 @@ namespace WowPsParty
         QueryResult q = CharacterDatabase.Query(
             "SELECT c.`guid`, c.`name` FROM `characters` c "
             "LEFT JOIN `account_party` ap ON ap.`guid` = c.`guid` "
-            "WHERE c.`account` = {} AND ap.`guid` IS NULL "
-            "ORDER BY c.`guid` LIMIT 5", account);
+            "WHERE c.`account` = {} AND ap.`guid` IS NULL AND c.`class` <= {} "
+            "ORDER BY c.`guid` LIMIT 5", account, WowPsParty::LAST_PARTY_CLASS);
         if (!q)
         {
             messages.emplace_back("No unenrolled chars on this account.");
@@ -8732,9 +8733,10 @@ public:
                 "LEFT JOIN `account_party` ap ON ap.guid = c.guid AND ap.account = c.account "
                 "WHERE c.`account` = {} "
                 "AND (c.`deleteInfos_Account` IS NULL OR c.`deleteInfos_Account` = 0) "
+                "AND c.`class` <= {} "
                 "ORDER BY (c.`roster_order` IS NULL) ASC, c.`roster_order` ASC, "
                 "         COALESCE(ap.`slot`, 255) ASC, c.`name` ASC",
-                accountId);
+                accountId, WowPsParty::LAST_PARTY_CLASS);
             if (!q) return;
 
             std::vector<uint32> order;

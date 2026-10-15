@@ -315,7 +315,7 @@ void WorldSession::HandleWhoOpcode(WorldPacket& recvData)
         }
 
         // check if class matches classmask
-        uint8 class_ = target.GetClass();
+        uint8 class_ = GetVisibleClass(target.GetClass());
         if (!(classmask & (1 << class_)))
         {
             continue;
@@ -1001,7 +1001,8 @@ void WorldSession::HandleInspectOpcode(WorldPacket& recv_data)
     WorldPacket data(SMSG_INSPECT_TALENT, guid_size + 4 + talent_points);
     data << player->GetPackGUID();
 
-    if (sWorld->getBoolConfig(CONFIG_TALENTS_INSPECTING) || _player->CanBeGameMaster())
+    if ((sWorld->getBoolConfig(CONFIG_TALENTS_INSPECTING) || _player->CanBeGameMaster()) &&
+        (player->getClass() < CLASS_NECROMANCER || CanUsePrivateClassAssets()))
     {
         player->BuildPlayerTalentsInfoData(&data);
     }

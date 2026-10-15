@@ -28,6 +28,7 @@ enum WorldObjectHook
     WORLDOBJECTHOOK_ON_WORLD_OBJECT_SET_MAP,
     WORLDOBJECTHOOK_ON_WORLD_OBJECT_RESET_MAP,
     WORLDOBJECTHOOK_ON_WORLD_OBJECT_UPDATE,
+    WORLDOBJECTHOOK_ON_DYNAMIC_OBJECT_VALUES_UPDATE_FIELD,
     WORLDOBJECTHOOK_END
 };
 
@@ -74,6 +75,15 @@ public:
      * @param diff Contains information about the diff time
      */
     virtual void OnWorldObjectUpdate(WorldObject* /*object*/, uint32 /*diff*/) { }
+
+    /**
+     * @brief Called for each field of a dynamic object that is written into an update for `target`, so a
+     * script can show that viewer a different value. Units have UnitScript's
+     * ShouldTrackValuesUpdatePosByIndex and OnPatchValuesUpdate instead.
+     *
+     * @param value The value sent to `target`; the object keeps its own
+     */
+    virtual void OnDynamicObjectValuesUpdateField(DynamicObject const* /*object*/, Player const* /*target*/, uint16 /*index*/, uint32& /*value*/) { }
 };
 
 #endif

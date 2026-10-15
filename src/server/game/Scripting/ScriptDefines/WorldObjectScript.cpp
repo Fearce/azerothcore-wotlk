@@ -54,6 +54,16 @@ void ScriptMgr::OnWorldObjectUpdate(WorldObject* object, uint32 diff)
     CALL_ENABLED_HOOKS(WorldObjectScript, WORLDOBJECTHOOK_ON_WORLD_OBJECT_UPDATE, script->OnWorldObjectUpdate(object, diff));
 }
 
+bool ScriptMgr::HasDynamicObjectValuesUpdateFieldHooks() const
+{
+    return !ScriptRegistry<WorldObjectScript>::EnabledHooks[WORLDOBJECTHOOK_ON_DYNAMIC_OBJECT_VALUES_UPDATE_FIELD].empty();
+}
+
+void ScriptMgr::OnDynamicObjectValuesUpdateField(DynamicObject const* object, Player const* target, uint16 index, uint32& value)
+{
+    CALL_ENABLED_HOOKS(WorldObjectScript, WORLDOBJECTHOOK_ON_DYNAMIC_OBJECT_VALUES_UPDATE_FIELD, script->OnDynamicObjectValuesUpdateField(object, target, index, value));
+}
+
 WorldObjectScript::WorldObjectScript(const char* name, std::vector<uint16> enabledHooks)
     : ScriptObject(name, WORLDOBJECTHOOK_END)
 {

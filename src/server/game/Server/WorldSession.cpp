@@ -20,6 +20,8 @@
 */
 
 #include "WorldSession.h"
+#include "Config.h"
+#include "PrivateClassPolicy.h"
 #include "AccountMgr.h"
 #include "BattlegroundMgr.h"
 #include "BanMgr.h"
@@ -289,6 +291,33 @@ ObjectGuid::LowType WorldSession::GetGuidLow() const
 }
 
 /// Send a packet to the client
+void WorldSession::SetClientRealmId(uint32 realmId)
+{
+    _clientRealmId = realmId;
+    _privateClassAssets = false;
+}
+
+void WorldSession::ConfirmPrivateClassAssets(bool marker)
+{
+    _privateClassAssets = marker && PrivateClasses::CanUse(
+        sConfigMgr->GetOption<bool>("PrivateMods.D2.Enabled", false, false),
+        sConfigMgr->GetOption<uint32>("PrivateMods.D2.AccountId", 0, false),
+        sConfigMgr->GetOption<uint32>("PrivateMods.D2.PreviewRealm", 0, false),
+        GetAccountId(), GetClientRealmId(), _isBot, realm.Id.Realm, marker);
+    LOG_INFO("module", "[WowPs PrivateMods] session-assets={} reason=authenticated-realm-policy",
+        _privateClassAssets ? "private" : "stock");
+}
+
+bool WorldSession::CanUsePrivateClassAssets() const
+{
+    return _privateClassAssets;
+}
+
+uint8 WorldSession::GetVisibleClass(uint8 cls) const
+{
+    return PrivateClasses::VisibleClass(cls, CanUsePrivateClassAssets());
+}
+
 void WorldSession::SendPacket(WorldPacket const* packet)
 {
     if (packet->GetOpcode() == NULL_OPCODE)
@@ -341,6 +370,18 @@ void WorldSession::SendPacket(WorldPacket const* packet)
     if (!sScriptMgr->CanPacketSend(this, *packet))
     {
         return;
+    }
+
+    WorldPacket replacement;
+    switch (sScriptMgr->OnPacketSendRewrite(this, *packet, replacement))
+    {
+        case PacketRewrite::Dropped:
+            return;
+        case PacketRewrite::Replaced:
+            m_Socket->SendPacket(replacement);
+            return;
+        default:
+            break;
     }
 
     m_Socket->SendPacket(*packet);
@@ -1190,6 +1231,7 @@ void WorldSession::WriteMovementInfo(WorldPacket* data, MovementInfo* mi)
 
 void WorldSession::ReadAddonsInfo(ByteBuffer& data)
 {
+    ConfirmPrivateClassAssets(false);
     if (data.rpos() + 4 > data.size())
         return;
 
@@ -1218,6 +1260,7 @@ void WorldSession::ReadAddonsInfo(ByteBuffer& data)
         {
             uint32 addonsCount;
             addonInfo >> addonsCount;                         // addons count
+            bool privateMarker = false;
 
             for (uint32 i = 0; i < addonsCount; ++i)
             {
@@ -1232,6 +1275,8 @@ void WorldSession::ReadAddonsInfo(ByteBuffer& data)
                 addonInfo >> addonName;
 
                 addonInfo >> enabled >> crc >> unk1;
+                if (addonName == "WowPsD2Preview_010" && enabled)
+                    privateMarker = true;
 
                 LOG_DEBUG("network", "ADDON: Name: {}, Enabled: 0x{:x}, CRC: 0x{:x}, Unknown2: 0x{:x}", addonName, enabled, crc, unk1);
 
@@ -1267,6 +1312,8 @@ void WorldSession::ReadAddonsInfo(ByteBuffer& data)
 
             if (addonInfo.rpos() != addonInfo.size())
                 LOG_DEBUG("network", "packet under-read!");
+            else
+                ConfirmPrivateClassAssets(privateMarker);
         }
         catch (ByteBufferException const& e)
         {

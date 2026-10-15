@@ -410,6 +410,13 @@ public:
     void UpdateAccountFlag(uint32 flag, bool remove = false);
     void ValidateAccountFlags();
 
+    // The realm the client selected in the realm list: RealmID, or one of RealmAliases.
+    uint32 GetClientRealmId() const { return _clientRealmId; }
+    void SetClientRealmId(uint32 realmId);
+    void ConfirmPrivateClassAssets(bool marker);
+    bool CanUsePrivateClassAssets() const;
+    uint8 GetVisibleClass(uint8 cls) const;
+
     bool IsGMAccount() const;
     bool IsTrialAccount() const;
     bool IsInternetGameRoomAccount() const;
@@ -1310,6 +1317,8 @@ private:
     uint32 _orderCounter;
 
     bool _isBot;
+    uint32 _clientRealmId = 0;
+    bool _privateClassAssets = false;
 
     WorldSession(WorldSession const& right) = delete;
     WorldSession& operator=(WorldSession const& right) = delete;

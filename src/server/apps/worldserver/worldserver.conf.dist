@@ -90,6 +90,27 @@
 RealmID = 1
 
 #
+#    RealmAliases
+#        Description: Further realmlist ids, separated by spaces, that point at this world server.
+#                     A client that selected one of them is accepted, and its session reports the
+#                     id it chose (WorldSession::GetClientRealmId), so a module can tell clients
+#                     apart by the realm entry they used. Characters stay on RealmID.
+#        Example:     "2"
+#        Default:     "" - (Only RealmID)
+
+RealmAliases = ""
+
+# Private D2 preview: off by default; the local owner id and preview realm must
+# both be nonzero. No GM bypass. Main-realm sessions always use stock assets.
+# The private package's enabled WowPsD2Preview_010 addon marker is also required.
+# Keep the real account id in untracked runtime configuration only.
+# Disabling retains character data. Restore this configuration and compatible
+# assets to regain access; never remove server data while custom characters exist.
+PrivateMods.D2.Enabled = 0
+PrivateMods.D2.AccountId = 0
+PrivateMods.D2.PreviewRealm = 0
+
+#
 #    WorldServerPort
 #        Description: TCP port to reach the world server.
 #        Default:     8085

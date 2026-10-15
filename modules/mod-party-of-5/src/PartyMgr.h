@@ -35,6 +35,8 @@ struct ItemTemplate;
 namespace WowPsParty
 {
     constexpr uint8 PARTY_SIZE = 5;
+    // Highest class a party member can have: the d2x classes (12, 13) have no bot AI.
+    constexpr uint32 LAST_PARTY_CLASS = 11;
 
     struct PartyMember
     {

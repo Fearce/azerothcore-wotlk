@@ -1241,7 +1241,7 @@ void Guild::HandleRoster(WorldSession* session)
 
         memberData.Status = member.GetFlags();
         memberData.Level = member.GetLevel();
-        memberData.ClassID = member.GetClass();
+        memberData.ClassID = session->GetVisibleClass(member.GetClass());
         memberData.Gender = member.GetGender();
 
         memberData.Name = member.GetName();

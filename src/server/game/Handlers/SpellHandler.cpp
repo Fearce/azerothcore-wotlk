@@ -760,7 +760,7 @@ void WorldSession::HandleMirrorImageDataRequest(WorldPacket& recvData)
     data << uint32(creator->GetDisplayId());
     data << uint8(creator->getRace());
     data << uint8(creator->getGender());
-    data << uint8(creator->getClass());
+    data << uint8(GetVisibleClass(creator->getClass()));
 
     if (creator->IsPlayer())
     {

@@ -32,12 +32,28 @@
 #include "WorldSession.h"
 #include "WorldSessionMgr.h"
 #include "RBAC.h"
+#include "StringConvert.h"
+#include "Tokenize.h"
 #include "zlib.h"
 #include <memory>
 
 #include "ServerPktHeader.h"
 
 using boost::asio::ip::tcp;
+
+namespace
+{
+    // RealmAliases: further realmlist ids that list this world server, e.g. "2 3".
+    bool IsRealmAlias(uint32 realmId)
+    {
+        std::string const aliases = sConfigMgr->GetOption<std::string>("RealmAliases", "", false);
+        for (std::string_view token : Acore::Tokenize(aliases, ' ', false))
+            if (Acore::StringTo<uint32>(token) == realmId)
+                return true;
+
+        return false;
+    }
+}
 
 void compressBuff(void* dst, uint32* dst_size, void* src, int src_size)
 {
@@ -591,7 +607,7 @@ void WorldSocket::HandleAuthSessionCallback(std::shared_ptr<ClientAuthSession> a
         return;
     }
 
-    if (authSession->RealmID != realm.Id.Realm)
+    if (authSession->RealmID != realm.Id.Realm && !IsRealmAlias(authSession->RealmID))
     {
         SendAuthResponseError(REALM_LIST_REALM_NOT_FOUND);
         LOG_ERROR("network", "WorldSocket::HandleAuthSession: Client {} requested connecting with realm id {} but this realm has id {} set in config.",
@@ -709,7 +725,19 @@ void WorldSocket::HandleAuthSessionCallback(std::shared_ptr<ClientAuthSession> a
     _worldSession = new WorldSession(account.Id, std::move(authSession->Account), account.Flags, shared_from_this(), account.Security,
         account.Expansion, account.MuteTime, account.Locale, account.Recruiter, account.IsRectuiter, account.Security ? true : false, account.TotalTime);
 
+    _worldSession->SetClientRealmId(authSession->RealmID);
     _worldSession->ReadAddonsInfo(authSession->AddonInfo);
+    if (authSession->RealmID != realm.Id.Realm &&
+        authSession->RealmID == sConfigMgr->GetOption<uint32>("PrivateMods.D2.PreviewRealm", 0, false) &&
+        !_worldSession->CanUsePrivateClassAssets())
+    {
+        LOG_INFO("module", "[WowPs PrivateMods] realm-auth=denied reason=private-preview-policy");
+        delete _worldSession;
+        _worldSession = nullptr;
+        SendAuthResponseError(AUTH_REJECT);
+        DelayedCloseSocket();
+        return;
+    }
 
     // Initialize Warden system only if it is enabled by config
     if (wardenActive)

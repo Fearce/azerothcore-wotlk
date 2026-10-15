@@ -5135,6 +5135,13 @@ bool Player::LoadFromDB(ObjectGuid playerGuid, CharacterDatabaseQueryHolder cons
 
     uint32 dbAccountId = fields[1].Get<uint32>();
 
+    uint8 const storedClass = fields[4].Get<uint8>();
+    if ((storedClass == CLASS_NECROMANCER || storedClass == CLASS_SORCERESS) && !GetSession()->CanUsePrivateClassAssets())
+    {
+        LOG_INFO("module", "[WowPs PrivateMods] load=denied reason=private-class-policy");
+        return false;
+    }
+
     // check if the character's account in the db and the logged in account match.
     // player should be able to load/delete character only with correct account!
     if (dbAccountId != GetSession()->GetAccountId())

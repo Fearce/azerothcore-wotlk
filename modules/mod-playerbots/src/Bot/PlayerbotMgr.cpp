@@ -120,6 +120,14 @@ void PlayerbotHolder::AddPlayerBot(ObjectGuid playerGuid, uint32 masterAccountId
         allowed = false;
         out << "Failure: You are not allowed to control bot " << botName.c_str();
     }
+    // The d2x classes have no bot AI, and mod-d2x-classes keeps them to the accounts it allows.
+    CharacterCacheEntry const* botCache = sCharacterCache->GetCharacterCacheByGuid(playerGuid);
+    if (allowed && botCache && (botCache->Class == CLASS_NECROMANCER || botCache->Class == CLASS_SORCERESS))
+    {
+        allowed = false;
+        out << "Failure: " << botName.c_str() << " cannot be played as a bot";
+        LOG_INFO("playerbots", "Refused to log in d2x-class character {} as a bot", playerGuid.ToString());
+    }
     if (masterAccountId && masterPlayer)
     {
         PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(masterPlayer);

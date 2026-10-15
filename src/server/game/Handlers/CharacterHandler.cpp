@@ -216,6 +216,7 @@ bool LoginQueryHolder::Initialize()
     return res;
 }
 
+// Private class ownership is enforced before any row enters the legitimate-login set.
 void WorldSession::HandleCharEnum(PreparedQueryResult result)
 {
     WorldPacket data(SMSG_CHAR_ENUM, 100);                  // we guess size
@@ -231,6 +232,12 @@ void WorldSession::HandleCharEnum(PreparedQueryResult result)
         {
             ObjectGuid guid = ObjectGuid::Create<HighGuid::Player>((*result)[0].Get<uint32>());
             LOG_DEBUG("network.opcode", "Loading char {} from account {}.", guid.ToString(), GetAccountId());
+            uint8 const cls = (*result)[3].Get<uint8>();
+            if ((cls == CLASS_NECROMANCER || cls == CLASS_SORCERESS) && !CanUsePrivateClassAssets())
+            {
+                LOG_INFO("module", "[WowPs PrivateMods] enum=denied reason=private-class-policy");
+                continue;
+            }
             if (Player::BuildEnumData(result, &data))
             {
                 _legitCharacters.insert(guid);
@@ -275,6 +282,13 @@ void WorldSession::HandleCharCreateOpcode(WorldPacket& recvData)
         >> createInfo->HairColor
         >> createInfo->FacialHair
         >> createInfo->OutfitId;
+
+    if ((createInfo->Class == CLASS_NECROMANCER || createInfo->Class == CLASS_SORCERESS) && !CanUsePrivateClassAssets())
+    {
+        LOG_INFO("module", "[WowPs PrivateMods] create=denied class={} reason=private-class-policy", createInfo->Class);
+        SendCharCreate(CHAR_CREATE_DISABLED);
+        return;
+    }
 
     if (!HasPermission(rbac::RBAC_PERM_SKIP_CHECK_CHARACTER_CREATION_TEAMMASK))
     {
@@ -686,6 +700,14 @@ void WorldSession::HandlePlayerLoginOpcode(WorldPacket& recvData)
 
     ObjectGuid playerGuid;
     recvData >> playerGuid;
+
+    if (CharacterCacheEntry const* entry = sCharacterCache->GetCharacterCacheByGuid(playerGuid))
+        if ((entry->Class == CLASS_NECROMANCER || entry->Class == CLASS_SORCERESS) && !CanUsePrivateClassAssets())
+        {
+            LOG_INFO("module", "[WowPs PrivateMods] login=denied reason=private-class-policy");
+            SendCharLoginFailed(LoginFailureReason::NoWorld);
+            return;
+        }
 
     if (!IsLegitCharacterForAccount(playerGuid))
     {

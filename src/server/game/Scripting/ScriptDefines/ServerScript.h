@@ -31,7 +31,15 @@ enum ServerHook
     SERVERHOOK_ON_SOCKET_CLOSE,
     SERVERHOOK_CAN_PACKET_SEND,
     SERVERHOOK_CAN_PACKET_RECEIVE,
+    SERVERHOOK_ON_PACKET_SEND_REWRITE,
     SERVERHOOK_END
+};
+
+enum class PacketRewrite : uint8
+{
+    Unchanged,
+    Replaced,
+    Dropped
 };
 
 class ServerScript : public ScriptObject
@@ -75,6 +83,16 @@ public:
     [[nodiscard]] virtual bool CanPacketReceive(WorldSession* /*session*/, WorldPacket const& /*packet*/) { return true; }
 
     virtual void OnPacketReceived(WorldSession* /*session*/, WorldPacket const& /*packet*/) { }
+
+    /**
+     * @brief Called for a packet about to reach a client's socket, after CanPacketSend allowed it.
+     * A broadcast hands the same packet to every session, so a script that needs this session to
+     * see something else writes the whole packet into `replacement` instead of editing `packet`.
+     * Bots have no socket and never reach this hook. Called from map and world threads alike.
+     *
+     * @return Replaced to send `replacement`, Dropped to send nothing, Unchanged to send `packet`
+     */
+    [[nodiscard]] virtual PacketRewrite OnPacketSendRewrite(WorldSession* /*session*/, WorldPacket const& /*packet*/, WorldPacket& /*replacement*/) { return PacketRewrite::Unchanged; }
 };
 
 #endif

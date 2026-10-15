@@ -5,6 +5,7 @@
 /conf/*
 !/conf/dist
 /modules/*
+!/modules/mod-d2x-classes/
 !/modules/*.md
 !/modules/*.sh
 !/modules/CMakeLists.txt

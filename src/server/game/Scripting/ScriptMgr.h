@@ -180,6 +180,7 @@ public: /* ServerScript */
     bool CanPacketReceive(WorldSession* session, WorldPacket const& packet);
     void OnPacketReceived(WorldSession* session, WorldPacket const& packet);
     bool CanPacketSend(WorldSession* session, WorldPacket const& packet);
+    PacketRewrite OnPacketSendRewrite(WorldSession* session, WorldPacket const& packet, WorldPacket& replacement);
 
 public: /* WorldScript */
     void OnLoadCustomDatabaseTable();
@@ -734,6 +735,8 @@ public: /* WorldObjectScript */
     void OnWorldObjectSetMap(WorldObject* object, Map* map);
     void OnWorldObjectResetMap(WorldObject* object);
     void OnWorldObjectUpdate(WorldObject* object, uint32 diff);
+    [[nodiscard]] bool HasDynamicObjectValuesUpdateFieldHooks() const;
+    void OnDynamicObjectValuesUpdateField(DynamicObject const* object, Player const* target, uint16 index, uint32& value);
 
 public: /* PetScript */
 

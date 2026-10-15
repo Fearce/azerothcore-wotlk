@@ -1871,9 +1871,9 @@ namespace WowPsParty
         // below keeps the shown list a reasonable size.
         QueryResult q = CharacterDatabase.Query(
             "SELECT `guid`,`name`,`class`,`level` FROM `characters` "
-            "WHERE `account` IN ({}) AND `online` = 0 AND `race` IN ({}) "
+            "WHERE `account` IN ({}) AND `online` = 0 AND `race` IN ({}) AND `class` <= {} "
             "ORDER BY RAND() LIMIT 400",
-            acctCsv, raceCsv);
+            acctCsv, raceCsv, WowPsParty::LAST_PARTY_CLASS);
 
         struct Raw { uint32 guid; std::string name; uint8 cls; uint8 level; };
         std::vector<Raw> raws;
@@ -3738,9 +3738,9 @@ namespace WowPsParty
             "SELECT c.`guid`, c.`name`, c.`class`, c.`level`, c.`online` "
             "FROM `characters` c "
             "LEFT JOIN `account_party` ap ON ap.`guid` = c.`guid` "
-            "WHERE c.`account` = {} AND ap.`guid` IS NULL "
+            "WHERE c.`account` = {} AND ap.`guid` IS NULL AND c.`class` <= {} "
             "ORDER BY (c.`roster_order` IS NULL) ASC, c.`roster_order` ASC, c.`name` ASC",
-            account);
+            account, WowPsParty::LAST_PARTY_CLASS);
         if (!q) return out;
         do
         {
@@ -3791,6 +3791,7 @@ namespace WowPsParty
         uint8 const cls          = f[3].Get<uint8>();
         bool  const enrolled     = f[4].Get<uint32>() != 0;
         if (charAccount != account) { outMsg = "That isn't one of your characters."; return false; }
+        if (cls > WowPsParty::LAST_PARTY_CLASS) { outMsg = "That class cannot join a party as a companion."; return false; }
         if (enrolled) { outMsg = "That character is already in your party."; return false; }
         // Real session, not the DB flag — a stale characters.online must not block
         // a hire (it clears the flag as a side effect, self-healing the row).
@@ -3945,6 +3946,14 @@ namespace WowPsParty
             return EnrollResult::TargetNotFound;
         if (targetAccount != requestorAccount)
             return EnrollResult::TakenByAnotherAccount;
+
+        if (targetGuid != requestor->GetGUID().GetCounter())
+            if (QueryResult cls = CharacterDatabase.Query("SELECT class FROM characters WHERE guid = {}", targetGuid))
+                if (cls->Fetch()[0].Get<uint8>() > LAST_PARTY_CLASS)
+                {
+                    LOG_INFO("module", "[WowPsParty Enroll] companion=denied reason=unsupported-custom-class");
+                    return EnrollResult::TargetNotFound;
+                }
 
         // Already enrolled?
         QueryResult existing = CharacterDatabase.Query(

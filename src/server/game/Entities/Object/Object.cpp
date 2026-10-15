@@ -495,13 +495,18 @@ void Object::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* targe
     uint32* flags = nullptr;
     uint32 visibleFlag = GetUpdateFieldData(target, flags);
 
+    DynamicObject const* scriptedDynObject = sScriptMgr->HasDynamicObjectValuesUpdateFieldHooks() ? ToDynObject() : nullptr;
+
     for (uint16 index = 0; index < m_valuesCount; ++index)
     {
         if (_fieldNotifyFlags & flags[index] ||
                 ((updateType == UPDATETYPE_VALUES ? _changesMask.GetBit(index) : m_uint32Values[index]) && (flags[index] & visibleFlag)))
         {
             updateMask.SetBit(index);
-            fieldBuffer << m_uint32Values[index];
+            uint32 value = m_uint32Values[index];
+            if (scriptedDynObject)
+                sScriptMgr->OnDynamicObjectValuesUpdateField(scriptedDynObject, target, index, value);
+            fieldBuffer << value;
         }
     }
 

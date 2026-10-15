@@ -29,6 +29,7 @@
 #include "SecretMgr.h"
 #include "StringConvert.h"
 #include "TOTP.h"
+#include "Tokenize.h"
 #include "Util.h"
 #include <boost/lexical_cast.hpp>
 
@@ -133,6 +134,37 @@ std::unordered_map<uint8, AuthHandler> AuthSession::InitHandlers()
 }
 
 std::unordered_map<uint8, AuthHandler> const Handlers = AuthSession::InitHandlers();
+
+namespace
+{
+    // RealmAccess = "<realm>:<account> <account>;<realm>:..." lists each named realm only to those account ids.
+    bool IsRealmListedFor(uint32 realmId, uint32 accountId)
+    {
+        std::string const access = sConfigMgr->GetOption<std::string>("RealmAccess", "", false);
+        for (std::string_view entry : Acore::Tokenize(access, ';', false))
+        {
+            std::vector<std::string_view> parts = Acore::Tokenize(entry, ':', true);
+            std::vector<std::string_view> realmTokens = parts.empty() ? parts : Acore::Tokenize(parts[0], ' ', false);
+            Optional<uint32> restrictedRealm = realmTokens.size() == 1 ? Acore::StringTo<uint32>(realmTokens[0]) : std::nullopt;
+            if (parts.size() != 2 || !restrictedRealm)
+            {
+                LOG_ERROR("server.authserver", "RealmAccess entry '{}' is not '<realm>:<accounts>'; it is ignored", entry);
+                continue;
+            }
+
+            if (*restrictedRealm != realmId)
+                continue;
+
+            for (std::string_view account : Acore::Tokenize(parts[1], ' ', false))
+                if (Acore::StringTo<uint32>(account) == accountId)
+                    return true;
+
+            return false;
+        }
+
+        return true;
+    }
+}
 
 void AccountInfo::LoadResult(Field* fields)
 {
@@ -754,6 +786,9 @@ void AuthSession::RealmListCallback(PreparedQueryResult result)
     std::size_t RealmListSize = 0;
     for (auto const& [realmHandle, realm] : sRealmList->GetRealms())
     {
+        if (!IsRealmListedFor(realm.Id.Realm, _accountInfo.Id))
+            continue;
+
         // don't work with realms which not compatible with the client
         bool okBuild = ((_expversion & POST_BC_EXP_FLAG) && realm.Build == _build) || ((_expversion & PRE_BC_EXP_FLAG) && !AuthHelper::IsPreBCAcceptedClientBuild(realm.Build));
 

@@ -48,7 +48,7 @@ void WorldSession::SendNameQueryOpcode(ObjectGuid guid)
     nameQueryResponse.Name = playerData->Name;
     nameQueryResponse.Race = player ? player->getRace() : playerData->Race;
     nameQueryResponse.Sex = player ? player->getGender() : playerData->Sex;
-    nameQueryResponse.Class = player ? player->getClass() : playerData->Class;
+    nameQueryResponse.Class = GetVisibleClass(player ? player->getClass() : playerData->Class);
 
     if (DeclinedName const* names = (player ? player->GetDeclinedNames() : nullptr))
     {

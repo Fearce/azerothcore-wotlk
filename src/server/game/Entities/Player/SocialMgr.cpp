@@ -167,7 +167,7 @@ void PlayerSocial::SendSocialList(Player* player, uint32 flags)
             {
                 data << uint32(friendInfo.Area);              // player area
                 data << uint32(friendInfo.Level);             // player level
-                data << uint32(friendInfo.Class);             // player class
+                data << uint32(player->GetSession()->GetVisibleClass(uint8(friendInfo.Class)));
             }
         }
     }
