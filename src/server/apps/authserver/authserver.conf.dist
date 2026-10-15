@@ -119,6 +119,8 @@ RealmsStateUpdateDelay = 20
 #                     the realm list. Entries are separated by ';', account ids by spaces.
 #        Example:     "2:101 205" - realm 2 is listed only to accounts 101 and 205
 #        Default:     "" - every realm is listed to every account
+#        Invalid, duplicate or empty entries refuse startup. Realm IDs must be 1-255;
+#        each restriction requires one or more positive account IDs. No trailing ';'.
 
 RealmAccess = ""
 

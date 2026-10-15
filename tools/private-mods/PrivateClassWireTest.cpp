@@ -2,6 +2,7 @@
 #include "D2xWire.h"
 #include "D2xAccess.h"
 #include "RealmRouting.h"
+#include "../../src/server/apps/authserver/Server/RealmAccessPolicy.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -123,6 +124,18 @@ void PartyPackets()
 
 int main()
 {
+    auto const open = RealmAccess::Policy::Parse(" \t");
+    Require(open.RestrictedRealms() == 0 && open.Allows(1, 18));
+    auto const access = RealmAccess::Policy::Parse("1:17 18; 9:4294967295");
+    Require(access.RestrictedRealms() == 2 && access.Allows(1, 17) && access.Allows(1, 18));
+    Require(!access.Allows(1, 19) && access.Allows(9, UINT32_MAX) && !access.Allows(9, 17));
+    Require(access.Allows(2, 19)); // ordinary unlisted realms remain available
+    for (std::string const invalid : {"broken", "1:", "1:17bad", "1:0", "0:17", "256:17", "1:17;", ";1:17", "1:17;;2:18", "1:17;1:18", "1:17:18", "-1:17", "1:+17", "1:4294967296"})
+    {
+        bool refused = false;
+        try { RealmAccess::Policy::Parse(invalid); } catch (std::invalid_argument const&) { refused = true; }
+        Require(refused);
+    }
     Require(RealmRouting::RealmIds(1, "") == std::vector<uint32_t>{1});
     Require(RealmRouting::RealmIds(9, "1 9\t2 1") == std::vector<uint32_t>({9, 1, 2}));
     for (std::string const invalid : {"0", "256", "-1", "2suffix", "9999999999999999999999"})

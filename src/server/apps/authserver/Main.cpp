@@ -37,6 +37,7 @@
 #include "OpenSSLCrypto.h"
 #include "ProcessPriority.h"
 #include "RealmList.h"
+#include "RealmAccessPolicy.h"
 #include "SecretMgr.h"
 #include "SharedDefines.h"
 #include "SteadyTimer.h"
@@ -88,6 +89,17 @@ int main(int argc, char** argv)
     // Init logging
     sLog->RegisterAppender<AppenderDB>();
     sLog->Initialize(nullptr);
+
+    try
+    {
+        auto const policy = RealmAccess::Policy::Parse(sConfigMgr->GetOption<std::string>("RealmAccess", "", false));
+        LOG_INFO("server.authserver", "[PrivateMods] RealmAccess validated: restrictedRealms={}", policy.RestrictedRealms());
+    }
+    catch (std::invalid_argument const& error)
+    {
+        LOG_ERROR("server.authserver", "[PrivateMods] Invalid RealmAccess; auth startup refused: {}", error.what());
+        return 1;
+    }
 
     Acore::Banner::Show("authserver",
         [](std::string_view text)
