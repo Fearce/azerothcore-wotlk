@@ -1,5 +1,15 @@
 # CLAUDE.md
 
+## The work board
+
+Read [BACKLOG.md](BACKLOG.md) before work. For this private server deployment,
+follow [the opt-in mod rules](../docs/PRIVATE_MODS.md) and
+[the gameplay roadmap](../docs/MOD_ROADMAP.md) in the owning WowPs checkout.
+Ordinary clients need no new patches. Private custom classes default off and
+require the locally configured owner account plus an explicit preview session.
+Use stock identities and asset fallbacks for nonparticipants. No Discord or
+public release without a separate instruction from the owner.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
