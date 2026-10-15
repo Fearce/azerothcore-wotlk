@@ -227,6 +227,14 @@ void AuthSession::CheckIpCallback(PreparedQueryResult result)
         }
     }
 
+    // The PROXY header read may also have received the first auth packet.
+    // Waiting for another socket read here would strand that buffered request.
+    if (GetReadBuffer().GetActiveSize())
+    {
+        LOG_DEBUG("session", "[PrivateMods] Auth transport processing bufferedBytes={}", GetReadBuffer().GetActiveSize());
+        if (ReadHandler() == SocketReadCallbackResult::Stop)
+            return;
+    }
     AsyncRead();
 }
 
