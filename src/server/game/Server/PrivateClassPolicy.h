@@ -7,6 +7,7 @@
 namespace PrivateClasses
 {
     constexpr bool IsCustom(uint8_t cls) { return cls == 12 || cls == 13; }
+    constexpr bool IsCustomSpell(uint32_t spell) { return spell >= 110000 && spell <= 119999; }
 
     constexpr bool CanUse(bool enabled, uint32_t owner, uint32_t preview,
         uint32_t account, uint32_t selectedRealm, bool bot, uint32_t normalRealm, bool assetsConfirmed)

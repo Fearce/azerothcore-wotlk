@@ -310,7 +310,13 @@ void WorldSession::ConfirmPrivateClassAssets(bool marker)
 
 bool WorldSession::CanUsePrivateClassAssets() const
 {
-    return _privateClassAssets;
+    // The marker belongs to this connection. Authorization remains live across
+    // config reloads, so disabling/rebinding the preview revokes old sessions.
+    return _privateClassAssets && PrivateClasses::CanUse(
+        sConfigMgr->GetOption<bool>("PrivateMods.D2.Enabled", false, false),
+        sConfigMgr->GetOption<uint32>("PrivateMods.D2.AccountId", 0, false),
+        sConfigMgr->GetOption<uint32>("PrivateMods.D2.PreviewRealm", 0, false),
+        GetAccountId(), GetClientRealmId(), _isBot, realm.Id.Realm, true);
 }
 
 uint8 WorldSession::GetVisibleClass(uint8 cls) const

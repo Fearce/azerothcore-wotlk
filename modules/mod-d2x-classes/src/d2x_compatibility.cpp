@@ -7,15 +7,62 @@
 #include "Player.h"
 #include "PrivateClassPolicy.h"
 #include "ScriptMgr.h"
+#include "Spell.h"
 #include "UpdateFields.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
+#include "WorldSessionMgr.h"
 
 #include <algorithm>
 #include <unordered_set>
 
 namespace
 {
+    static_assert(d2x::FIRST_CLASS_SPELL == 110000 && d2x::LAST_CLASS_SPELL == 119999,
+        "Update the core spell-learning gate when changing the reserved D2 range");
+
+    class d2x_private_spell_access : public AllSpellScript
+    {
+    public:
+        d2x_private_spell_access() : AllSpellScript("d2x_private_spell_access", {ALLSPELLHOOK_CAN_PREPARE}) { }
+
+        bool CanPrepare(Spell* spell, SpellCastTargets const*, AuraEffect const*) override
+        {
+            uint32 id = spell->GetSpellInfo()->Id;
+            if (id < d2x::FIRST_CLASS_SPELL || id > d2x::LAST_CLASS_SPELL)
+                return true;
+            Player* owner = spell->GetCaster()->GetCharmerOrOwnerPlayerOrPlayerItself();
+            if (owner && d2x::IsD2Class(owner) && owner->GetSession() && owner->GetSession()->CanUsePrivateClassAssets())
+                return true;
+            LOG_INFO("module", "[WowPs PrivateMods] cast=denied spell={} reason=private-class-policy", id);
+            spell->SendCastResult(SPELL_FAILED_NOT_KNOWN);
+            return false;
+        }
+    };
+
+    class d2x_private_policy_reload : public WorldScript
+    {
+    public:
+        d2x_private_policy_reload() : WorldScript("d2x_private_policy_reload", {WORLDHOOK_ON_AFTER_CONFIG_LOAD}) { }
+
+        void OnAfterConfigLoad(bool reload) override
+        {
+            if (!reload)
+                return;
+            for (auto const& entry : sWorldSessionMgr->GetAllSessions())
+            {
+                WorldSession* session = entry.second;
+                Player* player = session->GetPlayer();
+                if (player && d2x::IsD2Class(player) && !session->CanUsePrivateClassAssets())
+                {
+                    player->SaveToDB(false, false);
+                    LOG_INFO("module", "[WowPs PrivateMods] session=revoked reason=config-reload data=saved-for-reenablement");
+                    session->KickPlayer("Private class participation revoked by local configuration");
+                }
+            }
+        }
+    };
+
     bool UsesStockAssets(Player const* viewer)
     {
         return viewer && !viewer->GetSession()->CanUsePrivateClassAssets();
@@ -225,6 +272,8 @@ namespace
 
 void AddSC_d2x_compatibility()
 {
+    new d2x_private_spell_access();
+    new d2x_private_policy_reload();
     new d2x_stock_packets();
     new d2x_stock_units();
     new d2x_stock_dynamic_objects();

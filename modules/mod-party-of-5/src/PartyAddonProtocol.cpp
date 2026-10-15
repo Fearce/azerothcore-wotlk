@@ -309,6 +309,11 @@ namespace
     // Build + send the roster the party-management panel renders: one record per
     // character on the account, "<guid>:<name>:<race>:<class>:<level>:<slot|-1>:<role>".
     // Role precedence: account_party.role (enrolled) → party_loadout.role (solo) → dps.
+    static uint32 PrivateLeaderGuid(Player const* player)
+    {
+        return player->GetSession()->CanUsePrivateClassAssets() ? player->GetGUID().GetCounter() : 0;
+    }
+
     static void SendMgmtList(Player* player)
     {
         if (!player || !player->GetSession())
@@ -322,14 +327,16 @@ namespace
             "LEFT JOIN `account_party` ap ON ap.guid = c.guid AND ap.account = c.account "
             "LEFT JOIN `party_loadout` pl ON pl.guid = c.guid "
             "WHERE c.account = {} AND (c.deleteInfos_Account IS NULL OR c.deleteInfos_Account = 0) "
-            "  AND c.class <= {} "
+            "  AND (c.class <= {} OR c.guid = {}) "
             // The player's hand-sorted roster order wins; characters not yet placed
             // (roster_order NULL) fall to the bottom in the legacy enrolled-first /
             // name order, which also seeds the very first sort before any move.
             // KEEP THIS SORT IDENTICAL to the MGMT_MOVE read, or arrows swap the wrong row.
             "ORDER BY (c.roster_order IS NULL) ASC, c.roster_order ASC, "
             "         COALESCE(ap.slot, 255) ASC, c.name ASC",
-            accountId, WowPsParty::LAST_PARTY_CLASS);
+            accountId, WowPsParty::LAST_PARTY_CLASS, PrivateLeaderGuid(player));
+        if (player->getClass() > WowPsParty::LAST_PARTY_CLASS)
+            LOG_DEBUG("module", "[WowPsParty MGMT] private-leader=visible companions=stock-only");
 
         std::ostringstream out;
         out << "MGMT_LIST\t";
@@ -8733,10 +8740,10 @@ public:
                 "LEFT JOIN `account_party` ap ON ap.guid = c.guid AND ap.account = c.account "
                 "WHERE c.`account` = {} "
                 "AND (c.`deleteInfos_Account` IS NULL OR c.`deleteInfos_Account` = 0) "
-                "AND c.`class` <= {} "
+                "AND (c.`class` <= {} OR c.`guid` = {}) "
                 "ORDER BY (c.`roster_order` IS NULL) ASC, c.`roster_order` ASC, "
                 "         COALESCE(ap.`slot`, 255) ASC, c.`name` ASC",
-                accountId, WowPsParty::LAST_PARTY_CLASS);
+                accountId, WowPsParty::LAST_PARTY_CLASS, PrivateLeaderGuid(player));
             if (!q) return;
 
             std::vector<uint32> order;

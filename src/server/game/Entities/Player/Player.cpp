@@ -16,6 +16,7 @@
  */
 
 #include "Player.h"
+#include "PrivateClassPolicy.h"
 #include "AccountMgr.h"
 #include "AchievementMgr.h"
 #include "AreaDefines.h"
@@ -3038,6 +3039,13 @@ void Player::SendLearnPacket(uint32 spellId, bool learn)
 
 bool Player::addSpell(uint32 spellId, uint8 addSpecMask, bool updateActive, bool temporary /*= false*/, bool learnFromSkill /*= false*/)
 {
+    if (PrivateClasses::IsCustomSpell(spellId) &&
+        (!PrivateClasses::IsCustom(getClass()) || !GetSession() || !GetSession()->CanUsePrivateClassAssets()))
+    {
+        LOG_INFO("module", "[WowPs PrivateMods] learn-spell=denied spell={} reason=private-class-policy", spellId);
+        return false; // Preserve stored rows; never delete data when participation is disabled.
+    }
+
     if (!_addSpell(spellId, addSpecMask, temporary, learnFromSkill))
         return false;
 

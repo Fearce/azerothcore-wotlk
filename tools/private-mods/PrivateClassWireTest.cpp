@@ -34,6 +34,8 @@ void Policy()
                         (enabled && owner == 17 && preview == 2 && !bot));
     Require(!CanUse(true, 17, 1, 17, 1, false, 1, true));
     Require(!CanUse(true, 17, 2, 17, 2, false, 1, false));
+    Require(!IsCustomSpell(109999) && IsCustomSpell(110000));
+    Require(IsCustomSpell(119999) && !IsCustomSpell(120000));
     for (uint8_t cls = 0; cls < 20; ++cls)
     {
         Require(VisibleClass(cls, true) == cls);
