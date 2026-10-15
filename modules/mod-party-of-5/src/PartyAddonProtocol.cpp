@@ -5327,7 +5327,7 @@ static bool OpenLootableContainer(Player* requester, Player* srcChar, Item* srcI
         if (summary != lootedSummary.end())
             summary->second += li.count;
         else
-            lootedSummary.push_back({ li.itemid, li.count });   // li.count is a bitfield — read by value
+            lootedSummary.push_back({ li.itemid, uint32(li.count) }); // Materialize the bitfield before pair construction.
     }
     if (!allStored)
     {
