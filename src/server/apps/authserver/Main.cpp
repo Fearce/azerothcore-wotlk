@@ -38,6 +38,7 @@
 #include "ProcessPriority.h"
 #include "RealmList.h"
 #include "RealmAccessPolicy.h"
+#include "RealmCountAliases.h"
 #include "SecretMgr.h"
 #include "SharedDefines.h"
 #include "SteadyTimer.h"
@@ -98,6 +99,17 @@ int main(int argc, char** argv)
     catch (std::invalid_argument const& error)
     {
         LOG_ERROR("server.authserver", "[PrivateMods] Invalid RealmAccess; auth startup refused: {}", error.what());
+        return 1;
+    }
+
+    try
+    {
+        auto const aliases = RealmCountAliases::Parse(sConfigMgr->GetOption<std::string>("RealmCharacterCountAliases", "", false));
+        LOG_INFO("server.authserver", "[PrivateMods] RealmCharacterCountAliases validated: aliases={}", aliases.Size());
+    }
+    catch (std::invalid_argument const& error)
+    {
+        LOG_ERROR("server.authserver", "[PrivateMods] Invalid RealmCharacterCountAliases; auth startup refused: {}", error.what());
         return 1;
     }
 

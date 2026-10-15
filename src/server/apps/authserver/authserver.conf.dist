@@ -125,6 +125,17 @@ RealmsStateUpdateDelay = 20
 RealmAccess = ""
 
 #
+#    RealmCharacterCountAliases
+#        Description: Listings of the same world share the primary realm's character count.
+#                     Space-separated alias:source pairs. Counts remain stored only on the
+#                     primary realm, preserving account limits. Invalid IDs, duplicates,
+#                     chains and cycles refuse startup. This does not grant realm access.
+#        Example:     "2:1" - private listing 2 displays world 1's count
+#        Default:     "" - independent counts for every realm
+
+RealmCharacterCountAliases = ""
+
+#
 #    WrongPass.MaxCount
 #        Description: Number of login attempts with wrong password before the account or IP will be
 #                     banned.

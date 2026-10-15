@@ -27,6 +27,7 @@
 #include "Log.h"
 #include "RealmList.h"
 #include "RealmAccessPolicy.h"
+#include "RealmCountAliases.h"
 #include "SecretMgr.h"
 #include "StringConvert.h"
 #include "TOTP.h"
@@ -759,6 +760,8 @@ bool AuthSession::HandleRealmList()
 
 void AuthSession::RealmListCallback(PreparedQueryResult result)
 {
+    static RealmCountAliases const countAliases = RealmCountAliases::Parse(
+        sConfigMgr->GetOption<std::string>("RealmCharacterCountAliases", "", false));
     std::map<uint32, uint8> characterCounts;
     if (result)
     {
@@ -813,7 +816,7 @@ void AuthSession::RealmListCallback(PreparedQueryResult result)
         pkt << name;
         pkt << boost::lexical_cast<std::string>(realm.GetAddressForClient(GetRemoteIpAddress()));
         pkt << float(realm.PopulationLevel);
-        pkt << uint8(characterCounts[realm.Id.Realm]);
+        pkt << uint8(characterCounts[countAliases.Source(realm.Id.Realm)]);
         pkt << uint8(realm.Timezone);                       // realm category
 
         if (_expversion & POST_BC_EXP_FLAG)                 // 2.x and 3.x clients

@@ -3,6 +3,7 @@
 #include "D2xAccess.h"
 #include "RealmRouting.h"
 #include "../../src/server/apps/authserver/Server/RealmAccessPolicy.h"
+#include "../../src/server/apps/authserver/Server/RealmCountAliases.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -124,6 +125,16 @@ void PartyPackets()
 
 int main()
 {
+    auto const aliases = RealmCountAliases::Parse("2:1\t3:1");
+    Require(aliases.Size() == 2 && aliases.Source(2) == 1 && aliases.Source(3) == 1);
+    Require(aliases.Source(1) == 1 && aliases.Source(9) == 9);
+    Require(RealmCountAliases::Parse("").Source(2) == 2);
+    for (std::string const invalid : {"0:1", "2:0", "256:1", "2:256", "2:2", "2:1 2:3", "2:3 3:1", "2:3 3:2", "2:1;3:1", "2:foo", "2:1:1", "2:", ":1"})
+    {
+        bool refused = false;
+        try { RealmCountAliases::Parse(invalid); } catch (std::invalid_argument const&) { refused = true; }
+        Require(refused);
+    }
     auto const open = RealmAccess::Policy::Parse(" \t");
     Require(open.RestrictedRealms() == 0 && open.Allows(1, 18));
     auto const access = RealmAccess::Policy::Parse("1:17 18; 9:4294967295");

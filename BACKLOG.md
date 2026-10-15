@@ -12,4 +12,4 @@
 ## In progress
 
 - **Integrate the existing Necromancer and Sorceress with private access and stock-client fallbacks** (Implementor c76e32b6, 2026-10-15).
-  - Kevin confirmed the account and approved stock fallbacks. Access/wire and strict realm-policy tests pass. An isolated auth test reproduced a coalesced PROXY/login timeout; buffered first requests are now handled before the next read, pending binary retest. Full build/gameplay proof remain; see ../docs/PRIVATE_MODS.md.
+  - Kevin confirmed the account and approved stock fallbacks. Guarded SRP, source-IP, spoof/boundary and strict startup tests passed. A reproduced shared-world count defect now has an explicit display-only alias map, pending binary retest; account-limit storage stays authoritative. Full world build/gameplay proof remain; see ../docs/PRIVATE_MODS.md.
