@@ -42,6 +42,7 @@
 #include "ProcessPriority.h"
 #include "RASession.h"
 #include "RealmList.h"
+#include "RealmRouting.h"
 #include "Resolver.h"
 #include "ScriptLoader.h"
 #include "ScriptMgr.h"
@@ -280,8 +281,21 @@ int main(int argc, char** argv)
 
     std::shared_ptr<void> dbHandle(nullptr, [](void*) { StopDB(); });
 
-    // set server offline (not connectable)
-    LoginDatabase.DirectExecute("UPDATE realmlist SET flag = (flag & ~{}) | {} WHERE id = '{}'", REALM_FLAG_OFFLINE, REALM_FLAG_VERSION_MISMATCH, realm.Id.Realm);
+    // All listings of this process share its readiness and shutdown state.
+    std::vector<uint32> servedRealmIds;
+    try
+    {
+        servedRealmIds = RealmRouting::RealmIds(realm.Id.Realm,
+            sConfigMgr->GetOption<std::string>("RealmAliases", "", false));
+    }
+    catch (std::invalid_argument const& error)
+    {
+        LOG_ERROR("server", "[WowPs PrivateMods] Invalid realm routing: {}", error.what());
+        return 1;
+    }
+    LOG_INFO("server.loading", "[WowPs PrivateMods] Realm lifecycle: {} listing(s) served by this world", servedRealmIds.size());
+    for (uint32 id : servedRealmIds)
+        LoginDatabase.DirectExecute("UPDATE realmlist SET flag = (flag & ~{}) | {} WHERE id = '{}'", REALM_FLAG_OFFLINE, REALM_FLAG_VERSION_MISMATCH, id);
 
     LoadRealmInfo(*ioContext);
 
@@ -369,7 +383,8 @@ int main(int argc, char** argv)
     });
 
     // Set server online (allow connecting now)
-    LoginDatabase.DirectExecute("UPDATE realmlist SET flag = flag & ~{}, population = 0 WHERE id = '{}'", REALM_FLAG_VERSION_MISMATCH, realm.Id.Realm);
+    for (uint32 id : servedRealmIds)
+        LoginDatabase.DirectExecute("UPDATE realmlist SET flag = flag & ~{}, population = 0 WHERE id = '{}'", REALM_FLAG_VERSION_MISMATCH, id);
     realm.PopulationLevel = 0.0f;
     realm.Flags = RealmFlags(realm.Flags & ~uint32(REALM_FLAG_VERSION_MISMATCH));
 
@@ -408,7 +423,8 @@ int main(int argc, char** argv)
 
     // set server offline
     if (!sConfigMgr->GetOption<bool>("Network.UseSocketActivation", false))
-        LoginDatabase.DirectExecute("UPDATE realmlist SET flag = flag | {} WHERE id = '{}'", REALM_FLAG_OFFLINE, realm.Id.Realm);
+        for (uint32 id : servedRealmIds)
+            LoginDatabase.DirectExecute("UPDATE realmlist SET flag = flag | {} WHERE id = '{}'", REALM_FLAG_OFFLINE, id);
 
     LOG_INFO("server.worldserver", "Halting process...");
 

@@ -1,6 +1,7 @@
 #include "PrivateClassPolicy.h"
 #include "D2xWire.h"
 #include "D2xAccess.h"
+#include "RealmRouting.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -122,6 +123,14 @@ void PartyPackets()
 
 int main()
 {
+    Require(RealmRouting::RealmIds(1, "") == std::vector<uint32_t>{1});
+    Require(RealmRouting::RealmIds(9, "1 9\t2 1") == std::vector<uint32_t>({9, 1, 2}));
+    for (std::string const invalid : {"0", "256", "-1", "2suffix", "9999999999999999999999"})
+    {
+        bool refused = false;
+        try { RealmRouting::RealmIds(9, invalid); } catch (std::invalid_argument const&) { refused = true; }
+        Require(refused);
+    }
     Policy();
     AuraPackets();
     PartyPackets();

@@ -27,6 +27,7 @@
 #include "PacketLog.h"
 #include "Random.h"
 #include "Realm.h"
+#include "RealmRouting.h"
 #include "ScriptMgr.h"
 #include "World.h"
 #include "WorldSession.h"
@@ -46,12 +47,17 @@ namespace
     // RealmAliases: further realmlist ids that list this world server, e.g. "2 3".
     bool IsRealmAlias(uint32 realmId)
     {
-        std::string const aliases = sConfigMgr->GetOption<std::string>("RealmAliases", "", false);
-        for (std::string_view token : Acore::Tokenize(aliases, ' ', false))
-            if (Acore::StringTo<uint32>(token) == realmId)
-                return true;
-
-        return false;
+        try
+        {
+            auto const ids = RealmRouting::RealmIds(realm.Id.Realm,
+                sConfigMgr->GetOption<std::string>("RealmAliases", "", false));
+            return std::find(ids.begin(), ids.end(), realmId) != ids.end();
+        }
+        catch (std::invalid_argument const&)
+        {
+            LOG_ERROR("server", "[WowPs PrivateMods] Invalid RealmAliases configuration; alias authentication denied");
+            return false;
+        }
     }
 }
 

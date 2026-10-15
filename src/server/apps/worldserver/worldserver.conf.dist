@@ -95,6 +95,8 @@ RealmID = 1
 #                     A client that selected one of them is accepted, and its session reports the
 #                     id it chose (WorldSession::GetClientRealmId), so a module can tell clients
 #                     apart by the realm entry they used. Characters stay on RealmID.
+#                     All listings share readiness/offline flags. IDs must be 1-255;
+#                     changing this list requires a world restart.
 #        Example:     "2"
 #        Default:     "" - (Only RealmID)
 
