@@ -11,11 +11,15 @@
 
 ## In progress
 
-- **Repair the complete Linux build without precompiled headers** (Implementor c76e32b6, 2026-10-16).
-  - Full linking reached three undefined Cell::VisitObjects instantiations in Moonglade, ZulDrak and Nagrand PvP scripts; each lacks CellImpl.h. Preserve all encounter code and verify the final binary link.
+_(none: claim from Ready)_
 
-- **Block private aura and pet-spell acquisition through GM commands** (Implementor c76e32b6, 2026-10-15).
-  - Aura commands call Aura::TryRefreshStackOrCreate directly, and Pet::addSpell has no private policy check; cover direct grants and persistence without changing ordinary spells.
+## Shipped, awaiting live proof
 
 - **Integrate the existing Necromancer and Sorceress with private access and stock-client fallbacks** (Implementor c76e32b6, 2026-10-15).
-  - Guarded SRP/source-IP/spoof/boundary, strict startup and shared-count fixtures pass, including auth restart. Raw integer/float/addition/bit field edits now preserve private class identity; native policy checks pass, actual command negatives await the full world. See ../docs/PRIVATE_MODS.md; full deployment/gameplay proof remain.
+  - Owner requested goal handoff. Core 18880556c completes the Linux world/auth/module/Lua build; actual auth/count/restart fixtures and MSVC/GNU policy matrices pass. Default-off deployment, raw-field/aura/pet command negatives and all real class/mixed-client gameplay remain unaccepted. Resume from ../docs/MODDING_HANDOFF.md.
+
+- **Repair the complete Linux build without precompiled headers** (18880556c, Implementor c76e32b6).
+  - Explicit Cell/Grid template includes resolved the three link failures; complete single-compiler release/install/ldd passed. Candidate archive and build log are preserved under the owning WowPs private release/evidence folders; deployment remains pending.
+
+- **Block private aura and pet-spell acquisition through GM commands** (9a1d0ddb7, Implementor c76e32b6).
+  - Direct grants and pet loading now check private participation with denial logging and stored-row preservation. Native policy matrix and real compilation pass; actual command and pet persistence checks remain pending.
