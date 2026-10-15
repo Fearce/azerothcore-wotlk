@@ -15,9 +15,11 @@
  * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "CellImpl.h"
 #include "CreatureScript.h"
 #include "GameObjectScript.h"
 #include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
 #include "PassiveAI.h"
 #include "Player.h"
 #include "ScriptedCreature.h"
