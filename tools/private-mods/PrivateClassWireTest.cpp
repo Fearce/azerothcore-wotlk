@@ -1,4 +1,5 @@
 #include "PrivateClassPolicy.h"
+#include "PrivateClassFieldPolicy.h"
 #include "D2xWire.h"
 #include "D2xAccess.h"
 #include "RealmRouting.h"
@@ -30,6 +31,14 @@ void Word(Bytes& data, uint32_t value)
 void Policy()
 {
     using namespace PrivateClasses;
+    Require(!CanEditIdentityField(0x00000801, 0x00000c01));
+    Require(!CanEditIdentityField(0x00000801, 0x00000d01));
+    Require(!CanEditIdentityField(0x00000801, 0x3f000c01)); // float bits cannot bypass
+    Require(!CanEditIdentityField(0x00000c01, 0x00000801));
+    Require(!CanEditIdentityField(0x00000c01, 0x00000d01));
+    Require(!CanEditIdentityField(0x00000c01, 0));
+    Require(CanEditIdentityField(0x00000c01, 0x03010c01)); // same private class, other bytes
+    Require(CanEditIdentityField(0x00000801, 0x00000901)); // existing stock debug behavior
     for (bool enabled : {false, true})
         for (uint32_t owner : {0u, 17u, 18u})
             for (uint32_t preview : {0u, 2u, 3u})

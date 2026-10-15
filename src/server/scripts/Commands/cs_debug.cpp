@@ -37,12 +37,14 @@
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "PoolMgr.h"
+#include "PrivateClassFieldPolicy.h"
 #include "RBAC.h"
 #include "RaceMgr.h"
 #include "ScriptMgr.h"
 #include "Transport.h"
 #include "Warden.h"
 #include <algorithm>
+#include <bit>
 #include <fstream>
 #include <map>
 #include <set>
@@ -1243,6 +1245,18 @@ public:
         return true;
     }
 
+    static bool CanWriteDebugField(ChatHandler* handler, WorldObject* target, uint32 index, uint32 value)
+    {
+        if (target->GetTypeId() == TYPEID_PLAYER && index == UNIT_FIELD_BYTES_0 &&
+            !PrivateClasses::CanEditIdentityField(target->GetUInt32Value(index), value))
+        {
+            LOG_WARN("commands", "[PrivateMods] debug-field-write=denied field={} reason=private-class-identity", index);
+            handler->SendErrorMessage("Private class identity may only be assigned when creating a character.");
+            return false;
+        }
+        return true;
+    }
+
     static bool HandleDebugSetValueCommand(ChatHandler* handler, uint32 index, Variant<uint32, float> value)
     {
         WorldObject* target = handler->getSelectedObject();
@@ -1257,6 +1271,10 @@ public:
             handler->PSendSysMessage(LANG_TOO_BIG_INDEX, index, target->GetGUID().ToString(), target->GetValuesCount());
             return false;
         }
+
+        uint32 const bits = value.holds_alternative<uint32>() ? value.get<uint32>() : std::bit_cast<uint32>(value.get<float>());
+        if (!CanWriteDebugField(handler, target, index, bits))
+            return false;
 
         if (value.holds_alternative<uint32>())
         {
@@ -1314,6 +1332,8 @@ public:
         uint32 currentValue = handler->GetPlayer()->GetUInt32Value(index);
 
         currentValue += value;
+        if (!CanWriteDebugField(handler, handler->GetPlayer(), index, currentValue))
+            return false;
         handler->GetPlayer()->SetUInt32Value(index, currentValue);
 
         handler->PSendSysMessage(LANG_CHANGE_32BIT_FIELD, index, currentValue);
@@ -1350,6 +1370,8 @@ public:
             return true;
         }
 
+        if (!CanWriteDebugField(handler, unit, index, *value))
+            return false;
         unit->SetUInt32Value(index, *value);
 
         handler->PSendSysMessage(LANG_UPDATE_CHANGE, unit->GetGUID().ToString(), index, *value);
@@ -1368,7 +1390,16 @@ public:
         if (bit > 32) // uint32 = 32 bits
             return false;
 
-        uint32 value = bit ? 1 << (bit - 1) : 0;
+        if (index >= target->GetValuesCount())
+        {
+            LOG_WARN("commands", "[PrivateMods] debug-bit-write=denied field={} count={} reason=index-out-of-range", index, target->GetValuesCount());
+            handler->PSendSysMessage(LANG_TOO_BIG_INDEX, index, target->GetGUID().ToString(), target->GetValuesCount());
+            return false;
+        }
+
+        uint32 value = bit ? uint32(1) << (bit - 1) : 0;
+        if (!CanWriteDebugField(handler, target, index, value))
+            return false;
         target->SetUInt32Value(index, value);
 
         handler->PSendSysMessage(LANG_SET_32BIT_FIELD, index, value);

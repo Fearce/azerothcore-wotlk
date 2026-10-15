@@ -12,4 +12,4 @@
 ## In progress
 
 - **Integrate the existing Necromancer and Sorceress with private access and stock-client fallbacks** (Implementor c76e32b6, 2026-10-15).
-  - Kevin confirmed the account and approved stock fallbacks. Guarded SRP, source-IP, spoof/boundary and strict startup tests passed. A reproduced shared-world count defect now has an explicit display-only alias map, pending binary retest; account-limit storage stays authoritative. Full world build/gameplay proof remain; see ../docs/PRIVATE_MODS.md.
+  - Guarded SRP/source-IP/spoof/boundary, strict startup and shared-count fixtures pass, including auth restart. Raw integer/float/addition/bit field edits now preserve private class identity; native policy checks pass, actual command negatives await the full world. See ../docs/PRIVATE_MODS.md; full deployment/gameplay proof remain.
