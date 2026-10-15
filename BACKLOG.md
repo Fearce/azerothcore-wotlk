@@ -11,6 +11,9 @@
 
 ## In progress
 
+- **Repair the complete Linux build without precompiled headers** (Implementor c76e32b6, 2026-10-16).
+  - Full linking reached three undefined Cell::VisitObjects instantiations in Moonglade, ZulDrak and Nagrand PvP scripts; each lacks CellImpl.h. Preserve all encounter code and verify the final binary link.
+
 - **Block private aura and pet-spell acquisition through GM commands** (Implementor c76e32b6, 2026-10-15).
   - Aura commands call Aura::TryRefreshStackOrCreate directly, and Pet::addSpell has no private policy check; cover direct grants and persistence without changing ordinary spells.
 
