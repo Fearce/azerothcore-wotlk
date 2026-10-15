@@ -1,4 +1,5 @@
 #include "D2xClasses.h"
+#include "D2xAccess.h"
 #include "D2xWire.h"
 
 #include "DynamicObject.h"
@@ -8,6 +9,7 @@
 #include "PrivateClassPolicy.h"
 #include "ScriptMgr.h"
 #include "Spell.h"
+#include "SpellAuraEffects.h"
 #include "UpdateFields.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
@@ -20,20 +22,41 @@ namespace
 {
     static_assert(d2x::FIRST_CLASS_SPELL == 110000 && d2x::LAST_CLASS_SPELL == 119999,
         "Update the core spell-learning gate when changing the reserved D2 range");
+    static_assert(d2x::nec::LIFE_TAP == 110256 && d2x::nec::LIFE_TAP_HEAL == 110262,
+        "Update the delegated-effect policy when changing Life Tap IDs");
+
+    bool ParticipatingSource(Unit* caster)
+    {
+        Player* owner = caster ? caster->GetCharmerOrOwnerPlayerOrPlayerItself() : nullptr;
+        return owner && d2x::IsD2Class(owner) && owner->GetSession() && owner->GetSession()->CanUsePrivateClassAssets();
+    }
 
     class d2x_private_spell_access : public AllSpellScript
     {
     public:
         d2x_private_spell_access() : AllSpellScript("d2x_private_spell_access", {ALLSPELLHOOK_CAN_PREPARE}) { }
 
-        bool CanPrepare(Spell* spell, SpellCastTargets const*, AuraEffect const*) override
+        bool CanPrepare(Spell* spell, SpellCastTargets const* targets, AuraEffect const* sourceAura) override
         {
             uint32 id = spell->GetSpellInfo()->Id;
             if (id < d2x::FIRST_CLASS_SPELL || id > d2x::LAST_CLASS_SPELL)
                 return true;
-            Player* owner = spell->GetCaster()->GetCharmerOrOwnerPlayerOrPlayerItself();
-            if (owner && d2x::IsD2Class(owner) && owner->GetSession() && owner->GetSession()->CanUsePrivateClassAssets())
+            Unit* caster = spell->GetCaster();
+            if (ParticipatingSource(caster))
                 return true;
+            if (d2x::access::CanApplyLifeTapHeal(id, sourceAura ? sourceAura->GetId() : 0,
+                sourceAura && ParticipatingSource(sourceAura->GetCaster()),
+                caster->GetCharmerOrOwnerPlayerOrPlayerItself() != nullptr,
+                targets && targets->GetUnitTargetGUID() == caster->GetGUID()))
+            {
+                static thread_local bool logged = false;
+                if (!logged)
+                {
+                    logged = true;
+                    LOG_INFO("module", "[WowPs PrivateMods] delegated-heal={} reason=authorized-life-tap-aura access=effect-only", id);
+                }
+                return true;
+            }
             LOG_INFO("module", "[WowPs PrivateMods] cast=denied spell={} reason=private-class-policy", id);
             spell->SendCastResult(SPELL_FAILED_NOT_KNOWN);
             return false;

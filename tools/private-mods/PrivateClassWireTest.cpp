@@ -1,5 +1,6 @@
 #include "PrivateClassPolicy.h"
 #include "D2xWire.h"
+#include "D2xAccess.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -36,6 +37,13 @@ void Policy()
     Require(!CanUse(true, 17, 2, 17, 2, false, 1, false));
     Require(!IsCustomSpell(109999) && IsCustomSpell(110000));
     Require(IsCustomSpell(119999) && !IsCustomSpell(120000));
+    Require(d2x::access::CanApplyLifeTapHeal(110262, 110256, true, true, true));
+    Require(!d2x::access::CanApplyLifeTapHeal(110263, 110256, true, true, true)); // another helper
+    Require(!d2x::access::CanApplyLifeTapHeal(110262, 110257, true, true, true)); // another aura
+    Require(!d2x::access::CanApplyLifeTapHeal(110262, 0, true, true, true));      // no provenance
+    Require(!d2x::access::CanApplyLifeTapHeal(110262, 110256, false, true, true)); // revoked origin
+    Require(!d2x::access::CanApplyLifeTapHeal(110262, 110256, true, false, true)); // uncontrolled NPC
+    Require(!d2x::access::CanApplyLifeTapHeal(110262, 110256, true, true, false)); // another target
     for (uint8_t cls = 0; cls < 20; ++cls)
     {
         Require(VisibleClass(cls, true) == cls);

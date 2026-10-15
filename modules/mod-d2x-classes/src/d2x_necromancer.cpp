@@ -277,9 +277,10 @@ class spell_d2x_life_tap : public AuraScript
         if (!damage || !damage->GetDamage() || !attacker || !attacker->IsAlive() || !attacker->IsControlledByPlayer())
             return;
 
-        // Cast as the attacker's own heal: an absent curse caster must not stop it.
+        // Preserve curse provenance so the access gate can authorize a teammate's
+        // triggered self-heal without granting that teammate a custom spell.
         int32 const amount = CalculatePct(damage->GetDamage(), aurEff->GetAmount());
-        attacker->CastCustomSpell(attacker, nec::LIFE_TAP_HEAL, &amount, nullptr, nullptr, true);
+        attacker->CastCustomSpell(attacker, nec::LIFE_TAP_HEAL, &amount, nullptr, nullptr, true, nullptr, aurEff);
     }
 
     void Register() override
